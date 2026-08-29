@@ -74,6 +74,23 @@ type DomainEvent = {
   created_at: string
 }
 
+type EntityLink = {
+  kind: 'mission' | 'task' | 'run' | 'artifact'
+  id: string
+}
+
+type RoomMessage = {
+  id: string
+  room_id: string
+  actor_id: string
+  thread_root_id: string | null
+  reply_to_id: string | null
+  body: string
+  mentions: string[]
+  link: EntityLink | null
+  created_at: string
+}
+
 type BrowserSocketMessage =
   | { type: 'ready'; corp_id: string; replayed_through: number }
   | { type: 'event'; event: DomainEvent }
@@ -87,6 +104,7 @@ type SnapshotResponse = {
     missions: Mission[]
     tasks: Task[]
     runs: Run[]
+    room_messages: RoomMessage[]
     leases: Lease[]
     queued_messages: QueuedMessage[]
     events: DomainEvent[]
@@ -104,6 +122,7 @@ type BootstrapResponse = {
   room_id: string
   alice_actor_id: string
   bob_actor_id: string
+  eve_actor_id: string
   manager_agent_id: string
   worker_agent_id: string
 }
@@ -331,6 +350,183 @@ function EventRow({ event, actors }: { event: DomainEvent; actors: Actor[] }) {
   )
 }
 
+function RoomPanel({
+  room,
+  messages,
+  actors,
+  selectedActor,
+  missions,
+  tasks,
+  runs,
+  onPost,
+}: {
+  room: { id: string; name: string; purpose: string } | undefined
+  messages: RoomMessage[]
+  actors: Actor[]
+  selectedActor: Actor
+  missions: Mission[]
+  tasks: Task[]
+  runs: Run[]
+  onPost: (input: {
+    roomId: string
+    body: string
+    replyToId: string | null
+    mentions: string[]
+    link: EntityLink | null
+  }) => Promise<void>
+}) {
+  const [body, setBody] = useState('')
+  const [replyToId, setReplyToId] = useState<string | null>(null)
+  const [linkValue, setLinkValue] = useState('')
+
+  if (!room) {
+    return (
+      <section className="room-panel panel">
+        <div className="panel-heading">
+          <div>
+            <span className="section-code">ROOM / 03</span>
+            <h2>No room access</h2>
+            <p>{selectedActor.name} is not a member of this project room.</p>
+          </div>
+        </div>
+        <div className="room-denied">Room messages and room-scoped work are hidden.</div>
+      </section>
+    )
+  }
+
+  const linkedOptions = [
+    ...missions.slice(0, 2).map((mission) => ({
+      value: `mission:${mission.id}`,
+      label: `Mission · ${mission.title}`,
+    })),
+    ...tasks.slice(0, 2).map((task) => ({
+      value: `task:${task.id}`,
+      label: `Task · ${task.title}`,
+    })),
+    ...runs.slice(0, 2).flatMap((run) => [
+      { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
+      ...(run.artifact_sha256
+        ? [{ value: `artifact:${run.id}`, label: `Artifact · ${shortId(run.artifact_sha256)}` }]
+        : []),
+    ]),
+  ]
+  const visibleMessages = messages.slice(-40)
+  const replyTarget = replyToId
+    ? messages.find((message) => message.id === replyToId)
+    : undefined
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!body.trim()) return
+    const mentionedNames = Array.from(body.matchAll(/@([A-Za-z0-9_-]+)/g), (match) =>
+      match[1].toLowerCase(),
+    )
+    const mentions = actors
+      .filter((actor) => mentionedNames.includes(actor.name.toLowerCase()))
+      .map((actor) => actor.id)
+    const [kind, id] = linkValue.split(':')
+    const link =
+      kind && id
+        ? ({ kind, id } as EntityLink)
+        : null
+    await onPost({
+      roomId: room.id,
+      body,
+      replyToId,
+      mentions,
+      link,
+    })
+    setBody('')
+    setReplyToId(null)
+    setLinkValue('')
+  }
+
+  return (
+    <section className="room-panel panel">
+      <div className="panel-heading">
+        <div>
+          <span className="section-code">ROOM / 03</span>
+          <h2>{room.name} wire</h2>
+          <p>Humans and agents leave durable, linked messages here.</p>
+        </div>
+        <div className="room-count">{messages.length} messages</div>
+      </div>
+      <div className="room-layout">
+        <ol className="room-message-list" data-testid="room-message-list">
+          {visibleMessages.length ? (
+            visibleMessages.map((message) => {
+              const author = actors.find((actor) => actor.id === message.actor_id)
+              const linked = message.link
+                ? `${message.link.kind} · ${shortId(message.link.id)}`
+                : null
+              return (
+                <li
+                  key={message.id}
+                  className={`room-message ${message.thread_root_id ? 'room-reply' : ''}`}
+                >
+                  <div className="room-message-head">
+                    <strong>{author?.name ?? 'Unknown actor'}</strong>
+                    <span>{author?.role ?? 'member'}</span>
+                    <time dateTime={message.created_at}>{time(message.created_at)}</time>
+                  </div>
+                  <p>{message.body}</p>
+                  <div className="room-message-foot">
+                    <div>
+                      {message.mentions.map((actorId) => {
+                        const mentioned = actors.find((actor) => actor.id === actorId)
+                        return (
+                          <span className="mention-chip" key={actorId}>
+                            @{mentioned?.name ?? shortId(actorId)}
+                          </span>
+                        )
+                      })}
+                      {linked ? <span className="entity-link">{linked}</span> : null}
+                    </div>
+                    <button type="button" onClick={() => setReplyToId(message.id)}>
+                      Reply
+                    </button>
+                  </div>
+                </li>
+              )
+            })
+          ) : (
+            <li className="empty-state">
+              <strong>The room is quiet</strong>
+              <span>Post the first durable message.</span>
+            </li>
+          )}
+        </ol>
+        <form className="room-composer" onSubmit={submit}>
+          <label htmlFor="room-message">Post as {selectedActor.name}</label>
+          {replyTarget ? (
+            <div className="reply-context">
+              Replying to {actors.find((actor) => actor.id === replyTarget.actor_id)?.name ?? 'message'}
+              <button type="button" onClick={() => setReplyToId(null)}>Cancel</button>
+            </div>
+          ) : null}
+          <textarea
+            id="room-message"
+            value={body}
+            onChange={(event) => setBody(event.target.value)}
+            placeholder="Write a message. Mention a colleague with @Name."
+            rows={5}
+          />
+          <label htmlFor="room-link">Structured link</label>
+          <select id="room-link" value={linkValue} onChange={(event) => setLinkValue(event.target.value)}>
+            <option value="">No linked work item</option>
+            {linkedOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+          <button className="button button-primary" type="submit" disabled={!body.trim()}>
+            Post to room
+          </button>
+        </form>
+      </div>
+    </section>
+  )
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null)
   const [data, setData] = useState<SnapshotResponse | null>(null)
@@ -341,12 +537,14 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
-  const lastEventSeq = useRef(0)
+  const lastEventSeq = useRef<Record<string, number>>({})
 
-  const refresh = useCallback(async (corpId: string) => {
-    const snapshot = await api<SnapshotResponse>(`/api/corps/${corpId}/snapshot`)
+  const refresh = useCallback(async (corpId: string, actorId: string) => {
+    const snapshot = await api<SnapshotResponse>(
+      `/api/corps/${corpId}/snapshot?actor_id=${actorId}`,
+    )
     const newest = snapshot.snapshot.events.at(-1)?.seq ?? 0
-    lastEventSeq.current = Math.max(lastEventSeq.current, newest)
+    lastEventSeq.current[actorId] = Math.max(lastEventSeq.current[actorId] ?? 0, newest)
     setData(snapshot)
   }, [])
 
@@ -357,10 +555,13 @@ function App() {
         if (cancelled) return
         setBootstrap(result)
         const actorName = new URLSearchParams(window.location.search).get('actor')
-        const initialActor =
-          actorName?.toLowerCase() === 'bob' ? result.bob_actor_id : result.alice_actor_id
+        const initialActor = actorName?.toLowerCase() === 'bob'
+          ? result.bob_actor_id
+          : actorName?.toLowerCase() === 'eve'
+            ? result.eve_actor_id
+            : result.alice_actor_id
         setSelectedActorId(initialActor)
-        await refresh(result.corp_id)
+        await refresh(result.corp_id, initialActor)
       })
       .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)))
     return () => {
@@ -369,7 +570,7 @@ function App() {
   }, [refresh])
 
   useEffect(() => {
-    if (!bootstrap) return
+    if (!bootstrap || !selectedActorId) return
     let disposed = false
     let socket: WebSocket | null = null
 
@@ -380,24 +581,27 @@ function App() {
       setConnection('connecting')
       const wsUrl = API_URL.replace(/^http/, 'ws')
       socket = new WebSocket(
-        `${wsUrl}/ws/corps/${bootstrap.corp_id}?after_seq=${lastEventSeq.current}`,
+        `${wsUrl}/ws/corps/${bootstrap.corp_id}?actor_id=${selectedActorId}&after_seq=${lastEventSeq.current[selectedActorId] ?? 0}`,
       )
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data) as BrowserSocketMessage
         if (message.type === 'ready') {
-          lastEventSeq.current = Math.max(lastEventSeq.current, message.replayed_through)
+          lastEventSeq.current[selectedActorId] = Math.max(
+            lastEventSeq.current[selectedActorId] ?? 0,
+            message.replayed_through,
+          )
           replaying = false
           setConnection('live')
-          if (replayChanged) void refresh(bootstrap.corp_id)
+          if (replayChanged) void refresh(bootstrap.corp_id, selectedActorId)
           return
         }
-        if (message.event.seq <= lastEventSeq.current) return
-        lastEventSeq.current = message.event.seq
+        if (message.event.seq <= (lastEventSeq.current[selectedActorId] ?? 0)) return
+        lastEventSeq.current[selectedActorId] = message.event.seq
         if (replaying) {
           replayChanged = true
           return
         }
-        void refresh(bootstrap.corp_id)
+        void refresh(bootstrap.corp_id, selectedActorId)
       }
       socket.onerror = () => setConnection('offline')
       socket.onclose = () => {
@@ -413,7 +617,7 @@ function App() {
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
       socket?.close()
     }
-  }, [bootstrap, refresh])
+  }, [bootstrap, refresh, selectedActorId])
 
   const humans = useMemo(
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
@@ -426,10 +630,16 @@ function App() {
     : undefined
 
   const selectActor = (actor: Actor) => {
+    setData(null)
     setSelectedActorId(actor.id)
     const url = new URL(window.location.href)
     url.searchParams.set('actor', actor.name.toLowerCase())
     window.history.replaceState({}, '', url)
+    if (bootstrap) {
+      void refresh(bootstrap.corp_id, actor.id).catch((caught: unknown) => {
+        setError(caught instanceof Error ? caught.message : String(caught))
+      })
+    }
   }
 
   const createMission = async (event: FormEvent) => {
@@ -443,7 +653,7 @@ function App() {
         body: JSON.stringify({ title: missionTitle, requested_by: selectedActor.id }),
       })
       setMissionTitle('')
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -460,7 +670,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ requested_by: selectedActor.id }),
       })
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -490,7 +700,7 @@ function App() {
         const key = leaseTokenKey(selectedActor.id, agent.id)
         setLeaseTokens((current) => ({ ...current, [key]: result.token as string }))
       }
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -510,7 +720,7 @@ function App() {
         delete next[key]
         return next
       })
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -537,7 +747,7 @@ function App() {
         delete next[fromKey]
         return next
       })
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -554,7 +764,7 @@ function App() {
           reason: `${selectedActor.name} requested an emergency stop from the operations floor.`,
         }),
       })
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -572,7 +782,33 @@ function App() {
           text,
         }),
       })
-      await refresh(bootstrap.corp_id)
+      await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const postRoomMessage = async (input: {
+    roomId: string
+    body: string
+    replyToId: string | null
+    mentions: string[]
+    link: EntityLink | null
+  }) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/rooms/${input.roomId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          actor_id: selectedActor.id,
+          body: input.body,
+          reply_to_id: input.replyToId,
+          mentions: input.mentions,
+          link: input.link,
+        }),
+      })
+      await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -718,10 +954,21 @@ function App() {
         </aside>
       </section>
 
+      <RoomPanel
+        room={room}
+        messages={data.snapshot.room_messages}
+        actors={data.snapshot.actors}
+        selectedActor={selectedActor}
+        missions={data.snapshot.missions}
+        tasks={data.snapshot.tasks}
+        runs={data.snapshot.runs}
+        onPost={postRoomMessage}
+      />
+
       <section className="operations-panel panel">
         <div className="panel-heading operations-heading">
           <div>
-            <span className="section-code">JOURNAL / 03</span>
+            <span className="section-code">JOURNAL / 04</span>
             <h2>Immutable activity</h2>
           </div>
           <div className="operations-summary">

@@ -17,6 +17,10 @@ Known development-only shortcuts:
 
 These are explicit backlog items, not production claims.
 
+The development identity model still enforces room membership in persistence, snapshots, writes,
+WebSocket replay, and live delivery. Eve is a deliberate non-member fixture used to prove that
+room-scoped missions, tasks, runs, messages, and events are not returned.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.

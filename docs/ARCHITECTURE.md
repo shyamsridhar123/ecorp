@@ -86,12 +86,27 @@ Runner events have independent UUIDs. Replaying the same runner event is a no-op
 ## Real-time delivery
 
 The server publishes committed domain events to connected browser clients. Clients reconnect with
-an `after_seq` cursor. The server subscribes to live events before querying Postgres, replays every
-committed event after that cursor in bounded pages, sends a replay watermark, and then switches to
-the live stream while suppressing duplicate sequence numbers.
+an actor identity and `after_seq` cursor. The server verifies Corp membership before upgrading the
+connection, subscribes to live events before querying Postgres, replays every visible committed
+event after that cursor in bounded pages, sends a replay watermark, and then switches to the live
+stream while suppressing duplicate sequence numbers.
 
 The current browser refreshes its bounded materialized snapshot after replay or a live event. Later
 clients may apply typed events directly for lower latency.
+
+## Rooms and threads
+
+Room membership is a server-side visibility boundary:
+
+- snapshots include only rooms, missions, tasks, runs, messages, and events visible to the viewer
+- room writes require membership
+- WebSocket replay and live fan-out apply the same room filter
+- replies store both their immediate parent and stable thread root
+- mentions are actor IDs validated against room membership
+- links to missions, tasks, runs, and artifacts are validated against the same room
+
+The demo includes Eve as a Corp guest without Product Lab membership so isolation can be exercised
+end to end.
 
 ## Control lease
 

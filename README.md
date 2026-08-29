@@ -20,9 +20,11 @@ The UI can close without terminating active work.
 
 ## Current vertical slice
 
-- Shared demo Corp with two human actors and two agent identities
+- Shared demo Corp with three human actors and two agent identities
+- Durable room membership, human-agent messages, replies, mentions, and work-item links
 - Durable Postgres state and event journal
 - Browser WebSocket updates
+- Resumable, room-filtered event replay
 - Outbound-connected runner daemon
 - Real child-process execution through a deterministic fake-agent adapter
 - Mission creation and launch

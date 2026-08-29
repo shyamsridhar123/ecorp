@@ -12,11 +12,11 @@ async function post(path, body) {
   return payload;
 }
 
-function collectReplay(corpId, afterSeq) {
+function collectReplay(corpId, actorId, afterSeq) {
   return new Promise((resolvePromise, reject) => {
     const events = [];
     const socket = new WebSocket(
-      `${socketBase}/ws/corps/${corpId}?after_seq=${afterSeq}`,
+      `${socketBase}/ws/corps/${corpId}?actor_id=${actorId}&after_seq=${afterSeq}`,
     );
     const timeout = setTimeout(() => {
       socket.close();
@@ -46,7 +46,7 @@ function collectReplay(corpId, afterSeq) {
 }
 
 const demo = await post("/api/demo/reset", {});
-const first = await collectReplay(demo.corp_id, 0);
+const first = await collectReplay(demo.corp_id, demo.alice_actor_id, 0);
 if (first.events.length !== 1 || first.events[0].type !== "corp.demo_bootstrapped") {
   throw new Error(`unexpected initial replay: ${JSON.stringify(first)}`);
 }
@@ -56,7 +56,11 @@ await post(`/api/corps/${demo.corp_id}/missions`, {
   title: "Verify event-stream replay after a disconnected client.",
 });
 
-const second = await collectReplay(demo.corp_id, first.replayedThrough);
+const second = await collectReplay(
+  demo.corp_id,
+  demo.alice_actor_id,
+  first.replayedThrough,
+);
 const types = second.events.map((event) => event.type);
 if (types.join(",") !== "mission.created,task.created") {
   throw new Error(`unexpected reconnect replay: ${JSON.stringify(second)}`);
@@ -69,7 +73,11 @@ if (
   throw new Error(`replay sequence is not strictly ordered: ${JSON.stringify(second)}`);
 }
 
-const empty = await collectReplay(demo.corp_id, second.replayedThrough);
+const empty = await collectReplay(
+  demo.corp_id,
+  demo.alice_actor_id,
+  second.replayedThrough,
+);
 if (empty.events.length !== 0 || empty.replayedThrough !== second.replayedThrough) {
   throw new Error(`duplicate replay was delivered: ${JSON.stringify(empty)}`);
 }

@@ -225,6 +225,26 @@ pub struct QueuedMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityLink {
+    pub kind: String,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMessage {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub room_id: Uuid,
+    pub actor_id: Uuid,
+    pub thread_root_id: Option<Uuid>,
+    pub reply_to_id: Option<Uuid>,
+    pub body: String,
+    pub mentions: Vec<Uuid>,
+    pub link: Option<EntityLink>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainEvent {
     pub seq: i64,
     pub id: Uuid,
@@ -299,6 +319,7 @@ pub struct CorpSnapshot {
     pub missions: Vec<Mission>,
     pub tasks: Vec<Task>,
     pub runs: Vec<Run>,
+    pub room_messages: Vec<RoomMessage>,
     pub leases: Vec<ControlLease>,
     pub queued_messages: Vec<QueuedMessage>,
     pub events: Vec<DomainEvent>,

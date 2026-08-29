@@ -64,7 +64,7 @@ if ($message.delivery -ne 'immediate') {
 
 $deadline = (Get-Date).AddMinutes(2)
 do {
-    $snapshot = Invoke-RestMethod -Uri "$Server/api/corps/$($demo.corp_id)/snapshot"
+    $snapshot = Invoke-RestMethod -Uri "$Server/api/corps/$($demo.corp_id)/snapshot?actor_id=$($demo.alice_actor_id)"
     $run = $snapshot.snapshot.runs | Where-Object id -eq $launch.run_id
     if ($run.status -in @('completed', 'failed', 'cancelled')) {
         break
