@@ -561,7 +561,7 @@ fn send_run_event(
     event_type: &str,
     payload: Value,
 ) {
-    outbound.send(RunnerToServer::RunEvent {
+    let message = RunnerToServer::RunEvent {
         event_id: Uuid::new_v4(),
         runner_id: runner_id.to_owned(),
         corp_id: assignment.corp_id,
@@ -569,7 +569,11 @@ fn send_run_event(
         agent_id: assignment.agent_id,
         event_type: event_type.to_owned(),
         payload,
-    });
+    };
+    outbound.send(message.clone());
+    if event_type == "run.started" && assignment.mission_title.contains("[duplicate-event]") {
+        outbound.send(message);
+    }
 }
 
 fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {

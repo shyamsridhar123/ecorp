@@ -97,6 +97,8 @@ jobs:
         run: node tools/e2e_rooms.mjs
       - name: Verify runner grace and reconciliation
         run: node tools/e2e_runner_reconnect.mjs
+      - name: Verify duplicate runner delivery is idempotent
+        run: node tools/e2e_idempotency.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
