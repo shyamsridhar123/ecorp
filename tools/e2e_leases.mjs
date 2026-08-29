@@ -18,16 +18,18 @@ async function post(path, body) {
   return result.payload;
 }
 
-async function snapshot(corpId) {
-  const response = await fetch(`${server}/api/corps/${corpId}/snapshot`);
+async function snapshot(corpId, actorId) {
+  const response = await fetch(
+    `${server}/api/corps/${corpId}/snapshot?actor_id=${actorId}`,
+  );
   if (!response.ok) throw new Error(`snapshot failed: ${response.status}`);
   return response.json();
 }
 
-async function waitForRun(corpId, runId, terminal = false) {
+async function waitForRun(corpId, actorId, runId, terminal = false) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const current = await snapshot(corpId);
+    const current = await snapshot(corpId, actorId);
     const run = current.snapshot.runs.find((candidate) => candidate.id === runId);
     if (
       run &&
@@ -93,7 +95,10 @@ const transferLeasePath = `/api/corps/${transferDemo.corp_id}/agents/${transferD
 const aliceLease = await post(transferLeasePath, {
   actor_id: transferDemo.alice_actor_id,
 });
-const leaseSnapshot = await snapshot(transferDemo.corp_id);
+const leaseSnapshot = await snapshot(
+  transferDemo.corp_id,
+  transferDemo.alice_actor_id,
+);
 if (JSON.stringify(leaseSnapshot).includes(aliceLease.token)) {
   throw new Error("lease fencing token leaked into a shared snapshot or event");
 }
@@ -151,7 +156,12 @@ const launch = await post(
   `/api/corps/${stopDemo.corp_id}/missions/${mission.mission_id}/launch`,
   { requested_by: stopDemo.alice_actor_id },
 );
-await waitForRun(stopDemo.corp_id, launch.run_id, false);
+await waitForRun(
+  stopDemo.corp_id,
+  stopDemo.alice_actor_id,
+  launch.run_id,
+  false,
+);
 
 const forbiddenStop = await request(
   `/api/corps/${stopDemo.corp_id}/agents/${stopDemo.worker_agent_id}/emergency-stop`,
@@ -171,7 +181,12 @@ await post(
     reason: "Owner verified emergency-stop behavior.",
   },
 );
-const stopped = await waitForRun(stopDemo.corp_id, launch.run_id, true);
+const stopped = await waitForRun(
+  stopDemo.corp_id,
+  stopDemo.alice_actor_id,
+  launch.run_id,
+  true,
+);
 if (stopped.run.status !== "cancelled") {
   throw new Error(`emergency stop ended as ${stopped.run.status}`);
 }

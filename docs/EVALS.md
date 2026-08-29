@@ -63,3 +63,6 @@ receives no duplicate events.
 `tools/e2e_leases.mjs` races two controllers, verifies token rotation and stale-command rejection,
 exercises explicit release and transfer, checks role-gated emergency stop, and confirms the runner
 actually cancels the child process.
+`tools/e2e_rooms.mjs` verifies persisted top-level messages and replies, author attribution,
+structured mentions and entity links, two-member visibility, non-member write rejection, and
+room-filtered WebSocket replay.

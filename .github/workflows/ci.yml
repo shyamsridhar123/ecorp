@@ -93,6 +93,8 @@ jobs:
         run: node tools/e2e_replay.mjs
       - name: Verify control fencing and emergency stop
         run: node tools/e2e_leases.mjs
+      - name: Verify room threads and membership isolation
+        run: node tools/e2e_rooms.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4

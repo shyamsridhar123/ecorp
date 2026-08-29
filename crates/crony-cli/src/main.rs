@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use crony_domain::EntityLink;
 use crony_protocol::{
-    ClaimLeaseRequest, CreateMissionRequest, EmergencyStopRequest, LaunchMissionRequest,
-    QueueMessageRequest, ReleaseLeaseRequest, TransferLeaseRequest,
+    ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
+    LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest, TransferLeaseRequest,
 };
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -28,11 +29,26 @@ enum Command {
     Bootstrap,
     Snapshot {
         corp_id: Uuid,
+        actor_id: Uuid,
     },
     Mission {
         corp_id: Uuid,
         actor_id: Uuid,
         title: String,
+    },
+    RoomMessage {
+        corp_id: Uuid,
+        room_id: Uuid,
+        actor_id: Uuid,
+        body: String,
+        #[arg(long)]
+        reply_to: Option<Uuid>,
+        #[arg(long)]
+        mention: Vec<Uuid>,
+        #[arg(long, requires = "link_id")]
+        link_kind: Option<String>,
+        #[arg(long, requires = "link_kind")]
+        link_id: Option<Uuid>,
     },
     Launch {
         corp_id: Uuid,
@@ -96,11 +112,14 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::Snapshot { corp_id } => {
+        Command::Snapshot { corp_id, actor_id } => {
             request(
                 &client,
                 Method::GET,
-                format!("{}/api/corps/{corp_id}/snapshot", args.server),
+                format!(
+                    "{}/api/corps/{corp_id}/snapshot?actor_id={actor_id}",
+                    args.server
+                ),
                 None,
             )
             .await?
@@ -117,6 +136,38 @@ async fn main() -> Result<()> {
                 Some(serde_json::to_value(CreateMissionRequest {
                     title,
                     requested_by: actor_id,
+                })?),
+            )
+            .await?
+        }
+        Command::RoomMessage {
+            corp_id,
+            room_id,
+            actor_id,
+            body,
+            reply_to,
+            mention,
+            link_kind,
+            link_id,
+        } => {
+            let link = match (link_kind, link_id) {
+                (Some(kind), Some(id)) => Some(EntityLink { kind, id }),
+                (None, None) => None,
+                _ => anyhow::bail!("link kind and link id must be supplied together"),
+            };
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/rooms/{room_id}/messages",
+                    args.server
+                ),
+                Some(serde_json::to_value(CreateRoomMessageRequest {
+                    actor_id,
+                    body,
+                    reply_to_id: reply_to,
+                    mentions: mention,
+                    link,
                 })?),
             )
             .await?

@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
-    Actor, ActorKind, Agent, AgentStatus, ControlLease, Corp, CorpSnapshot, DomainEvent, Mission,
-    MissionStatus, NewEvent, QueuedMessage, Room, Run, RunStatus, Task, TaskStatus,
+    Actor, ActorKind, Agent, AgentStatus, ControlLease, Corp, CorpSnapshot, DomainEvent,
+    EntityLink, Mission, MissionStatus, NewEvent, QueuedMessage, Room, RoomMessage, Run, RunStatus,
+    Task, TaskStatus,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -11,6 +14,7 @@ use uuid::Uuid;
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
 const DEMO_BOB_ID: &str = "00000000-0000-4000-8000-000000000012";
+const DEMO_EVE_ID: &str = "00000000-0000-4000-8000-000000000013";
 const DEMO_MANAGER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000021";
 const DEMO_WORKER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000022";
 const DEMO_MANAGER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000031";
@@ -28,6 +32,7 @@ pub struct DemoIds {
     pub room_id: Uuid,
     pub alice_actor_id: Uuid,
     pub bob_actor_id: Uuid,
+    pub eve_actor_id: Uuid,
     pub manager_agent_id: Uuid,
     pub worker_agent_id: Uuid,
 }
@@ -79,6 +84,23 @@ pub struct StopRequestOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct RoomMessageOutcome {
+    pub message: RoomMessage,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRoomMessageInput {
+    pub corp_id: Uuid,
+    pub room_id: Uuid,
+    pub actor_id: Uuid,
+    pub body: String,
+    pub reply_to_id: Option<Uuid>,
+    pub mentions: Vec<Uuid>,
+    pub link: Option<EntityLink>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerEventInput {
     pub event_id: Uuid,
     pub runner_id: String,
@@ -115,6 +137,7 @@ impl PgStore {
             corp_id: parse_id(DEMO_CORP_ID)?,
             alice_actor_id: parse_id(DEMO_ALICE_ID)?,
             bob_actor_id: parse_id(DEMO_BOB_ID)?,
+            eve_actor_id: parse_id(DEMO_EVE_ID)?,
             manager_agent_id: parse_id(DEMO_MANAGER_AGENT_ID)?,
             worker_agent_id: parse_id(DEMO_WORKER_AGENT_ID)?,
             room_id: parse_id(DEMO_ROOM_ID)?,
@@ -137,6 +160,7 @@ impl PgStore {
         for (id, name, kind, role) in [
             (ids.alice_actor_id, "Alice", "human", "owner"),
             (ids.bob_actor_id, "Bob", "human", "reviewer"),
+            (ids.eve_actor_id, "Eve", "human", "guest"),
             (manager_actor_id, "Margo", "agent", "manager"),
             (worker_actor_id, "Wally", "agent", "engineer"),
         ] {
@@ -168,6 +192,25 @@ impl PgStore {
         .bind(ids.corp_id)
         .execute(&mut *tx)
         .await?;
+
+        for actor_id in [
+            ids.alice_actor_id,
+            ids.bob_actor_id,
+            manager_actor_id,
+            worker_actor_id,
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO room_memberships (room_id, actor_id, role)
+                VALUES ($1, $2, 'member')
+                ON CONFLICT (room_id, actor_id) DO NOTHING
+                "#,
+            )
+            .bind(ids.room_id)
+            .bind(actor_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         for (id, actor_id, name, role, accent) in [
             (
@@ -207,21 +250,18 @@ impl PgStore {
 
         let event = append_event_tx(
             &mut tx,
-            NewEvent {
-                room_id: Some(ids.room_id),
-                ..NewEvent::new(
-                    ids.corp_id,
-                    Some(ids.alice_actor_id),
-                    "corp.demo_bootstrapped",
-                    "corp",
-                    ids.corp_id,
-                    "demo-bootstrap-v1",
-                    json!({
-                        "name": "Crony Corp Demonstration Office",
-                        "actors": ["Alice", "Bob", "Margo", "Wally"]
-                    }),
-                )
-            },
+            NewEvent::new(
+                ids.corp_id,
+                Some(ids.alice_actor_id),
+                "corp.demo_bootstrapped",
+                "corp",
+                ids.corp_id,
+                "demo-bootstrap-v1",
+                json!({
+                    "name": "Crony Corp Demonstration Office",
+                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally"]
+                }),
+            ),
         )
         .await?;
         tx.commit().await?;
@@ -236,6 +276,10 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM queued_messages WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM room_messages WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
@@ -265,7 +309,12 @@ impl PgStore {
         self.bootstrap_demo().await
     }
 
-    pub async fn snapshot(&self, corp_id: Uuid) -> Result<CorpSnapshot> {
+    pub async fn snapshot(&self, corp_id: Uuid, viewer_actor_id: Uuid) -> Result<CorpSnapshot> {
+        if !self.actor_belongs_to_corp(corp_id, viewer_actor_id).await? {
+            return Err(anyhow!(
+                "viewer actor does not belong to the requested Corp"
+            ));
+        }
         let corp = map_corp(
             sqlx::query("SELECT id, slug, name, created_at FROM corps WHERE id = $1")
                 .bind(corp_id)
@@ -285,9 +334,16 @@ impl PgStore {
         .collect::<Result<Vec<_>>>()?;
 
         let rooms = sqlx::query(
-            "SELECT id, corp_id, name, purpose, created_at FROM rooms WHERE corp_id = $1 ORDER BY name",
+            r#"
+            SELECT r.id, r.corp_id, r.name, r.purpose, r.created_at
+            FROM rooms r
+            JOIN room_memberships rm ON rm.room_id = r.id
+            WHERE r.corp_id = $1 AND rm.actor_id = $2
+            ORDER BY r.name
+            "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -310,11 +366,16 @@ impl PgStore {
 
         let missions = sqlx::query(
             r#"
-            SELECT id, corp_id, room_id, requested_by, title, status, created_at, updated_at
-            FROM missions WHERE corp_id = $1 ORDER BY created_at DESC
+            SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title, m.status,
+                   m.created_at, m.updated_at
+            FROM missions m
+            JOIN room_memberships rm ON rm.room_id = m.room_id
+            WHERE m.corp_id = $1 AND rm.actor_id = $2
+            ORDER BY m.created_at DESC
             "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -323,12 +384,17 @@ impl PgStore {
 
         let tasks = sqlx::query(
             r#"
-            SELECT id, mission_id, corp_id, title, objective, status, assigned_agent_id,
-                   created_at, updated_at
-            FROM tasks WHERE corp_id = $1 ORDER BY created_at DESC
+            SELECT t.id, t.mission_id, t.corp_id, t.title, t.objective, t.status,
+                   t.assigned_agent_id, t.created_at, t.updated_at
+            FROM tasks t
+            JOIN missions m ON m.id = t.mission_id
+            JOIN room_memberships rm ON rm.room_id = m.room_id
+            WHERE t.corp_id = $1 AND rm.actor_id = $2
+            ORDER BY t.created_at DESC
             "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -337,12 +403,18 @@ impl PgStore {
 
         let runs = sqlx::query(
             r#"
-            SELECT id, corp_id, task_id, agent_id, runner_id, status, summary,
-                   artifact_path, artifact_sha256, created_at, updated_at
-            FROM runs WHERE corp_id = $1 ORDER BY created_at DESC
+            SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id, r.status,
+                   r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            JOIN room_memberships rm ON rm.room_id = m.room_id
+            WHERE r.corp_id = $1 AND rm.actor_id = $2
+            ORDER BY r.created_at DESC
             "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -376,15 +448,46 @@ impl PgStore {
         .map(map_queued_message)
         .collect();
 
+        let room_messages = sqlx::query(
+            r#"
+            SELECT msg.id, msg.corp_id, msg.room_id, msg.actor_id, msg.thread_root_id,
+                   msg.reply_to_id, msg.body, msg.mentions, msg.link_kind, msg.link_id,
+                   msg.created_at
+            FROM room_messages msg
+            JOIN room_memberships rm ON rm.room_id = msg.room_id
+            WHERE msg.corp_id = $1 AND rm.actor_id = $2
+            ORDER BY msg.created_at ASC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_room_message)
+        .collect();
+
         let mut events = sqlx::query(
             r#"
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
                    aggregate_type, aggregate_id, aggregate_version, correlation_id,
                    causation_id, idempotency_key, visibility, payload, created_at
-            FROM events WHERE corp_id = $1 ORDER BY seq DESC LIMIT 200
+            FROM events e
+            WHERE e.corp_id = $1
+              AND (
+                e.room_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM room_memberships rm
+                    WHERE rm.room_id = e.room_id AND rm.actor_id = $2
+                )
+              )
+            ORDER BY e.seq DESC
+            LIMIT 200
             "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -400,6 +503,7 @@ impl PgStore {
             missions,
             tasks,
             runs,
+            room_messages,
             leases,
             queued_messages,
             events,
@@ -409,6 +513,7 @@ impl PgStore {
     pub async fn events_after(
         &self,
         corp_id: Uuid,
+        viewer_actor_id: Uuid,
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<DomainEvent>> {
@@ -418,14 +523,22 @@ impl PgStore {
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
                    aggregate_type, aggregate_id, aggregate_version, correlation_id,
                    causation_id, idempotency_key, visibility, payload, created_at
-            FROM events
-            WHERE corp_id = $1 AND seq > $2
-            ORDER BY seq ASC
-            LIMIT $3
+            FROM events e
+            WHERE e.corp_id = $1 AND e.seq > $2
+              AND (
+                e.room_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM room_memberships rm
+                    WHERE rm.room_id = e.room_id AND rm.actor_id = $3
+                )
+              )
+            ORDER BY e.seq ASC
+            LIMIT $4
             "#,
         )
         .bind(corp_id)
         .bind(after_seq)
+        .bind(viewer_actor_id)
         .bind(bounded_limit)
         .fetch_all(&self.pool)
         .await?
@@ -433,6 +546,33 @@ impl PgStore {
         .map(map_event)
         .collect();
         Ok(events)
+    }
+
+    pub async fn actor_belongs_to_corp(&self, corp_id: Uuid, actor_id: Uuid) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND corp_id = $2)",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn visible_room_ids(&self, corp_id: Uuid, actor_id: Uuid) -> Result<Vec<Uuid>> {
+        let rooms = sqlx::query_scalar(
+            r#"
+            SELECT rm.room_id
+            FROM room_memberships rm
+            JOIN rooms r ON r.id = rm.room_id
+            WHERE r.corp_id = $1 AND rm.actor_id = $2
+            "#,
+        )
+        .bind(corp_id)
+        .bind(actor_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rooms)
     }
 
     pub async fn create_mission(
@@ -457,6 +597,7 @@ impl PgStore {
         .fetch_one(&mut *tx)
         .await
         .context("corp has no room")?;
+        assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
         let worker_agent_id: Uuid = sqlx::query_scalar(
             "SELECT id FROM agents WHERE corp_id = $1 AND role <> 'manager' ORDER BY created_at LIMIT 1",
         )
@@ -1196,6 +1337,122 @@ impl PgStore {
         })
     }
 
+    pub async fn create_room_message(
+        &self,
+        input: NewRoomMessageInput,
+    ) -> Result<RoomMessageOutcome> {
+        let NewRoomMessageInput {
+            corp_id,
+            room_id,
+            actor_id,
+            body,
+            reply_to_id,
+            mentions,
+            link,
+        } = input;
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(anyhow!("room message cannot be empty"));
+        }
+        if body.len() > 4_000 {
+            return Err(anyhow!("room message cannot exceed 4,000 characters"));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
+
+        let mut seen_mentions = HashSet::new();
+        let mentions = mentions
+            .into_iter()
+            .filter(|mentioned| seen_mentions.insert(*mentioned))
+            .collect::<Vec<_>>();
+        if mentions.len() > 20 {
+            return Err(anyhow!("room message cannot mention more than 20 actors"));
+        }
+        for mentioned in &mentions {
+            assert_room_membership_tx(&mut tx, corp_id, room_id, *mentioned).await?;
+        }
+
+        let (thread_root_id, reply_to_id) = if let Some(reply_to_id) = reply_to_id {
+            let row = sqlx::query(
+                r#"
+                SELECT id, thread_root_id
+                FROM room_messages
+                WHERE id = $1 AND corp_id = $2 AND room_id = $3
+                "#,
+            )
+            .bind(reply_to_id)
+            .bind(corp_id)
+            .bind(room_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("reply target is not visible in this room")?;
+            let root = row
+                .try_get::<Option<Uuid>, _>("thread_root_id")?
+                .unwrap_or_else(|| row.get("id"));
+            (Some(root), Some(reply_to_id))
+        } else {
+            (None, None)
+        };
+
+        if let Some(link) = &link {
+            validate_room_link_tx(&mut tx, corp_id, room_id, link).await?;
+        }
+
+        let message_id = Uuid::new_v4();
+        let link_kind = link.as_ref().map(|link| link.kind.as_str());
+        let link_id = link.as_ref().map(|link| link.id);
+        let row = sqlx::query(
+            r#"
+            INSERT INTO room_messages
+                (id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
+                 body, mentions, link_kind, link_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
+                      body, mentions, link_kind, link_id, created_at
+            "#,
+        )
+        .bind(message_id)
+        .bind(corp_id)
+        .bind(room_id)
+        .bind(actor_id)
+        .bind(thread_root_id)
+        .bind(reply_to_id)
+        .bind(body)
+        .bind(&mentions)
+        .bind(link_kind)
+        .bind(link_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let message = map_room_message(row);
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "room.message_posted",
+                    "room_message",
+                    message_id,
+                    format!("room-message:{message_id}"),
+                    json!({
+                        "message_id": message_id,
+                        "thread_root_id": thread_root_id,
+                        "reply_to_id": reply_to_id,
+                        "mentions": mentions,
+                        "link": link,
+                        "body": body
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("room message event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(RoomMessageOutcome { message, event })
+    }
+
     pub async fn request_emergency_stop(
         &self,
         corp_id: Uuid,
@@ -1309,6 +1566,107 @@ async fn assert_actor_scope_tx(
             .await?;
     if !actor_exists {
         return Err(anyhow!("actor does not belong to the requested Corp"));
+    }
+    Ok(())
+}
+
+async fn assert_room_membership_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    room_id: Uuid,
+    actor_id: Uuid,
+) -> Result<()> {
+    let member: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM room_memberships rm
+            JOIN rooms r ON r.id = rm.room_id
+            WHERE rm.room_id = $1 AND rm.actor_id = $2 AND r.corp_id = $3
+        )
+        "#,
+    )
+    .bind(room_id)
+    .bind(actor_id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !member {
+        return Err(anyhow!("forbidden: actor is not a member of this room"));
+    }
+    Ok(())
+}
+
+async fn validate_room_link_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    room_id: Uuid,
+    link: &EntityLink,
+) -> Result<()> {
+    let valid: bool = match link.kind.as_str() {
+        "mission" => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM missions WHERE id = $1 AND corp_id = $2 AND room_id = $3)",
+        )
+        .bind(link.id)
+        .bind(corp_id)
+        .bind(room_id)
+        .fetch_one(&mut **tx)
+        .await?,
+        "task" => {
+            sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM tasks t
+                    JOIN missions m ON m.id = t.mission_id
+                    WHERE t.id = $1 AND t.corp_id = $2 AND m.room_id = $3
+                )
+                "#,
+            )
+            .bind(link.id)
+            .bind(corp_id)
+            .bind(room_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        "run" => {
+            sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM runs r
+                    JOIN tasks t ON t.id = r.task_id
+                    JOIN missions m ON m.id = t.mission_id
+                    WHERE r.id = $1 AND r.corp_id = $2 AND m.room_id = $3
+                )
+                "#,
+            )
+            .bind(link.id)
+            .bind(corp_id)
+            .bind(room_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        "artifact" => {
+            sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM runs r
+                    JOIN tasks t ON t.id = r.task_id
+                    JOIN missions m ON m.id = t.mission_id
+                    WHERE r.id = $1 AND r.corp_id = $2 AND m.room_id = $3
+                      AND r.artifact_sha256 IS NOT NULL
+                )
+                "#,
+            )
+            .bind(link.id)
+            .bind(corp_id)
+            .bind(room_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        other => return Err(anyhow!("unsupported room message link kind {other}")),
+    };
+    if !valid {
+        return Err(anyhow!("linked entity is not visible in this room"));
     }
     Ok(())
 }
@@ -1459,6 +1817,27 @@ fn map_queued_message(row: sqlx::postgres::PgRow) -> QueuedMessage {
         actor_id: row.get("actor_id"),
         text: row.get("text"),
         status: row.get("status"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn map_room_message(row: sqlx::postgres::PgRow) -> RoomMessage {
+    let link_kind: Option<String> = row.get("link_kind");
+    let link_id: Option<Uuid> = row.get("link_id");
+    let link = match (link_kind, link_id) {
+        (Some(kind), Some(id)) => Some(EntityLink { kind, id }),
+        _ => None,
+    };
+    RoomMessage {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        room_id: row.get("room_id"),
+        actor_id: row.get("actor_id"),
+        thread_root_id: row.get("thread_root_id"),
+        reply_to_id: row.get("reply_to_id"),
+        body: row.get("body"),
+        mentions: row.get("mentions"),
+        link,
         created_at: row.get("created_at"),
     }
 }

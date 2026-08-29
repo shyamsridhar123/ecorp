@@ -1,4 +1,4 @@
-use crony_domain::{CorpSnapshot, DomainEvent};
+use crony_domain::{CorpSnapshot, DomainEvent, EntityLink};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -96,8 +96,24 @@ pub struct DemoBootstrapResponse {
     pub room_id: Uuid,
     pub alice_actor_id: Uuid,
     pub bob_actor_id: Uuid,
+    pub eve_actor_id: Uuid,
     pub manager_agent_id: Uuid,
     pub worker_agent_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRoomMessageRequest {
+    pub actor_id: Uuid,
+    pub body: String,
+    pub reply_to_id: Option<Uuid>,
+    #[serde(default)]
+    pub mentions: Vec<Uuid>,
+    pub link: Option<EntityLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRoomMessageResponse {
+    pub message_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

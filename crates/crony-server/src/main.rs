@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -15,12 +15,13 @@ use clap::Parser;
 use crony_domain::DomainEvent;
 use crony_protocol::{
     BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
-    CreateMissionResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
-    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest,
-    QueueMessageResponse, ReleaseLeaseRequest, RunnerSummary, RunnerToServer, ServerToRunner,
-    SnapshotResponse, TransferLeaseRequest,
+    CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
+    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, LaunchMissionRequest,
+    LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest, QueueMessageResponse,
+    ReleaseLeaseRequest, RunnerSummary, RunnerToServer, ServerToRunner, SnapshotResponse,
+    TransferLeaseRequest,
 };
-use crony_store::{PgStore, RunnerEventInput};
+use crony_store::{NewRoomMessageInput, PgStore, RunnerEventInput};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,14 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn map_store_error(error: anyhow::Error) -> ApiError {
+    if error.to_string().starts_with("forbidden:") {
+        ApiError::forbidden(error)
+    } else {
+        ApiError::bad_request(error)
+    }
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -142,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/demo/reset", post(reset_demo))
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
         .route("/api/corps/{corp_id}/missions", post(create_mission))
+        .route(
+            "/api/corps/{corp_id}/rooms/{room_id}/messages",
+            post(create_room_message),
+        )
         .route(
             "/api/corps/{corp_id}/missions/{mission_id}/launch",
             post(launch_mission),
@@ -209,6 +222,7 @@ async fn bootstrap_demo(
         room_id: ids.room_id,
         alice_actor_id: ids.alice_actor_id,
         bob_actor_id: ids.bob_actor_id,
+        eve_actor_id: ids.eve_actor_id,
         manager_agent_id: ids.manager_agent_id,
         worker_agent_id: ids.worker_agent_id,
     }))
@@ -226,6 +240,7 @@ async fn reset_demo(
         room_id: ids.room_id,
         alice_actor_id: ids.alice_actor_id,
         bob_actor_id: ids.bob_actor_id,
+        eve_actor_id: ids.eve_actor_id,
         manager_agent_id: ids.manager_agent_id,
         worker_agent_id: ids.worker_agent_id,
     }))
@@ -234,18 +249,24 @@ async fn reset_demo(
 async fn snapshot(
     State(state): State<AppState>,
     Path(corp_id): Path<Uuid>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     let snapshot = state
         .store
-        .snapshot(corp_id)
+        .snapshot(corp_id, query.actor_id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(map_store_error)?;
     let runners = state
         .runners
         .iter()
         .map(|entry| entry.summary.clone())
         .collect();
     Ok(Json(SnapshotResponse { snapshot, runners }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    actor_id: Uuid,
 }
 
 async fn create_mission(
@@ -257,13 +278,37 @@ async fn create_mission(
         .store
         .create_mission(corp_id, request.requested_by, &request.title)
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(map_store_error)?;
     for event in events {
         publish(&state, event);
     }
     Ok(Json(CreateMissionResponse {
         mission_id: ids.mission_id,
         task_id: ids.task_id,
+    }))
+}
+
+async fn create_room_message(
+    State(state): State<AppState>,
+    Path((corp_id, room_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateRoomMessageRequest>,
+) -> Result<Json<CreateRoomMessageResponse>, ApiError> {
+    let outcome = state
+        .store
+        .create_room_message(NewRoomMessageInput {
+            corp_id,
+            room_id,
+            actor_id: request.actor_id,
+            body: request.body,
+            reply_to_id: request.reply_to_id,
+            mentions: request.mentions,
+            link: request.link,
+        })
+        .await
+        .map_err(map_store_error)?;
+    publish(&state, outcome.event);
+    Ok(Json(CreateRoomMessageResponse {
+        message_id: outcome.message.id,
     }))
 }
 
@@ -451,23 +496,63 @@ async fn browser_websocket(
     State(state): State<AppState>,
     Path(corp_id): Path<Uuid>,
     Query(query): Query<BrowserQuery>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| browser_socket(socket, state, corp_id, query.after_seq))
+) -> Result<Response, ApiError> {
+    if !state
+        .store
+        .actor_belongs_to_corp(corp_id, query.actor_id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::forbidden(
+            "actor cannot subscribe to the requested Corp",
+        ));
+    }
+    let visible_rooms = state
+        .store
+        .visible_room_ids(corp_id, query.actor_id)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(ws
+        .on_upgrade(move |socket| {
+            browser_socket(
+                socket,
+                state,
+                corp_id,
+                query.actor_id,
+                query.after_seq,
+                visible_rooms,
+            )
+        })
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]
 struct BrowserQuery {
+    actor_id: Uuid,
     #[serde(default)]
     after_seq: i64,
 }
 
-async fn browser_socket(socket: WebSocket, state: AppState, corp_id: Uuid, after_seq: i64) {
+async fn browser_socket(
+    socket: WebSocket,
+    state: AppState,
+    corp_id: Uuid,
+    actor_id: Uuid,
+    after_seq: i64,
+    visible_rooms: HashSet<Uuid>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut events = state.event_tx.subscribe();
     let mut cursor = after_seq.max(0);
 
     loop {
-        let replay = match state.store.events_after(corp_id, cursor, 500).await {
+        let replay = match state
+            .store
+            .events_after(corp_id, actor_id, cursor, 500)
+            .await
+        {
             Ok(replay) => replay,
             Err(error) => {
                 warn!(%error, %corp_id, cursor, "browser replay query failed");
@@ -519,7 +604,13 @@ async fn browser_socket(socket: WebSocket, state: AppState, corp_id: Uuid, after
             }
             event = events.recv() => {
                 match event {
-                    Ok(event) if event.corp_id == corp_id && event.seq > cursor => {
+                    Ok(event)
+                        if event.corp_id == corp_id
+                            && event.seq > cursor
+                            && event
+                                .room_id
+                                .is_none_or(|room_id| visible_rooms.contains(&room_id)) =>
+                    {
                         cursor = event.seq;
                         if send_json(
                             &mut sender,
