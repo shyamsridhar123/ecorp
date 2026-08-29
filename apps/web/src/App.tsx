@@ -51,7 +51,6 @@ type Run = {
 type Lease = {
   agent_id: string
   actor_id: string
-  token: string
   expires_at: string
 }
 
@@ -139,6 +138,10 @@ function time(value: string): string {
   }).format(new Date(value))
 }
 
+function leaseTokenKey(actorId: string, agentId: string): string {
+  return `${actorId}:${agentId}`
+}
+
 function StatusMark({ status }: { status: Agent['status'] }) {
   return <span className={`status-mark status-${status}`} aria-label={status} />
 }
@@ -156,17 +159,27 @@ function AgentAvatar({ agent }: { agent: Agent }) {
 function AgentDesk({
   agent,
   lease,
+  leaseToken,
   actor,
+  otherHuman,
   queuedCount,
   onClaim,
+  onRelease,
+  onTransfer,
+  onEmergencyStop,
   onMessage,
 }: {
   agent: Agent
   lease: Lease | undefined
+  leaseToken: string | undefined
   actor: Actor
+  otherHuman: Actor | undefined
   queuedCount: number
   onClaim: (agent: Agent) => Promise<void>
-  onMessage: (agent: Agent, text: string) => Promise<void>
+  onRelease: (agent: Agent, token: string) => Promise<void>
+  onTransfer: (agent: Agent, token: string, toActor: Actor) => Promise<void>
+  onEmergencyStop: (agent: Agent) => Promise<void>
+  onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
 }) {
   const [text, setText] = useState('')
   const ownsLease = lease?.actor_id === actor.id
@@ -175,7 +188,7 @@ function AgentDesk({
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!text.trim()) return
-    await onMessage(agent, text)
+    await onMessage(agent, text, leaseToken)
     setText('')
   }
 
@@ -206,10 +219,37 @@ function AgentDesk({
       </div>
       <div className="desk-actions">
         <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
-          {ownsLease ? 'Renew control' : 'Claim control'}
+          {ownsLease && leaseToken ? 'Renew control' : 'Claim control'}
         </button>
+        {ownsLease && leaseToken ? (
+          <button
+            type="button"
+            className="button button-quiet"
+            onClick={() => onRelease(agent, leaseToken)}
+          >
+            Release
+          </button>
+        ) : null}
         <span className="queue-count">{queuedCount} queued</span>
       </div>
+      {ownsLease && leaseToken && otherHuman ? (
+        <button
+          type="button"
+          className="transfer-control"
+          onClick={() => onTransfer(agent, leaseToken, otherHuman)}
+        >
+          Transfer control to {otherHuman.name}
+        </button>
+      ) : null}
+      {agent.current_run_id && ['owner', 'admin', 'manager'].includes(actor.role) ? (
+        <button
+          type="button"
+          className="emergency-stop"
+          onClick={() => onEmergencyStop(agent)}
+        >
+          Emergency stop
+        </button>
+      ) : null}
       <form className="agent-message" onSubmit={submit}>
         <input
           aria-label={`Message ${agent.name}`}
@@ -299,6 +339,7 @@ function App() {
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
   const lastEventSeq = useRef(0)
 
@@ -380,6 +421,9 @@ function App() {
   )
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
+  const otherHuman = selectedActor
+    ? humans.find((actor) => actor.id !== selectedActor.id)
+    : undefined
 
   const selectActor = (actor: Actor) => {
     setSelectedActorId(actor.id)
@@ -428,7 +472,11 @@ function App() {
     if (!bootstrap || !selectedActor) return
     setError(null)
     try {
-      const result = await api<{ acquired: boolean; holder_actor_id: string }>(
+      const result = await api<{
+        acquired: boolean
+        holder_actor_id: string
+        token: string | null
+      }>(
         `/api/corps/${bootstrap.corp_id}/agents/${agent.id}/lease`,
         {
           method: 'POST',
@@ -438,6 +486,9 @@ function App() {
       if (!result.acquired) {
         const holder = humans.find((actor) => actor.id === result.holder_actor_id)
         setError(`${holder?.name ?? 'Another operator'} currently controls ${agent.name}.`)
+      } else if (result.token) {
+        const key = leaseTokenKey(selectedActor.id, agent.id)
+        setLeaseTokens((current) => ({ ...current, [key]: result.token as string }))
       }
       await refresh(bootstrap.corp_id)
     } catch (caught) {
@@ -445,13 +496,81 @@ function App() {
     }
   }
 
-  const sendMessage = async (agent: Agent, text: string) => {
+  const releaseLease = async (agent: Agent, token: string) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/lease/release`, {
+        method: 'POST',
+        body: JSON.stringify({ actor_id: selectedActor.id, token }),
+      })
+      const key = leaseTokenKey(selectedActor.id, agent.id)
+      setLeaseTokens((current) => {
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const transferLease = async (agent: Agent, token: string, toActor: Actor) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api<{ token: null; holder_actor_id: string }>(
+        `/api/corps/${bootstrap.corp_id}/agents/${agent.id}/lease/transfer`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            token,
+            to_actor_id: toActor.id,
+          }),
+        },
+      )
+      const fromKey = leaseTokenKey(selectedActor.id, agent.id)
+      setLeaseTokens((current) => {
+        const next = { ...current }
+        delete next[fromKey]
+        return next
+      })
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const emergencyStop = async (agent: Agent) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/emergency-stop`, {
+        method: 'POST',
+        body: JSON.stringify({
+          actor_id: selectedActor.id,
+          reason: `${selectedActor.name} requested an emergency stop from the operations floor.`,
+        }),
+      })
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const sendMessage = async (agent: Agent, text: string, token: string | undefined) => {
     if (!bootstrap || !selectedActor) return
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ actor_id: selectedActor.id, text }),
+        body: JSON.stringify({
+          actor_id: selectedActor.id,
+          lease_token: token ?? null,
+          text,
+        }),
       })
       await refresh(bootstrap.corp_id)
     } catch (caught) {
@@ -539,9 +658,14 @@ function App() {
                 key={agent.id}
                 agent={agent}
                 actor={selectedActor}
+                otherHuman={otherHuman}
                 lease={data.snapshot.leases.find((lease) => lease.agent_id === agent.id)}
+                leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, agent.id)]}
                 queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === agent.id).length}
                 onClaim={claimLease}
+                onRelease={releaseLease}
+                onTransfer={transferLease}
+                onEmergencyStop={emergencyStop}
                 onMessage={sendMessage}
               />
             ))}

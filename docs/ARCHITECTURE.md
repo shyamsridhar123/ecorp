@@ -98,10 +98,19 @@ clients may apply typed events directly for lower latency.
 Only one human actor controls an agent at a time. A lease:
 
 - is scoped to an agent and Corp
-- has a random token
+- has a random fencing token that is never included in shared snapshots or journal payloads
 - expires
 - can be renewed by its owner
 - can only be replaced by a different actor after expiry
+- can be explicitly released or transferred
+
+Every immediate control command must carry the current fencing token. Renewing or transferring a
+lease rotates that token, so delayed commands from an earlier controller fail closed. Operators
+without the lease may still leave a durable queued message without a token.
+
+Owners, admins, and managers may issue an emergency stop independently of ordinary control
+ownership. The request is audited, delivered to the runner, kills the active child process, and
+ends the mission, task, and run as cancelled.
 
 Messages from the current controller can be delivered to the active process. Other messages are
 durably queued.
@@ -117,7 +126,7 @@ durably queued.
 
 ## Near-term architecture work
 
-1. Add runner heartbeats, disconnect grace, and fencing tokens.
+1. Add runner heartbeats and disconnect grace.
 2. Move child-process behavior behind an `AgentAdapter` trait.
 3. Add git worktree isolation.
 4. Add durable approvals and policy evaluation.

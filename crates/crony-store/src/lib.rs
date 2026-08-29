@@ -57,11 +57,24 @@ pub struct LeaseOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct LeaseMutationOutcome {
+    pub lease: Option<ControlLease>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
 pub struct MessageOutcome {
     pub message: QueuedMessage,
     pub delivery: String,
     pub run_id: Option<Uuid>,
     pub runner_id: Option<String>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct StopRequestOutcome {
+    pub run_id: Uuid,
+    pub runner_id: String,
     pub event: DomainEvent,
 }
 
@@ -832,6 +845,37 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            "run.cancelled" => {
+                let summary = payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Run cancelled by an authorized operator");
+                sqlx::query(
+                    "UPDATE runs SET status = 'cancelled', summary = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(summary)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE tasks SET status = 'cancelled', updated_at = now() WHERE id = $1",
+                )
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE missions SET status = 'cancelled', updated_at = now() WHERE id = $1",
+                )
+                .bind(mission_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
+                )
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             _ => {}
         }
 
@@ -846,6 +890,7 @@ impl PgStore {
         actor_id: Uuid,
     ) -> Result<LeaseOutcome> {
         let mut tx = self.pool.begin().await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
         let token = Uuid::new_v4();
         let expires_at = Utc::now() + Duration::minutes(5);
         let acquired_row = sqlx::query(
@@ -891,10 +936,9 @@ impl PgStore {
                     "control.lease_acquired",
                     "agent",
                     agent_id,
-                    format!("lease:{agent_id}:{token}"),
+                    format!("lease-acquire:{agent_id}:{}", Uuid::new_v4()),
                     json!({
                         "actor_id": actor_id,
-                        "token": token,
                         "expires_at": expires_at
                     }),
                 ),
@@ -911,11 +955,136 @@ impl PgStore {
         })
     }
 
+    pub async fn release_lease(
+        &self,
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        token: Uuid,
+    ) -> Result<LeaseMutationOutcome> {
+        let mut tx = self.pool.begin().await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        let released = sqlx::query(
+            r#"
+            DELETE FROM control_leases
+            WHERE agent_id = $1 AND corp_id = $2 AND actor_id = $3
+              AND token = $4 AND expires_at > now()
+            RETURNING agent_id
+            "#,
+        )
+        .bind(agent_id)
+        .bind(corp_id)
+        .bind(actor_id)
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if released.is_none() {
+            return Err(anyhow!("stale or unauthorized control lease"));
+        }
+
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "control.lease_released",
+                "agent",
+                agent_id,
+                format!("lease-release:{agent_id}:{}", Uuid::new_v4()),
+                json!({"actor_id": actor_id}),
+            ),
+        )
+        .await?
+        .context("lease release event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(LeaseMutationOutcome { lease: None, event })
+    }
+
+    pub async fn transfer_lease(
+        &self,
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        token: Uuid,
+        to_actor_id: Uuid,
+    ) -> Result<LeaseMutationOutcome> {
+        let mut tx = self.pool.begin().await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        assert_actor_scope_tx(&mut tx, corp_id, to_actor_id).await?;
+        if actor_id == to_actor_id {
+            return Err(anyhow!("lease transfer target must be another actor"));
+        }
+
+        let existing = sqlx::query(
+            r#"
+            SELECT agent_id, corp_id, actor_id, token, expires_at
+            FROM control_leases
+            WHERE agent_id = $1 AND corp_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(agent_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_lease)
+        .context("agent has no active control lease")?;
+        if existing.actor_id != actor_id
+            || existing.token != token
+            || existing.expires_at <= Utc::now()
+        {
+            return Err(anyhow!("stale or unauthorized control lease"));
+        }
+
+        let new_token = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::minutes(5);
+        let row = sqlx::query(
+            r#"
+            UPDATE control_leases
+            SET actor_id = $1, token = $2, expires_at = $3
+            WHERE agent_id = $4 AND corp_id = $5
+            RETURNING agent_id, corp_id, actor_id, token, expires_at
+            "#,
+        )
+        .bind(to_actor_id)
+        .bind(new_token)
+        .bind(expires_at)
+        .bind(agent_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let lease = map_lease(row);
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "control.lease_transferred",
+                "agent",
+                agent_id,
+                format!("lease-transfer:{agent_id}:{}", Uuid::new_v4()),
+                json!({
+                    "from_actor_id": actor_id,
+                    "to_actor_id": to_actor_id,
+                    "expires_at": expires_at
+                }),
+            ),
+        )
+        .await?
+        .context("lease transfer event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(LeaseMutationOutcome {
+            lease: Some(lease),
+            event,
+        })
+    }
+
     pub async fn queue_message(
         &self,
         corp_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
+        lease_token: Option<Uuid>,
         text: &str,
     ) -> Result<MessageOutcome> {
         let text = text.trim();
@@ -927,19 +1096,32 @@ impl PgStore {
         }
 
         let mut tx = self.pool.begin().await?;
-        let holds_lease: bool = sqlx::query_scalar(
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        let active_lease = sqlx::query(
             r#"
-            SELECT EXISTS(
-                SELECT 1 FROM control_leases
-                WHERE agent_id = $1 AND corp_id = $2 AND actor_id = $3 AND expires_at > now()
-            )
+            SELECT agent_id, corp_id, actor_id, token, expires_at
+            FROM control_leases
+            WHERE agent_id = $1 AND corp_id = $2
+            FOR UPDATE
             "#,
         )
         .bind(agent_id)
         .bind(corp_id)
-        .bind(actor_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_lease)
+        .filter(|lease| lease.expires_at > Utc::now());
+
+        let holds_lease = match (&active_lease, lease_token) {
+            (Some(lease), Some(supplied))
+                if lease.actor_id == actor_id && lease.token == supplied =>
+            {
+                true
+            }
+            (Some(lease), None) if lease.actor_id != actor_id => false,
+            (None, None) => false,
+            _ => return Err(anyhow!("stale or unauthorized control lease token")),
+        };
 
         let active_run = sqlx::query(
             r#"
@@ -1013,6 +1195,122 @@ impl PgStore {
             event,
         })
     }
+
+    pub async fn request_emergency_stop(
+        &self,
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        reason: &str,
+    ) -> Result<StopRequestOutcome> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(anyhow!("emergency stop reason cannot be empty"));
+        }
+        if reason.len() > 500 {
+            return Err(anyhow!(
+                "emergency stop reason cannot exceed 500 characters"
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        let role: String =
+            sqlx::query_scalar("SELECT role FROM actors WHERE id = $1 AND corp_id = $2")
+                .bind(actor_id)
+                .bind(corp_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !matches!(role.as_str(), "owner" | "admin" | "manager") {
+            return Err(anyhow!(
+                "forbidden: actor role {role} cannot emergency-stop runs"
+            ));
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT r.id, r.runner_id, t.mission_id, m.room_id
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            WHERE r.agent_id = $1 AND r.corp_id = $2
+              AND r.status IN ('provisioning', 'starting', 'running',
+                               'waiting_for_input', 'waiting_for_approval', 'verifying')
+            ORDER BY r.created_at DESC
+            LIMIT 1
+            FOR UPDATE OF r
+            "#,
+        )
+        .bind(agent_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("agent has no active run to stop")?;
+        let run_id: Uuid = row.get("id");
+        let runner_id: String = row.get("runner_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "run.stop_requested",
+                    "run",
+                    run_id,
+                    format!("run-stop:{run_id}:{}", Uuid::new_v4()),
+                    json!({"agent_id": agent_id, "reason": reason}),
+                )
+            },
+        )
+        .await?
+        .context("run stop event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(StopRequestOutcome {
+            run_id,
+            runner_id,
+            event,
+        })
+    }
+}
+
+async fn assert_actor_agent_scope_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    actor_id: Uuid,
+    agent_id: Uuid,
+) -> Result<()> {
+    assert_actor_scope_tx(tx, corp_id, actor_id).await?;
+    let agent_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND corp_id = $2)")
+            .bind(agent_id)
+            .bind(corp_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !agent_exists {
+        return Err(anyhow!("agent does not belong to the requested Corp"));
+    }
+    Ok(())
+}
+
+async fn assert_actor_scope_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    actor_id: Uuid,
+) -> Result<()> {
+    let actor_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actors WHERE id = $1 AND corp_id = $2)")
+            .bind(actor_id)
+            .bind(corp_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !actor_exists {
+        return Err(anyhow!("actor does not belong to the requested Corp"));
+    }
+    Ok(())
 }
 
 async fn append_event_tx(

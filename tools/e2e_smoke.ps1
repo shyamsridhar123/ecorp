@@ -55,6 +55,7 @@ $message = Post-Json `
     -Uri "$Server/api/corps/$($demo.corp_id)/agents/$($demo.worker_agent_id)/messages" `
     -Body @{
         actor_id = $demo.alice_actor_id
+        lease_token = $aliceLease.token
         text = 'Include the live-control acknowledgement in the run evidence.'
     }
 if ($message.delivery -ne 'immediate') {
@@ -136,4 +137,3 @@ $report = [ordered]@{
 
 $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath
 $report | ConvertTo-Json -Depth 10
-

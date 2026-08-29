@@ -525,11 +525,12 @@
 .desk-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 7px;
   margin-top: 12px;
 }
 
 .queue-count {
+  margin-left: auto;
   color: var(--ink-soft);
   font: 10px/1 var(--mono);
   text-transform: uppercase;
@@ -600,6 +601,34 @@ select:focus-visible {
 .button-ink {
   color: var(--paper-light);
   background: var(--ink);
+}
+
+.button-quiet {
+  color: var(--ink-soft);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.transfer-control,
+.emergency-stop {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 9px;
+  font: 700 9px/1.2 var(--mono);
+  letter-spacing: 0.04em;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  text-transform: uppercase;
+}
+
+.transfer-control {
+  color: var(--cobalt-dark);
+  background: transparent;
+}
+
+.emergency-stop {
+  color: var(--paper-light);
+  background: var(--signal);
 }
 
 .mission-panel {

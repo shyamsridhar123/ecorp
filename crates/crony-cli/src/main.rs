@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crony_protocol::{
-    ClaimLeaseRequest, CreateMissionRequest, LaunchMissionRequest, QueueMessageRequest,
+    ClaimLeaseRequest, CreateMissionRequest, EmergencyStopRequest, LaunchMissionRequest,
+    QueueMessageRequest, ReleaseLeaseRequest, TransferLeaseRequest,
 };
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -43,11 +44,32 @@ enum Command {
         agent_id: Uuid,
         actor_id: Uuid,
     },
+    ReleaseLease {
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        token: Uuid,
+    },
+    TransferLease {
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        token: Uuid,
+        to_actor_id: Uuid,
+    },
     Message {
         corp_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
+        #[arg(long)]
+        lease_token: Option<Uuid>,
         text: String,
+    },
+    EmergencyStop {
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        reason: String,
     },
 }
 
@@ -133,10 +155,53 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::ReleaseLease {
+            corp_id,
+            agent_id,
+            actor_id,
+            token,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/agents/{agent_id}/lease/release",
+                    args.server
+                ),
+                Some(serde_json::to_value(ReleaseLeaseRequest {
+                    actor_id,
+                    token,
+                })?),
+            )
+            .await?
+        }
+        Command::TransferLease {
+            corp_id,
+            agent_id,
+            actor_id,
+            token,
+            to_actor_id,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/agents/{agent_id}/lease/transfer",
+                    args.server
+                ),
+                Some(serde_json::to_value(TransferLeaseRequest {
+                    actor_id,
+                    token,
+                    to_actor_id,
+                })?),
+            )
+            .await?
+        }
         Command::Message {
             corp_id,
             agent_id,
             actor_id,
+            lease_token,
             text,
         } => {
             request(
@@ -148,7 +213,28 @@ async fn main() -> Result<()> {
                 ),
                 Some(serde_json::to_value(QueueMessageRequest {
                     actor_id,
+                    lease_token,
                     text,
+                })?),
+            )
+            .await?
+        }
+        Command::EmergencyStop {
+            corp_id,
+            agent_id,
+            actor_id,
+            reason,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/agents/{agent_id}/emergency-stop",
+                    args.server
+                ),
+                Some(serde_json::to_value(EmergencyStopRequest {
+                    actor_id,
+                    reason,
                 })?),
             )
             .await?

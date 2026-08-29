@@ -55,7 +55,13 @@ struct Assignment {
     mission_title: String,
 }
 
-type ActiveInputs = Arc<DashMap<Uuid, mpsc::UnboundedSender<String>>>;
+#[derive(Clone)]
+struct ActiveRunControl {
+    input: mpsc::UnboundedSender<String>,
+    stop: mpsc::UnboundedSender<String>,
+}
+
+type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,7 +91,7 @@ async fn run_connection(args: Args) -> Result<()> {
         .with_context(|| format!("connect to {}", args.server_ws))?;
     let (mut socket_tx, mut socket_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RunnerToServer>();
-    let active_inputs: ActiveInputs = Arc::new(DashMap::new());
+    let active_runs: ActiveRuns = Arc::new(DashMap::new());
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
@@ -174,16 +180,30 @@ async fn run_connection(args: Args) -> Result<()> {
                     agent_id,
                     mission_title,
                 };
+                if active_runs.contains_key(&assignment.run_id) {
+                    warn!(run_id = %assignment.run_id, "duplicate start command ignored");
+                    continue;
+                }
+                let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+                let (stop_tx, stop_rx) = mpsc::unbounded_channel::<String>();
+                active_runs.insert(
+                    assignment.run_id,
+                    ActiveRunControl {
+                        input: input_tx,
+                        stop: stop_tx,
+                    },
+                );
                 let task_args = args.clone();
                 let task_tx = out_tx.clone();
-                let task_inputs = active_inputs.clone();
+                let task_runs = active_runs.clone();
                 tokio::spawn(async move {
                     let runner_id = task_args.runner_id.clone();
                     if let Err(error) = execute_assignment(
                         task_args,
                         assignment.clone(),
                         task_tx.clone(),
-                        task_inputs,
+                        input_rx,
+                        stop_rx,
                     )
                     .await
                     {
@@ -196,22 +216,35 @@ async fn run_connection(args: Args) -> Result<()> {
                             json!({"error": error.to_string()}),
                         );
                     }
+                    task_runs.remove(&assignment.run_id);
                 });
             }
             ServerToRunner::ControlMessage {
                 run_id,
                 actor_id,
+                lease_token: _,
                 text,
                 ..
             } => {
-                if let Some(input) = active_inputs.get(&run_id) {
-                    let _ = input.send(json!({"actor_id": actor_id, "text": text}).to_string());
+                if let Some(active) = active_runs.get(&run_id) {
+                    let _ = active.input.send(
+                        json!({
+                            "actor_id": actor_id,
+                            "text": text
+                        })
+                        .to_string(),
+                    );
+                    info!(%run_id, %actor_id, "accepted fenced control message");
                 } else {
                     warn!(%run_id, "control message arrived for inactive run");
                 }
             }
             ServerToRunner::StopRun { run_id, reason, .. } => {
-                warn!(%run_id, %reason, "stop command is not implemented in the first slice");
+                if let Some(active) = active_runs.get(&run_id) {
+                    let _ = active.stop.send(reason);
+                } else {
+                    warn!(%run_id, "stop command arrived for inactive run");
+                }
             }
         }
     }
@@ -225,7 +258,8 @@ async fn execute_assignment(
     args: Args,
     assignment: Assignment,
     out_tx: mpsc::UnboundedSender<RunnerToServer>,
-    active_inputs: ActiveInputs,
+    mut input_rx: mpsc::UnboundedReceiver<String>,
+    mut stop_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let run_dir = args.workspace.join(assignment.run_id.to_string());
     tokio::fs::create_dir_all(&run_dir)
@@ -268,8 +302,6 @@ async fn execute_assignment(
     let stdin = child.stdin.take().context("fake agent stdin missing")?;
     let stdout = child.stdout.take().context("fake agent stdout missing")?;
     let stderr = child.stderr.take().context("fake agent stderr missing")?;
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
-    active_inputs.insert(assignment.run_id, input_tx);
 
     let input_writer = tokio::spawn(async move {
         let mut stdin = stdin;
@@ -298,110 +330,135 @@ async fn execute_assignment(
         }
     });
 
-    let mut completed = false;
+    let mut terminal_event = false;
+    let mut cancelled = false;
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        let event: Value = match serde_json::from_str(&line) {
-            Ok(event) => event,
-            Err(_) => {
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.output",
-                    json!({"stream": "stdout", "text": line}),
-                );
-                continue;
+    loop {
+        tokio::select! {
+            reason = stop_rx.recv() => {
+                if let Some(reason) = reason {
+                    child.kill().await.context("kill stopped agent process")?;
+                    send_run_event(
+                        &out_tx,
+                        &args.runner_id,
+                        &assignment,
+                        "run.cancelled",
+                        json!({"reason": reason}),
+                    );
+                    terminal_event = true;
+                    cancelled = true;
+                    break;
+                }
             }
-        };
-        let kind = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("output");
-        match kind {
-            "status" => {
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.status",
-                    json!({
-                        "status": event.get("status").and_then(Value::as_str).unwrap_or("working"),
-                        "station": event.get("station").and_then(Value::as_str).unwrap_or("terminal"),
-                        "message": event.get("message").and_then(Value::as_str).unwrap_or("")
-                    }),
-                );
-            }
-            "artifact" => {
-                let relative = event
-                    .get("path")
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+                let event: Value = match serde_json::from_str(&line) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.output",
+                            json!({"stream": "stdout", "text": line}),
+                        );
+                        continue;
+                    }
+                };
+                let kind = event
+                    .get("type")
                     .and_then(Value::as_str)
-                    .context("artifact event missing path")?;
-                let artifact_path = run_dir.join(relative);
-                let bytes = tokio::fs::read(&artifact_path)
-                    .await
-                    .with_context(|| format!("read artifact {}", artifact_path.display()))?;
-                let sha256 = hex::encode(Sha256::digest(&bytes));
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.artifact",
-                    json!({
-                        "path": artifact_path,
-                        "sha256": sha256,
-                        "bytes": bytes.len(),
-                        "media_type": event.get("media_type").and_then(Value::as_str).unwrap_or("text/markdown")
-                    }),
-                );
-            }
-            "completed" => {
-                completed = true;
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.completed",
-                    json!({
-                        "summary": event.get("summary").and_then(Value::as_str).unwrap_or("Mission artifact completed")
-                    }),
-                );
-            }
-            "failed" => {
-                completed = true;
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.failed",
-                    json!({
-                        "error": event.get("error").and_then(Value::as_str).unwrap_or("Fake agent reported failure")
-                    }),
-                );
-            }
-            _ => {
-                send_run_event(
-                    &out_tx,
-                    &args.runner_id,
-                    &assignment,
-                    "run.output",
-                    json!({
-                        "stream": event.get("stream").and_then(Value::as_str).unwrap_or("stdout"),
-                        "text": event.get("text").and_then(Value::as_str).unwrap_or(&line)
-                    }),
-                );
+                    .unwrap_or("output");
+                match kind {
+                    "status" => {
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.status",
+                            json!({
+                                "status": event.get("status").and_then(Value::as_str).unwrap_or("working"),
+                                "station": event.get("station").and_then(Value::as_str).unwrap_or("terminal"),
+                                "message": event.get("message").and_then(Value::as_str).unwrap_or("")
+                            }),
+                        );
+                    }
+                    "artifact" => {
+                        let relative = event
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .context("artifact event missing path")?;
+                        let artifact_path = run_dir.join(relative);
+                        let bytes = tokio::fs::read(&artifact_path)
+                            .await
+                            .with_context(|| format!("read artifact {}", artifact_path.display()))?;
+                        let sha256 = hex::encode(Sha256::digest(&bytes));
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.artifact",
+                            json!({
+                                "path": artifact_path,
+                                "sha256": sha256,
+                                "bytes": bytes.len(),
+                                "media_type": event.get("media_type").and_then(Value::as_str).unwrap_or("text/markdown")
+                            }),
+                        );
+                    }
+                    "completed" => {
+                        terminal_event = true;
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.completed",
+                            json!({
+                                "summary": event.get("summary").and_then(Value::as_str).unwrap_or("Mission artifact completed")
+                            }),
+                        );
+                    }
+                    "failed" => {
+                        terminal_event = true;
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({
+                                "error": event.get("error").and_then(Value::as_str).unwrap_or("Fake agent reported failure")
+                            }),
+                        );
+                    }
+                    _ => {
+                        send_run_event(
+                            &out_tx,
+                            &args.runner_id,
+                            &assignment,
+                            "run.output",
+                            json!({
+                                "stream": event.get("stream").and_then(Value::as_str).unwrap_or("stdout"),
+                                "text": event.get("text").and_then(Value::as_str).unwrap_or(&line)
+                            }),
+                        );
+                    }
+                }
             }
         }
     }
 
     let status = child.wait().await?;
-    active_inputs.remove(&assignment.run_id);
     input_writer.abort();
     let _ = stderr_task.await;
-    if !status.success() && !completed {
+    if cancelled {
+        return Ok(());
+    }
+    if !status.success() && !terminal_event {
         return Err(anyhow!("fake agent exited with {status}"));
     }
-    if !completed {
+    if !terminal_event {
         return Err(anyhow!("fake agent exited without a terminal event"));
     }
     Ok(())

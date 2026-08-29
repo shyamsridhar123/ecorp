@@ -208,6 +208,7 @@ pub struct ControlLease {
     pub agent_id: Uuid,
     pub corp_id: Uuid,
     pub actor_id: Uuid,
+    #[serde(skip_serializing)]
     pub token: Uuid,
     pub expires_at: DateTime<Utc>,
 }

@@ -53,6 +53,7 @@ pub enum ServerToRunner {
         run_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
+        lease_token: Uuid,
         text: String,
     },
     StopRun {
@@ -136,8 +137,29 @@ pub struct ClaimLeaseResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseLeaseRequest {
+    pub actor_id: Uuid,
+    pub token: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferLeaseRequest {
+    pub actor_id: Uuid,
+    pub token: Uuid,
+    pub to_actor_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseMutationResponse {
+    pub holder_actor_id: Option<Uuid>,
+    pub token: Option<Uuid>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueMessageRequest {
     pub actor_id: Uuid,
+    pub lease_token: Option<Uuid>,
     pub text: String,
 }
 
@@ -145,4 +167,16 @@ pub struct QueueMessageRequest {
 pub struct QueueMessageResponse {
     pub message_id: Uuid,
     pub delivery: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyStopRequest {
+    pub actor_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyStopResponse {
+    pub run_id: Uuid,
+    pub requested: bool,
 }
