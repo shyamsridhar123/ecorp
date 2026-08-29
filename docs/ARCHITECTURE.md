@@ -85,9 +85,13 @@ Runner events have independent UUIDs. Replaying the same runner event is a no-op
 
 ## Real-time delivery
 
-The server publishes committed domain events to connected browser clients. A browser currently
-refreshes its bounded snapshot after each event. The next protocol revision will resume from an
-explicit event sequence rather than relying only on snapshot refresh.
+The server publishes committed domain events to connected browser clients. Clients reconnect with
+an `after_seq` cursor. The server subscribes to live events before querying Postgres, replays every
+committed event after that cursor in bounded pages, sends a replay watermark, and then switches to
+the live stream while suppressing duplicate sequence numbers.
+
+The current browser refreshes its bounded materialized snapshot after replay or a live event. Later
+clients may apply typed events directly for lower latency.
 
 ## Control lease
 
@@ -113,11 +117,9 @@ durably queued.
 
 ## Near-term architecture work
 
-1. Add event-sequence resume and bounded replay.
-2. Add runner heartbeats, disconnect grace, and fencing tokens.
-3. Move child-process behavior behind an `AgentAdapter` trait.
-4. Add git worktree isolation.
-5. Add durable approvals and policy evaluation.
-6. Add authenticated users and runner enrollment.
-7. Add artifact upload rather than host-local artifact paths.
-
+1. Add runner heartbeats, disconnect grace, and fencing tokens.
+2. Move child-process behavior behind an `AgentAdapter` trait.
+3. Add git worktree isolation.
+4. Add durable approvals and policy evaluation.
+5. Add authenticated users and runner enrollment.
+6. Add artifact upload rather than host-local artifact paths.

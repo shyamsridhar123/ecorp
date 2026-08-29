@@ -80,8 +80,13 @@ pub struct SnapshotResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserSocketMessage {
-    Ready { corp_id: Uuid },
-    Event { event: Box<DomainEvent> },
+    Ready {
+        corp_id: Uuid,
+        replayed_through: i64,
+    },
+    Event {
+        event: Box<DomainEvent>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

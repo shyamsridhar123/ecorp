@@ -58,4 +58,5 @@ pnpm lint:web
 ```
 
 The repository also contains `tools/e2e_smoke.ps1`, which exercises the actual running stack.
-
+`tools/e2e_replay.mjs` verifies ordered reconnect replay and proves that an up-to-date cursor
+receives no duplicate events.

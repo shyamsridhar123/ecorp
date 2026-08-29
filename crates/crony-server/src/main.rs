@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -22,7 +22,7 @@ use crony_protocol::{
 use crony_store::{PgStore, RunnerEventInput};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::{
@@ -341,15 +341,57 @@ async fn browser_websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(corp_id): Path<Uuid>,
-    Query(_query): Query<HashMap<String, String>>,
+    Query(query): Query<BrowserQuery>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| browser_socket(socket, state, corp_id))
+    ws.on_upgrade(move |socket| browser_socket(socket, state, corp_id, query.after_seq))
 }
 
-async fn browser_socket(socket: WebSocket, state: AppState, corp_id: Uuid) {
+#[derive(Debug, Deserialize)]
+struct BrowserQuery {
+    #[serde(default)]
+    after_seq: i64,
+}
+
+async fn browser_socket(socket: WebSocket, state: AppState, corp_id: Uuid, after_seq: i64) {
     let (mut sender, mut receiver) = socket.split();
     let mut events = state.event_tx.subscribe();
-    let ready = BrowserSocketMessage::Ready { corp_id };
+    let mut cursor = after_seq.max(0);
+
+    loop {
+        let replay = match state.store.events_after(corp_id, cursor, 500).await {
+            Ok(replay) => replay,
+            Err(error) => {
+                warn!(%error, %corp_id, cursor, "browser replay query failed");
+                return;
+            }
+        };
+        if replay.is_empty() {
+            break;
+        }
+        let page_len = replay.len();
+        for event in replay {
+            cursor = cursor.max(event.seq);
+            if send_json(
+                &mut sender,
+                &BrowserSocketMessage::Event {
+                    event: Box::new(event),
+                },
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+        if page_len < 500 {
+            break;
+        }
+    }
+
+    let ready = BrowserSocketMessage::Ready {
+        corp_id,
+        replayed_through: cursor,
+    };
     if send_json(&mut sender, &ready).await.is_err() {
         return;
     }
@@ -368,7 +410,8 @@ async fn browser_socket(socket: WebSocket, state: AppState, corp_id: Uuid) {
             }
             event = events.recv() => {
                 match event {
-                    Ok(event) if event.corp_id == corp_id => {
+                    Ok(event) if event.corp_id == corp_id && event.seq > cursor => {
+                        cursor = event.seq;
                         if send_json(
                             &mut sender,
                             &BrowserSocketMessage::Event {
