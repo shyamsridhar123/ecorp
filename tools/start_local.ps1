@@ -85,14 +85,13 @@ try {
         -WindowStyle Hidden
 
     $web = Start-Process `
-        -FilePath 'pnpm.cmd' `
+        -FilePath (Join-Path $root 'apps\web\node_modules\.bin\vite.cmd') `
         -ArgumentList @(
-            '--dir', 'apps/web', 'dev',
             '--host', '127.0.0.1',
             '--port', $webPort,
             '--strictPort'
         ) `
-        -WorkingDirectory $root `
+        -WorkingDirectory (Join-Path $root 'apps\web') `
         -RedirectStandardOutput (Join-Path $output 'web.stdout.log') `
         -RedirectStandardError (Join-Path $output 'web.stderr.log') `
         -PassThru `

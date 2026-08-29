@@ -393,6 +393,35 @@ impl PgStore {
         })
     }
 
+    pub async fn events_after(
+        &self,
+        corp_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<DomainEvent>> {
+        let bounded_limit = limit.clamp(1, 1_000);
+        let events = sqlx::query(
+            r#"
+            SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
+                   aggregate_type, aggregate_id, aggregate_version, correlation_id,
+                   causation_id, idempotency_key, visibility, payload, created_at
+            FROM events
+            WHERE corp_id = $1 AND seq > $2
+            ORDER BY seq ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(corp_id)
+        .bind(after_seq)
+        .bind(bounded_limit)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_event)
+        .collect();
+        Ok(events)
+    }
+
     pub async fn create_mission(
         &self,
         corp_id: Uuid,

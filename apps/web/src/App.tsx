@@ -75,6 +75,10 @@ type DomainEvent = {
   created_at: string
 }
 
+type BrowserSocketMessage =
+  | { type: 'ready'; corp_id: string; replayed_through: number }
+  | { type: 'event'; event: DomainEvent }
+
 type SnapshotResponse = {
   snapshot: {
     corp: { id: string; name: string }
@@ -296,9 +300,12 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const reconnectTimer = useRef<number | null>(null)
+  const lastEventSeq = useRef(0)
 
   const refresh = useCallback(async (corpId: string) => {
     const snapshot = await api<SnapshotResponse>(`/api/corps/${corpId}/snapshot`)
+    const newest = snapshot.snapshot.events.at(-1)?.seq ?? 0
+    lastEventSeq.current = Math.max(lastEventSeq.current, newest)
     setData(snapshot)
   }, [])
 
@@ -327,11 +334,28 @@ function App() {
 
     const connect = () => {
       if (disposed) return
+      let replaying = true
+      let replayChanged = false
       setConnection('connecting')
       const wsUrl = API_URL.replace(/^http/, 'ws')
-      socket = new WebSocket(`${wsUrl}/ws/corps/${bootstrap.corp_id}`)
-      socket.onopen = () => setConnection('live')
-      socket.onmessage = () => {
+      socket = new WebSocket(
+        `${wsUrl}/ws/corps/${bootstrap.corp_id}?after_seq=${lastEventSeq.current}`,
+      )
+      socket.onmessage = (event) => {
+        const message = JSON.parse(event.data) as BrowserSocketMessage
+        if (message.type === 'ready') {
+          lastEventSeq.current = Math.max(lastEventSeq.current, message.replayed_through)
+          replaying = false
+          setConnection('live')
+          if (replayChanged) void refresh(bootstrap.corp_id)
+          return
+        }
+        if (message.event.seq <= lastEventSeq.current) return
+        lastEventSeq.current = message.event.seq
+        if (replaying) {
+          replayChanged = true
+          return
+        }
         void refresh(bootstrap.corp_id)
       }
       socket.onerror = () => setConnection('offline')

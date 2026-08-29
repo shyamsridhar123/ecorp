@@ -89,6 +89,8 @@ jobs:
       - name: Exercise the real server-to-runner path
         shell: pwsh
         run: ./tools/e2e_smoke.ps1
+      - name: Verify resumable event replay
+        run: node tools/e2e_replay.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,4 +101,3 @@ jobs:
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md
-
