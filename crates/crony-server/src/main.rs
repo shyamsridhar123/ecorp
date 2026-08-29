@@ -18,10 +18,10 @@ use crony_protocol::{
     CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
     DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, LaunchMissionRequest,
     LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest, QueueMessageResponse,
-    ReleaseLeaseRequest, RunnerSummary, RunnerToServer, ServerToRunner, SnapshotResponse,
-    TransferLeaseRequest,
+    ReleaseLeaseRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
+    SnapshotResponse, TransferLeaseRequest,
 };
-use crony_store::{NewRoomMessageInput, PgStore, RunnerEventInput};
+use crony_store::{NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,9 @@ struct Args {
 
     #[arg(long, env = "CRONY_BIND", default_value = "127.0.0.1:8791")]
     bind: SocketAddr,
+
+    #[arg(long, env = "CRONY_RUNNER_GRACE_SECS", default_value_t = 5)]
+    runner_grace_secs: i64,
 }
 
 #[derive(Clone)]
@@ -53,11 +56,12 @@ struct AppState {
     store: PgStore,
     event_tx: broadcast::Sender<DomainEvent>,
     runners: Arc<DashMap<String, RunnerConnection>>,
+    runner_grace_secs: i64,
 }
 
 #[derive(Clone)]
 struct RunnerConnection {
-    summary: RunnerSummary,
+    connection_epoch: Uuid,
     tx: mpsc::UnboundedSender<ServerToRunner>,
 }
 
@@ -143,12 +147,17 @@ async fn main() -> anyhow::Result<()> {
         store,
         event_tx,
         runners: Arc::new(DashMap::new()),
+        runner_grace_secs: args.runner_grace_secs.max(1),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/demo/bootstrap", post(bootstrap_demo))
         .route("/api/demo/reset", post(reset_demo))
+        .route(
+            "/api/demo/runners/{runner_id}/disconnect",
+            post(debug_disconnect_runner),
+        )
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
         .route("/api/corps/{corp_id}/missions", post(create_mission))
         .route(
@@ -246,6 +255,34 @@ async fn reset_demo(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct DebugDisconnectRequest {
+    reconnect_delay_ms: u64,
+}
+
+async fn debug_disconnect_runner(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    Json(request): Json<DebugDisconnectRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let runner = state
+        .runners
+        .get(&runner_id)
+        .ok_or_else(|| ApiError::conflict("runner is not connected"))?;
+    runner
+        .tx
+        .send(ServerToRunner::Disconnect {
+            reason: "development reconnect test".to_owned(),
+            reconnect_delay_ms: request.reconnect_delay_ms.min(60_000),
+        })
+        .map_err(|_| ApiError::conflict("runner disconnected before debug command delivery"))?;
+    Ok(Json(json!({
+        "runner_id": runner_id,
+        "disconnect_requested": true,
+        "reconnect_delay_ms": request.reconnect_delay_ms.min(60_000)
+    })))
+}
+
 async fn snapshot(
     State(state): State<AppState>,
     Path(corp_id): Path<Uuid>,
@@ -257,9 +294,22 @@ async fn snapshot(
         .await
         .map_err(map_store_error)?;
     let runners = state
-        .runners
-        .iter()
-        .map(|entry| entry.summary.clone())
+        .store
+        .runner_records()
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|record| RunnerSummary {
+            id: record.id,
+            hostname: record.hostname,
+            os: record.os,
+            capabilities: serde_json::from_value::<Vec<RunnerCapability>>(record.capabilities)
+                .unwrap_or_default(),
+            connected: record.status == "connected",
+            status: record.status,
+            last_seen_at: record.last_seen_at.to_rfc3339(),
+            grace_expires_at: record.grace_expires_at.map(|value| value.to_rfc3339()),
+        })
         .collect();
     Ok(Json(SnapshotResponse { snapshot, runners }))
 }
@@ -340,6 +390,7 @@ async fn launch_mission(
             task_id: record.task_id,
             run_id: record.run_id,
             agent_id: record.agent_id,
+            assignment_token: record.assignment_token,
             mission_title: record.mission_title,
         })
         .map_err(|_| ApiError::conflict("runner disconnected before accepting the run"))?;
@@ -479,7 +530,6 @@ async fn emergency_stop(
     runner
         .tx
         .send(ServerToRunner::StopRun {
-            corp_id,
             run_id: outcome.run_id,
             reason: request.reason,
         })
@@ -653,14 +703,21 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut registered_id: Option<String> = None;
+    let mut registered: Option<(String, Uuid)> = None;
     while let Some(message) = receiver.next().await {
         let message = match message {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
             Ok(_) => continue,
             Err(error) => {
-                warn!(%error, "runner websocket read failed");
+                if error
+                    .to_string()
+                    .contains("reset without closing handshake")
+                {
+                    info!(%error, "runner transport disconnected");
+                } else {
+                    warn!(%error, "runner websocket read failed");
+                }
                 break;
             }
         };
@@ -674,32 +731,139 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         match incoming {
             RunnerToServer::Register {
                 runner_id,
+                connection_epoch,
                 hostname,
                 os,
                 capabilities,
+                active_runs,
             } => {
-                registered_id = Some(runner_id.clone());
-                state.runners.insert(
+                let record = match state
+                    .store
+                    .runner_connected(RunnerConnectInput {
+                        id: runner_id.clone(),
+                        hostname,
+                        os,
+                        capabilities: match serde_json::to_value(&capabilities) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                warn!(%error, %runner_id, "failed to serialize runner capabilities");
+                                continue;
+                            }
+                        },
+                        connection_epoch,
+                    })
+                    .await
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        warn!(%error, %runner_id, "failed to persist runner connection");
+                        continue;
+                    }
+                };
+
+                let previous = state.runners.insert(
                     runner_id.clone(),
                     RunnerConnection {
-                        summary: RunnerSummary {
-                            id: runner_id.clone(),
-                            hostname,
-                            os,
-                            capabilities,
-                            connected: true,
-                        },
+                        connection_epoch,
                         tx: command_tx.clone(),
                     },
                 );
+                if let Some(previous) = previous
+                    && previous.connection_epoch != connection_epoch
+                {
+                    let _ = previous.tx.send(ServerToRunner::Disconnect {
+                        reason: "runner connected with a newer epoch".to_owned(),
+                        reconnect_delay_ms: 0,
+                    });
+                }
+                registered = Some((runner_id.clone(), connection_epoch));
                 let _ = command_tx.send(ServerToRunner::Registered {
                     runner_id: runner_id.clone(),
                 });
-                info!(%runner_id, "runner connected");
+                let claims = active_runs
+                    .iter()
+                    .map(|claim| RunClaim {
+                        run_id: claim.run_id,
+                        assignment_token: claim.assignment_token,
+                    })
+                    .collect::<Vec<_>>();
+                match state
+                    .store
+                    .reconcile_runner_claims(&runner_id, connection_epoch, &claims)
+                    .await
+                {
+                    Ok(outcome) => {
+                        for event in outcome.events {
+                            publish(&state, event);
+                        }
+                        for stale_run in outcome.stale {
+                            let _ = command_tx.send(ServerToRunner::StopRun {
+                                run_id: stale_run,
+                                reason: "stale or unknown run assignment after reconnect"
+                                    .to_owned(),
+                            });
+                        }
+                        let accepted = outcome.accepted;
+                        let finalize_state = state.clone();
+                        let finalize_runner = runner_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            match finalize_state
+                                .store
+                                .mark_unclaimed_runner_runs_lost(
+                                    &finalize_runner,
+                                    connection_epoch,
+                                    &accepted,
+                                )
+                                .await
+                            {
+                                Ok(events) => {
+                                    for event in events {
+                                        publish(&finalize_state, event);
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(%error, runner_id = %finalize_runner, "runner reconciliation finalization failed")
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        warn!(%error, %runner_id, "runner active-run reconciliation failed")
+                    }
+                }
+                info!(
+                    %runner_id,
+                    %connection_epoch,
+                    status = %record.status,
+                    "runner connected"
+                );
             }
-            RunnerToServer::Heartbeat { runner_id } => {
-                if registered_id.as_deref() != Some(runner_id.as_str()) {
+            RunnerToServer::Heartbeat {
+                runner_id,
+                connection_epoch,
+                active_runs,
+            } => {
+                if !registered.as_ref().is_some_and(|(registered_id, epoch)| {
+                    registered_id == &runner_id && *epoch == connection_epoch
+                }) {
                     warn!(%runner_id, "heartbeat from unregistered runner");
+                    continue;
+                }
+                match state
+                    .store
+                    .runner_heartbeat(&runner_id, connection_epoch)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::debug!(
+                            %runner_id,
+                            active_run_count = active_runs.len(),
+                            "runner heartbeat persisted"
+                        );
+                    }
+                    Ok(false) => warn!(%runner_id, "runner heartbeat epoch was rejected"),
+                    Err(error) => warn!(%error, %runner_id, "runner heartbeat persistence failed"),
                 }
             }
             RunnerToServer::RunEvent {
@@ -711,7 +875,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 event_type,
                 payload,
             } => {
-                if registered_id.as_deref() != Some(runner_id.as_str()) {
+                if registered.as_ref().map(|value| value.0.as_str()) != Some(runner_id.as_str()) {
                     warn!(%runner_id, "run event runner id does not match registered socket");
                     continue;
                 }
@@ -731,16 +895,61 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     Ok(Some(event)) => publish(&state, event),
                     Ok(None) => {}
                     Err(error) => {
-                        warn!(%error, %run_id, %event_type, "failed to apply runner event")
+                        if error
+                            .to_string()
+                            .contains("runner event does not match an active run")
+                        {
+                            info!(%run_id, %event_type, "ignored stale runner event");
+                        } else {
+                            warn!(%error, %run_id, %event_type, "failed to apply runner event")
+                        }
                     }
                 }
             }
         }
     }
 
-    if let Some(runner_id) = registered_id {
-        state.runners.remove(&runner_id);
-        info!(%runner_id, "runner disconnected");
+    if let Some((runner_id, connection_epoch)) = registered {
+        let is_current = state
+            .runners
+            .get(&runner_id)
+            .is_some_and(|entry| entry.connection_epoch == connection_epoch);
+        if is_current {
+            state.runners.remove(&runner_id);
+        }
+        match state
+            .store
+            .runner_disconnected(&runner_id, connection_epoch, state.runner_grace_secs)
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    publish(&state, event);
+                }
+            }
+            Err(error) => warn!(%error, %runner_id, "failed to start runner grace period"),
+        }
+        let expiry_state = state.clone();
+        let expiry_runner = runner_id.clone();
+        let grace_seconds = state.runner_grace_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace_seconds as u64)).await;
+            match expiry_state
+                .store
+                .expire_runner_grace(&expiry_runner, connection_epoch)
+                .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        publish(&expiry_state, event);
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, runner_id = %expiry_runner, "runner grace expiry failed")
+                }
+            }
+        });
+        info!(%runner_id, %connection_epoch, "runner disconnected into grace");
     }
     writer.abort();
 }

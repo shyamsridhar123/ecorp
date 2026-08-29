@@ -20,6 +20,10 @@ const emit = (event) => {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 };
 
+const slowRun = mission.includes("[slow]");
+const briefingDelay = slowRun ? 4_000 : 700;
+const workDelay = slowRun ? 5_000 : 900;
+
 const wait = (milliseconds) =>
   new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 
@@ -46,7 +50,7 @@ emit({
   station: "briefing",
   message: "Reading the mission contract",
 });
-await wait(700);
+await wait(briefingDelay);
 
 emit({
   type: "output",
@@ -59,7 +63,7 @@ emit({
   station: "research",
   message: "Collecting evidence and constraints",
 });
-await wait(900);
+await wait(workDelay);
 
 emit({
   type: "status",
@@ -67,7 +71,7 @@ emit({
   station: "terminal",
   message: "Producing the artifact in an isolated workspace",
 });
-await wait(900);
+await wait(workDelay);
 
 const artifact = [
   "# Verified mission artifact",
@@ -101,4 +105,3 @@ emit({
   summary: "Created and verified result.md through the runner-owned child process.",
 });
 input.close();
-

@@ -33,9 +33,12 @@ room-scoped missions, tasks, runs, messages, and events are not returned.
 - Irreversible effects require authorization and idempotency.
 - Artifacts are content-hashed.
 - Agent control uses rotating fencing tokens; stale tokens are rejected.
-- Lease tokens are returned only to the acquiring or receiving controller and are omitted from
-  shared snapshots and event payloads.
+- Lease tokens are returned only when the current controller explicitly claims or renews control;
+  they are omitted from shared snapshots, transfers, and event payloads.
 - Emergency stop is role-gated and audited.
+- Runner connections use epochs, and run assignments use independent private fencing tokens.
+- Assignment tokens are omitted from shared snapshots and event payloads.
+- A stale runner cannot turn a `lost` run back into an active or cancelled run.
 
 ## Reporting
 

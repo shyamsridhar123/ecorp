@@ -11,16 +11,26 @@ pub struct RunnerCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveRunClaim {
+    pub run_id: Uuid,
+    pub assignment_token: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerToServer {
     Register {
         runner_id: String,
+        connection_epoch: Uuid,
         hostname: String,
         os: String,
         capabilities: Vec<RunnerCapability>,
+        active_runs: Vec<ActiveRunClaim>,
     },
     Heartbeat {
         runner_id: String,
+        connection_epoch: Uuid,
+        active_runs: Vec<ActiveRunClaim>,
     },
     RunEvent {
         event_id: Uuid,
@@ -46,6 +56,7 @@ pub enum ServerToRunner {
         task_id: Uuid,
         run_id: Uuid,
         agent_id: Uuid,
+        assignment_token: Uuid,
         mission_title: String,
     },
     ControlMessage {
@@ -57,9 +68,12 @@ pub enum ServerToRunner {
         text: String,
     },
     StopRun {
-        corp_id: Uuid,
         run_id: Uuid,
         reason: String,
+    },
+    Disconnect {
+        reason: String,
+        reconnect_delay_ms: u64,
     },
 }
 
@@ -70,6 +84,9 @@ pub struct RunnerSummary {
     pub os: String,
     pub capabilities: Vec<RunnerCapability>,
     pub connected: bool,
+    pub status: String,
+    pub last_seen_at: String,
+    pub grace_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

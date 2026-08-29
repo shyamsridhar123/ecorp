@@ -51,6 +51,7 @@ pub struct LaunchRecord {
     pub task_id: Uuid,
     pub run_id: Uuid,
     pub agent_id: Uuid,
+    pub assignment_token: Uuid,
     pub mission_title: String,
 }
 
@@ -98,6 +99,40 @@ pub struct NewRoomMessageInput {
     pub reply_to_id: Option<Uuid>,
     pub mentions: Vec<Uuid>,
     pub link: Option<EntityLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerRecord {
+    pub id: String,
+    pub hostname: String,
+    pub os: String,
+    pub capabilities: Value,
+    pub connection_epoch: Uuid,
+    pub status: String,
+    pub last_seen_at: chrono::DateTime<Utc>,
+    pub grace_expires_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunClaim {
+    pub run_id: Uuid,
+    pub assignment_token: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerConnectInput {
+    pub id: String,
+    pub hostname: String,
+    pub os: String,
+    pub capabilities: Value,
+    pub connection_epoch: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerReconcileOutcome {
+    pub accepted: Vec<Uuid>,
+    pub stale: Vec<Uuid>,
+    pub events: Vec<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,8 +438,9 @@ impl PgStore {
 
         let runs = sqlx::query(
             r#"
-            SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id, r.status,
-                   r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
+            SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id,
+                   r.assignment_token, r.status, r.summary, r.artifact_path,
+                   r.artifact_sha256, r.created_at, r.updated_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -575,6 +611,278 @@ impl PgStore {
         Ok(rooms)
     }
 
+    pub async fn runner_connected(&self, input: RunnerConnectInput) -> Result<RunnerRecord> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO runner_nodes
+                (id, hostname, os, capabilities, connection_epoch, status,
+                 connected_at, last_seen_at, disconnected_at, grace_expires_at)
+            VALUES ($1, $2, $3, $4, $5, 'connected', now(), now(), NULL, NULL)
+            ON CONFLICT (id) DO UPDATE
+            SET hostname = EXCLUDED.hostname,
+                os = EXCLUDED.os,
+                capabilities = EXCLUDED.capabilities,
+                connection_epoch = EXCLUDED.connection_epoch,
+                status = 'connected',
+                connected_at = now(),
+                last_seen_at = now(),
+                disconnected_at = NULL,
+                grace_expires_at = NULL
+            RETURNING id, hostname, os, capabilities, connection_epoch, status,
+                      last_seen_at, grace_expires_at
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.hostname)
+        .bind(input.os)
+        .bind(input.capabilities)
+        .bind(input.connection_epoch)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(map_runner(row))
+    }
+
+    pub async fn runner_heartbeat(&self, runner_id: &str, connection_epoch: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE runner_nodes
+            SET last_seen_at = now()
+            WHERE id = $1 AND connection_epoch = $2 AND status = 'connected'
+            "#,
+        )
+        .bind(runner_id)
+        .bind(connection_epoch)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn runner_records(&self) -> Result<Vec<RunnerRecord>> {
+        let records = sqlx::query(
+            r#"
+            SELECT id, hostname, os, capabilities, connection_epoch, status,
+                   last_seen_at, grace_expires_at
+            FROM runner_nodes
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_runner)
+        .collect();
+        Ok(records)
+    }
+
+    pub async fn runner_disconnected(
+        &self,
+        runner_id: &str,
+        connection_epoch: Uuid,
+        grace_seconds: i64,
+    ) -> Result<Vec<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let grace_expires_at = Utc::now() + Duration::seconds(grace_seconds.max(1));
+        let result = sqlx::query(
+            r#"
+            UPDATE runner_nodes
+            SET status = 'grace', disconnected_at = now(), grace_expires_at = $3
+            WHERE id = $1 AND connection_epoch = $2 AND status = 'connected'
+            "#,
+        )
+        .bind(runner_id)
+        .bind(connection_epoch)
+        .bind(grace_expires_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        let rows = active_runner_run_rows(&mut tx, runner_id).await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run_id: Uuid = row.get("run_id");
+            let corp_id: Uuid = row.get("corp_id");
+            let room_id: Uuid = row.get("room_id");
+            let mission_id: Uuid = row.get("mission_id");
+            if let Some(event) = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: Some(room_id),
+                    correlation_id: Some(mission_id),
+                    ..NewEvent::new(
+                        corp_id,
+                        None,
+                        "runner.grace_started",
+                        "run",
+                        run_id,
+                        format!("runner-grace:{runner_id}:{connection_epoch}:{run_id}"),
+                        json!({
+                            "runner_id": runner_id,
+                            "grace_expires_at": grace_expires_at
+                        }),
+                    )
+                },
+            )
+            .await?
+            {
+                events.push(event);
+            }
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn expire_runner_grace(
+        &self,
+        runner_id: &str,
+        connection_epoch: Uuid,
+    ) -> Result<Vec<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let expired = sqlx::query(
+            r#"
+            UPDATE runner_nodes
+            SET status = 'offline', grace_expires_at = NULL
+            WHERE id = $1 AND connection_epoch = $2 AND status = 'grace'
+              AND grace_expires_at <= now()
+            RETURNING id
+            "#,
+        )
+        .bind(runner_id)
+        .bind(connection_epoch)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if expired.is_none() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let events =
+            mark_runner_runs_lost_tx(&mut tx, runner_id, &[], "runner grace period expired")
+                .await?;
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn reconcile_runner_claims(
+        &self,
+        runner_id: &str,
+        connection_epoch: Uuid,
+        claims: &[RunClaim],
+    ) -> Result<RunnerReconcileOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let connected: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM runner_nodes
+                WHERE id = $1 AND connection_epoch = $2 AND status = 'connected'
+            )
+            "#,
+        )
+        .bind(runner_id)
+        .bind(connection_epoch)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !connected {
+            return Err(anyhow!("runner connection epoch is not active"));
+        }
+
+        let mut accepted = Vec::new();
+        let mut stale = Vec::new();
+        let mut events = Vec::new();
+        for claim in claims {
+            let row = sqlx::query(
+                r#"
+                SELECT r.id, r.corp_id, r.assignment_token, t.mission_id, m.room_id
+                FROM runs r
+                JOIN tasks t ON t.id = r.task_id
+                JOIN missions m ON m.id = t.mission_id
+                WHERE r.id = $1 AND r.runner_id = $2
+                  AND r.status IN ('provisioning', 'starting', 'running',
+                                   'waiting_for_input', 'waiting_for_approval', 'verifying')
+                FOR UPDATE OF r
+                "#,
+            )
+            .bind(claim.run_id)
+            .bind(runner_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                stale.push(claim.run_id);
+                continue;
+            };
+            let expected: Uuid = row.get("assignment_token");
+            if expected != claim.assignment_token {
+                stale.push(claim.run_id);
+                continue;
+            }
+            accepted.push(claim.run_id);
+            let corp_id: Uuid = row.get("corp_id");
+            let mission_id: Uuid = row.get("mission_id");
+            let room_id: Uuid = row.get("room_id");
+            if let Some(event) = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: Some(room_id),
+                    correlation_id: Some(mission_id),
+                    ..NewEvent::new(
+                        corp_id,
+                        None,
+                        "run.reconciled",
+                        "run",
+                        claim.run_id,
+                        format!("run-reconciled:{}:{connection_epoch}", claim.run_id),
+                        json!({"runner_id": runner_id}),
+                    )
+                },
+            )
+            .await?
+            {
+                events.push(event);
+            }
+        }
+        tx.commit().await?;
+        Ok(RunnerReconcileOutcome {
+            accepted,
+            stale,
+            events,
+        })
+    }
+
+    pub async fn mark_unclaimed_runner_runs_lost(
+        &self,
+        runner_id: &str,
+        connection_epoch: Uuid,
+        accepted_claims: &[Uuid],
+    ) -> Result<Vec<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let connected: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM runner_nodes
+                WHERE id = $1 AND connection_epoch = $2 AND status = 'connected'
+            )
+            "#,
+        )
+        .bind(runner_id)
+        .bind(connection_epoch)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !connected {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let events = mark_runner_runs_lost_tx(
+            &mut tx,
+            runner_id,
+            accepted_claims,
+            "runner reconnected without an active claim",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(events)
+    }
+
     pub async fn create_mission(
         &self,
         corp_id: Uuid,
@@ -740,10 +1048,12 @@ impl PgStore {
         }
 
         let run_id = Uuid::new_v4();
+        let assignment_token = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO runs (id, corp_id, task_id, agent_id, runner_id, status)
-            VALUES ($1, $2, $3, $4, $5, 'starting')
+            INSERT INTO runs
+                (id, corp_id, task_id, agent_id, runner_id, assignment_token, status)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting')
             "#,
         )
         .bind(run_id)
@@ -751,6 +1061,7 @@ impl PgStore {
         .bind(task_id)
         .bind(agent_id)
         .bind(runner_id)
+        .bind(assignment_token)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
@@ -802,6 +1113,7 @@ impl PgStore {
                 task_id,
                 run_id,
                 agent_id,
+                assignment_token,
                 mission_title,
             },
             event,
@@ -826,6 +1138,8 @@ impl PgStore {
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.status IN ('provisioning', 'starting', 'running',
+                               'waiting_for_input', 'waiting_for_approval', 'verifying')
             FOR UPDATE OF r, t, m
             "#,
         )
@@ -1534,6 +1848,108 @@ impl PgStore {
     }
 }
 
+async fn active_runner_run_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    runner_id: &str,
+) -> Result<Vec<sqlx::postgres::PgRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id AS run_id, r.corp_id, r.task_id, r.agent_id,
+               t.mission_id, m.room_id
+        FROM runs r
+        JOIN tasks t ON t.id = r.task_id
+        JOIN missions m ON m.id = t.mission_id
+        WHERE r.runner_id = $1
+          AND r.status IN ('provisioning', 'starting', 'running',
+                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+        ORDER BY r.created_at
+        FOR UPDATE OF r, t, m
+        "#,
+    )
+    .bind(runner_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+async fn mark_runner_runs_lost_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runner_id: &str,
+    excluded_run_ids: &[Uuid],
+    reason: &str,
+) -> Result<Vec<DomainEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id AS run_id, r.corp_id, r.task_id, r.agent_id,
+               t.mission_id, m.room_id
+        FROM runs r
+        JOIN tasks t ON t.id = r.task_id
+        JOIN missions m ON m.id = t.mission_id
+        WHERE r.runner_id = $1
+          AND r.status IN ('provisioning', 'starting', 'running',
+                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+          AND (
+            cardinality($2::uuid[]) = 0
+            OR NOT (r.id = ANY($2::uuid[]))
+          )
+        ORDER BY r.created_at
+        FOR UPDATE OF r, t, m
+        "#,
+    )
+    .bind(runner_id)
+    .bind(excluded_run_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let run_id: Uuid = row.get("run_id");
+        let corp_id: Uuid = row.get("corp_id");
+        let task_id: Uuid = row.get("task_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        sqlx::query(
+            "UPDATE runs SET status = 'lost', summary = $1, updated_at = now() WHERE id = $2",
+        )
+        .bind(reason)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET status = 'blocked', updated_at = now() WHERE id = $1")
+            .bind(task_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'offline', station = NULL, current_run_id = NULL WHERE id = $1",
+        )
+        .bind(agent_id)
+        .execute(&mut **tx)
+        .await?;
+        if let Some(event) = append_event_tx(
+            tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "run.lost",
+                    "run",
+                    run_id,
+                    format!("run-lost:{run_id}"),
+                    json!({"runner_id": runner_id, "reason": reason}),
+                )
+            },
+        )
+        .await?
+        {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
 async fn assert_actor_agent_scope_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -1790,6 +2206,7 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         task_id: row.get("task_id"),
         agent_id: row.get("agent_id"),
         runner_id: row.get("runner_id"),
+        assignment_token: row.get("assignment_token"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
         artifact_path: row.get("artifact_path"),
@@ -1839,6 +2256,19 @@ fn map_room_message(row: sqlx::postgres::PgRow) -> RoomMessage {
         mentions: row.get("mentions"),
         link,
         created_at: row.get("created_at"),
+    }
+}
+
+fn map_runner(row: sqlx::postgres::PgRow) -> RunnerRecord {
+    RunnerRecord {
+        id: row.get("id"),
+        hostname: row.get("hostname"),
+        os: row.get("os"),
+        capabilities: row.get("capabilities"),
+        connection_epoch: row.get("connection_epoch"),
+        status: row.get("status"),
+        last_seen_at: row.get("last_seen_at"),
+        grace_expires_at: row.get("grace_expires_at"),
     }
 }
 

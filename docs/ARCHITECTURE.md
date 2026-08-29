@@ -139,11 +139,32 @@ durably queued.
 - `crony-runner`: process supervision and isolation
 - `crony-cli`: scriptable operator interface
 
+## Runner liveness and reconciliation
+
+Every runner connection has a fresh connection epoch. Postgres stores:
+
+- hostname, operating system, and capabilities
+- connected, grace, or offline status
+- connection epoch
+- last heartbeat
+- disconnect and grace-expiry timestamps
+
+Every run assignment has a private assignment fencing token that is sent only to its runner.
+Active runners include run IDs and assignment tokens when reconnecting. Matching claims emit a
+`run.reconciled` event and continue. Unknown or stale claims receive a stop command.
+
+A disconnect enters a bounded grace period rather than immediately failing work. Reconnecting with
+a newer epoch cancels the old grace timer. When grace expires, active runs become `lost`, their
+tasks become `blocked`, and their agents become `offline`. A later stale runner claim cannot
+overwrite that terminal lost state.
+
+The runner keeps active process controls and a bounded outbound event queue outside any individual
+WebSocket connection, so a transport reconnect does not kill the child process or discard events.
+
 ## Near-term architecture work
 
-1. Add runner heartbeats and disconnect grace.
-2. Move child-process behavior behind an `AgentAdapter` trait.
-3. Add git worktree isolation.
-4. Add durable approvals and policy evaluation.
-5. Add authenticated users and runner enrollment.
-6. Add artifact upload rather than host-local artifact paths.
+1. Move child-process behavior behind an `AgentAdapter` trait.
+2. Add git worktree isolation.
+3. Add durable approvals and policy evaluation.
+4. Add authenticated users and runner enrollment.
+5. Add artifact upload rather than host-local artifact paths.

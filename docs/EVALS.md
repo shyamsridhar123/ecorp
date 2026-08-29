@@ -66,3 +66,6 @@ actually cancels the child process.
 `tools/e2e_rooms.mjs` verifies persisted top-level messages and replies, author attribution,
 structured mentions and entity links, two-member visibility, non-member write rejection, and
 room-filtered WebSocket replay.
+`tools/e2e_runner_reconnect.mjs` verifies persisted heartbeat timestamps, visible grace state,
+short-disconnect process survival, assignment-token reconciliation, deterministic grace expiry,
+lost-run state, and rejection of a later stale claim.
