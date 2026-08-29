@@ -119,6 +119,19 @@ if (-not $controlOutput) {
     throw 'The child process did not acknowledge the live control message.'
 }
 
+$adapterCapability = $snapshot.runners |
+    ForEach-Object capabilities |
+    Where-Object name -eq 'fake-process' |
+    Select-Object -First 1
+if (
+    -not $adapterCapability -or
+    -not $adapterCapability.available -or
+    $adapterCapability.detail -notmatch 'spawn=yes' -or
+    $adapterCapability.detail -notmatch 'resume=no'
+) {
+    throw 'Runner did not report the explicit fake-process adapter capability contract.'
+}
+
 $report = [ordered]@{
     checked_at = (Get-Date).ToUniversalTime().ToString('o')
     corp_id = $demo.corp_id
@@ -133,6 +146,7 @@ $report = [ordered]@{
     artifact_sha256 = $actualSha
     event_count = $snapshot.snapshot.events.Count
     control_acknowledged = [bool]$controlOutput
+    adapter_capability = $adapterCapability.detail
 }
 
 $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath

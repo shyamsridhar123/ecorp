@@ -391,6 +391,7 @@ async fn launch_mission(
             run_id: record.run_id,
             agent_id: record.agent_id,
             assignment_token: record.assignment_token,
+            adapter: record.adapter,
             mission_title: record.mission_title,
         })
         .map_err(|_| ApiError::conflict("runner disconnected before accepting the run"))?;

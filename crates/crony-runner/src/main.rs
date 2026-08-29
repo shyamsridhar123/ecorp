@@ -1,3 +1,5 @@
+mod adapter;
+
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -11,15 +13,15 @@ use crony_protocol::{ActiveRunClaim, RunnerCapability, RunnerToServer, ServerToR
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+use adapter::{
+    AdapterControl, AdapterEvent, AdapterEventSink, AdapterRegistry, AdapterRunRequest,
+    AgentAdapter,
+};
 
 #[derive(Debug, Parser, Clone)]
 #[command(name = "crony-runner")]
@@ -57,14 +59,14 @@ struct Assignment {
     task_id: Uuid,
     run_id: Uuid,
     agent_id: Uuid,
+    adapter: String,
     mission_title: String,
 }
 
 #[derive(Clone)]
 struct ActiveRunControl {
     assignment_token: Uuid,
-    input: mpsc::UnboundedSender<String>,
-    stop: mpsc::UnboundedSender<String>,
+    control: mpsc::UnboundedSender<AdapterControl>,
 }
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
@@ -136,8 +138,15 @@ async fn main() -> Result<()> {
 
     let active_runs: ActiveRuns = Arc::new(DashMap::new());
     let outbound = OutboundBus::default();
+    let adapters = Arc::new(AdapterRegistry::new(args.fake_agent_script.clone()));
     loop {
-        let delay = match run_connection(args.clone(), active_runs.clone(), outbound.clone()).await
+        let delay = match run_connection(
+            args.clone(),
+            active_runs.clone(),
+            outbound.clone(),
+            adapters.clone(),
+        )
+        .await
         {
             Ok(delay) => delay,
             Err(error) => {
@@ -153,6 +162,7 @@ async fn run_connection(
     args: Args,
     active_runs: ActiveRuns,
     outbound: OutboundBus,
+    adapters: Arc<AdapterRegistry>,
 ) -> Result<Duration> {
     let (socket, _) = connect_async(&args.server_ws)
         .await
@@ -180,24 +190,31 @@ async fn run_connection(
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned());
     let claims = active_run_claims(&active_runs);
+    let mut capabilities = adapters
+        .all()
+        .into_iter()
+        .map(|adapter| RunnerCapability {
+            name: adapter.id().to_owned(),
+            available: adapter.capabilities().spawn.supported(),
+            detail: Some(format!(
+                "{}; {}",
+                adapter.display_name(),
+                adapter.capabilities().summary()
+            )),
+        })
+        .collect::<Vec<_>>();
+    capabilities.push(RunnerCapability {
+        name: "workspace-isolation".to_owned(),
+        available: true,
+        detail: Some(args.workspace.display().to_string()),
+    });
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
             connection_epoch,
             hostname,
             os: std::env::consts::OS.to_owned(),
-            capabilities: vec![
-                RunnerCapability {
-                    name: "fake-process".to_owned(),
-                    available: true,
-                    detail: Some("deterministic child-process adapter".to_owned()),
-                },
-                RunnerCapability {
-                    name: "workspace-isolation".to_owned(),
-                    available: true,
-                    detail: Some(args.workspace.display().to_string()),
-                },
-            ],
+            capabilities,
             active_runs: claims,
         })
         .map_err(|_| anyhow!("runner writer stopped before registration"))?;
@@ -249,6 +266,7 @@ async fn run_connection(
                 run_id,
                 agent_id,
                 assignment_token,
+                adapter,
                 mission_title,
             } => {
                 let assignment = Assignment {
@@ -258,33 +276,45 @@ async fn run_connection(
                     task_id,
                     run_id,
                     agent_id,
+                    adapter,
                     mission_title,
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate start command ignored");
                     continue;
                 }
-                let (input_tx, input_rx) = mpsc::unbounded_channel::<String>();
-                let (stop_tx, stop_rx) = mpsc::unbounded_channel::<String>();
+                let Some(adapter) = adapters.get(&assignment.adapter) else {
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({
+                            "error": format!("adapter {} is not installed", assignment.adapter)
+                        }),
+                    );
+                    continue;
+                };
+                let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
                         assignment_token,
-                        input: input_tx,
-                        stop: stop_tx,
+                        control: control_tx,
                     },
                 );
-                let task_args = args.clone();
+                let workspace_root = args.workspace.clone();
+                let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
                 tokio::spawn(async move {
-                    let runner_id = task_args.runner_id.clone();
                     if let Err(error) = execute_assignment(
-                        task_args,
+                        workspace_root,
+                        runner_id.clone(),
                         assignment.clone(),
+                        adapter,
                         task_outbound.clone(),
-                        input_rx,
-                        stop_rx,
+                        control_rx,
                     )
                     .await
                     {
@@ -308,13 +338,9 @@ async fn run_connection(
                 ..
             } => {
                 if let Some(active) = active_runs.get(&run_id) {
-                    let _ = active.input.send(
-                        json!({
-                            "actor_id": actor_id,
-                            "text": text
-                        })
-                        .to_string(),
-                    );
+                    let _ = active
+                        .control
+                        .send(AdapterControl::Steer { actor_id, text });
                     info!(%run_id, %actor_id, "accepted fenced control message");
                 } else {
                     warn!(%run_id, "control message arrived for inactive run");
@@ -322,7 +348,7 @@ async fn run_connection(
             }
             ServerToRunner::StopRun { run_id, reason, .. } => {
                 if let Some(active) = active_runs.get(&run_id) {
-                    let _ = active.stop.send(reason);
+                    let _ = active.control.send(AdapterControl::Stop { reason });
                 } else {
                     warn!(%run_id, "stop command arrived for inactive run");
                 }
@@ -344,216 +370,99 @@ async fn run_connection(
     Ok(reconnect_delay)
 }
 
-async fn execute_assignment(
-    args: Args,
-    assignment: Assignment,
+struct RunnerEventSink {
     outbound: OutboundBus,
-    mut input_rx: mpsc::UnboundedReceiver<String>,
-    mut stop_rx: mpsc::UnboundedReceiver<String>,
-) -> Result<()> {
-    let run_dir = args.workspace.join(assignment.run_id.to_string());
-    tokio::fs::create_dir_all(&run_dir)
-        .await
-        .with_context(|| format!("create run directory {}", run_dir.display()))?;
-
-    send_run_event(
-        &outbound,
-        &args.runner_id,
-        &assignment,
-        "run.started",
-        json!({
-            "room_id": assignment.room_id,
-            "mission_id": assignment.mission_id,
-            "task_id": assignment.task_id,
-            "workspace": run_dir,
-        }),
-    );
-
-    let mut child = Command::new("node")
-        .arg(&args.fake_agent_script)
-        .arg("--run-id")
-        .arg(assignment.run_id.to_string())
-        .arg("--workdir")
-        .arg(&run_dir)
-        .arg("--mission")
-        .arg(&assignment.mission_title)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "spawn fake agent script {}",
-                args.fake_agent_script.display()
-            )
-        })?;
-
-    let stdin = child.stdin.take().context("fake agent stdin missing")?;
-    let stdout = child.stdout.take().context("fake agent stdout missing")?;
-    let stderr = child.stderr.take().context("fake agent stderr missing")?;
-
-    let input_writer = tokio::spawn(async move {
-        let mut stdin = stdin;
-        while let Some(line) = input_rx.recv().await {
-            if stdin.write_all(line.as_bytes()).await.is_err()
-                || stdin.write_all(b"\n").await.is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let stderr_assignment = assignment.clone();
-    let stderr_runner_id = args.runner_id.clone();
-    let stderr_outbound = outbound.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            send_run_event(
-                &stderr_outbound,
-                &stderr_runner_id,
-                &stderr_assignment,
-                "run.output",
-                json!({"stream": "stderr", "text": line}),
-            );
-        }
-    });
-
-    let mut terminal_event = false;
-    let mut cancelled = false;
-    let mut lines = BufReader::new(stdout).lines();
-    loop {
-        tokio::select! {
-            reason = stop_rx.recv() => {
-                if let Some(reason) = reason {
-                    child.kill().await.context("kill stopped agent process")?;
-                    send_run_event(
-                        &outbound,
-                        &args.runner_id,
-                        &assignment,
-                        "run.cancelled",
-                        json!({"reason": reason}),
-                    );
-                    terminal_event = true;
-                    cancelled = true;
-                    break;
-                }
-            }
-            line = lines.next_line() => {
-                let Some(line) = line? else {
-                    break;
-                };
-                let event: Value = match serde_json::from_str(&line) {
-                    Ok(event) => event,
-                    Err(_) => {
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.output",
-                            json!({"stream": "stdout", "text": line}),
-                        );
-                        continue;
-                    }
-                };
-                let kind = event
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("output");
-                match kind {
-                    "status" => {
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.status",
-                            json!({
-                                "status": event.get("status").and_then(Value::as_str).unwrap_or("working"),
-                                "station": event.get("station").and_then(Value::as_str).unwrap_or("terminal"),
-                                "message": event.get("message").and_then(Value::as_str).unwrap_or("")
-                            }),
-                        );
-                    }
-                    "artifact" => {
-                        let relative = event
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .context("artifact event missing path")?;
-                        let artifact_path = run_dir.join(relative);
-                        let bytes = tokio::fs::read(&artifact_path)
-                            .await
-                            .with_context(|| format!("read artifact {}", artifact_path.display()))?;
-                        let sha256 = hex::encode(Sha256::digest(&bytes));
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.artifact",
-                            json!({
-                                "path": artifact_path,
-                                "sha256": sha256,
-                                "bytes": bytes.len(),
-                                "media_type": event.get("media_type").and_then(Value::as_str).unwrap_or("text/markdown")
-                            }),
-                        );
-                    }
-                    "completed" => {
-                        terminal_event = true;
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.completed",
-                            json!({
-                                "summary": event.get("summary").and_then(Value::as_str).unwrap_or("Mission artifact completed")
-                            }),
-                        );
-                    }
-                    "failed" => {
-                        terminal_event = true;
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.failed",
-                            json!({
-                                "error": event.get("error").and_then(Value::as_str).unwrap_or("Fake agent reported failure")
-                            }),
-                        );
-                    }
-                    _ => {
-                        send_run_event(
-                            &outbound,
-                            &args.runner_id,
-                            &assignment,
-                            "run.output",
-                            json!({
-                                "stream": event.get("stream").and_then(Value::as_str).unwrap_or("stdout"),
-                                "text": event.get("text").and_then(Value::as_str).unwrap_or(&line)
-                            }),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let status = child.wait().await?;
-    input_writer.abort();
-    let _ = stderr_task.await;
-    if cancelled {
-        return Ok(());
-    }
-    if !status.success() && !terminal_event {
-        return Err(anyhow!("fake agent exited with {status}"));
-    }
-    if !terminal_event {
-        return Err(anyhow!("fake agent exited without a terminal event"));
-    }
-    Ok(())
+    runner_id: String,
+    assignment: Assignment,
 }
 
+impl AdapterEventSink for RunnerEventSink {
+    fn emit(&self, event: AdapterEvent) {
+        let (event_type, payload) = match event {
+            AdapterEvent::Started { workspace } => (
+                "run.started",
+                json!({
+                    "room_id": self.assignment.room_id,
+                    "mission_id": self.assignment.mission_id,
+                    "task_id": self.assignment.task_id,
+                    "workspace": workspace,
+                    "adapter": self.assignment.adapter,
+                }),
+            ),
+            AdapterEvent::Status {
+                status,
+                station,
+                message,
+            } => (
+                "run.status",
+                json!({
+                    "status": status,
+                    "station": station,
+                    "message": message,
+                }),
+            ),
+            AdapterEvent::Output { stream, text } => (
+                "run.output",
+                json!({
+                    "stream": stream,
+                    "text": text,
+                }),
+            ),
+            AdapterEvent::Artifact(artifact) => (
+                "run.artifact",
+                json!({
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                    "bytes": artifact.bytes,
+                    "media_type": artifact.media_type,
+                }),
+            ),
+            AdapterEvent::Usage(usage) => (
+                "run.usage",
+                json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cost_microusd": usage.cost_microusd,
+                }),
+            ),
+            AdapterEvent::Completed { summary } => ("run.completed", json!({"summary": summary})),
+            AdapterEvent::Failed { error } => ("run.failed", json!({"error": error})),
+            AdapterEvent::Cancelled { reason } => ("run.cancelled", json!({"reason": reason})),
+        };
+        send_run_event(
+            &self.outbound,
+            &self.runner_id,
+            &self.assignment,
+            event_type,
+            payload,
+        );
+    }
+}
+
+async fn execute_assignment(
+    workspace_root: PathBuf,
+    runner_id: String,
+    assignment: Assignment,
+    adapter: Arc<dyn AgentAdapter>,
+    outbound: OutboundBus,
+    controls: mpsc::UnboundedReceiver<AdapterControl>,
+) -> Result<()> {
+    let request = AdapterRunRequest {
+        run_id: assignment.run_id,
+        mission_id: assignment.mission_id,
+        task_id: assignment.task_id,
+        agent_id: assignment.agent_id,
+        mission_title: assignment.mission_title.clone(),
+        workspace: workspace_root.join(assignment.run_id.to_string()),
+    };
+    let sink: Arc<dyn AdapterEventSink> = Arc::new(RunnerEventSink {
+        outbound,
+        runner_id,
+        assignment,
+    });
+    adapter.execute(request, controls, sink).await?;
+    Ok(())
+}
 fn send_run_event(
     outbound: &OutboundBus,
     runner_id: &str,

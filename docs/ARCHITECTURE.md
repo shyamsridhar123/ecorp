@@ -161,9 +161,24 @@ overwrite that terminal lost state.
 The runner keeps active process controls and a bounded outbound event queue outside any individual
 WebSocket connection, so a transport reconnect does not kill the child process or discard events.
 
+## Agent adapters
+
+Provider runtimes implement one `AgentAdapter` contract:
+
+- execute a new run
+- stream status, output, artifacts, usage, and terminal events
+- receive steer, interrupt, and stop controls
+- optionally resume a provider session
+- optionally collect usage after a session
+
+Every feature is reported as supported or unsupported with a reason. The deterministic
+`fake-process` implementation now uses the same contract as future Codex, Claude Code, and OpenCode
+adapters. Provider-independent conformance tests prove spawn, streaming, steering, artifact
+delivery, stop, and typed unsupported behavior.
+
 ## Near-term architecture work
 
-1. Move child-process behavior behind an `AgentAdapter` trait.
+1. Add the first real Codex adapter.
 2. Add git worktree isolation.
 3. Add durable approvals and policy evaluation.
 4. Add authenticated users and runner enrollment.
