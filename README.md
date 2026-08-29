@@ -26,7 +26,8 @@ The UI can close without terminating active work.
 - Outbound-connected runner daemon
 - Real child-process execution through a deterministic fake-agent adapter
 - Mission creation and launch
-- Agent control leasing and queued messages
+- Agent control leasing with private rotating fencing tokens
+- Explicit release and transfer, queued messages, and role-gated emergency stop
 - Artifact creation and SHA-256 evidence
 - Live office, operations panel, and activity replay
 

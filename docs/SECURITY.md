@@ -28,9 +28,12 @@ These are explicit backlog items, not production claims.
 - Long-lived secrets never enter prompts, logs, command arguments, or agent-readable files.
 - Irreversible effects require authorization and idempotency.
 - Artifacts are content-hashed.
+- Agent control uses rotating fencing tokens; stale tokens are rejected.
+- Lease tokens are returned only to the acquiring or receiving controller and are omitted from
+  shared snapshots and event payloads.
+- Emergency stop is role-gated and audited.
 
 ## Reporting
 
 Until private vulnerability reporting is enabled on the GitHub repository, report security issues
 directly to the repository owner rather than opening a public issue with exploit details.
-

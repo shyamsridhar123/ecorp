@@ -91,6 +91,8 @@ jobs:
         run: ./tools/e2e_smoke.ps1
       - name: Verify resumable event replay
         run: node tools/e2e_replay.mjs
+      - name: Verify control fencing and emergency stop
+        run: node tools/e2e_leases.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4

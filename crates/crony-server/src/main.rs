@@ -15,9 +15,10 @@ use clap::Parser;
 use crony_domain::DomainEvent;
 use crony_protocol::{
     BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
-    CreateMissionResponse, DemoBootstrapResponse, LaunchMissionRequest, LaunchMissionResponse,
-    QueueMessageRequest, QueueMessageResponse, RunnerSummary, RunnerToServer, ServerToRunner,
-    SnapshotResponse,
+    CreateMissionResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
+    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest,
+    QueueMessageResponse, ReleaseLeaseRequest, RunnerSummary, RunnerToServer, ServerToRunner,
+    SnapshotResponse, TransferLeaseRequest,
 };
 use crony_store::{PgStore, RunnerEventInput};
 use dashmap::DashMap;
@@ -87,6 +88,13 @@ impl ApiError {
             message: error.to_string(),
         }
     }
+
+    fn forbidden(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: error.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -143,8 +151,20 @@ async fn main() -> anyhow::Result<()> {
             post(claim_lease),
         )
         .route(
+            "/api/corps/{corp_id}/agents/{agent_id}/lease/release",
+            post(release_lease),
+        )
+        .route(
+            "/api/corps/{corp_id}/agents/{agent_id}/lease/transfer",
+            post(transfer_lease),
+        )
+        .route(
             "/api/corps/{corp_id}/agents/{agent_id}/messages",
             post(queue_message),
+        )
+        .route(
+            "/api/corps/{corp_id}/agents/{agent_id}/emergency-stop",
+            post(emergency_stop),
         )
         .route("/ws/corps/{corp_id}", get(browser_websocket))
         .route("/ws/runner", get(runner_websocket))
@@ -306,6 +326,52 @@ async fn claim_lease(
     }))
 }
 
+async fn release_lease(
+    State(state): State<AppState>,
+    Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ReleaseLeaseRequest>,
+) -> Result<Json<LeaseMutationResponse>, ApiError> {
+    let outcome = state
+        .store
+        .release_lease(corp_id, agent_id, request.actor_id, request.token)
+        .await
+        .map_err(ApiError::conflict)?;
+    publish(&state, outcome.event);
+    Ok(Json(LeaseMutationResponse {
+        holder_actor_id: None,
+        token: None,
+        expires_at: None,
+    }))
+}
+
+async fn transfer_lease(
+    State(state): State<AppState>,
+    Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<TransferLeaseRequest>,
+) -> Result<Json<LeaseMutationResponse>, ApiError> {
+    let outcome = state
+        .store
+        .transfer_lease(
+            corp_id,
+            agent_id,
+            request.actor_id,
+            request.token,
+            request.to_actor_id,
+        )
+        .await
+        .map_err(ApiError::conflict)?;
+    let lease = outcome
+        .lease
+        .context("transfer outcome omitted the new lease")
+        .map_err(ApiError::internal)?;
+    publish(&state, outcome.event);
+    Ok(Json(LeaseMutationResponse {
+        holder_actor_id: Some(lease.actor_id),
+        token: None,
+        expires_at: Some(lease.expires_at.to_rfc3339()),
+    }))
+}
+
 async fn queue_message(
     State(state): State<AppState>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
@@ -313,20 +379,28 @@ async fn queue_message(
 ) -> Result<Json<QueueMessageResponse>, ApiError> {
     let outcome = state
         .store
-        .queue_message(corp_id, agent_id, request.actor_id, &request.text)
+        .queue_message(
+            corp_id,
+            agent_id,
+            request.actor_id,
+            request.lease_token,
+            &request.text,
+        )
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(ApiError::conflict)?;
     publish(&state, outcome.event);
 
     if outcome.delivery == "immediate"
         && let (Some(run_id), Some(runner_id)) = (outcome.run_id, outcome.runner_id)
         && let Some(runner) = state.runners.get(&runner_id)
+        && let Some(lease_token) = request.lease_token
     {
         let _ = runner.tx.send(ServerToRunner::ControlMessage {
             corp_id,
             run_id,
             agent_id,
             actor_id: request.actor_id,
+            lease_token,
             text: request.text,
         });
     }
@@ -334,6 +408,41 @@ async fn queue_message(
     Ok(Json(QueueMessageResponse {
         message_id: outcome.message.id,
         delivery: outcome.delivery,
+    }))
+}
+
+async fn emergency_stop(
+    State(state): State<AppState>,
+    Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<EmergencyStopRequest>,
+) -> Result<Json<EmergencyStopResponse>, ApiError> {
+    let outcome = match state
+        .store
+        .request_emergency_stop(corp_id, agent_id, request.actor_id, &request.reason)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.to_string().starts_with("forbidden:") => {
+            return Err(ApiError::forbidden(error));
+        }
+        Err(error) => return Err(ApiError::conflict(error)),
+    };
+    let runner = state
+        .runners
+        .get(&outcome.runner_id)
+        .ok_or_else(|| ApiError::conflict("run's runner is disconnected"))?;
+    runner
+        .tx
+        .send(ServerToRunner::StopRun {
+            corp_id,
+            run_id: outcome.run_id,
+            reason: request.reason,
+        })
+        .map_err(|_| ApiError::conflict("runner disconnected before stop delivery"))?;
+    publish(&state, outcome.event);
+    Ok(Json(EmergencyStopResponse {
+        run_id: outcome.run_id,
+        requested: true,
     }))
 }
 
@@ -498,7 +607,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 info!(%runner_id, "runner connected");
             }
             RunnerToServer::Heartbeat { runner_id } => {
-                if !state.runners.contains_key(&runner_id) {
+                if registered_id.as_deref() != Some(runner_id.as_str()) {
                     warn!(%runner_id, "heartbeat from unregistered runner");
                 }
             }
@@ -510,23 +619,31 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 agent_id,
                 event_type,
                 payload,
-            } => match state
-                .store
-                .apply_runner_event(RunnerEventInput {
-                    event_id,
-                    runner_id,
-                    corp_id,
-                    run_id,
-                    agent_id,
-                    event_type: event_type.clone(),
-                    payload,
-                })
-                .await
-            {
-                Ok(Some(event)) => publish(&state, event),
-                Ok(None) => {}
-                Err(error) => warn!(%error, %run_id, %event_type, "failed to apply runner event"),
-            },
+            } => {
+                if registered_id.as_deref() != Some(runner_id.as_str()) {
+                    warn!(%runner_id, "run event runner id does not match registered socket");
+                    continue;
+                }
+                match state
+                    .store
+                    .apply_runner_event(RunnerEventInput {
+                        event_id,
+                        runner_id,
+                        corp_id,
+                        run_id,
+                        agent_id,
+                        event_type: event_type.clone(),
+                        payload,
+                    })
+                    .await
+                {
+                    Ok(Some(event)) => publish(&state, event),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(%error, %run_id, %event_type, "failed to apply runner event")
+                    }
+                }
+            }
         }
     }
 
