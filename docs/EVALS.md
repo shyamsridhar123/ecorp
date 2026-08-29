@@ -69,3 +69,5 @@ room-filtered WebSocket replay.
 `tools/e2e_runner_reconnect.mjs` verifies persisted heartbeat timestamps, visible grace state,
 short-disconnect process survival, assignment-token reconciliation, deterministic grace expiry,
 lost-run state, and rejection of a later stale claim.
+`tools/e2e_idempotency.mjs` makes the runner deliver the exact same `run.started` event twice and
+proves that Postgres persists one event and applies one state transition.
