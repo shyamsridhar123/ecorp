@@ -1,0 +1,76 @@
+:root {
+  --paper: #eee8d8;
+  --paper-light: #f8f4e8;
+  --paper-deep: #d8d0bc;
+  --ink: #17272d;
+  --ink-soft: #4d5b5f;
+  --cobalt: #23627a;
+  --cobalt-dark: #164354;
+  --marigold: #e5a640;
+  --signal: #bc4a3f;
+  --mint: #4e806d;
+  --line: #9c9a8d;
+  --shadow: 5px 5px 0 #17272d;
+  --sans: Bahnschrift, "Arial Narrow", "Segoe UI", sans-serif;
+  --body: Aptos, "Segoe UI", sans-serif;
+  --mono: "Cascadia Mono", Consolas, monospace;
+
+  font: 16px/1.45 var(--body);
+  color: var(--ink);
+  background: #c7c1b1;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    linear-gradient(90deg, rgb(23 39 45 / 6%) 1px, transparent 1px),
+    linear-gradient(rgb(23 39 45 / 6%) 1px, transparent 1px),
+    #c7c1b1;
+  background-size: 22px 22px;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  color: var(--paper-light);
+  background: var(--cobalt-dark);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

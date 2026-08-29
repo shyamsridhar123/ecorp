@@ -1,0 +1,15 @@
+[package]
+name = "crony-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crony-domain = { path = "../crony-domain" }
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true

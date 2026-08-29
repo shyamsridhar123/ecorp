@@ -1,0 +1,595 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { FormEvent } from 'react'
+import './App.css'
+
+type Actor = {
+  id: string
+  name: string
+  kind: 'human' | 'agent' | 'service'
+  role: string
+}
+
+type Agent = {
+  id: string
+  actor_id: string
+  name: string
+  role: string
+  adapter: string
+  status: 'idle' | 'starting' | 'working' | 'blocked' | 'reviewing' | 'offline'
+  station: string | null
+  current_run_id: string | null
+  accent: string
+}
+
+type Mission = {
+  id: string
+  title: string
+  status: 'draft' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
+  created_at: string
+}
+
+type Task = {
+  id: string
+  mission_id: string
+  title: string
+  objective: string
+  status: string
+  assigned_agent_id: string | null
+}
+
+type Run = {
+  id: string
+  task_id: string
+  agent_id: string
+  runner_id: string
+  status: string
+  summary: string | null
+  artifact_path: string | null
+  artifact_sha256: string | null
+}
+
+type Lease = {
+  agent_id: string
+  actor_id: string
+  token: string
+  expires_at: string
+}
+
+type QueuedMessage = {
+  id: string
+  agent_id: string
+  actor_id: string
+  text: string
+  status: string
+  created_at: string
+}
+
+type DomainEvent = {
+  seq: number
+  id: string
+  type: string
+  actor_id: string | null
+  aggregate_type: string
+  aggregate_id: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+type SnapshotResponse = {
+  snapshot: {
+    corp: { id: string; name: string }
+    actors: Actor[]
+    rooms: { id: string; name: string; purpose: string }[]
+    agents: Agent[]
+    missions: Mission[]
+    tasks: Task[]
+    runs: Run[]
+    leases: Lease[]
+    queued_messages: QueuedMessage[]
+    events: DomainEvent[]
+  }
+  runners: {
+    id: string
+    hostname: string
+    os: string
+    connected: boolean
+  }[]
+}
+
+type BootstrapResponse = {
+  corp_id: string
+  room_id: string
+  alice_actor_id: string
+  bob_actor_id: string
+  manager_agent_id: string
+  worker_agent_id: string
+}
+
+const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
+const DEFAULT_MISSION = 'Prepare a verified launch-readiness brief for the Crony Corp alpha.'
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, {
+    ...init,
+    headers: {
+      'content-type': 'application/json',
+      ...init?.headers,
+    },
+  })
+  const body = await response.json()
+  if (!response.ok) {
+    throw new Error(body.error ?? `${response.status} ${response.statusText}`)
+  }
+  return body as T
+}
+
+function shortId(value: string | null | undefined): string {
+  return value ? value.slice(0, 8) : '—'
+}
+
+function time(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value))
+}
+
+function StatusMark({ status }: { status: Agent['status'] }) {
+  return <span className={`status-mark status-${status}`} aria-label={status} />
+}
+
+function AgentAvatar({ agent }: { agent: Agent }) {
+  return (
+    <div className={`agent-avatar accent-${agent.accent} agent-${agent.status}`} aria-hidden="true">
+      <span className="avatar-head" />
+      <span className="avatar-body" />
+      <span className="avatar-shadow" />
+    </div>
+  )
+}
+
+function AgentDesk({
+  agent,
+  lease,
+  actor,
+  queuedCount,
+  onClaim,
+  onMessage,
+}: {
+  agent: Agent
+  lease: Lease | undefined
+  actor: Actor
+  queuedCount: number
+  onClaim: (agent: Agent) => Promise<void>
+  onMessage: (agent: Agent, text: string) => Promise<void>
+}) {
+  const [text, setText] = useState('')
+  const ownsLease = lease?.actor_id === actor.id
+  const holderLabel = lease ? (ownsLease ? 'You hold control' : 'Controlled by another operator') : 'Unclaimed'
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!text.trim()) return
+    await onMessage(agent, text)
+    setText('')
+  }
+
+  return (
+    <article className={`agent-desk desk-${agent.status}`} data-testid={`agent-${agent.name}`}>
+      <div className="desk-room-label">{agent.role}</div>
+      <div className="desk-stage">
+        <div className="work-station">
+          <span className="monitor" />
+          <span className="desk-surface" />
+        </div>
+        <AgentAvatar agent={agent} />
+        {agent.status !== 'idle' ? (
+          <div className="activity-bubble">{agent.station ?? agent.status}</div>
+        ) : null}
+      </div>
+      <div className="desk-card">
+        <div>
+          <div className="agent-name">
+            <StatusMark status={agent.status} />
+            {agent.name}
+          </div>
+          <div className="agent-meta">
+            {agent.adapter} · run {shortId(agent.current_run_id)}
+          </div>
+        </div>
+        <div className={`lease-label ${ownsLease ? 'lease-owned' : ''}`}>{holderLabel}</div>
+      </div>
+      <div className="desk-actions">
+        <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
+          {ownsLease ? 'Renew control' : 'Claim control'}
+        </button>
+        <span className="queue-count">{queuedCount} queued</span>
+      </div>
+      <form className="agent-message" onSubmit={submit}>
+        <input
+          aria-label={`Message ${agent.name}`}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          placeholder={ownsLease ? 'Send live direction…' : 'Queue a note…'}
+        />
+        <button className="button button-ink" type="submit">
+          Send
+        </button>
+      </form>
+    </article>
+  )
+}
+
+function MissionCard({
+  mission,
+  task,
+  run,
+  onLaunch,
+}: {
+  mission: Mission
+  task: Task | undefined
+  run: Run | undefined
+  onLaunch: (mission: Mission) => Promise<void>
+}) {
+  return (
+    <article className="mission-card" data-testid={`mission-${mission.id}`}>
+      <div className="mission-card-top">
+        <span className={`status-chip status-chip-${mission.status}`}>{mission.status}</span>
+        <span className="mission-id">#{shortId(mission.id)}</span>
+      </div>
+      <h3>{mission.title}</h3>
+      <dl>
+        <div>
+          <dt>Task</dt>
+          <dd>{task?.status ?? 'planning'}</dd>
+        </div>
+        <div>
+          <dt>Run</dt>
+          <dd>{run?.status ?? 'not started'}</dd>
+        </div>
+      </dl>
+      {run?.artifact_sha256 ? (
+        <div className="evidence-box">
+          <strong>Verified artifact</strong>
+          <span>{shortId(run.artifact_sha256)}…</span>
+        </div>
+      ) : null}
+      {mission.status === 'ready' ? (
+        <button className="button button-primary mission-launch" type="button" onClick={() => onLaunch(mission)}>
+          Dispatch mission
+        </button>
+      ) : null}
+    </article>
+  )
+}
+
+function EventRow({ event, actors }: { event: DomainEvent; actors: Actor[] }) {
+  const actor = actors.find((candidate) => candidate.id === event.actor_id)
+  const label = event.type.replaceAll('.', ' / ')
+  const detail =
+    typeof event.payload.message === 'string'
+      ? event.payload.message
+      : typeof event.payload.summary === 'string'
+        ? event.payload.summary
+        : typeof event.payload.title === 'string'
+          ? event.payload.title
+          : event.aggregate_type
+
+  return (
+    <li className="event-row">
+      <span className="event-seq">{String(event.seq).padStart(4, '0')}</span>
+      <span className="event-type">{label}</span>
+      <span className="event-detail">{detail}</span>
+      <span className="event-actor">{actor?.name ?? 'system'}</span>
+      <time dateTime={event.created_at}>{time(event.created_at)}</time>
+    </li>
+  )
+}
+
+function App() {
+  const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null)
+  const [data, setData] = useState<SnapshotResponse | null>(null)
+  const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
+  const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
+  const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const reconnectTimer = useRef<number | null>(null)
+
+  const refresh = useCallback(async (corpId: string) => {
+    const snapshot = await api<SnapshotResponse>(`/api/corps/${corpId}/snapshot`)
+    setData(snapshot)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    void api<BootstrapResponse>('/api/demo/bootstrap', { method: 'POST', body: '{}' })
+      .then(async (result) => {
+        if (cancelled) return
+        setBootstrap(result)
+        const actorName = new URLSearchParams(window.location.search).get('actor')
+        const initialActor =
+          actorName?.toLowerCase() === 'bob' ? result.bob_actor_id : result.alice_actor_id
+        setSelectedActorId(initialActor)
+        await refresh(result.corp_id)
+      })
+      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)))
+    return () => {
+      cancelled = true
+    }
+  }, [refresh])
+
+  useEffect(() => {
+    if (!bootstrap) return
+    let disposed = false
+    let socket: WebSocket | null = null
+
+    const connect = () => {
+      if (disposed) return
+      setConnection('connecting')
+      const wsUrl = API_URL.replace(/^http/, 'ws')
+      socket = new WebSocket(`${wsUrl}/ws/corps/${bootstrap.corp_id}`)
+      socket.onopen = () => setConnection('live')
+      socket.onmessage = () => {
+        void refresh(bootstrap.corp_id)
+      }
+      socket.onerror = () => setConnection('offline')
+      socket.onclose = () => {
+        if (disposed) return
+        setConnection('offline')
+        reconnectTimer.current = window.setTimeout(connect, 1_500)
+      }
+    }
+
+    connect()
+    return () => {
+      disposed = true
+      if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
+      socket?.close()
+    }
+  }, [bootstrap, refresh])
+
+  const humans = useMemo(
+    () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
+    [data],
+  )
+  const selectedActor =
+    humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
+
+  const selectActor = (actor: Actor) => {
+    setSelectedActorId(actor.id)
+    const url = new URL(window.location.href)
+    url.searchParams.set('actor', actor.name.toLowerCase())
+    window.history.replaceState({}, '', url)
+  }
+
+  const createMission = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!bootstrap || !selectedActor || !missionTitle.trim()) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/missions`, {
+        method: 'POST',
+        body: JSON.stringify({ title: missionTitle, requested_by: selectedActor.id }),
+      })
+      setMissionTitle('')
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const launchMission = async (mission: Mission) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/missions/${mission.id}/launch`, {
+        method: 'POST',
+        body: JSON.stringify({ requested_by: selectedActor.id }),
+      })
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const claimLease = async (agent: Agent) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      const result = await api<{ acquired: boolean; holder_actor_id: string }>(
+        `/api/corps/${bootstrap.corp_id}/agents/${agent.id}/lease`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ actor_id: selectedActor.id }),
+        },
+      )
+      if (!result.acquired) {
+        const holder = humans.find((actor) => actor.id === result.holder_actor_id)
+        setError(`${holder?.name ?? 'Another operator'} currently controls ${agent.name}.`)
+      }
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const sendMessage = async (agent: Agent, text: string) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ actor_id: selectedActor.id, text }),
+      })
+      await refresh(bootstrap.corp_id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  if (!data || !bootstrap || !selectedActor) {
+    return (
+      <main className="loading-shell">
+        <div className="loading-stamp">CRONY CORP</div>
+        <h1>Opening the office ledger…</h1>
+        {error ? <p className="error-banner">{error}</p> : <p>Waiting for the control plane.</p>}
+      </main>
+    )
+  }
+
+  const latestMissions = data.snapshot.missions.slice(0, 8)
+  const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
+  const room = data.snapshot.rooms[0]
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <div className="brand-lockup">
+          <span className="brand-kicker">Persistent operations office</span>
+          <div className="brand-row">
+            <span className="brand-mark">CC</span>
+            <h1>Crony Corp</h1>
+            <span className="alpha-stamp">ALPHA / SHIFT 00A</span>
+          </div>
+        </div>
+        <div className="operator-console">
+          <div className={`live-indicator live-${connection}`}>
+            <span />
+            {connection}
+          </div>
+          <div className={`runner-indicator ${data.runners.length ? 'runner-online' : ''}`}>
+            {data.runners.length ? `${data.runners.length} runner online` : 'No runner'}
+          </div>
+          <label>
+            Operating as
+            <select value={selectedActor.id} onChange={(event) => {
+              const actor = humans.find((candidate) => candidate.id === event.target.value)
+              if (actor) selectActor(actor)
+            }}>
+              {humans.map((actor) => (
+                <option key={actor.id} value={actor.id}>
+                  {actor.name} · {actor.role}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </header>
+
+      {error ? (
+        <div className="error-banner" role="alert">
+          <strong>Operations notice</strong>
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)} aria-label="Dismiss error">
+            ×
+          </button>
+        </div>
+      ) : null}
+
+      <section className="office-grid">
+        <div className="floor-panel panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-code">FLOOR / 01</span>
+              <h2>{room?.name ?? 'Main floor'}</h2>
+              <p>{room?.purpose}</p>
+            </div>
+            <div className="floor-legend">
+              <span><StatusMark status="idle" /> idle</span>
+              <span><StatusMark status="working" /> active</span>
+              <span><StatusMark status="reviewing" /> review</span>
+            </div>
+          </div>
+          <div className="floor-plan">
+            <div className="corridor-label">AUTHORIZED STAFF BEYOND THIS LINE</div>
+            {data.snapshot.agents.map((agent) => (
+              <AgentDesk
+                key={agent.id}
+                agent={agent}
+                actor={selectedActor}
+                lease={data.snapshot.leases.find((lease) => lease.agent_id === agent.id)}
+                queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === agent.id).length}
+                onClaim={claimLease}
+                onMessage={sendMessage}
+              />
+            ))}
+          </div>
+        </div>
+
+        <aside className="mission-panel panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-code">MISSIONS / 02</span>
+              <h2>Dispatch ledger</h2>
+              <p>Work is only complete when evidence lands.</p>
+            </div>
+          </div>
+          <form className="mission-form" onSubmit={createMission}>
+            <label htmlFor="mission-title">New mission</label>
+            <textarea
+              id="mission-title"
+              value={missionTitle}
+              onChange={(event) => setMissionTitle(event.target.value)}
+              placeholder="Describe the outcome the Corp should produce."
+              rows={4}
+            />
+            <button className="button button-primary" type="submit" disabled={busy || !missionTitle.trim()}>
+              File mission
+            </button>
+          </form>
+          <div className="mission-list">
+            {latestMissions.length ? (
+              latestMissions.map((mission) => {
+                const task = data.snapshot.tasks.find((candidate) => candidate.mission_id === mission.id)
+                const run = task ? data.snapshot.runs.find((candidate) => candidate.task_id === task.id) : undefined
+                return (
+                  <MissionCard
+                    key={mission.id}
+                    mission={mission}
+                    task={task}
+                    run={run}
+                    onLaunch={launchMission}
+                  />
+                )
+              })
+            ) : (
+              <div className="empty-state">
+                <strong>No missions filed</strong>
+                <span>Write the first outcome above.</span>
+              </div>
+            )}
+          </div>
+        </aside>
+      </section>
+
+      <section className="operations-panel panel">
+        <div className="panel-heading operations-heading">
+          <div>
+            <span className="section-code">JOURNAL / 03</span>
+            <h2>Immutable activity</h2>
+          </div>
+          <div className="operations-summary">
+            <span>{data.snapshot.missions.length} missions</span>
+            <span>{data.snapshot.runs.length} runs</span>
+            <span>{data.snapshot.events.length} events loaded</span>
+          </div>
+        </div>
+        <ol className="event-list" data-testid="event-list">
+          {latestEvents.map((event) => (
+            <EventRow key={event.id} event={event} actors={data.snapshot.actors} />
+          ))}
+        </ol>
+      </section>
+    </main>
+  )
+}
+
+export default App

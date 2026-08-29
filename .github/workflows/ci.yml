@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: pnpm build:web
+      - run: pnpm lint:web
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: crony
+          POSTGRES_PASSWORD: crony
+          POSTGRES_DB: crony
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U crony -d crony"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: cargo build -p crony-server -p crony-runner
+      - name: Start control and execution planes
+        shell: bash
+        run: |
+          target/debug/crony-server \
+            --bind 127.0.0.1:8791 \
+            --database-url postgres://crony:crony@127.0.0.1:54329/crony \
+            > output/server-ci.log 2>&1 &
+          echo $! > output/server-ci.pid
+          target/debug/crony-runner \
+            --server-ws ws://127.0.0.1:8791/ws/runner \
+            --workspace "$PWD/output/runner" \
+            --fake-agent-script "$PWD/scripts/fake-agent.mjs" \
+            > output/runner-ci.log 2>&1 &
+          echo $! > output/runner-ci.pid
+      - name: Wait for runner
+        shell: bash
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8791/health | grep -q '"runners":1'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat output/server-ci.log || true
+          cat output/runner-ci.log || true
+          exit 1
+      - name: Exercise the real server-to-runner path
+        shell: pwsh
+        run: ./tools/e2e_smoke.ps1
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-evidence
+          path: |
+            output/e2e-smoke.json
+            output/server-ci.log
+            output/runner-ci.log
+            output/runner/**/result.md
+

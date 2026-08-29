@@ -1,0 +1,25 @@
+name: Bug
+description: Report behavior that contradicts the product contract.
+title: "[Bug] "
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and evidence
+      description: Include exact commands, logs, screenshots, run IDs, and event IDs.
+    validations:
+      required: true
+
