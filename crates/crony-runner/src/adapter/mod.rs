@@ -1,0 +1,380 @@
+mod fake;
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+pub use fake::FakeProcessAdapter;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureSupport {
+    Supported,
+    Unsupported { reason: String },
+}
+
+impl FeatureSupport {
+    pub fn supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    #[allow(dead_code)] // Used by default unsupported operations and conformance tests.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterCapabilities {
+    pub spawn: FeatureSupport,
+    pub stream: FeatureSupport,
+    pub steer: FeatureSupport,
+    pub interrupt: FeatureSupport,
+    pub stop: FeatureSupport,
+    pub resume: FeatureSupport,
+    pub usage: FeatureSupport,
+    pub artifacts: FeatureSupport,
+}
+
+impl AdapterCapabilities {
+    pub fn summary(&self) -> String {
+        let features = [
+            ("spawn", &self.spawn),
+            ("stream", &self.stream),
+            ("steer", &self.steer),
+            ("interrupt", &self.interrupt),
+            ("stop", &self.stop),
+            ("resume", &self.resume),
+            ("usage", &self.usage),
+            ("artifacts", &self.artifacts),
+        ];
+        features
+            .into_iter()
+            .map(|(name, support)| {
+                if support.supported() {
+                    format!("{name}=yes")
+                } else {
+                    format!("{name}=no")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterRunRequest {
+    pub run_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub agent_id: Uuid,
+    pub mission_title: String,
+    pub workspace: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdapterControl {
+    Steer {
+        actor_id: Uuid,
+        text: String,
+    },
+    #[allow(dead_code)] // Reserved for adapters that distinguish interrupt from stop.
+    Interrupt {
+        reason: String,
+    },
+    Stop {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterArtifact {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub bytes: usize,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdapterEvent {
+    Started {
+        workspace: PathBuf,
+    },
+    Status {
+        status: String,
+        station: String,
+        message: String,
+    },
+    Output {
+        stream: String,
+        text: String,
+    },
+    Artifact(AdapterArtifact),
+    #[allow(dead_code)] // Real model adapters emit usage; fake-process reports it unsupported.
+    Usage(UsageSnapshot),
+    Completed {
+        summary: String,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageSnapshot {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_microusd: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterExit {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+pub trait AdapterEventSink: Send + Sync {
+    fn emit(&self, event: AdapterEvent);
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AdapterError {
+    #[allow(dead_code)] // Produced by default lifecycle methods and conformance tests.
+    #[error("{feature} is unsupported: {reason}")]
+    Unsupported {
+        feature: &'static str,
+        reason: String,
+    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Runtime(#[from] anyhow::Error),
+}
+
+#[async_trait]
+pub trait AgentAdapter: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn display_name(&self) -> &'static str;
+    fn capabilities(&self) -> AdapterCapabilities;
+
+    async fn execute(
+        &self,
+        request: AdapterRunRequest,
+        controls: mpsc::UnboundedReceiver<AdapterControl>,
+        sink: Arc<dyn AdapterEventSink>,
+    ) -> Result<AdapterExit, AdapterError>;
+
+    #[allow(dead_code)] // Contract surface for adapters with persistent provider sessions.
+    async fn resume(
+        &self,
+        _request: AdapterRunRequest,
+        _session_id: &str,
+        _controls: mpsc::UnboundedReceiver<AdapterControl>,
+        _sink: Arc<dyn AdapterEventSink>,
+    ) -> Result<AdapterExit, AdapterError> {
+        Err(unsupported("resume", self.capabilities().resume.reason()))
+    }
+
+    #[allow(dead_code)] // Contract surface for adapters that expose post-run usage.
+    async fn collect_usage(&self, _session_id: &str) -> Result<UsageSnapshot, AdapterError> {
+        Err(unsupported("usage", self.capabilities().usage.reason()))
+    }
+}
+
+#[allow(dead_code)] // Called by default lifecycle methods when a feature is unsupported.
+fn unsupported(feature: &'static str, reason: Option<&str>) -> AdapterError {
+    AdapterError::Unsupported {
+        feature,
+        reason: reason
+            .unwrap_or("adapter did not provide a reason")
+            .to_owned(),
+    }
+}
+
+#[derive(Clone)]
+pub struct AdapterRegistry {
+    adapters: Arc<HashMap<String, Arc<dyn AgentAdapter>>>,
+}
+
+impl AdapterRegistry {
+    pub fn new(fake_agent_script: impl AsRef<Path>) -> Self {
+        let fake: Arc<dyn AgentAdapter> = Arc::new(FakeProcessAdapter::new(
+            fake_agent_script.as_ref().to_path_buf(),
+        ));
+        let mut adapters = HashMap::new();
+        adapters.insert(fake.id().to_owned(), fake);
+        Self {
+            adapters: Arc::new(adapters),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<dyn AgentAdapter>> {
+        self.adapters.get(id).cloned()
+    }
+
+    pub fn all(&self) -> Vec<Arc<dyn AgentAdapter>> {
+        let mut adapters = self.adapters.values().cloned().collect::<Vec<_>>();
+        adapters.sort_by_key(|adapter| adapter.id());
+        adapters
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<AdapterEvent>>,
+    }
+
+    impl AdapterEventSink for RecordingSink {
+        fn emit(&self, event: AdapterEvent) {
+            if let Ok(mut events) = self.events.lock() {
+                events.push(event);
+            }
+        }
+    }
+
+    fn test_adapter() -> FakeProcessAdapter {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fake-agent.mjs");
+        FakeProcessAdapter::new(script)
+    }
+
+    fn test_request(title: &str) -> AdapterRunRequest {
+        let run_id = Uuid::new_v4();
+        AdapterRunRequest {
+            run_id,
+            mission_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            mission_title: title.to_owned(),
+            workspace: std::env::temp_dir()
+                .join("crony-adapter-tests")
+                .join(run_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn capabilities_are_explicit() {
+        let capabilities = test_adapter().capabilities();
+        assert!(capabilities.spawn.supported());
+        assert!(capabilities.stream.supported());
+        assert!(capabilities.steer.supported());
+        assert!(capabilities.stop.supported());
+        assert!(capabilities.artifacts.supported());
+        assert!(!capabilities.interrupt.supported());
+        assert!(capabilities.interrupt.reason().is_some());
+        assert!(!capabilities.resume.supported());
+        assert!(capabilities.resume.reason().is_some());
+        assert!(!capabilities.usage.supported());
+        assert!(capabilities.usage.reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_passes_spawn_stream_steer_and_artifact_contract() {
+        let adapter = test_adapter();
+        let request = test_request("adapter conformance");
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_adapter = adapter.clone();
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { task_adapter.execute(request, control_rx, task_sink).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        control_tx
+            .send(AdapterControl::Steer {
+                actor_id: Uuid::new_v4(),
+                text: "record this control message".to_owned(),
+            })
+            .expect("send steer");
+        let exit = task.await.expect("join adapter").expect("adapter execute");
+        assert_eq!(exit, AdapterExit::Completed);
+        let events = sink.events.lock().expect("recording lock");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Started { .. }))
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, AdapterEvent::Output { stream, .. } if stream == "control")
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Artifact(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Completed { .. }))
+        );
+        drop(events);
+        assert!(workspace.join("result.md").is_file());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn fake_adapter_passes_stop_contract() {
+        let adapter = test_adapter();
+        let request = test_request("[slow] adapter stop conformance");
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_adapter = adapter.clone();
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { task_adapter.execute(request, control_rx, task_sink).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        control_tx
+            .send(AdapterControl::Stop {
+                reason: "contract stop".to_owned(),
+            })
+            .expect("send stop");
+        let exit = task.await.expect("join adapter").expect("adapter execute");
+        assert_eq!(exit, AdapterExit::Cancelled);
+        assert!(sink.events.lock().expect("recording lock").iter().any(
+            |event| matches!(event, AdapterEvent::Cancelled { reason } if reason == "contract stop")
+        ));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn unsupported_features_return_typed_errors() {
+        let adapter = test_adapter();
+        let request = test_request("unsupported contract");
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let resume = adapter.resume(request, "missing", rx, sink).await;
+        assert!(matches!(
+            resume,
+            Err(AdapterError::Unsupported {
+                feature: "resume",
+                ..
+            })
+        ));
+        let usage = adapter.collect_usage("missing").await;
+        assert!(matches!(
+            usage,
+            Err(AdapterError::Unsupported {
+                feature: "usage",
+                ..
+            })
+        ));
+    }
+}

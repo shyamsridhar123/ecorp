@@ -57,6 +57,7 @@ pub enum ServerToRunner {
         run_id: Uuid,
         agent_id: Uuid,
         assignment_token: Uuid,
+        adapter: String,
         mission_title: String,
     },
     ControlMessage {

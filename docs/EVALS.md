@@ -71,3 +71,7 @@ short-disconnect process survival, assignment-token reconciliation, deterministi
 lost-run state, and rejection of a later stale claim.
 `tools/e2e_idempotency.mjs` makes the runner deliver the exact same `run.started` event twice and
 proves that Postgres persists one event and applies one state transition.
+
+The runner unit suite applies one provider-independent lifecycle conformance harness to the
+`fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
+typed errors for unsupported resume and usage operations.

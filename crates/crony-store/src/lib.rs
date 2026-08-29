@@ -52,6 +52,7 @@ pub struct LaunchRecord {
     pub run_id: Uuid,
     pub agent_id: Uuid,
     pub assignment_token: Uuid,
+    pub adapter: String,
     pub mission_title: String,
 }
 
@@ -1011,9 +1012,10 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT m.room_id, m.title, t.id AS task_id, t.assigned_agent_id
+            SELECT m.room_id, m.title, t.id AS task_id, t.assigned_agent_id, a.adapter
             FROM missions m
             JOIN tasks t ON t.mission_id = m.id
+            JOIN agents a ON a.id = t.assigned_agent_id
             WHERE m.id = $1 AND m.corp_id = $2
             ORDER BY t.created_at LIMIT 1
             FOR UPDATE OF m, t
@@ -1031,6 +1033,7 @@ impl PgStore {
             .context("task has no assigned agent")?;
         let room_id: Uuid = row.get("room_id");
         let mission_title: String = row.get("title");
+        let adapter: String = row.get("adapter");
 
         let active: Option<Uuid> = sqlx::query_scalar(
             r#"
@@ -1114,6 +1117,7 @@ impl PgStore {
                 run_id,
                 agent_id,
                 assignment_token,
+                adapter,
                 mission_title,
             },
             event,
