@@ -95,6 +95,8 @@ jobs:
         run: node tools/e2e_leases.mjs
       - name: Verify room threads and membership isolation
         run: node tools/e2e_rooms.mjs
+      - name: Verify runner grace and reconciliation
+        run: node tools/e2e_runner_reconnect.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4

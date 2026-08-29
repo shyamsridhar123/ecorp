@@ -114,6 +114,9 @@ type SnapshotResponse = {
     hostname: string
     os: string
     connected: boolean
+    status: 'connected' | 'grace' | 'offline'
+    last_seen_at: string
+    grace_expires_at: string | null
   }[]
 }
 
@@ -827,6 +830,12 @@ function App() {
   const latestMissions = data.snapshot.missions.slice(0, 8)
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
   const room = data.snapshot.rooms[0]
+  const connectedRunners = data.runners.filter((runner) => runner.connected)
+  const runnerLabel = connectedRunners.length
+    ? `${connectedRunners.length} runner online`
+    : data.runners.some((runner) => runner.status === 'grace')
+      ? 'Runner reconnecting'
+      : 'No runner'
 
   return (
     <main className="app-shell">
@@ -844,8 +853,8 @@ function App() {
             <span />
             {connection}
           </div>
-          <div className={`runner-indicator ${data.runners.length ? 'runner-online' : ''}`}>
-            {data.runners.length ? `${data.runners.length} runner online` : 'No runner'}
+          <div className={`runner-indicator ${connectedRunners.length ? 'runner-online' : ''}`}>
+            {runnerLabel}
           </div>
           <label>
             Operating as

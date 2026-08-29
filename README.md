@@ -26,6 +26,7 @@ The UI can close without terminating active work.
 - Browser WebSocket updates
 - Resumable, room-filtered event replay
 - Outbound-connected runner daemon
+- Persisted runner heartbeats, disconnect grace, and active-run reconciliation
 - Real child-process execution through a deterministic fake-agent adapter
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens

@@ -195,6 +195,8 @@ pub struct Run {
     pub task_id: Uuid,
     pub agent_id: Uuid,
     pub runner_id: String,
+    #[serde(skip_serializing)]
+    pub assignment_token: Uuid,
     pub status: RunStatus,
     pub summary: Option<String>,
     pub artifact_path: Option<String>,

@@ -1,8 +1,13 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use crony_protocol::{RunnerCapability, RunnerToServer, ServerToRunner};
+use crony_protocol::{ActiveRunClaim, RunnerCapability, RunnerToServer, ServerToRunner};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -57,11 +62,63 @@ struct Assignment {
 
 #[derive(Clone)]
 struct ActiveRunControl {
+    assignment_token: Uuid,
     input: mpsc::UnboundedSender<String>,
     stop: mpsc::UnboundedSender<String>,
 }
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
+
+#[derive(Clone, Default)]
+struct OutboundBus {
+    state: Arc<Mutex<OutboundState>>,
+}
+
+#[derive(Default)]
+struct OutboundState {
+    connection: Option<mpsc::UnboundedSender<RunnerToServer>>,
+    pending: VecDeque<RunnerToServer>,
+}
+
+impl OutboundBus {
+    fn attach(&self, connection: mpsc::UnboundedSender<RunnerToServer>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.connection = Some(connection.clone());
+        while let Some(message) = state.pending.pop_front() {
+            if connection.send(message.clone()).is_err() {
+                state.pending.push_front(message);
+                state.connection = None;
+                break;
+            }
+        }
+    }
+
+    fn detach(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.connection = None;
+        }
+    }
+
+    fn send(&self, message: RunnerToServer) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let delivered = state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.send(message.clone()).is_ok());
+        if delivered {
+            return;
+        }
+        state.connection = None;
+        if state.pending.len() >= 2_000 {
+            state.pending.pop_front();
+        }
+        state.pending.push_back(message);
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -77,21 +134,32 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("create runner workspace {}", args.workspace.display()))?;
 
+    let active_runs: ActiveRuns = Arc::new(DashMap::new());
+    let outbound = OutboundBus::default();
     loop {
-        if let Err(error) = run_connection(args.clone()).await {
-            warn!(%error, "runner connection ended; retrying");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let delay = match run_connection(args.clone(), active_runs.clone(), outbound.clone()).await
+        {
+            Ok(delay) => delay,
+            Err(error) => {
+                warn!(%error, "runner connection ended; retrying");
+                Duration::from_secs(2)
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
-async fn run_connection(args: Args) -> Result<()> {
+async fn run_connection(
+    args: Args,
+    active_runs: ActiveRuns,
+    outbound: OutboundBus,
+) -> Result<Duration> {
     let (socket, _) = connect_async(&args.server_ws)
         .await
         .with_context(|| format!("connect to {}", args.server_ws))?;
     let (mut socket_tx, mut socket_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RunnerToServer>();
-    let active_runs: ActiveRuns = Arc::new(DashMap::new());
+    let connection_epoch = Uuid::new_v4();
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
@@ -111,9 +179,11 @@ async fn run_connection(args: Args) -> Result<()> {
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned());
+    let claims = active_run_claims(&active_runs);
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
+            connection_epoch,
             hostname,
             os: std::env::consts::OS.to_owned(),
             capabilities: vec![
@@ -128,11 +198,14 @@ async fn run_connection(args: Args) -> Result<()> {
                     detail: Some(args.workspace.display().to_string()),
                 },
             ],
+            active_runs: claims,
         })
         .map_err(|_| anyhow!("runner writer stopped before registration"))?;
+    outbound.attach(out_tx.clone());
 
     let heartbeat_tx = out_tx.clone();
     let heartbeat_runner_id = args.runner_id.clone();
+    let heartbeat_runs = active_runs.clone();
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -140,6 +213,8 @@ async fn run_connection(args: Args) -> Result<()> {
             if heartbeat_tx
                 .send(RunnerToServer::Heartbeat {
                     runner_id: heartbeat_runner_id.clone(),
+                    connection_epoch,
+                    active_runs: active_run_claims(&heartbeat_runs),
                 })
                 .is_err()
             {
@@ -148,13 +223,17 @@ async fn run_connection(args: Args) -> Result<()> {
         }
     });
 
-    info!(runner_id = %args.runner_id, server = %args.server_ws, "runner connected");
-    while let Some(message) = socket_rx.next().await {
+    info!(runner_id = %args.runner_id, %connection_epoch, server = %args.server_ws, "runner connected");
+    let mut reconnect_delay = Duration::from_secs(2);
+    'read: while let Some(message) = socket_rx.next().await {
         let text = match message {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
             Ok(_) => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                warn!(%error, "runner socket read failed");
+                break;
+            }
         };
         let command: ServerToRunner =
             serde_json::from_str(text.as_str()).context("decode server command")?;
@@ -169,6 +248,7 @@ async fn run_connection(args: Args) -> Result<()> {
                 task_id,
                 run_id,
                 agent_id,
+                assignment_token,
                 mission_title,
             } => {
                 let assignment = Assignment {
@@ -189,19 +269,20 @@ async fn run_connection(args: Args) -> Result<()> {
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
+                        assignment_token,
                         input: input_tx,
                         stop: stop_tx,
                     },
                 );
                 let task_args = args.clone();
-                let task_tx = out_tx.clone();
+                let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
                 tokio::spawn(async move {
                     let runner_id = task_args.runner_id.clone();
                     if let Err(error) = execute_assignment(
                         task_args,
                         assignment.clone(),
-                        task_tx.clone(),
+                        task_outbound.clone(),
                         input_rx,
                         stop_rx,
                     )
@@ -209,7 +290,7 @@ async fn run_connection(args: Args) -> Result<()> {
                     {
                         error!(%error, run_id = %assignment.run_id, "run execution failed");
                         send_run_event(
-                            &task_tx,
+                            &task_outbound,
                             &runner_id,
                             &assignment,
                             "run.failed",
@@ -246,18 +327,27 @@ async fn run_connection(args: Args) -> Result<()> {
                     warn!(%run_id, "stop command arrived for inactive run");
                 }
             }
+            ServerToRunner::Disconnect {
+                reason,
+                reconnect_delay_ms,
+            } => {
+                reconnect_delay = Duration::from_millis(reconnect_delay_ms);
+                info!(%reason, reconnect_delay_ms, "server requested runner reconnect");
+                break 'read;
+            }
         }
     }
 
+    outbound.detach();
     heartbeat.abort();
     writer.abort();
-    Ok(())
+    Ok(reconnect_delay)
 }
 
 async fn execute_assignment(
     args: Args,
     assignment: Assignment,
-    out_tx: mpsc::UnboundedSender<RunnerToServer>,
+    outbound: OutboundBus,
     mut input_rx: mpsc::UnboundedReceiver<String>,
     mut stop_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
@@ -267,7 +357,7 @@ async fn execute_assignment(
         .with_context(|| format!("create run directory {}", run_dir.display()))?;
 
     send_run_event(
-        &out_tx,
+        &outbound,
         &args.runner_id,
         &assignment,
         "run.started",
@@ -316,12 +406,12 @@ async fn execute_assignment(
 
     let stderr_assignment = assignment.clone();
     let stderr_runner_id = args.runner_id.clone();
-    let stderr_tx = out_tx.clone();
+    let stderr_outbound = outbound.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             send_run_event(
-                &stderr_tx,
+                &stderr_outbound,
                 &stderr_runner_id,
                 &stderr_assignment,
                 "run.output",
@@ -339,7 +429,7 @@ async fn execute_assignment(
                 if let Some(reason) = reason {
                     child.kill().await.context("kill stopped agent process")?;
                     send_run_event(
-                        &out_tx,
+                        &outbound,
                         &args.runner_id,
                         &assignment,
                         "run.cancelled",
@@ -358,7 +448,7 @@ async fn execute_assignment(
                     Ok(event) => event,
                     Err(_) => {
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.output",
@@ -374,7 +464,7 @@ async fn execute_assignment(
                 match kind {
                     "status" => {
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.status",
@@ -396,7 +486,7 @@ async fn execute_assignment(
                             .with_context(|| format!("read artifact {}", artifact_path.display()))?;
                         let sha256 = hex::encode(Sha256::digest(&bytes));
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.artifact",
@@ -411,7 +501,7 @@ async fn execute_assignment(
                     "completed" => {
                         terminal_event = true;
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.completed",
@@ -423,7 +513,7 @@ async fn execute_assignment(
                     "failed" => {
                         terminal_event = true;
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.failed",
@@ -434,7 +524,7 @@ async fn execute_assignment(
                     }
                     _ => {
                         send_run_event(
-                            &out_tx,
+                            &outbound,
                             &args.runner_id,
                             &assignment,
                             "run.output",
@@ -465,13 +555,13 @@ async fn execute_assignment(
 }
 
 fn send_run_event(
-    out_tx: &mpsc::UnboundedSender<RunnerToServer>,
+    outbound: &OutboundBus,
     runner_id: &str,
     assignment: &Assignment,
     event_type: &str,
     payload: Value,
 ) {
-    let _ = out_tx.send(RunnerToServer::RunEvent {
+    outbound.send(RunnerToServer::RunEvent {
         event_id: Uuid::new_v4(),
         runner_id: runner_id.to_owned(),
         corp_id: assignment.corp_id,
@@ -480,4 +570,16 @@ fn send_run_event(
         event_type: event_type.to_owned(),
         payload,
     });
+}
+
+fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
+    let mut claims = active_runs
+        .iter()
+        .map(|entry| ActiveRunClaim {
+            run_id: *entry.key(),
+            assignment_token: entry.assignment_token,
+        })
+        .collect::<Vec<_>>();
+    claims.sort_by_key(|claim| claim.run_id);
+    claims
 }
