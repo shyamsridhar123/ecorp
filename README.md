@@ -87,6 +87,11 @@ The supported development path performs demo bootstrap and runner enrollment aut
 
 Open `http://127.0.0.1:5187`.
 
+The UI now includes a four-step start guide that explains runner setup, provider selection, mission
+planning and dispatch, live operation, approvals, and evidence review. See
+[`docs/USER_AND_DEVELOPER_JOURNEY.md`](docs/USER_AND_DEVELOPER_JOURNEY.md) for the complete user and
+developer journey.
+
 The runner uses the current Git repository and `HEAD` as its source by default. Set
 `CRONY_SOURCE_REPOSITORY` and `CRONY_SOURCE_BASE_REF` to choose another local checkout and base.
 Agents receive linked worktrees below `CRONY_RUNNER_WORKSPACE`; they never execute in the source
@@ -108,6 +113,7 @@ the authorized artifact API URI and signed metadata, never runner-local paths or
 ## Documents
 
 - [`docs/PRODUCT_AND_TECHNICAL_PLAN.md`](docs/PRODUCT_AND_TECHNICAL_PLAN.md)
+- [`docs/USER_AND_DEVELOPER_JOURNEY.md`](docs/USER_AND_DEVELOPER_JOURNEY.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/SECURITY.md`](docs/SECURITY.md)
 - [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)

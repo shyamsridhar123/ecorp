@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { CSSProperties, FormEvent } from 'react'
 import './App.css'
 
 type Actor = {
@@ -241,8 +241,98 @@ type BootstrapResponse = {
   codex_agent_id: string
 }
 
+type CreateMissionResponse = {
+  mission_id: string
+  task_ids: string[]
+  strategy: string
+}
+
 const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const DEFAULT_MISSION = 'Prepare a verified launch-readiness brief for the Crony Corp alpha.'
+const MISSION_EXAMPLES = [
+  {
+    label: 'Build a feature',
+    value: 'Implement the requested feature, test it in the isolated worktree, and produce a reviewable artifact with concrete verification.',
+  },
+  {
+    label: 'Fix a bug',
+    value: 'Reproduce the reported bug, identify the root cause, implement the smallest correct fix, and verify the user-visible behavior.',
+  },
+  {
+    label: 'Review a change',
+    value: 'Review the current repository changes for correctness, safety, regressions, and missing tests. Produce prioritized findings with evidence.',
+  },
+] as const
+
+const OFFICE_POSITIONS = [
+  { x: 14, y: 31 },
+  { x: 39, y: 31 },
+  { x: 64, y: 31 },
+  { x: 24, y: 69 },
+  { x: 50, y: 69 },
+  { x: 76, y: 69 },
+] as const
+
+function adapterLabel(adapter: string): string {
+  if (adapter === 'github-copilot') return 'GitHub Copilot'
+  if (adapter === 'codex') return 'OpenAI Codex'
+  if (adapter === 'claude-code') return 'Claude Code'
+  if (adapter === 'opencode') return 'OpenCode'
+  if (adapter === 'fake-process') return 'Test harness'
+  return adapter
+}
+
+function adapterDescription(adapter: string): string {
+  if (adapter === 'github-copilot') return 'Use any model enabled for your Copilot account.'
+  if (adapter === 'codex') return 'Run a real Codex coding session in an isolated worktree.'
+  if (adapter === 'claude-code') return 'Run the locally authenticated Claude Code CLI.'
+  if (adapter === 'opencode') return 'Run the configured OpenCode provider.'
+  if (adapter === 'fake-process') return 'Deterministic and quota-free. Use this only to test Crony itself.'
+  return 'Run work through this connected agent adapter.'
+}
+
+function availableRunnerAdapters(data: SnapshotResponse | null): RunnerCapability[] {
+  if (!data) return []
+  const connectedRunners = data.runners.filter((runner) => runner.connected)
+  const agentAdapters = new Set(data.snapshot.agents.map((agent) => agent.adapter))
+  return Array.from(
+    connectedRunners
+      .flatMap((runner) => runner.capabilities)
+      .filter(
+        (capability) =>
+          capability.available && agentAdapters.has(capability.name),
+      )
+      .reduce((adapters, capability) => {
+        const existing = adapters.get(capability.name)
+        const modelsById = new Map(
+          (existing?.models ?? []).map((model) => [model.id, model]),
+        )
+        for (const model of capability.models) {
+          const prior = modelsById.get(model.id)
+          if (
+            !prior ||
+            (prior.policy_state === 'disabled' &&
+              model.policy_state !== 'disabled')
+          ) {
+            modelsById.set(model.id, model)
+          }
+        }
+        adapters.set(capability.name, {
+          ...capability,
+          detail: existing?.detail ?? capability.detail,
+          models: Array.from(modelsById.values()),
+        })
+        return adapters
+      }, new Map<string, RunnerCapability>())
+      .values(),
+  )
+}
+
+function detailValue(detail: string | null | undefined, key: string): string | null {
+  if (!detail) return null
+  const match = detail.match(new RegExp(`(?:^|;)\\s*${key}=([^;]+)`))
+  return match?.[1]?.trim() ?? null
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
@@ -281,10 +371,107 @@ function StatusMark({ status }: { status: Agent['status'] }) {
 
 function AgentAvatar({ agent }: { agent: Agent }) {
   return (
-    <div className={`agent-avatar accent-${agent.accent} agent-${agent.status}`} aria-hidden="true">
-      <span className="avatar-head" />
-      <span className="avatar-body" />
-      <span className="avatar-shadow" />
+    <div className={`agent-sprite accent-${agent.accent} sprite-${agent.status}`} aria-hidden="true">
+      <span className="sprite-shadow" />
+      <span className="sprite-person">
+        <span className="sprite-head">
+          <span className="sprite-face" />
+        </span>
+        <span className="sprite-body" />
+        <span className="sprite-arm sprite-arm-left" />
+        <span className="sprite-arm sprite-arm-right" />
+        <span className="sprite-leg sprite-leg-left" />
+        <span className="sprite-leg sprite-leg-right" />
+      </span>
+    </div>
+  )
+}
+
+function OfficeFloor({
+  agents,
+  selectedAgentId,
+  onSelect,
+}: {
+  agents: Agent[]
+  selectedAgentId: string
+  onSelect: (agent: Agent) => void
+}) {
+  return (
+    <div className="office-stage" aria-label="Live agent office">
+      <div className="office-wall">
+        <span className="office-clock" />
+        <span className="office-window office-window-left" />
+        <span className="office-window office-window-right" />
+        <span className="office-sign">PRODUCT LAB · LIVE FLOOR</span>
+      </div>
+      <div className="office-zone zone-review">
+        <span>Review table</span>
+        <i />
+      </div>
+      <div className="office-zone zone-approval">
+        <span>Approval desk</span>
+        <i />
+      </div>
+      <div className="office-zone zone-lounge">
+        <span>Stand-up</span>
+        <i />
+      </div>
+      {agents.map((agent, index) => {
+        const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+        const destination =
+          agent.status === 'blocked'
+            ? { x: 86, y: 25 }
+            : agent.status === 'reviewing'
+              ? { x: 51 + (index % 2) * 8, y: 23 }
+              : agent.status === 'offline'
+                ? { x: 6, y: 82 }
+                : home
+        const style = {
+          '--agent-x': `${destination.x}%`,
+          '--agent-y': `${destination.y}%`,
+          '--agent-delay': `${index * -0.37}s`,
+        } as CSSProperties
+        return (
+          <button
+            key={agent.id}
+            type="button"
+            className={`office-agent office-agent-${agent.status} ${
+              selectedAgentId === agent.id ? 'office-agent-selected' : ''
+            }`}
+            style={style}
+            onClick={() => onSelect(agent)}
+            aria-label={`Inspect ${agent.name}, ${agent.status}`}
+            data-testid={`agent-${agent.name}`}
+          >
+            {agent.status !== 'idle' && agent.status !== 'offline' ? (
+              <span className="sprite-activity">
+                {agent.status === 'blocked' ? 'Approval needed' : agent.station ?? agent.status}
+              </span>
+            ) : null}
+            <AgentAvatar agent={agent} />
+            <span className="sprite-name">
+              <StatusMark status={agent.status} />
+              {agent.name}
+            </span>
+          </button>
+        )
+      })}
+      {agents.map((agent, index) => {
+        const position = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+        const style = {
+          '--desk-x': `${position.x}%`,
+          '--desk-y': `${position.y}%`,
+        } as CSSProperties
+        return (
+          <div className="office-desk-mini" style={style} key={`desk-${agent.id}`} aria-hidden="true">
+            <span className="mini-monitor" />
+            <span className="mini-desk" />
+            <span className="mini-chair" />
+          </div>
+        )
+      })}
+      <div className="office-door" aria-hidden="true"><span>Runner</span></div>
+      <div className="office-carpet" aria-hidden="true" />
     </div>
   )
 }
@@ -328,30 +515,26 @@ function AgentDesk({
   }
 
   return (
-    <article className={`agent-desk desk-${agent.status}`} data-testid={`agent-${agent.name}`}>
-      <div className="desk-room-label">{agent.role}</div>
-      <div className="desk-stage">
-        <div className="work-station">
-          <span className="monitor" />
-          <span className="desk-surface" />
-        </div>
+    <article className={`agent-inspector desk-${agent.status}`}>
+      <div className="agent-inspector-summary">
         <AgentAvatar agent={agent} />
-        {agent.status !== 'idle' ? (
-          <div className="activity-bubble">{agent.station ?? agent.status}</div>
-        ) : null}
-      </div>
-      <div className="desk-card">
         <div>
+          <span className="agent-inspector-kicker">{agent.role} · {agent.status}</span>
           <div className="agent-name">
             <StatusMark status={agent.status} />
             {agent.name}
           </div>
           <div className="agent-meta">
-            {agent.adapter} · run {shortId(agent.current_run_id)}
+            {adapterLabel(agent.adapter)} · run {shortId(agent.current_run_id)}
           </div>
+          <div className={`lease-label ${ownsLease ? 'lease-owned' : ''}`}>{holderLabel}</div>
         </div>
-        <div className={`lease-label ${ownsLease ? 'lease-owned' : ''}`}>{holderLabel}</div>
       </div>
+      <p className="agent-inspector-help">
+        {agent.current_run_id
+          ? `${agent.name} is ${agent.station ?? agent.status}. Claim control to steer the live session.`
+          : `${agent.name} is available for missions using ${adapterLabel(agent.adapter)}.`}
+      </p>
       <div className="desk-actions">
         <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
           {ownsLease && leaseToken ? 'Renew control' : 'Claim control'}
@@ -608,7 +791,7 @@ function RoomPanel({
 
   if (!room) {
     return (
-      <section className="room-panel panel">
+      <section className="room-panel panel" id="room">
         <div className="panel-heading">
           <div>
             <span className="section-code">ROOM / 03</span>
@@ -672,7 +855,7 @@ function RoomPanel({
   }
 
   return (
-    <section className="room-panel panel" data-room-id={room.id}>
+    <section className="room-panel panel" id="room" data-room-id={room.id}>
       <div className="panel-heading">
         <div>
           <span className="section-code">ROOM / 03</span>
@@ -762,10 +945,13 @@ function App() {
   const [data, setData] = useState<SnapshotResponse | null>(null)
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
-  const [missionAdapter, setMissionAdapter] = useState('fake-process')
+  const [missionAdapter, setMissionAdapter] = useState('')
   const [missionModel, setMissionModel] = useState('')
   const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
   const [missionStrategy, setMissionStrategy] = useState('single')
+  const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [journeyOpen, setJourneyOpen] = useState(true)
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -890,11 +1076,22 @@ function App() {
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
     [data],
   )
+  const availableAdapters = useMemo(() => availableRunnerAdapters(data), [data])
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
   const otherHuman = selectedActor
     ? humans.find((actor) => actor.id !== selectedActor.id)
     : undefined
+  const preferredAdapter =
+    availableAdapters.find((adapter) => adapter.name === 'github-copilot') ??
+    availableAdapters.find((adapter) => adapter.name === 'codex') ??
+    availableAdapters.find((adapter) => adapter.name === 'claude-code') ??
+    availableAdapters[0]
+  const effectiveMissionAdapter = availableAdapters.some(
+    (adapter) => adapter.name === missionAdapter,
+  )
+    ? missionAdapter
+    : preferredAdapter?.name ?? ''
 
   const selectActor = (actor: Actor) => {
     setData(null)
@@ -915,19 +1112,33 @@ function App() {
     setBusy(true)
     setError(null)
     try {
-      await api(`/api/corps/${bootstrap.corp_id}/missions`, {
+      const created = await api<CreateMissionResponse>(`/api/corps/${bootstrap.corp_id}/missions`, {
         method: 'POST',
         body: JSON.stringify({
           title: missionTitle,
           requested_by: selectedActor.id,
-          preferred_adapter: missionAdapter,
-          preferred_model: missionModel || null,
-          reasoning_effort: missionReasoningEffort || null,
+          preferred_adapter: effectiveMissionAdapter,
+          preferred_model: selectedModel ? missionModel : null,
+          reasoning_effort:
+            selectedModel?.supported_reasoning_efforts.includes(missionReasoningEffort)
+              ? missionReasoningEffort
+              : null,
           strategy: missionStrategy,
         }),
       })
+      if (!pauseAfterPlanning) {
+        await api(`/api/corps/${bootstrap.corp_id}/missions/${created.mission_id}/launch`, {
+          method: 'POST',
+          body: JSON.stringify({ requested_by: selectedActor.id }),
+        })
+      }
       setMissionTitle('')
       await refresh(bootstrap.corp_id, selectedActor.id)
+      window.setTimeout(() => {
+        document
+          .querySelector(`[data-mission-id="${CSS.escape(created.mission_id)}"]`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 80)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -1191,40 +1402,8 @@ function App() {
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
   const room = data.snapshot.rooms[0]
   const connectedRunners = data.runners.filter((runner) => runner.connected)
-  const agentAdapters = new Set(data.snapshot.agents.map((agent) => agent.adapter))
-  const availableAdapters = Array.from(
-    connectedRunners
-      .flatMap((runner) => runner.capabilities)
-      .filter(
-        (capability) =>
-          capability.available && agentAdapters.has(capability.name),
-      )
-      .reduce((adapters, capability) => {
-        const existing = adapters.get(capability.name)
-        const modelsById = new Map(
-          (existing?.models ?? []).map((model) => [model.id, model]),
-        )
-        for (const model of capability.models) {
-          const prior = modelsById.get(model.id)
-          if (
-            !prior ||
-            (prior.policy_state === 'disabled' &&
-              model.policy_state !== 'disabled')
-          ) {
-            modelsById.set(model.id, model)
-          }
-        }
-        adapters.set(capability.name, {
-          ...capability,
-          detail: existing?.detail ?? capability.detail,
-          models: Array.from(modelsById.values()),
-        })
-        return adapters
-      }, new Map<string, RunnerCapability>())
-      .values(),
-  )
   const selectedAdapter = availableAdapters.find(
-    (adapter) => adapter.name === missionAdapter,
+    (adapter) => adapter.name === effectiveMissionAdapter,
   )
   const selectedModel = selectedAdapter?.models.find(
     (model) => model.id === missionModel,
@@ -1234,6 +1413,25 @@ function App() {
     : data.runners.some((runner) => runner.status === 'grace')
       ? 'Runner reconnecting'
       : 'No runner'
+  const selectedAgent =
+    data.snapshot.agents.find((agent) => agent.id === selectedAgentId) ??
+    data.snapshot.agents[0]
+  const workspaceCapability = connectedRunners
+    .flatMap((runner) => runner.capabilities)
+    .find((capability) => capability.name === 'workspace-isolation')
+  const sourceRepository =
+    detailValue(workspaceCapability?.detail, 'repository') ?? 'No source repository reported'
+  const sourceBase = detailValue(workspaceCapability?.detail, 'base') ?? 'HEAD'
+  const realAdapters = availableAdapters.filter((adapter) => adapter.name !== 'fake-process')
+  const pendingApprovals = data.snapshot.action_approvals.filter(
+    (approval) => approval.status === 'pending',
+  )
+  const activeRuns = data.snapshot.runs.filter((run) =>
+    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
+  )
+  const acceptedArtifacts = data.snapshot.runs.filter(
+    (run) => run.verification_status === 'passed' && run.artifact_uri,
+  )
 
   return (
     <main className="app-shell">
@@ -1270,6 +1468,106 @@ function App() {
         </div>
       </header>
 
+      <nav className="workspace-nav" aria-label="Crony workspace sections">
+        <a href="#floor">Office</a>
+        <a href="#missions">Missions</a>
+        <a href="#room">Room</a>
+        <a href="#activity">Activity</a>
+        <button type="button" onClick={() => setJourneyOpen((current) => !current)}>
+          {journeyOpen ? 'Hide start guide' : 'Show start guide'}
+        </button>
+      </nav>
+
+      <section className={`journey-panel ${journeyOpen ? '' : 'journey-panel-collapsed'}`}>
+        <div className="journey-heading">
+          <div>
+            <span className="section-code">START HERE</span>
+            <h2>From repository to verified result</h2>
+          </div>
+          <p>
+            Crony plans the work, runs agents in isolated worktrees, pauses for approvals,
+            and records the evidence.
+          </p>
+        </div>
+        {journeyOpen ? (
+          <>
+            <ol className="journey-steps">
+              <li className={connectedRunners.length ? 'journey-complete' : 'journey-current'}>
+                <span>1</span>
+                <div>
+                  <strong>Connect a runner</strong>
+                  <small>
+                    {connectedRunners.length
+                      ? `${connectedRunners.length} runner connected to ${sourceBase}`
+                      : 'Start the local stack or enroll a remote runner.'}
+                  </small>
+                </div>
+              </li>
+              <li className={realAdapters.length ? 'journey-complete' : 'journey-current'}>
+                <span>2</span>
+                <div>
+                  <strong>Choose the crew</strong>
+                  <small>
+                    {realAdapters.length
+                      ? `${realAdapters.map((adapter) => adapterLabel(adapter.name)).join(', ')} ready`
+                      : 'No real AI runtime is available; the test harness still works offline.'}
+                  </small>
+                </div>
+              </li>
+              <li className={data.snapshot.missions.length ? 'journey-complete' : 'journey-current'}>
+                <span>3</span>
+                <div>
+                  <strong>Plan and run a mission</strong>
+                  <small>
+                    {activeRuns.length
+                      ? `${activeRuns.length} run active now`
+                      : data.snapshot.missions.length
+                        ? `${data.snapshot.missions.length} mission records available`
+                        : 'Describe the outcome below; Crony creates the task contract.'}
+                  </small>
+                </div>
+              </li>
+              <li className={acceptedArtifacts.length ? 'journey-complete' : pendingApprovals.length ? 'journey-current' : ''}>
+                <span>4</span>
+                <div>
+                  <strong>Operate and review</strong>
+                  <small>
+                    {pendingApprovals.length
+                      ? `${pendingApprovals.length} decision${pendingApprovals.length === 1 ? '' : 's'} waiting`
+                      : acceptedArtifacts.length
+                        ? `${acceptedArtifacts.length} verified artifact${acceptedArtifacts.length === 1 ? '' : 's'} ready`
+                        : 'Watch the floor, steer an agent, approve risk, then download evidence.'}
+                  </small>
+                </div>
+              </li>
+            </ol>
+            <details className="setup-drawer" open={!connectedRunners.length}>
+              <summary>
+                <span>Developer setup</span>
+                <small>What is running, where agents write, and how to restart it</small>
+              </summary>
+              <div className="setup-grid">
+                <div className="setup-health">
+                  <div><span className={`setup-dot setup-${connection}`} />Control plane<strong>{connection}</strong></div>
+                  <div><span className={`setup-dot ${connectedRunners.length ? 'setup-live' : 'setup-offline'}`} />Runner<strong>{runnerLabel}</strong></div>
+                  <div><span className={`setup-dot ${realAdapters.length ? 'setup-live' : 'setup-offline'}`} />AI runtimes<strong>{realAdapters.length || 'none'}</strong></div>
+                </div>
+                <div className="setup-path">
+                  <span>Source repository</span>
+                  <code>{sourceRepository}</code>
+                  <small>Every write-capable run receives a linked worktree. The source checkout is never edited directly.</small>
+                </div>
+                <div className="setup-command">
+                  <span>Start or restart locally</span>
+                  <code>./tools/start_local.ps1</code>
+                  <small>Then open http://127.0.0.1:5187. Use CRONY_SOURCE_REPOSITORY to target another checkout.</small>
+                </div>
+              </div>
+            </details>
+          </>
+        ) : null}
+      </section>
+
       {error ? (
         <div className="error-banner" role="alert">
           <strong>Operations notice</strong>
@@ -1281,86 +1579,127 @@ function App() {
       ) : null}
 
       <section className="office-grid">
-        <div className="floor-panel panel">
+        <div className="floor-panel panel" id="floor">
           <div className="panel-heading">
             <div>
               <span className="section-code">FLOOR / 01</span>
               <h2>{room?.name ?? 'Main floor'}</h2>
-              <p>{room?.purpose}</p>
+              <p>Agent movement reflects real runtime state. Select anyone to inspect or steer them.</p>
             </div>
             <div className="floor-legend">
               <span><StatusMark status="idle" /> idle</span>
               <span><StatusMark status="working" /> active</span>
               <span><StatusMark status="reviewing" /> review</span>
+              <span><StatusMark status="blocked" /> blocked</span>
             </div>
           </div>
           <div className="floor-plan">
-            <div className="corridor-label">AUTHORIZED STAFF BEYOND THIS LINE</div>
-            {data.snapshot.agents.map((agent) => (
-              <AgentDesk
-                key={agent.id}
-                agent={agent}
-                actor={selectedActor}
-                otherHuman={otherHuman}
-                lease={data.snapshot.leases.find((lease) => lease.agent_id === agent.id)}
-                leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, agent.id)]}
-                queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === agent.id).length}
-                onClaim={claimLease}
-                onRelease={releaseLease}
-                onTransfer={transferLease}
-                onInterrupt={interruptRun}
-                onEmergencyStop={emergencyStop}
-                onMessage={sendMessage}
-              />
-            ))}
+            <OfficeFloor
+              agents={data.snapshot.agents}
+              selectedAgentId={selectedAgent.id}
+              onSelect={(agent) => setSelectedAgentId(agent.id)}
+            />
+            <div className="agent-roster" aria-label="Agent roster">
+              {data.snapshot.agents.map((agent) => (
+                <button
+                  key={agent.id}
+                  type="button"
+                  className={selectedAgent.id === agent.id ? 'agent-roster-selected' : ''}
+                  onClick={() => setSelectedAgentId(agent.id)}
+                >
+                  <StatusMark status={agent.status} />
+                  <span>{agent.name}</span>
+                  <small>{adapterLabel(agent.adapter)}</small>
+                </button>
+              ))}
+            </div>
+            <AgentDesk
+              agent={selectedAgent}
+              actor={selectedActor}
+              otherHuman={otherHuman}
+              lease={data.snapshot.leases.find((lease) => lease.agent_id === selectedAgent.id)}
+              leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, selectedAgent.id)]}
+              queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === selectedAgent.id).length}
+              onClaim={claimLease}
+              onRelease={releaseLease}
+              onTransfer={transferLease}
+              onInterrupt={interruptRun}
+              onEmergencyStop={emergencyStop}
+              onMessage={sendMessage}
+            />
           </div>
         </div>
 
-        <aside className="mission-panel panel">
+        <aside className="mission-panel panel" id="missions">
           <div className="panel-heading">
             <div>
               <span className="section-code">MISSIONS / 02</span>
-              <h2>Dispatch ledger</h2>
-              <p>Work is only complete when evidence lands.</p>
+              <h2>Plan and run</h2>
+              <p>Describe the outcome. Crony isolates the repo, dispatches agents, and verifies the result.</p>
             </div>
           </div>
           <form className="mission-form" onSubmit={createMission}>
-            <label htmlFor="mission-title">New mission</label>
+            <div className="mission-form-heading">
+              <div>
+                <strong>What should the crew deliver?</strong>
+                <span>Write the outcome and the proof you expect—not a chat message.</span>
+              </div>
+              <span>{missionTitle.length}/240</span>
+            </div>
             <textarea
               id="mission-title"
+              aria-label="Mission outcome"
               value={missionTitle}
               onChange={(event) => setMissionTitle(event.target.value)}
-              placeholder="Describe the outcome the Corp should produce."
+              placeholder="Example: Fix checkout totals, add regression tests, and attach the test evidence."
               rows={4}
+              maxLength={240}
             />
-            <label htmlFor="mission-adapter">Agent runtime</label>
-            <select
-              id="mission-adapter"
-              value={missionAdapter}
-              onChange={(event) => {
-                setMissionAdapter(event.target.value)
-                setMissionModel('')
-                setMissionReasoningEffort('')
-              }}
-            >
-              {availableAdapters.map((adapter) => (
-                <option key={adapter.name} value={adapter.name}>
-                  {adapter.name === 'codex'
-                    ? 'OpenAI Codex'
-                    : adapter.name === 'fake-process'
-                      ? 'Deterministic test harness (no AI)'
-                    : adapter.name === 'github-copilot'
-                      ? `GitHub Copilot (${adapter.models.filter((model) => model.policy_state !== 'disabled').length} models)`
-                      : adapter.name}
-                </option>
+            <div className="mission-examples" aria-label="Mission examples">
+              {MISSION_EXAMPLES.map((example) => (
+                <button
+                  key={example.label}
+                  type="button"
+                  onClick={() => setMissionTitle(example.value)}
+                >
+                  {example.label}
+                </button>
               ))}
-            </select>
+            </div>
+            <div className="mission-field">
+              <label htmlFor="mission-adapter">Who should run it?</label>
+              <select
+                id="mission-adapter"
+                value={effectiveMissionAdapter}
+                onChange={(event) => {
+                  setMissionAdapter(event.target.value)
+                  setMissionModel('')
+                  setMissionReasoningEffort('')
+                }}
+              >
+                {availableAdapters.map((adapter) => (
+                  <option key={adapter.name} value={adapter.name}>
+                    {adapterLabel(adapter.name)}
+                    {adapter.name === 'github-copilot'
+                      ? ` · ${adapter.models.filter((model) => model.policy_state !== 'disabled').length} models`
+                      : adapter.name === 'fake-process'
+                        ? ' · no AI'
+                        : ''}
+                  </option>
+                ))}
+              </select>
+              <small className={effectiveMissionAdapter === 'fake-process' ? 'field-warning' : ''}>
+                {selectedAdapter
+                  ? adapterDescription(selectedAdapter.name)
+                  : 'Connect a runner to make an agent runtime available.'}
+              </small>
+            </div>
             {selectedAdapter?.models.length ? (
-              <>
+              <div className="mission-field">
                 <label htmlFor="mission-model">Model</label>
                 <select
                   id="mission-model"
-                  value={missionModel}
+                  value={selectedModel ? missionModel : ''}
                   onChange={(event) => {
                     const nextModel = selectedAdapter.models.find(
                       (model) => model.id === event.target.value,
@@ -1383,14 +1722,23 @@ function App() {
                     </option>
                   ))}
                 </select>
-              </>
+                <small>
+                  {selectedModel
+                    ? `${selectedModel.max_context_window_tokens?.toLocaleString() ?? 'Unknown'} context tokens${selectedModel.supports_vision ? ' · vision' : ''}`
+                    : 'Use the provider default or choose an account-enabled model.'}
+                </small>
+              </div>
             ) : null}
             {selectedModel?.supports_reasoning_effort ? (
-              <>
+              <div className="mission-field">
                 <label htmlFor="mission-reasoning">Reasoning effort</label>
                 <select
                   id="mission-reasoning"
-                  value={missionReasoningEffort}
+                  value={
+                    selectedModel.supported_reasoning_efforts.includes(missionReasoningEffort)
+                      ? missionReasoningEffort
+                      : ''
+                  }
                   onChange={(event) =>
                     setMissionReasoningEffort(event.target.value)
                   }
@@ -1402,24 +1750,55 @@ function App() {
                     </option>
                   ))}
                 </select>
-              </>
+              </div>
             ) : null}
-            <label htmlFor="mission-strategy">Manager strategy</label>
-            <select
-              id="mission-strategy"
-              value={missionStrategy}
-              onChange={(event) => setMissionStrategy(event.target.value)}
+            <div className="mission-field">
+              <label htmlFor="mission-strategy">How should the work be organized?</label>
+              <select
+                id="mission-strategy"
+                value={missionStrategy}
+                onChange={(event) => setMissionStrategy(event.target.value)}
+              >
+                <option value="single">One agent delivers the outcome</option>
+                <option value="parallel-specialists">Two specialists, then synthesis</option>
+                <option value="verification-matrix">Automated verification matrix</option>
+                <option value="human-approval">Pause for human approval</option>
+                <option value="independent-review">Require an independent reviewer</option>
+                <option value="verification-failure">Verification failure demo</option>
+              </select>
+              <small>
+                {missionStrategy === 'single'
+                  ? 'Best for a focused build, fix, or review.'
+                  : missionStrategy === 'parallel-specialists'
+                    ? 'Crony runs two independent approaches before a final synthesis task.'
+                    : missionStrategy.includes('approval') || missionStrategy.includes('review')
+                      ? 'The run pauses until an authorized human records a decision.'
+                      : 'This strategy exercises Crony verification behavior.'}
+              </small>
+            </div>
+            <label className="mission-run-toggle">
+              <input
+                type="checkbox"
+                checked={pauseAfterPlanning}
+                onChange={(event) => setPauseAfterPlanning(event.target.checked)}
+              />
+              <span>
+                <strong>Pause after planning</strong>
+                <small>Inspect the generated task graph before dispatching agents.</small>
+              </span>
+            </label>
+            <button
+              className="button button-primary mission-submit"
+              type="submit"
+              disabled={busy || !missionTitle.trim() || !effectiveMissionAdapter}
             >
-              <option value="single">Single delivery</option>
-              <option value="parallel-specialists">Parallel specialists + synthesis</option>
-              <option value="verification-matrix">Automated verification matrix</option>
-              <option value="verification-failure">Failing verification fixture</option>
-              <option value="human-approval">Human approval gate</option>
-              <option value="independent-review">Independent reviewer gate</option>
-            </select>
-            <button className="button button-primary" type="submit" disabled={busy || !missionTitle.trim()}>
-              File mission
+              {busy ? 'Working…' : pauseAfterPlanning ? 'Create mission plan' : 'Plan and run mission'}
             </button>
+            <p className="mission-submit-note">
+              {pauseAfterPlanning
+                ? 'No agent starts until you press “Dispatch mission” on the new plan.'
+                : 'The mission is planned and dispatched immediately. Risky actions still require approval.'}
+            </p>
           </form>
           <div className="mission-list">
             {latestMissions.length ? (
@@ -1444,8 +1823,8 @@ function App() {
               })
             ) : (
               <div className="empty-state">
-                <strong>No missions filed</strong>
-                <span>Write the first outcome above.</span>
+                <strong>No missions yet</strong>
+                <span>Start with a concrete outcome and let Crony create the task contract.</span>
               </div>
             )}
           </div>
@@ -1463,7 +1842,7 @@ function App() {
         onPost={postRoomMessage}
       />
 
-      <section className="operations-panel panel">
+      <section className="operations-panel panel" id="activity">
         <div className="panel-heading operations-heading">
           <div>
             <span className="section-code">JOURNAL / 04</span>
