@@ -291,6 +291,12 @@ function adapterDescription(adapter: string): string {
   return 'Run work through this connected agent adapter.'
 }
 
+function agentStatusLabel(agent: Agent): string {
+  if (agent.status === 'idle' && !agent.current_run_id) return 'available · off shift'
+  if (agent.status === 'offline') return 'runner unavailable'
+  return agent.status
+}
+
 function availableRunnerAdapters(data: SnapshotResponse | null): RunnerCapability[] {
   if (!data) return []
   const connectedRunners = data.runners.filter((runner) => runner.connected)
@@ -396,6 +402,11 @@ function OfficeFloor({
   selectedAgentId: string
   onSelect: (agent: Agent) => void
 }) {
+  const liveAgents = agents.filter(
+    (agent) =>
+      agent.current_run_id ||
+      ['starting', 'working', 'blocked', 'reviewing'].includes(agent.status),
+  )
   return (
     <div className="office-stage" aria-label="Live agent office">
       <div className="office-wall">
@@ -416,7 +427,8 @@ function OfficeFloor({
         <span>Stand-up</span>
         <i />
       </div>
-      {agents.map((agent, index) => {
+      {liveAgents.map((agent) => {
+        const index = agents.findIndex((candidate) => candidate.id === agent.id)
         const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
         const destination =
           agent.status === 'blocked'
@@ -456,6 +468,13 @@ function OfficeFloor({
           </button>
         )
       })}
+      {liveAgents.length === 0 ? (
+        <div className="office-empty" role="status">
+          <span>No live agent processes</span>
+          <strong>The crew is off shift</strong>
+          <small>Start a mission to launch a worker in an isolated worktree.</small>
+        </div>
+      ) : null}
       {agents.map((agent, index) => {
         const position = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
         const style = {
@@ -519,7 +538,7 @@ function AgentDesk({
       <div className="agent-inspector-summary">
         <AgentAvatar agent={agent} />
         <div>
-          <span className="agent-inspector-kicker">{agent.role} · {agent.status}</span>
+          <span className="agent-inspector-kicker">{agent.role} · {agentStatusLabel(agent)}</span>
           <div className="agent-name">
             <StatusMark status={agent.status} />
             {agent.name}
@@ -533,7 +552,7 @@ function AgentDesk({
       <p className="agent-inspector-help">
         {agent.current_run_id
           ? `${agent.name} is ${agent.station ?? agent.status}. Claim control to steer the live session.`
-          : `${agent.name} is available for missions using ${adapterLabel(agent.adapter)}.`}
+          : `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`}
       </p>
       <div className="desk-actions">
         <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
@@ -1584,10 +1603,10 @@ function App() {
             <div>
               <span className="section-code">FLOOR / 01</span>
               <h2>{room?.name ?? 'Main floor'}</h2>
-              <p>Agent movement reflects real runtime state. Select anyone to inspect or steer them.</p>
+              <p>Only live provider sessions appear on the floor. Finished agents return off shift.</p>
             </div>
             <div className="floor-legend">
-              <span><StatusMark status="idle" /> idle</span>
+              <span><StatusMark status="idle" /> off shift</span>
               <span><StatusMark status="working" /> active</span>
               <span><StatusMark status="reviewing" /> review</span>
               <span><StatusMark status="blocked" /> blocked</span>
@@ -1609,7 +1628,9 @@ function App() {
                 >
                   <StatusMark status={agent.status} />
                   <span>{agent.name}</span>
-                  <small>{adapterLabel(agent.adapter)}</small>
+                  <small>
+                    {adapterLabel(agent.adapter)} · {agent.current_run_id ? agent.status : 'off shift'}
+                  </small>
                 </button>
               ))}
             </div>

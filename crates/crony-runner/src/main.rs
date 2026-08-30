@@ -995,6 +995,24 @@ async fn execute_assignment(
     } else {
         adapter.execute(request, controls, sink).await
     };
+    let provider_outcome = match &execution {
+        Ok(AdapterExit::Completed) => "completed",
+        Ok(AdapterExit::Failed) => "failed",
+        Ok(AdapterExit::Cancelled) => "cancelled",
+        Err(_) => "runtime_error",
+    };
+    send_run_event(
+        &outbound,
+        &runner_id,
+        &assignment,
+        "run.session_terminated",
+        json!({
+            "adapter": &assignment.adapter,
+            "outcome": provider_outcome,
+            "provider_process_alive": false,
+            "message": "Provider session stopped; no idle agent process remains.",
+        }),
+    );
     if execution.is_ok() {
         let buffered = terminal.lock().ok().and_then(|mut value| value.take());
         let terminal =

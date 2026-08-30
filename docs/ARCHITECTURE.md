@@ -295,6 +295,12 @@ Decisions are durable, actor-attributed, and can release downstream scheduler wo
 
 ## Agent adapters
 
+`execute` and `resume` are terminal lifecycle boundaries: an adapter may return only after its
+child process or SDK client has exited, disconnected, or been force-stopped. The runner then emits
+`run.session_terminated` before verification, records that no live provider process remains, and
+removes the run from its active-process map after workspace finalization. Provider session IDs may
+remain persisted for an explicit future resume, but they do not imply a resident process.
+
 Provider runtimes implement one `AgentAdapter` contract:
 
 - execute a new run

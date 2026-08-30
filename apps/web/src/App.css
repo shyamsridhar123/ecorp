@@ -1819,11 +1819,6 @@ html {
   border-radius: 50%;
 }
 
-.office-agent-idle {
-  animation: sprite-roam 10s steps(8, end) infinite;
-  animation-delay: var(--agent-delay);
-}
-
 .agent-sprite {
   position: relative;
   width: 48px;
@@ -1982,11 +1977,6 @@ html {
   transform: rotate(45deg);
 }
 
-.sprite-idle .sprite-person {
-  animation: sprite-idle 2.4s steps(2, end) infinite;
-  animation-delay: var(--agent-delay);
-}
-
 .sprite-starting .sprite-person {
   animation: sprite-walk 0.42s steps(2, end) infinite;
 }
@@ -2011,6 +2001,39 @@ html {
 .sprite-offline {
   filter: grayscale(1);
   opacity: 0.45;
+}
+
+.office-empty {
+  position: absolute;
+  z-index: 12;
+  top: 51%;
+  left: 50%;
+  display: grid;
+  width: min(390px, calc(100% - 40px));
+  gap: 7px;
+  padding: 18px 20px;
+  text-align: center;
+  border: 2px solid var(--ink);
+  background: rgb(248 244 232 / 94%);
+  box-shadow: 4px 4px 0 var(--cobalt-dark);
+  transform: translate(-50%, -50%) rotate(-0.5deg);
+}
+
+.office-empty span {
+  color: var(--mint);
+  font: 700 9px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.office-empty strong {
+  font: 700 24px/1 var(--sans);
+  text-transform: uppercase;
+}
+
+.office-empty small {
+  color: var(--ink-soft);
+  font-size: 12px;
 }
 
 .agent-roster {
@@ -2250,36 +2273,6 @@ html {
 
 .mission-list {
   max-height: 730px;
-}
-
-@keyframes sprite-idle {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-2px);
-  }
-}
-
-@keyframes sprite-roam {
-  0%,
-  18%,
-  100% {
-    transform: translate(-50%, -68%);
-  }
-  30% {
-    transform: translate(calc(-50% + 18px), calc(-68% - 7px));
-  }
-  46% {
-    transform: translate(calc(-50% + 26px), -68%);
-  }
-  62% {
-    transform: translate(calc(-50% - 12px), calc(-68% + 4px));
-  }
-  78% {
-    transform: translate(calc(-50% - 22px), calc(-68% - 5px));
-  }
 }
 
 @keyframes sprite-walk {

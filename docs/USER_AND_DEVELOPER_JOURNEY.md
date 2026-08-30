@@ -66,16 +66,22 @@ Strategy meanings:
 
 The shared office maps authoritative agent state to visible behavior:
 
-- idle agents wander near their desks;
+- idle identities move off shift and remain only in the available roster; no provider process is
+  running for them;
 - starting agents walk;
 - working agents type;
 - reviewing agents move to the review table;
 - blocked agents move to the approval desk;
-- offline agents wait near the runner door.
+- offline identities show that their required runner or adapter is unavailable.
 
 Select a sprite to inspect the agent. Claiming control grants the live steering lease. People without
 the lease can still queue a note. Authorized operators can transfer or release control, interrupt a
 turn, or issue an emergency stop.
+
+When a run becomes completed, failed, or cancelled, its adapter disconnects or stops the provider,
+the runner removes the run from its active-process map, and the employee identity returns off shift.
+Crony preserves the identity and resumable session metadata so future work can be scheduled without
+leaving an operating-system process alive.
 
 Risky commands create durable approval records. After verification passes, the mission card exposes
 the signed artifact for download. The room and immutable activity feed preserve the collaboration

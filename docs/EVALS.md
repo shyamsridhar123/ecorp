@@ -47,6 +47,12 @@ An implementation claim needs evidence at the same scope:
 - Postgres unavailable
 - browser reconnect
 
+## Terminal provider cleanup
+
+`node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active,
+`run.session_terminated` records that the provider process is gone before verification and accepted
+completion, and the persistent agent identity returns to `idle` with no `current_run_id`.
+
 ## Quality gates
 
 ```powershell

@@ -242,6 +242,8 @@ pub trait AgentAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Runs one provider session to a terminal state. Implementations must not
+    /// return while their child process or SDK client is still live.
     async fn execute(
         &self,
         request: AdapterRunRequest,
@@ -249,6 +251,8 @@ pub trait AgentAdapter: Send + Sync {
         sink: Arc<dyn AdapterEventSink>,
     ) -> Result<AdapterExit, AdapterError>;
 
+    /// Resumes persisted provider state in a new bounded runtime. As with
+    /// `execute`, returning means the live process/client has been stopped.
     #[allow(dead_code)] // Contract surface for adapters with persistent provider sessions.
     async fn resume(
         &self,
