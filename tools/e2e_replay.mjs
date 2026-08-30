@@ -1,5 +1,9 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+
 const server = process.env.CRONY_SERVER_HTTP ?? "http://127.0.0.1:8791";
 const socketBase = server.replace(/^http/, "ws");
+const root = path.resolve(import.meta.dirname, "..");
 
 async function post(path, body) {
   const response = await fetch(`${server}${path}`, {
@@ -83,18 +87,17 @@ if (empty.events.length !== 0 || empty.replayedThrough !== second.replayedThroug
   throw new Error(`duplicate replay was delivered: ${JSON.stringify(empty)}`);
 }
 
-console.log(
-  JSON.stringify(
-    {
+const report = {
       corp_id: demo.corp_id,
       initial_replay_count: first.events.length,
       reconnect_replay_count: second.events.length,
       duplicate_replay_count: empty.events.length,
       replayed_through: second.replayedThrough,
       event_types: types,
-    },
-    null,
-    2,
-  ),
+};
+await writeFile(
+  path.join(root, "output", "e2e-replay.json"),
+  `${JSON.stringify(report, null, 2)}\n`,
 );
+console.log(JSON.stringify(report, null, 2));
 

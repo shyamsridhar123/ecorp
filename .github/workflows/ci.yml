@@ -144,6 +144,10 @@ jobs:
         run: node tools/e2e_approvals.mjs
       - name: Verify budget and loop circuit-breaker stages
         run: node tools/e2e_budgets.mjs
+      - name: Run the versioned 100-scenario deterministic evaluation lane
+        run: node tools/run_evals.mjs
+      - name: Consolidate chaos and restart evidence
+        run: node tools/e2e_chaos_report.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -160,7 +164,34 @@ jobs:
             output/e2e-secrets.json
             output/e2e-approvals.json
             output/e2e-budgets.json
+            output/e2e-chaos.json
+            output/eval-report.json
+            output/e2e-runner-reconnect.json
+            output/e2e-idempotency.json
+            output/e2e-replay.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md
             output/runner/**/evidence/*.json
+
+  runner-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p crony-runner
+      - run: node tools/platform_runner_contract.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runner-platform-${{ matrix.os }}
+          path: output/platform/*

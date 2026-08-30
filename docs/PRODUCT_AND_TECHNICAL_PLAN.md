@@ -32,7 +32,10 @@
   screenshots on the runner, with durable human and independent-review decisions.
 - OIDC-backed production authentication, Corp-scoped RBAC, rotating runner workload identity,
   scoped encrypted secret delivery, durable action approvals, and budget circuit breakers are
-  implemented. The next critical-path work is artifact storage and alpha-scale evaluation.
+  implemented.
+- The versioned 100-scenario deterministic evaluation lane, consolidated chaos evidence, and
+  hosted Windows/macOS/Linux runner matrix are implemented. Real-provider and real-team evidence
+  remain explicitly separate.
 
 ---
 

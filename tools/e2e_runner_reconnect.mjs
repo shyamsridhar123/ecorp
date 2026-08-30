@@ -1,4 +1,8 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+
 const server = process.env.CRONY_SERVER_HTTP ?? "http://127.0.0.1:8791";
+const root = path.resolve(import.meta.dirname, "..");
 
 async function request(path, body) {
   const response = await fetch(`${server}${path}`, {
@@ -137,9 +141,7 @@ if (!finalRunner || Date.parse(finalRunner.last_seen_at) <= initialHeartbeat) {
   throw new Error("runner heartbeat timestamp did not advance after reconnect");
 }
 
-console.log(
-  JSON.stringify(
-    {
+const report = {
       initial_runner_status: initialRunner.status,
       grace_observed: Boolean(graceObserved),
       short_reconnect_status: reconnected.runners.find(
@@ -152,9 +154,10 @@ console.log(
       lost_run_status: finalRun.status,
       stale_claim_preserved_lost_state: true,
       heartbeat_advanced: true,
-    },
-    null,
-    2,
-  ),
+};
+await writeFile(
+  path.join(root, "output", "e2e-runner-reconnect.json"),
+  `${JSON.stringify(report, null, 2)}\n`,
 );
+console.log(JSON.stringify(report, null, 2));
 

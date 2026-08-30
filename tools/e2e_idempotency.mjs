@@ -1,4 +1,8 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+
 const server = process.env.CRONY_SERVER_HTTP ?? "http://127.0.0.1:8791";
+const root = path.resolve(import.meta.dirname, "..");
 
 async function post(path, body) {
   const response = await fetch(`${server}${path}`, {
@@ -54,17 +58,16 @@ if (new Set(ids).size !== ids.length) {
   throw new Error("snapshot contains duplicate event IDs");
 }
 
-console.log(
-  JSON.stringify(
-    {
+const report = {
       run_id: launch.run_id,
       duplicate_deliveries_sent: 2,
       persisted_run_started_events: started.length,
       unique_event_ids: new Set(ids).size,
       run_status: run.status,
-    },
-    null,
-    2,
-  ),
+};
+await writeFile(
+  path.join(root, "output", "e2e-idempotency.json"),
+  `${JSON.stringify(report, null, 2)}\n`,
 );
+console.log(JSON.stringify(report, null, 2));
 
