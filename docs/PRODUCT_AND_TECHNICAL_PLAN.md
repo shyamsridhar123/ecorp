@@ -28,7 +28,9 @@
   for resume, and preserves every dirty, committed, or uncertain result.
 - Replaceable manager strategies now persist bounded task contracts and dependency graphs; the
   scheduler dispatches parallel roots, releases downstream tasks, and enforces retry limits.
-- The next critical-path item is evidence-gated verification.
+- Evidence-gated completion now verifies artifacts, files, commands, tests, JSON schemas, and
+  screenshots on the runner, with durable human and independent-review decisions.
+- The next critical-path items are authentication, runner identity, and scoped secrets.
 
 ---
 

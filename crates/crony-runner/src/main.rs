@@ -1,4 +1,5 @@
 mod adapter;
+mod verifier;
 mod workspace;
 
 use std::{
@@ -10,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use crony_domain::VerificationPolicy;
 use crony_protocol::{ActiveRunClaim, RunnerCapability, RunnerToServer, ServerToRunner};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -20,8 +22,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use adapter::{
-    AdapterControl, AdapterEvent, AdapterEventSink, AdapterRegistry, AdapterRunRequest,
-    AgentAdapter,
+    AdapterArtifact, AdapterControl, AdapterEvent, AdapterEventSink, AdapterExit, AdapterRegistry,
+    AdapterRunRequest, AgentAdapter,
 };
 use workspace::{WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager};
 
@@ -73,6 +75,7 @@ struct Assignment {
     agent_id: Uuid,
     adapter: String,
     mission_title: String,
+    verification_policy: VerificationPolicy,
 }
 
 #[derive(Clone)]
@@ -306,6 +309,7 @@ async fn run_connection(
                 assignment_token,
                 adapter,
                 mission_title,
+                verification_policy,
             } => {
                 let assignment = Assignment {
                     corp_id,
@@ -317,6 +321,7 @@ async fn run_connection(
                     agent_id,
                     adapter,
                     mission_title,
+                    verification_policy,
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate start command ignored");
@@ -382,6 +387,7 @@ async fn run_connection(
                 adapter,
                 provider_session_id,
                 prompt,
+                verification_policy,
             } => {
                 let assignment = Assignment {
                     corp_id,
@@ -393,6 +399,7 @@ async fn run_connection(
                     agent_id,
                     adapter,
                     mission_title: prompt,
+                    verification_policy,
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate resume command ignored");
@@ -498,6 +505,15 @@ struct RunnerEventSink {
     runner_id: String,
     assignment: Assignment,
     workspace: WorkspaceLease,
+    artifacts: Arc<Mutex<Vec<AdapterArtifact>>>,
+    terminal: Arc<Mutex<Option<BufferedTerminal>>>,
+}
+
+#[derive(Debug, Clone)]
+enum BufferedTerminal {
+    Completed(String),
+    Failed(String),
+    Cancelled(String),
 }
 
 impl AdapterEventSink for RunnerEventSink {
@@ -538,15 +554,20 @@ impl AdapterEventSink for RunnerEventSink {
                     "text": text,
                 }),
             ),
-            AdapterEvent::Artifact(artifact) => (
-                "run.artifact",
-                json!({
-                    "path": artifact.path,
-                    "sha256": artifact.sha256,
-                    "bytes": artifact.bytes,
-                    "media_type": artifact.media_type,
-                }),
-            ),
+            AdapterEvent::Artifact(artifact) => {
+                if let Ok(mut artifacts) = self.artifacts.lock() {
+                    artifacts.push(artifact.clone());
+                }
+                (
+                    "run.artifact",
+                    json!({
+                        "path": artifact.path,
+                        "sha256": artifact.sha256,
+                        "bytes": artifact.bytes,
+                        "media_type": artifact.media_type,
+                    }),
+                )
+            }
             AdapterEvent::Usage(usage) => (
                 "run.usage",
                 json!({
@@ -555,9 +576,24 @@ impl AdapterEventSink for RunnerEventSink {
                     "cost_microusd": usage.cost_microusd,
                 }),
             ),
-            AdapterEvent::Completed { summary } => ("run.completed", json!({"summary": summary})),
-            AdapterEvent::Failed { error } => ("run.failed", json!({"error": error})),
-            AdapterEvent::Cancelled { reason } => ("run.cancelled", json!({"reason": reason})),
+            AdapterEvent::Completed { summary } => {
+                if let Ok(mut terminal) = self.terminal.lock() {
+                    *terminal = Some(BufferedTerminal::Completed(summary));
+                }
+                return;
+            }
+            AdapterEvent::Failed { error } => {
+                if let Ok(mut terminal) = self.terminal.lock() {
+                    *terminal = Some(BufferedTerminal::Failed(error));
+                }
+                return;
+            }
+            AdapterEvent::Cancelled { reason } => {
+                if let Ok(mut terminal) = self.terminal.lock() {
+                    *terminal = Some(BufferedTerminal::Cancelled(reason));
+                }
+                return;
+            }
         };
         send_run_event(
             &self.outbound,
@@ -590,21 +626,150 @@ async fn execute_assignment(
         mission_title: assignment.mission_title.clone(),
         workspace: workspace.path.clone(),
     };
+    let artifacts = Arc::new(Mutex::new(Vec::<AdapterArtifact>::new()));
+    let terminal = Arc::new(Mutex::new(None::<BufferedTerminal>));
     let sink: Arc<dyn AdapterEventSink> = Arc::new(RunnerEventSink {
         outbound: outbound.clone(),
         runner_id: runner_id.clone(),
         assignment: assignment.clone(),
         workspace: workspace.clone(),
+        artifacts: artifacts.clone(),
+        terminal: terminal.clone(),
     });
     let execution = if let Some(session_id) = resume_session_id {
         adapter.resume(request, &session_id, controls, sink).await
     } else {
         adapter.execute(request, controls, sink).await
     };
+    if execution.is_ok() {
+        let buffered = terminal.lock().ok().and_then(|mut value| value.take());
+        let terminal =
+            buffered.unwrap_or_else(|| match execution.as_ref().expect("checked above") {
+                AdapterExit::Completed => {
+                    BufferedTerminal::Completed("Agent completed without a summary.".to_owned())
+                }
+                AdapterExit::Failed => {
+                    BufferedTerminal::Failed("Agent failed without an error message.".to_owned())
+                }
+                AdapterExit::Cancelled => {
+                    BufferedTerminal::Cancelled("Agent cancelled without a reason.".to_owned())
+                }
+            });
+        match terminal {
+            BufferedTerminal::Completed(summary) => {
+                send_verification_events(
+                    &outbound,
+                    &runner_id,
+                    &assignment,
+                    &workspace,
+                    &artifacts,
+                    &summary,
+                )
+                .await;
+            }
+            BufferedTerminal::Failed(error) => send_run_event(
+                &outbound,
+                &runner_id,
+                &assignment,
+                "run.failed",
+                json!({"error": error}),
+            ),
+            BufferedTerminal::Cancelled(reason) => send_run_event(
+                &outbound,
+                &runner_id,
+                &assignment,
+                "run.cancelled",
+                json!({"reason": reason}),
+            ),
+        }
+    }
     let cleanup = workspaces.finalize(&workspace).await;
     send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
     execution?;
     Ok(())
+}
+
+async fn send_verification_events(
+    outbound: &OutboundBus,
+    runner_id: &str,
+    assignment: &Assignment,
+    workspace: &WorkspaceLease,
+    artifacts: &Arc<Mutex<Vec<AdapterArtifact>>>,
+    completion_summary: &str,
+) {
+    send_run_event(
+        outbound,
+        runner_id,
+        assignment,
+        "run.verification_started",
+        json!({
+            "check_count": assignment.verification_policy.checks.len(),
+        }),
+    );
+    let artifacts = artifacts
+        .lock()
+        .map(|artifacts| artifacts.clone())
+        .unwrap_or_default();
+    let report =
+        verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await;
+    for check in &report.checks {
+        send_run_event(
+            outbound,
+            runner_id,
+            assignment,
+            "run.verification_evidence",
+            json!({
+                "evidence_id": Uuid::new_v4(),
+                "check_index": check.check_index,
+                "kind": check.kind,
+                "status": if check.passed { "passed" } else { "failed" },
+                "summary": check.summary,
+                "payload": check.payload,
+            }),
+        );
+    }
+    if !report.passed {
+        send_run_event(
+            outbound,
+            runner_id,
+            assignment,
+            "run.verification_failed",
+            json!({
+                "error": report.summary,
+                "completion_summary": completion_summary,
+            }),
+        );
+        return;
+    }
+    send_run_event(
+        outbound,
+        runner_id,
+        assignment,
+        "run.verification_passed",
+        json!({"summary": report.summary}),
+    );
+    if let Some(gate) = report.manual_gate {
+        send_run_event(
+            outbound,
+            runner_id,
+            assignment,
+            "run.verification_waiting",
+            json!({
+                "gate_type": gate.kind(),
+                "gate": gate,
+                "verification_summary": report.summary,
+                "completion_summary": completion_summary,
+            }),
+        );
+    } else {
+        send_run_event(
+            outbound,
+            runner_id,
+            assignment,
+            "run.completed",
+            json!({"summary": completion_summary}),
+        );
+    }
 }
 
 fn send_workspace_cleanup_event(

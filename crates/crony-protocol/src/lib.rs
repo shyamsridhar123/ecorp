@@ -1,4 +1,4 @@
-use crony_domain::{CorpSnapshot, DomainEvent, EntityLink};
+use crony_domain::{CorpSnapshot, DomainEvent, EntityLink, VerificationPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -59,6 +59,7 @@ pub enum ServerToRunner {
         assignment_token: Uuid,
         adapter: String,
         mission_title: String,
+        verification_policy: VerificationPolicy,
     },
     ResumeRun {
         corp_id: Uuid,
@@ -72,6 +73,7 @@ pub enum ServerToRunner {
         adapter: String,
         provider_session_id: String,
         prompt: String,
+        verification_policy: VerificationPolicy,
     },
     ControlMessage {
         corp_id: Uuid,
@@ -263,4 +265,17 @@ pub struct InterruptRunRequest {
 pub struct InterruptRunResponse {
     pub run_id: Uuid,
     pub requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationDecisionRequest {
+    pub actor_id: Uuid,
+    pub approved: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationDecisionResponse {
+    pub run_id: Uuid,
+    pub status: String,
 }

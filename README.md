@@ -36,6 +36,8 @@ The UI can close without terminating active work.
 - Fail-safe worktree cleanup that preserves dirty, committed, or uncertain work
 - Replaceable manager strategies that produce bounded, dependency-aware task graphs
 - Deterministic capability matching, parallel root dispatch, dependency release, and bounded retries
+- Runner-side evidence policies for artifacts, files, commands, tests, JSON schemas, and screenshots
+- Human approval and independent-review gates with role and requester separation
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens
 - Explicit release and transfer, queued messages, and role-gated emergency stop
@@ -84,6 +86,7 @@ checkout itself.
 - [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
 - [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
 - [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
+- [`docs/evidence/2026-08-29-evidence-verification-validation.md`](docs/evidence/2026-08-29-evidence-verification-validation.md)
 
 ## License
 

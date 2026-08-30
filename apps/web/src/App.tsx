@@ -57,6 +57,8 @@ type Task = {
   attempt_count: number
   required_adapter: string | null
   depends_on: string[]
+  verification_policy: Record<string, unknown>
+  verification_status: string
   status: string
   assigned_agent_id: string | null
 }
@@ -78,6 +80,8 @@ type Run = {
   workspace_base_commit: string | null
   workspace_disposition: string | null
   workspace_detail: string | null
+  verification_status: string
+  verification_summary: string | null
   status: string
   summary: string | null
   artifact_path: string | null
@@ -97,6 +101,25 @@ type QueuedMessage = {
   text: string
   status: string
   created_at: string
+}
+
+type VerificationEvidence = {
+  id: string
+  task_id: string
+  run_id: string
+  check_index: number
+  kind: string
+  status: 'passed' | 'failed'
+  summary: string
+}
+
+type VerificationRequest = {
+  run_id: string
+  task_id: string
+  gate_type: 'human_approval' | 'independent_review'
+  status: 'pending' | 'approved' | 'rejected'
+  decided_by: string | null
+  decision_note: string | null
 }
 
 type DomainEvent = {
@@ -143,6 +166,8 @@ type SnapshotResponse = {
     room_messages: RoomMessage[]
     leases: Lease[]
     queued_messages: QueuedMessage[]
+    verification_evidence: VerificationEvidence[]
+    verification_requests: VerificationRequest[]
     events: DomainEvent[]
   }
   runners: {
@@ -344,14 +369,20 @@ function MissionCard({
   mission,
   tasks,
   runs,
+  evidence,
+  verificationRequests,
   onLaunch,
   onResume,
+  onVerificationDecision,
 }: {
   mission: Mission
   tasks: Task[]
   runs: Run[]
+  evidence: VerificationEvidence[]
+  verificationRequests: VerificationRequest[]
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
+  onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
 }) {
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
@@ -364,6 +395,15 @@ function MissionCard({
   const resumableRun = runs.find(
     (run) => run.provider_session_id && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
   )
+  const pendingRun = runs.find((run) => run.status === 'waiting_for_approval')
+  const pendingRequest = pendingRun
+    ? verificationRequests.find(
+        (request) => request.run_id === pendingRun.id && request.status === 'pending',
+      )
+    : undefined
+  const latestEvidence = latestRun
+    ? evidence.filter((item) => item.run_id === latestRun.id)
+    : []
   return (
     <article className="mission-card" data-testid={`mission-${mission.id}`}>
       <div className="mission-card-top">
@@ -393,8 +433,17 @@ function MissionCard({
       </div>
       {latestRun?.artifact_sha256 ? (
         <div className="evidence-box">
-          <strong>Verified artifact</strong>
+          <strong>Artifact recorded</strong>
           <span>{shortId(latestRun.artifact_sha256)}…</span>
+        </div>
+      ) : null}
+      {latestRun ? (
+        <div className={`verification-box verification-${latestRun.verification_status}`}>
+          <strong>{latestRun.verification_status.replaceAll('_', ' ')}</strong>
+          <span>
+            {latestEvidence.filter((item) => item.status === 'passed').length}/
+            {latestEvidence.length} checks passed
+          </span>
         </div>
       ) : null}
       {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
@@ -417,6 +466,25 @@ function MissionCard({
         <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(resumableRun)}>
           Resume agent session
         </button>
+      ) : null}
+      {pendingRun && pendingRequest ? (
+        <div className="verification-actions">
+          <span>{pendingRequest.gate_type.replaceAll('_', ' ')}</span>
+          <button
+            className="button button-primary"
+            type="button"
+            onClick={() => onVerificationDecision(pendingRun, true)}
+          >
+            Approve evidence
+          </button>
+          <button
+            className="button button-danger"
+            type="button"
+            onClick={() => onVerificationDecision(pendingRun, false)}
+          >
+            Reject evidence
+          </button>
+        </div>
       ) : null}
     </article>
   )
@@ -801,6 +869,29 @@ function App() {
     }
   }
 
+  const decideVerification = async (run: Run, approved: boolean) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/runs/${run.id}/verification-decision`, {
+        method: 'POST',
+        body: JSON.stringify({
+          actor_id: selectedActor.id,
+          approved,
+          note: approved
+            ? `${selectedActor.name} accepted the recorded verification evidence.`
+            : `${selectedActor.name} rejected the recorded verification evidence.`,
+        }),
+      })
+      await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const claimLease = async (agent: Agent) => {
     if (!bootstrap || !selectedActor) return
     setError(null)
@@ -1101,6 +1192,10 @@ function App() {
             >
               <option value="single">Single delivery</option>
               <option value="parallel-specialists">Parallel specialists + synthesis</option>
+              <option value="verification-matrix">Automated verification matrix</option>
+              <option value="verification-failure">Failing verification fixture</option>
+              <option value="human-approval">Human approval gate</option>
+              <option value="independent-review">Independent reviewer gate</option>
             </select>
             <button className="button button-primary" type="submit" disabled={busy || !missionTitle.trim()}>
               File mission
@@ -1118,8 +1213,11 @@ function App() {
                     mission={mission}
                     tasks={tasks}
                     runs={runs}
+                    evidence={data.snapshot.verification_evidence}
+                    verificationRequests={data.snapshot.verification_requests}
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
+                    onVerificationDecision={decideVerification}
                   />
                 )
               })

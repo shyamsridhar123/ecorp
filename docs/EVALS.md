@@ -83,6 +83,9 @@ worktree and branch.
 `tools/e2e_task_graph.mjs` validates a three-node graph with two parallel specialist roots and a
 dependency-gated synthesis task, then proves an always-failing task stops exactly at its retry
 limit.
+`tools/e2e_verification.mjs` proves all six automated verifier types, a missing-file failure that
+blocks completion, an owner approval gate, and an independent-review gate that rejects the
+requester before accepting Bob's reviewer decision.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
@@ -105,3 +108,7 @@ detached-state fail-safe behavior, path/ref validation, and occupied-target reje
 Planning unit tests prove strategy replacement, deterministic adapter matching, cycle rejection,
 depth bounds, retry bounds, per-task budgets, and total mission budgets. See
 `docs/evidence/2026-08-29-task-graph-validation.md`.
+
+Runner verifier tests cover valid and missing files, artifact hashes, commands, tests, JSON
+required-key schemas, screenshot signatures, and path traversal. See
+`docs/evidence/2026-08-29-evidence-verification-validation.md`.

@@ -100,6 +100,8 @@ jobs:
         run: node tools/e2e_worktrees.mjs
       - name: Verify bounded task-graph planning, scheduling, and retries
         run: node tools/e2e_task_graph.mjs
+      - name: Verify automated, failed, human, and independent evidence gates
+        run: node tools/e2e_verification.mjs
       - name: Verify resumable event replay
         run: node tools/e2e_replay.mjs
       - name: Verify control fencing and emergency stop
@@ -121,6 +123,7 @@ jobs:
             output/e2e-codex.json
             output/e2e-worktrees.json
             output/e2e-task-graph.json
+            output/e2e-verification.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md
