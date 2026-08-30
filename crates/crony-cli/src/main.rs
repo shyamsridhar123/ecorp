@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
                     requested_by: actor_id,
                     preferred_adapter: adapter,
                     strategy,
+                    secret_refs: Vec::new(),
                 })?),
             )
             .await?

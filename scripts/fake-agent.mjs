@@ -26,6 +26,7 @@ const failRun = mission.includes("[always-fail]");
 const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
+const secretProbe = mission.includes("[secret-probe]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
 const briefingDelay = slowRun ? 4_000 : graphSlowRun ? 1_200 : 700;
 const workDelay = slowRun ? 5_000 : graphSlowRun ? 1_200 : 900;
@@ -98,6 +99,12 @@ if (verificationMatrix) {
   );
 }
 
+if (secretProbe && !process.env.CRONY_TEST_SECRET) {
+  emit({ type: "failed", error: "Task-scoped secret was not delivered." });
+  input.close();
+  process.exit(0);
+}
+
 const artifact = [
   "# Verified mission artifact",
   "",
@@ -113,6 +120,7 @@ const artifact = [
   "- Wrote this artifact inside the run-specific workspace.",
   "- Runner computes and reports the SHA-256 digest.",
   `- Live control messages observed: ${controls.length}.`,
+  `- Task-scoped secret available: ${secretProbe ? "yes" : "not requested"}.`,
   "",
   "## Result",
   "",

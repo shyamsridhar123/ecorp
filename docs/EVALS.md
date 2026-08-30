@@ -91,6 +91,10 @@ requester before accepting Bob's member-role decision.
 authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
 rejection, and revocation. See `docs/evidence/2026-08-30-identity-validation.md`.
 
+`tools/e2e_secrets.mjs` proves encrypted storage, scoped dispatch, environment delivery, denial for
+an unauthorized requester, revocation, and absence of plaintext canaries from shared state and
+logs. See `docs/evidence/2026-08-30-secret-broker-validation.md`.
+
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
 typed errors for unsupported resume and usage operations.

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use crony_domain::{
     Agent, AgentStatus, ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan,
-    VerificationPolicy, VerifierCheck,
+    TaskSecretReference, VerificationPolicy, VerifierCheck,
 };
 
 pub const MAX_GRAPH_NODES: usize = 8;
@@ -19,6 +19,7 @@ pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 500_000;
 pub struct PlanningRequest<'a> {
     pub mission_title: &'a str,
     pub preferred_adapter: Option<&'a str>,
+    pub secret_refs: &'a [TaskSecretReference],
 }
 
 pub trait ManagerStrategy: Send + Sync {
@@ -92,6 +93,12 @@ impl ManagerStrategy for SingleTaskStrategy {
             })
             .context("no worker agent satisfies the requested adapter")?;
         let budget_tokens = 100_000;
+        let mut task_contract = contract(
+            format!("Complete the mission outcome: {}", request.mission_title),
+            "A source-backed, verified mission artifact",
+            budget_tokens,
+        );
+        task_contract.secret_refs = request.secret_refs.to_vec();
         Ok(TaskGraphPlan {
             strategy: self.id().to_owned(),
             max_nodes: 1,
@@ -100,11 +107,7 @@ impl ManagerStrategy for SingleTaskStrategy {
             tasks: vec![PlannedTask {
                 key: "deliver".to_owned(),
                 title: "Produce the mission outcome".to_owned(),
-                contract: contract(
-                    format!("Complete the mission outcome: {}", request.mission_title),
-                    "A source-backed, verified mission artifact",
-                    budget_tokens,
-                ),
+                contract: task_contract,
                 assigned_agent_id: agent.id,
                 required_adapter: agent.adapter.clone(),
                 depends_on: Vec::new(),
@@ -425,6 +428,7 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         budget_tokens,
         deadline_at: None,
         escalation: "ask the current human controller or mission owner".to_owned(),
+        secret_refs: Vec::new(),
     }
 }
 
@@ -545,6 +549,37 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
             return Err(anyhow!(
                 "task {task_key} contains an invalid contract entry"
             ));
+        }
+    }
+    let mut environment_names = HashSet::new();
+    for secret in &contract.secret_refs {
+        if secret.env_name.is_empty()
+            || secret.env_name.len() > 128
+            || !secret.env_name.chars().all(|character| {
+                character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+            })
+            || secret
+                .env_name
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+        {
+            return Err(anyhow!(
+                "task {task_key} secret environment name is invalid"
+            ));
+        }
+        if !environment_names.insert(secret.env_name.as_str()) {
+            return Err(anyhow!(
+                "task {task_key} repeats secret environment name {}",
+                secret.env_name
+            ));
+        }
+        if secret.tool.trim().is_empty()
+            || secret.tool.len() > 64
+            || secret.resource.trim().is_empty()
+            || secret.resource.len() > 512
+        {
+            return Err(anyhow!("task {task_key} secret scope is invalid"));
         }
     }
     Ok(())
@@ -725,6 +760,7 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "ship the bounded graph",
             preferred_adapter: Some("codex"),
+            secret_refs: &[],
         };
         let agents = agents();
         let first = registry
@@ -756,6 +792,7 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "bounded plan",
             preferred_adapter: None,
+            secret_refs: &[],
         };
         let mut plan = registry
             .plan("parallel-specialists", &request, &agents)
@@ -826,6 +863,7 @@ mod tests {
                 &PlanningRequest {
                     mission_title: "use Codex",
                     preferred_adapter: Some("codex"),
+                    secret_refs: &[],
                 },
                 &agents,
             )
@@ -840,6 +878,7 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "verify safely",
             preferred_adapter: Some("fake-process"),
+            secret_refs: &[],
         };
 
         let mut plan = registry

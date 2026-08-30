@@ -195,6 +195,16 @@ pub struct TaskContract {
     pub budget_tokens: i64,
     pub deadline_at: Option<DateTime<Utc>>,
     pub escalation: String,
+    #[serde(default)]
+    pub secret_refs: Vec<TaskSecretReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSecretReference {
+    pub secret_id: Uuid,
+    pub env_name: String,
+    pub tool: String,
+    pub resource: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

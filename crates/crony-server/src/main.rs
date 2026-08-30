@@ -1,5 +1,6 @@
 mod auth;
 mod planning;
+mod secrets;
 
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
@@ -25,12 +26,13 @@ use crony_domain::DomainEvent;
 use crony_protocol::{
     BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
     CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
-    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, DemoBootstrapResponse,
-    EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest, InterruptRunResponse,
-    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest,
-    QueueMessageResponse, ReleaseLeaseRequest, ResumeRunRequest, ResumeRunResponse,
-    RevokeRunnerRequest, RevokeRunnerResponse, RunnerCapability, RunnerSummary, RunnerToServer,
-    ServerToRunner, SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
+    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, CreateSecretRequest,
+    CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
+    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
+    LeaseMutationResponse, QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest,
+    ResolvedSecret, ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
+    RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
+    SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
     VerificationDecisionResponse,
 };
 use crony_store::{
@@ -51,6 +53,7 @@ use uuid::Uuid;
 
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
 use planning::{PlanningRequest, StrategyRegistry};
+use secrets::SecretCipher;
 
 #[derive(Debug, Parser)]
 #[command(name = "crony-server")]
@@ -91,6 +94,9 @@ struct Args {
         default_value_t = 86_400
     )]
     runner_credential_ttl_secs: i64,
+
+    #[arg(long, env = "CRONY_SECRET_MASTER_KEY_HEX")]
+    secret_master_key_hex: Option<String>,
 }
 
 #[derive(Clone)]
@@ -102,6 +108,7 @@ struct AppState {
     runner_grace_secs: i64,
     runner_credential_ttl_secs: i64,
     auth: AuthService,
+    secret_cipher: SecretCipher,
 }
 
 #[derive(Clone)]
@@ -203,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         args.allow_insecure_oidc,
     )
     .await?;
+    let secret_cipher = SecretCipher::initialize(args.mode, args.secret_master_key_hex.as_deref())?;
     let (event_tx, _) = broadcast::channel(2_048);
     let state = AppState {
         store,
@@ -212,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
         runner_grace_secs: args.runner_grace_secs.max(1),
         runner_credential_ttl_secs: args.runner_credential_ttl_secs.clamp(300, 604_800),
         auth,
+        secret_cipher,
     };
 
     let protected = Router::new()
@@ -268,6 +277,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/ws-ticket",
             post(create_websocket_ticket),
+        )
+        .route("/api/corps/{corp_id}/secrets", post(create_secret))
+        .route(
+            "/api/corps/{corp_id}/secrets/{secret_id}/revoke",
+            post(revoke_secret),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -608,6 +622,130 @@ async fn create_websocket_ticket(
     })))
 }
 
+async fn create_secret(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<CreateSecretRequest>,
+) -> Result<Json<CreateSecretResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 100 {
+        return Err(ApiError::bad_request(
+            "secret name must contain between 1 and 100 characters",
+        ));
+    }
+    if request.value.is_empty() || request.value.len() > 65_536 {
+        return Err(ApiError::bad_request(
+            "secret value must contain between 1 and 65,536 bytes",
+        ));
+    }
+    if request.allowed_tools.is_empty() || request.allowed_tools.len() > 32 {
+        return Err(ApiError::bad_request(
+            "secret must allow between 1 and 32 tools",
+        ));
+    }
+    if request
+        .allowed_tools
+        .iter()
+        .any(|tool| !valid_scope_component(tool))
+    {
+        return Err(ApiError::bad_request(
+            "secret tool scopes must use letters, digits, dot, dash, or underscore",
+        ));
+    }
+    let resource_prefix = request.resource_prefix.trim();
+    if resource_prefix.is_empty() || resource_prefix.len() > 512 {
+        return Err(ApiError::bad_request(
+            "secret resource prefix must contain between 1 and 512 characters",
+        ));
+    }
+    let allowed_actor_ids = if request.allowed_actor_ids.is_empty() {
+        vec![actor_id]
+    } else {
+        request.allowed_actor_ids
+    };
+    for allowed_actor_id in &allowed_actor_ids {
+        if state
+            .store
+            .human_authorization(corp_id, *allowed_actor_id)
+            .await
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::bad_request(format!(
+                "allowed actor {allowed_actor_id} is not a human member of this Corp"
+            )));
+        }
+    }
+
+    let secret_id = Uuid::new_v4();
+    let (ciphertext, nonce) = state
+        .secret_cipher
+        .encrypt(corp_id, secret_id, name, request.value.as_bytes())
+        .map_err(ApiError::internal)?;
+    let event = state
+        .store
+        .create_secret(
+            corp_id,
+            actor_id,
+            secret_id,
+            name,
+            &ciphertext,
+            &nonce,
+            &allowed_actor_ids,
+            &request.allowed_tools,
+            resource_prefix,
+            request.max_ttl_seconds.clamp(30, 3_600) as i32,
+        )
+        .await
+        .map_err(map_store_error)?;
+    publish(&state, event);
+    Ok(Json(CreateSecretResponse {
+        secret_id,
+        name: name.to_owned(),
+    }))
+}
+
+async fn revoke_secret(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, secret_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RevokeSecretRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let event = state
+        .store
+        .revoke_secret(corp_id, actor_id, secret_id, &request.reason)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::bad_request("secret is missing or already revoked"))?;
+    publish(&state, event);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn valid_scope_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+}
+
 async fn snapshot(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -669,6 +807,11 @@ async fn create_mission(
     )
     .await?;
     let strategy = request.strategy.as_deref().unwrap_or("single");
+    if !request.secret_refs.is_empty() && strategy != "single" {
+        return Err(ApiError::bad_request(
+            "secret references currently require the single-task strategy",
+        ));
+    }
     let agents = state
         .store
         .agents_for_planning(corp_id)
@@ -681,6 +824,7 @@ async fn create_mission(
             &PlanningRequest {
                 mission_title: &request.title,
                 preferred_adapter: request.preferred_adapter.as_deref(),
+                secret_refs: &request.secret_refs,
             },
             &agents,
         )
@@ -794,6 +938,23 @@ async fn schedule_ready_tasks(
         else {
             continue;
         };
+        let secrets = match resolve_run_secrets(state, &record, &runner_id).await {
+            Ok(secrets) => secrets,
+            Err(error) => {
+                if let Ok(event) = state
+                    .store
+                    .fail_run_before_dispatch(
+                        corp_id,
+                        record.run_id,
+                        &format!("secret broker denied assignment: {error}"),
+                    )
+                    .await
+                {
+                    publish(state, event);
+                }
+                continue;
+            }
+        };
         runner_tx
             .send(ServerToRunner::StartRun {
                 corp_id: record.corp_id,
@@ -806,12 +967,55 @@ async fn schedule_ready_tasks(
                 adapter: record.adapter.clone(),
                 mission_title: record.mission_title.clone(),
                 verification_policy: record.verification_policy.clone(),
+                secrets,
             })
             .map_err(|_| anyhow::anyhow!("runner disconnected before accepting the run"))?;
         publish(state, event);
         scheduled.push((record, runner_id));
     }
     Ok(scheduled)
+}
+
+async fn resolve_run_secrets(
+    state: &AppState,
+    record: &LaunchRecord,
+    runner_id: &str,
+) -> anyhow::Result<Vec<ResolvedSecret>> {
+    let (grants, events) = state
+        .store
+        .grant_run_secrets(
+            record.corp_id,
+            record.task_id,
+            record.run_id,
+            runner_id,
+            &record.secret_refs,
+        )
+        .await?;
+    let mut resolved = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let plaintext = state.secret_cipher.decrypt(
+            record.corp_id,
+            grant.secret_id,
+            &grant.name,
+            &grant.ciphertext,
+            &grant.nonce,
+        )?;
+        let value = String::from_utf8(plaintext).context("secret value is not valid UTF-8")?;
+        resolved.push(ResolvedSecret {
+            grant_id: grant.grant_id,
+            secret_id: grant.secret_id,
+            env_name: grant.env_name,
+            value,
+            tool: grant.tool,
+            resource: grant.resource,
+            expires_at: grant.expires_at.to_rfc3339(),
+            assurance: "environment_reduced_assurance".to_owned(),
+        });
+    }
+    for event in events {
+        publish(state, event);
+    }
+    Ok(resolved)
 }
 
 async fn schedule_ready_corp(state: &AppState, corp_id: Uuid) -> anyhow::Result<()> {
@@ -879,6 +1083,38 @@ async fn resume_run(
             "source run's runner is enrolled to a different Corp",
         ));
     }
+    let launch_record = LaunchRecord {
+        corp_id: record.corp_id,
+        room_id: record.room_id,
+        mission_id: record.mission_id,
+        task_id: record.task_id,
+        run_id: record.run_id,
+        agent_id: record.agent_id,
+        assignment_token: record.assignment_token,
+        attempt: 0,
+        adapter: record.adapter.clone(),
+        mission_title: prompt.to_owned(),
+        verification_policy: record.verification_policy.clone(),
+        secret_refs: record.secret_refs.clone(),
+    };
+    let secrets = match resolve_run_secrets(&state, &launch_record, &record.runner_id).await {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let failure = state
+                .store
+                .fail_run_before_dispatch(
+                    corp_id,
+                    record.run_id,
+                    &format!("secret broker denied resumed assignment: {error}"),
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            publish(&state, failure);
+            return Err(ApiError::conflict(
+                "secret broker denied resumed assignment",
+            ));
+        }
+    };
     runner
         .tx
         .send(ServerToRunner::ResumeRun {
@@ -894,6 +1130,7 @@ async fn resume_run(
             provider_session_id: record.provider_session_id.clone(),
             prompt: prompt.to_owned(),
             verification_policy: record.verification_policy,
+            secrets,
         })
         .map_err(|_| ApiError::conflict("runner disconnected before accepting resume"))?;
     publish(&state, event);

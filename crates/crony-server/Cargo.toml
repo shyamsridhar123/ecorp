@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+chacha20poly1305.workspace = true
 clap.workspace = true
 crony-domain = { path = "../crony-domain" }
 crony-protocol = { path = "../crony-protocol" }

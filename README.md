@@ -25,6 +25,7 @@ The UI can close without terminating active work.
 - Durable Postgres state and event journal
 - Production OIDC authentication with Corp-scoped, deny-by-default RBAC
 - One-time runner enrollment, rotating workload credentials, replay rejection, and revocation
+- Encrypted, actor/task/tool/resource-scoped secret delivery with metadata-only audit events
 - Browser WebSocket updates
 - Resumable, room-filtered event replay
 - Outbound-connected runner daemon
@@ -77,7 +78,8 @@ checkout itself.
 
 In production, set `CRONY_MODE=production`, configure an HTTPS `CRONY_OIDC_ISSUER`, provision
 `human_identities`, and explicitly enroll each runner. Demo endpoints and claimed demo identities
-are unavailable in production.
+are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a deployment-managed
+32-byte key encoded as 64 hexadecimal characters.
 
 ## Documents
 
@@ -92,6 +94,7 @@ are unavailable in production.
 - [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
 - [`docs/evidence/2026-08-29-evidence-verification-validation.md`](docs/evidence/2026-08-29-evidence-verification-validation.md)
 - [`docs/evidence/2026-08-30-identity-validation.md`](docs/evidence/2026-08-30-identity-validation.md)
+- [`docs/evidence/2026-08-30-secret-broker-validation.md`](docs/evidence/2026-08-30-secret-broker-validation.md)
 
 ## License
 

@@ -23,6 +23,8 @@ Before a non-trivial change, read:
 - Irreversible effects require authorization and idempotency.
 - Tenant and Corp scope must be explicit on every stored object.
 - Never put long-lived secrets in prompts, logs, command arguments, or agent-readable files.
+- Secret values must be brokered against actor, task, run, runner, tool, resource, and expiry scope.
+- Environment-only secret delivery must remain explicitly labeled reduced assurance.
 
 ## Validation
 
