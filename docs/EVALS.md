@@ -85,7 +85,11 @@ dependency-gated synthesis task, then proves an always-failing task stops exactl
 limit.
 `tools/e2e_verification.mjs` proves all six automated verifier types, a missing-file failure that
 blocks completion, an owner approval gate, and an independent-review gate that rejects the
-requester before accepting Bob's reviewer decision.
+requester before accepting Bob's member-role decision.
+
+`tools/e2e_identity.mjs` proves production OIDC enforcement, actor-spoof and cross-Corp rejection,
+authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
+rejection, and revocation. See `docs/evidence/2026-08-30-identity-validation.md`.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and

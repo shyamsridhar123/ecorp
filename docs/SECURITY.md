@@ -2,14 +2,12 @@
 
 ## Current status
 
-The current implementation is a local development vertical slice. It demonstrates architecture
-and end-to-end behavior; it is not yet suitable for an untrusted network.
+The current implementation has production authentication and workload identity boundaries, but it
+is not yet suitable for an untrusted network until scoped secrets and durable artifact storage land.
 
 Known development-only shortcuts:
 
-- no human authentication
 - fixed demo identities
-- no runner enrollment secret or certificate
 - permissive CORS
 - host-local artifact paths
 - fake process runs with the local user's permissions
@@ -17,9 +15,14 @@ Known development-only shortcuts:
 
 These are explicit backlog items, not production claims.
 
-The development identity model still enforces room membership in persistence, snapshots, writes,
-WebSocket replay, and live delivery. Eve is a deliberate non-member fixture used to prove that
-room-scoped missions, tasks, runs, messages, and events are not returned.
+Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
+maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.
+Development mode still enforces room membership in persistence, snapshots, writes, WebSocket
+replay, and live delivery. Eve is a deliberate non-member fixture used to prove that room-scoped
+missions, tasks, runs, messages, and events are not returned.
+
+Runner nodes require one-time enrollment followed by rotating, expiring workload credentials.
+Only credential hashes are stored. Replayed, expired, unknown, and revoked credentials are denied.
 
 ## Required production boundaries
 

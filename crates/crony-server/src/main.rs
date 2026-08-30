@@ -1,28 +1,36 @@
+mod auth;
 mod planning;
 
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
+    body::Body,
     extract::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{
+        HeaderValue, Method, Request, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName},
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::DomainEvent;
 use crony_protocol::{
     BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
     CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
-    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest,
-    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
-    QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResumeRunRequest,
-    ResumeRunResponse, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
+    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, DemoBootstrapResponse,
+    EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest, InterruptRunResponse,
+    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest,
+    QueueMessageResponse, ReleaseLeaseRequest, ResumeRunRequest, ResumeRunResponse,
+    RevokeRunnerRequest, RevokeRunnerResponse, RunnerCapability, RunnerSummary, RunnerToServer,
+    ServerToRunner, SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
     VerificationDecisionResponse,
 };
 use crony_store::{
@@ -32,6 +40,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -40,6 +49,7 @@ use tower_http::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
 use planning::{PlanningRequest, StrategyRegistry};
 
 #[derive(Debug, Parser)]
@@ -57,6 +67,30 @@ struct Args {
 
     #[arg(long, env = "CRONY_RUNNER_GRACE_SECS", default_value_t = 5)]
     runner_grace_secs: i64,
+
+    #[arg(
+        long,
+        env = "CRONY_MODE",
+        value_enum,
+        default_value_t = ServerMode::Development
+    )]
+    mode: ServerMode,
+
+    #[arg(long, env = "CRONY_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    #[arg(long, env = "CRONY_ALLOW_INSECURE_OIDC", default_value_t = false)]
+    allow_insecure_oidc: bool,
+
+    #[arg(long, env = "CRONY_CORS_ORIGINS", value_delimiter = ',')]
+    cors_origins: Vec<String>,
+
+    #[arg(
+        long,
+        env = "CRONY_RUNNER_CREDENTIAL_TTL_SECS",
+        default_value_t = 86_400
+    )]
+    runner_credential_ttl_secs: i64,
 }
 
 #[derive(Clone)]
@@ -66,10 +100,13 @@ struct AppState {
     runners: Arc<DashMap<String, RunnerConnection>>,
     strategies: StrategyRegistry,
     runner_grace_secs: i64,
+    runner_credential_ttl_secs: i64,
+    auth: AuthService,
 }
 
 #[derive(Clone)]
 struct RunnerConnection {
+    corp_id: Uuid,
     connection_epoch: Uuid,
     tx: mpsc::UnboundedSender<ServerToRunner>,
     capabilities: Vec<RunnerCapability>,
@@ -110,6 +147,13 @@ impl ApiError {
             message: error.to_string(),
         }
     }
+
+    fn unauthorized(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: error.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -137,6 +181,7 @@ struct HealthResponse {
     status: &'static str,
     service: &'static str,
     runners: usize,
+    mode: &'static str,
 }
 
 #[tokio::main]
@@ -152,6 +197,12 @@ async fn main() -> anyhow::Result<()> {
 
     let store = PgStore::connect(&args.database_url).await?;
     store.migrate().await?;
+    let auth = AuthService::initialize(
+        args.mode,
+        args.oidc_issuer.clone(),
+        args.allow_insecure_oidc,
+    )
+    .await?;
     let (event_tx, _) = broadcast::channel(2_048);
     let state = AppState {
         store,
@@ -159,16 +210,11 @@ async fn main() -> anyhow::Result<()> {
         runners: Arc::new(DashMap::new()),
         strategies: StrategyRegistry::new(),
         runner_grace_secs: args.runner_grace_secs.max(1),
+        runner_credential_ttl_secs: args.runner_credential_ttl_secs.clamp(300, 604_800),
+        auth,
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/api/demo/bootstrap", post(bootstrap_demo))
-        .route("/api/demo/reset", post(reset_demo))
-        .route(
-            "/api/demo/runners/{runner_id}/disconnect",
-            post(debug_disconnect_runner),
-        )
+    let protected = Router::new()
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
         .route("/api/corps/{corp_id}/missions", post(create_mission))
         .route(
@@ -211,16 +257,67 @@ async fn main() -> anyhow::Result<()> {
             "/api/corps/{corp_id}/agents/{agent_id}/interrupt",
             post(interrupt_run),
         )
+        .route(
+            "/api/corps/{corp_id}/runners/enroll",
+            post(create_runner_enrollment),
+        )
+        .route(
+            "/api/corps/{corp_id}/runners/{runner_id}/revoke",
+            post(revoke_runner),
+        )
+        .route(
+            "/api/corps/{corp_id}/ws-ticket",
+            post(create_websocket_ticket),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_http,
+        ));
+
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .route("/ws/corps/{corp_id}", get(browser_websocket))
         .route("/ws/runner", get(runner_websocket))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers(Any)
-                .allow_methods(Any),
-        )
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .layer(TraceLayer::new_for_http());
+
+    if args.mode == ServerMode::Development {
+        app = app
+            .route("/api/demo/bootstrap", post(bootstrap_demo))
+            .route("/api/demo/reset", post(reset_demo))
+            .route("/api/demo/oidc-link", post(debug_link_oidc_identity))
+            .route(
+                "/api/demo/runners/{runner_id}/disconnect",
+                post(debug_disconnect_runner),
+            )
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_headers(Any)
+                    .allow_methods(Any),
+            );
+    } else {
+        let origins = args
+            .cors_origins
+            .iter()
+            .map(|value| {
+                HeaderValue::from_str(value)
+                    .with_context(|| format!("invalid CRONY_CORS_ORIGINS entry {value}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut cors = CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                HeaderName::from_static("x-crony-request-id"),
+            ]);
+        if !origins.is_empty() {
+            cors = cors.allow_origin(origins).allow_credentials(true);
+        }
+        app = app.layer(cors);
+    }
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
@@ -235,7 +332,74 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         service: "crony-server",
         runners: state.runners.len(),
+        mode: match state.auth.mode() {
+            ServerMode::Development => "development",
+            ServerMode::Production => "production",
+        },
     })
+}
+
+async fn authenticate_http(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    match state.auth.authenticate_headers(request.headers()).await {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(error) => ApiError::unauthorized(error).into_response(),
+    }
+}
+
+async fn authorize_actor(
+    state: &AppState,
+    principal: &Principal,
+    corp_id: Uuid,
+    claimed_actor_id: Option<Uuid>,
+    permission: Permission,
+) -> Result<Uuid, ApiError> {
+    let authorization = match principal {
+        Principal::Development => {
+            let actor_id = claimed_actor_id
+                .ok_or_else(|| ApiError::unauthorized("development actor identity is missing"))?;
+            state
+                .store
+                .human_authorization(corp_id, actor_id)
+                .await
+                .map_err(ApiError::internal)?
+        }
+        Principal::Oidc {
+            issuer,
+            subject,
+            email,
+        } => {
+            let _ = email;
+            state
+                .store
+                .resolve_human_identity(corp_id, issuer, subject)
+                .await
+                .map_err(ApiError::internal)?
+        }
+    }
+    .ok_or_else(|| ApiError::forbidden("identity is not a human member of this Corp"))?;
+
+    if let Some(claimed) = claimed_actor_id
+        && claimed != authorization.actor_id
+    {
+        return Err(ApiError::forbidden(
+            "request actor does not match the authenticated identity",
+        ));
+    }
+    let role = CorpRole::parse(&authorization.role).map_err(ApiError::forbidden)?;
+    if !role.allows(permission) {
+        return Err(ApiError::forbidden(format!(
+            "Corp role {} is not allowed to perform this action",
+            authorization.role
+        )));
+    }
+    Ok(authorization.actor_id)
 }
 
 async fn bootstrap_demo(
@@ -308,24 +472,170 @@ async fn debug_disconnect_runner(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct DebugOidcLinkRequest {
+    actor_id: Uuid,
+    issuer: String,
+    subject: String,
+    email: Option<String>,
+}
+
+async fn debug_link_oidc_identity(
+    State(state): State<AppState>,
+    Json(request): Json<DebugOidcLinkRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .store
+        .link_human_identity(
+            request.actor_id,
+            request.issuer.trim_end_matches('/'),
+            &request.subject,
+            request.email.as_deref(),
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_runner_enrollment(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<CreateRunnerEnrollmentRequest>,
+) -> Result<Json<CreateRunnerEnrollmentResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let ttl = request.expires_in_seconds.clamp(60, 3_600) as i64;
+    let expires_at = Utc::now() + ChronoDuration::seconds(ttl);
+    let enrollment_token = new_runner_token("enroll");
+    let outcome = state
+        .store
+        .create_runner_enrollment(
+            corp_id,
+            actor_id,
+            &request.runner_id,
+            &hash_secret(&enrollment_token),
+            expires_at,
+        )
+        .await
+        .map_err(map_store_error)?;
+    publish(&state, outcome.event);
+    Ok(Json(CreateRunnerEnrollmentResponse {
+        runner_id: request.runner_id,
+        enrollment_token,
+        expires_at: outcome.expires_at.to_rfc3339(),
+    }))
+}
+
+async fn revoke_runner(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, runner_id)): Path<(Uuid, String)>,
+    Json(request): Json<RevokeRunnerRequest>,
+) -> Result<Json<RevokeRunnerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .revoke_runner(corp_id, actor_id, &runner_id, &request.reason)
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.revoked
+        && let Some(connection) = state.runners.get(&runner_id)
+        && connection.corp_id == corp_id
+    {
+        let _ = connection.tx.send(ServerToRunner::Disconnect {
+            reason: "runner credential revoked".to_owned(),
+            reconnect_delay_ms: 60_000,
+        });
+    }
+    Ok(Json(RevokeRunnerResponse {
+        runner_id,
+        revoked: outcome.revoked,
+    }))
+}
+
+fn new_runner_token(kind: &str) -> String {
+    format!(
+        "crony_{kind}_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn hash_secret(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketTicketRequest {
+    actor_id: Uuid,
+}
+
+async fn create_websocket_ticket(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<WebSocketTicketRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Read,
+    )
+    .await?;
+    let (ticket, expires_in_seconds) = state.auth.issue_websocket_ticket(corp_id, actor_id);
+    Ok(Json(json!({
+        "ticket": ticket,
+        "expires_in_seconds": expires_in_seconds,
+    })))
+}
+
 async fn snapshot(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(corp_id): Path<Uuid>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Read,
+    )
+    .await?;
     let snapshot = state
         .store
-        .snapshot(corp_id, query.actor_id)
+        .snapshot(corp_id, actor_id)
         .await
         .map_err(map_store_error)?;
     let runners = state
         .store
-        .runner_records()
+        .runner_records(corp_id)
         .await
         .map_err(ApiError::internal)?
         .into_iter()
         .map(|record| RunnerSummary {
             id: record.id,
+            corp_id: record.corp_id,
             hostname: record.hostname,
             os: record.os,
             capabilities: serde_json::from_value::<Vec<RunnerCapability>>(record.capabilities)
@@ -346,9 +656,18 @@ struct SnapshotQuery {
 
 async fn create_mission(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(corp_id): Path<Uuid>,
     Json(request): Json<CreateMissionRequest>,
 ) -> Result<Json<CreateMissionResponse>, ApiError> {
+    let requested_by = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.requested_by),
+        Permission::Operate,
+    )
+    .await?;
     let strategy = request.strategy.as_deref().unwrap_or("single");
     let agents = state
         .store
@@ -368,7 +687,7 @@ async fn create_mission(
         .map_err(ApiError::bad_request)?;
     let (ids, events) = state
         .store
-        .create_mission(corp_id, request.requested_by, &request.title, &plan)
+        .create_mission(corp_id, requested_by, &request.title, &plan)
         .await
         .map_err(map_store_error)?;
     for event in events {
@@ -384,15 +703,24 @@ async fn create_mission(
 
 async fn create_room_message(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, room_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateRoomMessageRequest>,
 ) -> Result<Json<CreateRoomMessageResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::PostMessage,
+    )
+    .await?;
     let outcome = state
         .store
         .create_room_message(NewRoomMessageInput {
             corp_id,
             room_id,
-            actor_id: request.actor_id,
+            actor_id,
             body: request.body,
             reply_to_id: request.reply_to_id,
             mentions: request.mentions,
@@ -408,10 +736,19 @@ async fn create_room_message(
 
 async fn launch_mission(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<LaunchMissionRequest>,
 ) -> Result<Json<LaunchMissionResponse>, ApiError> {
-    let records = schedule_ready_tasks(&state, corp_id, mission_id, Some(request.requested_by))
+    let requested_by = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.requested_by),
+        Permission::Operate,
+    )
+    .await?;
+    let records = schedule_ready_tasks(&state, corp_id, mission_id, Some(requested_by))
         .await
         .map_err(ApiError::conflict)?;
     let first = records
@@ -439,7 +776,9 @@ async fn schedule_ready_tasks(
     let candidates = state.store.schedulable_tasks(corp_id, mission_id).await?;
     let mut scheduled = Vec::new();
     for candidate in candidates {
-        let Some((runner_id, runner_tx)) = select_runner(state, &candidate.required_adapter) else {
+        let Some((runner_id, runner_tx)) =
+            select_runner(state, corp_id, &candidate.required_adapter)
+        else {
             continue;
         };
         let Ok((record, event)) = state
@@ -484,16 +823,18 @@ async fn schedule_ready_corp(state: &AppState, corp_id: Uuid) -> anyhow::Result<
 
 fn select_runner(
     state: &AppState,
+    corp_id: Uuid,
     required_adapter: &str,
 ) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
     let mut runners = state
         .runners
         .iter()
         .filter(|entry| {
-            entry
-                .capabilities
-                .iter()
-                .any(|capability| capability.name == required_adapter && capability.available)
+            entry.corp_id == corp_id
+                && entry
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.name == required_adapter && capability.available)
         })
         .map(|entry| (entry.key().clone(), entry.tx.clone()))
         .collect::<Vec<_>>();
@@ -503,9 +844,18 @@ fn select_runner(
 
 async fn resume_run(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, source_run_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ResumeRunRequest>,
 ) -> Result<Json<ResumeRunResponse>, ApiError> {
+    let requested_by = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.requested_by),
+        Permission::Operate,
+    )
+    .await?;
     let prompt = request.prompt.trim();
     if prompt.is_empty() {
         return Err(ApiError::bad_request("resume prompt cannot be empty"));
@@ -517,13 +867,18 @@ async fn resume_run(
     }
     let (record, event) = state
         .store
-        .create_resume_run(corp_id, source_run_id, request.requested_by)
+        .create_resume_run(corp_id, source_run_id, requested_by)
         .await
         .map_err(ApiError::conflict)?;
     let runner = state
         .runners
         .get(&record.runner_id)
         .ok_or_else(|| ApiError::conflict("source run's runner is disconnected"))?;
+    if runner.corp_id != corp_id {
+        return Err(ApiError::forbidden(
+            "source run's runner is enrolled to a different Corp",
+        ));
+    }
     runner
         .tx
         .send(ServerToRunner::ResumeRun {
@@ -551,18 +906,21 @@ async fn resume_run(
 
 async fn decide_verification(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, run_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<VerificationDecisionRequest>,
 ) -> Result<Json<VerificationDecisionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Approve,
+    )
+    .await?;
     let outcome = state
         .store
-        .decide_verification(
-            corp_id,
-            run_id,
-            request.actor_id,
-            request.approved,
-            &request.note,
-        )
+        .decide_verification(corp_id, run_id, actor_id, request.approved, &request.note)
         .await
         .map_err(map_store_error)?;
     publish(&state, outcome.event);
@@ -579,12 +937,21 @@ async fn decide_verification(
 
 async fn claim_lease(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
     let outcome = state
         .store
-        .acquire_lease(corp_id, agent_id, request.actor_id)
+        .acquire_lease(corp_id, agent_id, actor_id)
         .await
         .map_err(ApiError::bad_request)?;
     if let Some(event) = outcome.event {
@@ -600,12 +967,21 @@ async fn claim_lease(
 
 async fn release_lease(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ReleaseLeaseRequest>,
 ) -> Result<Json<LeaseMutationResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
     let outcome = state
         .store
-        .release_lease(corp_id, agent_id, request.actor_id, request.token)
+        .release_lease(corp_id, agent_id, actor_id, request.token)
         .await
         .map_err(ApiError::conflict)?;
     publish(&state, outcome.event);
@@ -618,15 +994,24 @@ async fn release_lease(
 
 async fn transfer_lease(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<TransferLeaseRequest>,
 ) -> Result<Json<LeaseMutationResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
     let outcome = state
         .store
         .transfer_lease(
             corp_id,
             agent_id,
-            request.actor_id,
+            actor_id,
             request.token,
             request.to_actor_id,
         )
@@ -646,15 +1031,24 @@ async fn transfer_lease(
 
 async fn queue_message(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<QueueMessageRequest>,
 ) -> Result<Json<QueueMessageResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
     let outcome = state
         .store
         .queue_message(
             corp_id,
             agent_id,
-            request.actor_id,
+            actor_id,
             request.lease_token,
             &request.text,
         )
@@ -671,7 +1065,7 @@ async fn queue_message(
             corp_id,
             run_id,
             agent_id,
-            actor_id: request.actor_id,
+            actor_id,
             lease_token,
             text: request.text,
         });
@@ -685,12 +1079,21 @@ async fn queue_message(
 
 async fn emergency_stop(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<EmergencyStopRequest>,
 ) -> Result<Json<EmergencyStopResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::EmergencyStop,
+    )
+    .await?;
     let outcome = match state
         .store
-        .request_emergency_stop(corp_id, agent_id, request.actor_id, &request.reason)
+        .request_emergency_stop(corp_id, agent_id, actor_id, &request.reason)
         .await
     {
         Ok(outcome) => outcome,
@@ -719,15 +1122,24 @@ async fn emergency_stop(
 
 async fn interrupt_run(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<InterruptRunRequest>,
 ) -> Result<Json<InterruptRunResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
     let outcome = state
         .store
         .request_interrupt(
             corp_id,
             agent_id,
-            request.actor_id,
+            actor_id,
             request.lease_token,
             &request.reason,
         )
@@ -757,19 +1169,49 @@ async fn browser_websocket(
     Path(corp_id): Path<Uuid>,
     Query(query): Query<BrowserQuery>,
 ) -> Result<Response, ApiError> {
-    if !state
-        .store
-        .actor_belongs_to_corp(corp_id, query.actor_id)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        return Err(ApiError::forbidden(
-            "actor cannot subscribe to the requested Corp",
-        ));
-    }
+    let principal = match state.auth.mode() {
+        ServerMode::Development => Principal::Development,
+        ServerMode::Production => {
+            let token = query
+                .ticket
+                .as_deref()
+                .ok_or_else(|| ApiError::unauthorized("WebSocket ticket is required"))?;
+            let actor_id = state
+                .auth
+                .consume_websocket_ticket(corp_id, token)
+                .map_err(ApiError::unauthorized)?;
+            let visible_rooms = state
+                .store
+                .visible_room_ids(corp_id, actor_id)
+                .await
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            return Ok(ws
+                .on_upgrade(move |socket| {
+                    browser_socket(
+                        socket,
+                        state,
+                        corp_id,
+                        actor_id,
+                        query.after_seq,
+                        visible_rooms,
+                    )
+                })
+                .into_response());
+        }
+    };
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        query.actor_id,
+        Permission::Read,
+    )
+    .await?;
     let visible_rooms = state
         .store
-        .visible_room_ids(corp_id, query.actor_id)
+        .visible_room_ids(corp_id, actor_id)
         .await
         .map_err(ApiError::internal)?
         .into_iter()
@@ -780,7 +1222,7 @@ async fn browser_websocket(
                 socket,
                 state,
                 corp_id,
-                query.actor_id,
+                actor_id,
                 query.after_seq,
                 visible_rooms,
             )
@@ -790,7 +1232,8 @@ async fn browser_websocket(
 
 #[derive(Debug, Deserialize)]
 struct BrowserQuery {
-    actor_id: Uuid,
+    actor_id: Option<Uuid>,
+    ticket: Option<String>,
     #[serde(default)]
     after_seq: i64,
 }
@@ -913,7 +1356,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut registered: Option<(String, Uuid)> = None;
+    let mut registered: Option<(String, Uuid, Uuid)> = None;
     while let Some(message) = receiver.next().await {
         let message = match message {
             Ok(Message::Text(text)) => text,
@@ -941,16 +1384,44 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         match incoming {
             RunnerToServer::Register {
                 runner_id,
+                corp_id,
+                credential,
                 connection_epoch,
                 hostname,
                 os,
                 capabilities,
                 active_runs,
             } => {
+                let next_credential = new_runner_token("runner");
+                let credential_expires_at =
+                    Utc::now() + ChronoDuration::seconds(state.runner_credential_ttl_secs);
+                let authentication = match state
+                    .store
+                    .authenticate_and_rotate_runner(
+                        corp_id,
+                        &runner_id,
+                        &hash_secret(&credential),
+                        &hash_secret(&next_credential),
+                        credential_expires_at,
+                    )
+                    .await
+                {
+                    Ok(authentication) => authentication,
+                    Err(error) => {
+                        warn!(%error, %runner_id, %corp_id, "runner authentication rejected");
+                        let _ = command_tx.send(ServerToRunner::RegistrationRejected {
+                            reason: "runner credential rejected".to_owned(),
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        break;
+                    }
+                };
+                publish(&state, authentication.event);
                 let record = match state
                     .store
                     .runner_connected(RunnerConnectInput {
                         id: runner_id.clone(),
+                        corp_id,
                         hostname,
                         os,
                         capabilities: match serde_json::to_value(&capabilities) {
@@ -974,6 +1445,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 let previous = state.runners.insert(
                     runner_id.clone(),
                     RunnerConnection {
+                        corp_id,
                         connection_epoch,
                         tx: command_tx.clone(),
                         capabilities: capabilities.clone(),
@@ -987,9 +1459,20 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                         reconnect_delay_ms: 0,
                     });
                 }
-                registered = Some((runner_id.clone(), connection_epoch));
+                registered = Some((runner_id.clone(), corp_id, connection_epoch));
                 let _ = command_tx.send(ServerToRunner::Registered {
                     runner_id: runner_id.clone(),
+                    credential: next_credential,
+                    expires_at: authentication.expires_at.to_rfc3339(),
+                });
+                let rotation_tx = command_tx.clone();
+                let rotate_after = (state.runner_credential_ttl_secs - 60).max(60) as u64;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(rotate_after)).await;
+                    let _ = rotation_tx.send(ServerToRunner::Disconnect {
+                        reason: "rotate runner workload credential".to_owned(),
+                        reconnect_delay_ms: 0,
+                    });
                 });
                 let claims = active_runs
                     .iter()
@@ -1055,9 +1538,12 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 connection_epoch,
                 active_runs,
             } => {
-                if !registered.as_ref().is_some_and(|(registered_id, epoch)| {
-                    registered_id == &runner_id && *epoch == connection_epoch
-                }) {
+                if !registered
+                    .as_ref()
+                    .is_some_and(|(registered_id, _, epoch)| {
+                        registered_id == &runner_id && *epoch == connection_epoch
+                    })
+                {
                     warn!(%runner_id, "heartbeat from unregistered runner");
                     continue;
                 }
@@ -1086,7 +1572,12 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 event_type,
                 payload,
             } => {
-                if registered.as_ref().map(|value| value.0.as_str()) != Some(runner_id.as_str()) {
+                if !registered
+                    .as_ref()
+                    .is_some_and(|(registered_id, registered_corp, _)| {
+                        registered_id == &runner_id && *registered_corp == corp_id
+                    })
+                {
                     warn!(%runner_id, "run event runner id does not match registered socket");
                     continue;
                 }
@@ -1132,7 +1623,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    if let Some((runner_id, connection_epoch)) = registered {
+    if let Some((runner_id, _, connection_epoch)) = registered {
         let is_current = state
             .runners
             .get(&runner_id)

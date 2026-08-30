@@ -339,11 +339,7 @@ impl ManagerStrategy for IndependentReviewStrategy {
             VerificationPolicy {
                 checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
                 manual_gate: Some(ManualVerificationGate::IndependentReview {
-                    roles: vec![
-                        "reviewer".to_owned(),
-                        "owner".to_owned(),
-                        "admin".to_owned(),
-                    ],
+                    roles: vec!["member".to_owned(), "owner".to_owned(), "admin".to_owned()],
                     exclude_requester: true,
                 }),
             },

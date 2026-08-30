@@ -144,6 +144,7 @@ pub struct NewRoomMessageInput {
 #[derive(Debug, Clone)]
 pub struct RunnerRecord {
     pub id: String,
+    pub corp_id: Uuid,
     pub hostname: String,
     pub os: String,
     pub capabilities: Value,
@@ -162,6 +163,7 @@ pub struct RunClaim {
 #[derive(Debug, Clone)]
 pub struct RunnerConnectInput {
     pub id: String,
+    pub corp_id: Uuid,
     pub hostname: String,
     pub os: String,
     pub capabilities: Value,
@@ -176,6 +178,26 @@ pub struct RunnerReconcileOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct RunnerEnrollmentOutcome {
+    pub enrollment_id: Uuid,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerAuthenticationOutcome {
+    pub corp_id: Uuid,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerRevocationOutcome {
+    pub revoked: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerEventInput {
     pub event_id: Uuid,
     pub runner_id: String,
@@ -184,6 +206,12 @@ pub struct RunnerEventInput {
     pub agent_id: Uuid,
     pub event_type: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct HumanAuthorization {
+    pub actor_id: Uuid,
+    pub role: String,
 }
 
 impl PgStore {
@@ -205,6 +233,89 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn human_authorization(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<Option<HumanAuthorization>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, role
+            FROM actors
+            WHERE id = $1 AND corp_id = $2 AND kind = 'human'
+            "#,
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| HumanAuthorization {
+            actor_id: row.get("id"),
+            role: row.get("role"),
+        }))
+    }
+
+    pub async fn resolve_human_identity(
+        &self,
+        corp_id: Uuid,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<HumanAuthorization>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE human_identities identity
+            SET last_authenticated_at = now()
+            FROM actors actor
+            WHERE identity.issuer = $1
+              AND identity.subject = $2
+              AND identity.actor_id = actor.id
+              AND actor.corp_id = $3
+              AND actor.kind = 'human'
+            RETURNING actor.id, actor.role
+            "#,
+        )
+        .bind(issuer)
+        .bind(subject)
+        .bind(corp_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| HumanAuthorization {
+            actor_id: row.get("id"),
+            role: row.get("role"),
+        }))
+    }
+
+    pub async fn link_human_identity(
+        &self,
+        actor_id: Uuid,
+        issuer: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> Result<()> {
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM actors WHERE id = $1")
+            .bind(actor_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if kind.as_deref() != Some("human") {
+            return Err(anyhow!("identity can only be linked to a human actor"));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO human_identities (issuer, subject, actor_id, email)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (issuer, subject) DO UPDATE
+            SET actor_id = EXCLUDED.actor_id, email = EXCLUDED.email
+            "#,
+        )
+        .bind(issuer)
+        .bind(subject)
+        .bind(actor_id)
+        .bind(email)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn agents_for_planning(&self, corp_id: Uuid) -> Result<Vec<Agent>> {
@@ -255,7 +366,7 @@ impl PgStore {
 
         for (id, name, kind, role) in [
             (ids.alice_actor_id, "Alice", "human", "owner"),
-            (ids.bob_actor_id, "Bob", "human", "reviewer"),
+            (ids.bob_actor_id, "Bob", "human", "member"),
             (ids.eve_actor_id, "Eve", "human", "guest"),
             (manager_actor_id, "Margo", "agent", "manager"),
             (worker_actor_id, "Wally", "agent", "engineer"),
@@ -766,15 +877,277 @@ impl PgStore {
         Ok(rooms)
     }
 
+    pub async fn create_runner_enrollment(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        runner_id: &str,
+        token_hash: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<RunnerEnrollmentOutcome> {
+        let runner_id = runner_id.trim();
+        if runner_id.is_empty() || runner_id.len() > 128 {
+            return Err(anyhow!(
+                "runner id must contain between 1 and 128 characters"
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can enroll a runner"
+            ));
+        }
+        let enrollment_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO runner_enrollment_tokens
+                (id, corp_id, runner_id, token_hash, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(enrollment_id)
+        .bind(corp_id)
+        .bind(runner_id)
+        .bind(token_hash)
+        .bind(actor_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "runner.enrollment_created",
+                "runner_enrollment",
+                enrollment_id,
+                format!("runner-enrollment-created:{enrollment_id}"),
+                json!({
+                    "runner_id": runner_id,
+                    "expires_at": expires_at,
+                }),
+            ),
+        )
+        .await?
+        .context("new runner enrollment event was unexpectedly deduplicated")?;
+        tx.commit().await?;
+        Ok(RunnerEnrollmentOutcome {
+            enrollment_id,
+            expires_at,
+            event,
+        })
+    }
+
+    pub async fn authenticate_and_rotate_runner(
+        &self,
+        corp_id: Uuid,
+        runner_id: &str,
+        presented_token_hash: &str,
+        next_token_hash: &str,
+        next_expires_at: chrono::DateTime<Utc>,
+    ) -> Result<RunnerAuthenticationOutcome> {
+        let mut tx = self.pool.begin().await?;
+
+        let credential = sqlx::query(
+            r#"
+            SELECT id, enrolled_by
+            FROM runner_credentials
+            WHERE runner_id = $1
+              AND corp_id = $2
+              AND token_hash = $3
+              AND revoked_at IS NULL
+              AND expires_at > now()
+            FOR UPDATE
+            "#,
+        )
+        .bind(runner_id)
+        .bind(corp_id)
+        .bind(presented_token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (credential_id, actor_id, event_type) = if let Some(row) = credential {
+            (
+                row.get::<Uuid, _>("id"),
+                row.get::<Uuid, _>("enrolled_by"),
+                "runner.credential_rotated",
+            )
+        } else {
+            let enrollment = sqlx::query(
+                r#"
+                SELECT id, created_by
+                FROM runner_enrollment_tokens
+                WHERE corp_id = $1
+                  AND runner_id = $2
+                  AND token_hash = $3
+                  AND used_at IS NULL
+                  AND expires_at > now()
+                FOR UPDATE
+                "#,
+            )
+            .bind(corp_id)
+            .bind(runner_id)
+            .bind(presented_token_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("forbidden: unknown, expired, replayed, or revoked runner credential")?;
+            let enrollment_id: Uuid = enrollment.get("id");
+            let actor_id: Uuid = enrollment.get("created_by");
+            sqlx::query(
+                "UPDATE runner_enrollment_tokens SET used_at = now() WHERE id = $1 AND used_at IS NULL",
+            )
+            .bind(enrollment_id)
+            .execute(&mut *tx)
+            .await?;
+            let credential_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO runner_credentials
+                    (id, runner_id, corp_id, token_hash, expires_at, enrolled_by)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (runner_id) DO UPDATE
+                SET id = EXCLUDED.id,
+                    corp_id = EXCLUDED.corp_id,
+                    token_hash = EXCLUDED.token_hash,
+                    expires_at = EXCLUDED.expires_at,
+                    revoked_at = NULL,
+                    enrolled_by = EXCLUDED.enrolled_by,
+                    rotated_at = now()
+                "#,
+            )
+            .bind(credential_id)
+            .bind(runner_id)
+            .bind(corp_id)
+            .bind(next_token_hash)
+            .bind(next_expires_at)
+            .bind(actor_id)
+            .execute(&mut *tx)
+            .await?;
+            (credential_id, actor_id, "runner.enrolled")
+        };
+
+        if event_type == "runner.credential_rotated" {
+            sqlx::query(
+                r#"
+                UPDATE runner_credentials
+                SET token_hash = $1, expires_at = $2, rotated_at = now()
+                WHERE id = $3
+                "#,
+            )
+            .bind(next_token_hash)
+            .bind(next_expires_at)
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                event_type,
+                "runner",
+                credential_id,
+                format!("{event_type}:{credential_id}:{}", Uuid::new_v4()),
+                json!({
+                    "runner_id": runner_id,
+                    "credential_expires_at": next_expires_at,
+                }),
+            ),
+        )
+        .await?
+        .context("runner authentication event was unexpectedly deduplicated")?;
+        tx.commit().await?;
+        Ok(RunnerAuthenticationOutcome {
+            corp_id,
+            expires_at: next_expires_at,
+            event,
+        })
+    }
+
+    pub async fn revoke_runner(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        runner_id: &str,
+        reason: &str,
+    ) -> Result<RunnerRevocationOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can revoke a runner"
+            ));
+        }
+        let row = sqlx::query(
+            r#"
+            UPDATE runner_credentials
+            SET revoked_at = now()
+            WHERE runner_id = $1 AND corp_id = $2 AND revoked_at IS NULL
+            RETURNING id
+            "#,
+        )
+        .bind(runner_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(RunnerRevocationOutcome {
+                revoked: false,
+                event: None,
+            });
+        };
+        let credential_id: Uuid = row.get("id");
+        sqlx::query("UPDATE runner_nodes SET status = 'offline' WHERE id = $1 AND corp_id = $2")
+            .bind(runner_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "runner.revoked",
+                "runner",
+                credential_id,
+                format!("runner-revoked:{credential_id}"),
+                json!({"runner_id": runner_id, "reason": reason}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RunnerRevocationOutcome {
+            revoked: true,
+            event,
+        })
+    }
+
     pub async fn runner_connected(&self, input: RunnerConnectInput) -> Result<RunnerRecord> {
         let row = sqlx::query(
             r#"
             INSERT INTO runner_nodes
-                (id, hostname, os, capabilities, connection_epoch, status,
+                (id, corp_id, hostname, os, capabilities, connection_epoch, status,
                  connected_at, last_seen_at, disconnected_at, grace_expires_at)
-            VALUES ($1, $2, $3, $4, $5, 'connected', now(), now(), NULL, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, 'connected', now(), now(), NULL, NULL)
             ON CONFLICT (id) DO UPDATE
-            SET hostname = EXCLUDED.hostname,
+            SET corp_id = EXCLUDED.corp_id,
+                hostname = EXCLUDED.hostname,
                 os = EXCLUDED.os,
                 capabilities = EXCLUDED.capabilities,
                 connection_epoch = EXCLUDED.connection_epoch,
@@ -783,11 +1156,12 @@ impl PgStore {
                 last_seen_at = now(),
                 disconnected_at = NULL,
                 grace_expires_at = NULL
-            RETURNING id, hostname, os, capabilities, connection_epoch, status,
+            RETURNING id, corp_id, hostname, os, capabilities, connection_epoch, status,
                       last_seen_at, grace_expires_at
             "#,
         )
         .bind(input.id)
+        .bind(input.corp_id)
         .bind(input.hostname)
         .bind(input.os)
         .bind(input.capabilities)
@@ -812,15 +1186,17 @@ impl PgStore {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn runner_records(&self) -> Result<Vec<RunnerRecord>> {
+    pub async fn runner_records(&self, corp_id: Uuid) -> Result<Vec<RunnerRecord>> {
         let records = sqlx::query(
             r#"
-            SELECT id, hostname, os, capabilities, connection_epoch, status,
+            SELECT id, corp_id, hostname, os, capabilities, connection_epoch, status,
                    last_seen_at, grace_expires_at
             FROM runner_nodes
+            WHERE corp_id = $1
             ORDER BY id
             "#,
         )
+        .bind(corp_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -3653,6 +4029,7 @@ fn map_room_message(row: sqlx::postgres::PgRow) -> RoomMessage {
 fn map_runner(row: sqlx::postgres::PgRow) -> RunnerRecord {
     RunnerRecord {
         id: row.get("id"),
+        corp_id: row.get("corp_id"),
         hostname: row.get("hostname"),
         os: row.get("os"),
         capabilities: row.get("capabilities"),

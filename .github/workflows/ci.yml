@@ -68,8 +68,32 @@ jobs:
             --database-url postgres://crony:crony@127.0.0.1:54329/crony \
             > output/server-ci.log 2>&1 &
           echo $! > output/server-ci.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8791/health | grep -q '"status":"ok"'; then
+              break
+            fi
+            sleep 1
+          done
+          DEMO_JSON="$(curl --fail --silent -X POST \
+            -H 'content-type: application/json' \
+            -d '{}' \
+            http://127.0.0.1:8791/api/demo/bootstrap)"
+          CORP_ID="$(node -e 'console.log(JSON.parse(process.argv[1]).corp_id)' "$DEMO_JSON")"
+          ALICE_ID="$(node -e 'console.log(JSON.parse(process.argv[1]).alice_actor_id)' "$DEMO_JSON")"
+          ENROLLMENT_JSON="$(curl --fail --silent -X POST \
+            -H 'content-type: application/json' \
+            -d "{\"actor_id\":\"$ALICE_ID\",\"runner_id\":\"runner-local\",\"expires_in_seconds\":600}" \
+            "http://127.0.0.1:8791/api/corps/$CORP_ID/runners/enroll")"
+          mkdir -p output/runner
+          node -e 'process.stdout.write(JSON.parse(process.argv[1]).enrollment_token)' \
+            "$ENROLLMENT_JSON" > output/runner/enrollment.token
+          chmod 600 output/runner/enrollment.token
           target/debug/crony-runner \
             --server-ws ws://127.0.0.1:8791/ws/runner \
+            --runner-id runner-local \
+            --corp-id "$CORP_ID" \
+            --credential-file "$PWD/output/runner/credential.json" \
+            --enrollment-token-file "$PWD/output/runner/enrollment.token" \
             --workspace "$PWD/output/runner" \
             --source-repository "$PWD" \
             --source-base-ref HEAD \
@@ -112,6 +136,8 @@ jobs:
         run: node tools/e2e_runner_reconnect.mjs
       - name: Verify duplicate runner delivery is idempotent
         run: node tools/e2e_idempotency.mjs
+      - name: Verify OIDC, Corp RBAC, runner enrollment, rotation, replay defense, and revocation
+        run: node tools/e2e_identity.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,6 +150,7 @@ jobs:
             output/e2e-worktrees.json
             output/e2e-task-graph.json
             output/e2e-verification.json
+            output/e2e-identity.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md
