@@ -180,7 +180,21 @@ try {
       '--secret-master-key-hex',
       'a5c3f1458279dfb241239378dbefa6b8d2ab32703cba1768343712fd37ac1f04',
     ],
-    { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] },
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        CRONY_OBJECT_STORE_BACKEND: 's3',
+        CRONY_OBJECT_STORE_ENDPOINT: 'https://s3.invalid',
+        CRONY_OBJECT_STORE_BUCKET: 'crony-identity-test',
+        CRONY_OBJECT_STORE_REGION: 'us-east-1',
+        CRONY_OBJECT_STORE_ACCESS_KEY: 'identity-test',
+        CRONY_OBJECT_STORE_SECRET_KEY: 'identity-test-secret',
+        CRONY_OBJECT_STORE_ALLOW_HTTP: 'false',
+        CRONY_ARTIFACT_SIGNING_KEY_HEX: '4c'.repeat(32),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
   )
   await waitFor(`${productionServer}/health`, (body) => body.mode === 'production')
 
