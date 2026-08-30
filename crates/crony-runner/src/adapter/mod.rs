@@ -1,4 +1,5 @@
 mod codex;
+mod external;
 mod fake;
 
 use std::{
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub use codex::CodexAdapter;
+pub use external::{ExternalCliAdapter, ExternalFlavor};
 pub use fake::FakeProcessAdapter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,15 +257,34 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    pub fn new(fake_agent_script: impl AsRef<Path>, codex_command: impl AsRef<Path>) -> Self {
+    pub fn new(
+        fake_agent_script: impl AsRef<Path>,
+        codex_command: impl AsRef<Path>,
+        claude_command: impl AsRef<Path>,
+        claude_prefix_args: Vec<std::ffi::OsString>,
+        opencode_command: impl AsRef<Path>,
+        opencode_prefix_args: Vec<std::ffi::OsString>,
+    ) -> Self {
         let fake: Arc<dyn AgentAdapter> = Arc::new(FakeProcessAdapter::new(
             fake_agent_script.as_ref().to_path_buf(),
         ));
         let codex: Arc<dyn AgentAdapter> =
             Arc::new(CodexAdapter::new(codex_command.as_ref().to_path_buf()));
+        let claude: Arc<dyn AgentAdapter> = Arc::new(ExternalCliAdapter::new_with_prefix(
+            ExternalFlavor::ClaudeCode,
+            claude_command.as_ref().to_path_buf(),
+            claude_prefix_args,
+        ));
+        let opencode: Arc<dyn AgentAdapter> = Arc::new(ExternalCliAdapter::new_with_prefix(
+            ExternalFlavor::OpenCode,
+            opencode_command.as_ref().to_path_buf(),
+            opencode_prefix_args,
+        ));
         let mut adapters = HashMap::new();
         adapters.insert(fake.id().to_owned(), fake);
         adapters.insert(codex.id().to_owned(), codex);
+        adapters.insert(claude.id().to_owned(), claude);
+        adapters.insert(opencode.id().to_owned(), opencode);
         Self {
             adapters: Arc::new(adapters),
         }

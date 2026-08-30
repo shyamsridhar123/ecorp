@@ -78,6 +78,26 @@ struct Args {
 
     #[arg(long, env = "CRONY_CODEX_COMMAND")]
     codex_command: Option<PathBuf>,
+
+    #[arg(long, env = "CRONY_CLAUDE_COMMAND")]
+    claude_command: Option<PathBuf>,
+
+    #[arg(
+        long = "claude-command-arg",
+        env = "CRONY_CLAUDE_COMMAND_ARGS",
+        value_delimiter = ';'
+    )]
+    claude_command_args: Vec<std::ffi::OsString>,
+
+    #[arg(long, env = "CRONY_OPENCODE_COMMAND")]
+    opencode_command: Option<PathBuf>,
+
+    #[arg(
+        long = "opencode-command-arg",
+        env = "CRONY_OPENCODE_COMMAND_ARGS",
+        value_delimiter = ';'
+    )]
+    opencode_command_args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +136,14 @@ fn default_codex_command() -> PathBuf {
         PathBuf::from("codex.exe")
     } else {
         PathBuf::from("codex")
+    }
+}
+
+fn default_provider_command(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("{name}.exe"))
+    } else {
+        PathBuf::from(name)
     }
 }
 
@@ -198,6 +226,14 @@ async fn main() -> Result<()> {
     let adapters = Arc::new(AdapterRegistry::new(
         args.fake_agent_script.clone(),
         codex_command,
+        args.claude_command
+            .clone()
+            .unwrap_or_else(|| default_provider_command("claude")),
+        args.claude_command_args.clone(),
+        args.opencode_command
+            .clone()
+            .unwrap_or_else(|| default_provider_command("opencode")),
+        args.opencode_command_args.clone(),
     ));
     loop {
         let delay = match run_connection(

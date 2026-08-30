@@ -117,6 +117,10 @@ The Codex adapter suite uses a protocol-faithful fake app-server to verify avail
 start, streaming, usage de-duplication, live `turn/steer`, graceful `turn/interrupt`, stop, durable
 resume, completed evidence, cancelled evidence, and failed evidence without requiring credentials.
 
+The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
+through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
+completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before

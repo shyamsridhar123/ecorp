@@ -19,9 +19,13 @@ const DEMO_EVE_ID: &str = "00000000-0000-4000-8000-000000000013";
 const DEMO_MANAGER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000021";
 const DEMO_WORKER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000022";
 const DEMO_CODEX_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000023";
+const DEMO_CLAUDE_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000024";
+const DEMO_OPENCODE_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000025";
 const DEMO_MANAGER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000031";
 const DEMO_WORKER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000032";
 const DEMO_CODEX_AGENT_ID: &str = "00000000-0000-4000-8000-000000000033";
+const DEMO_CLAUDE_AGENT_ID: &str = "00000000-0000-4000-8000-000000000034";
+const DEMO_OPENCODE_AGENT_ID: &str = "00000000-0000-4000-8000-000000000035";
 const DEMO_ROOM_ID: &str = "00000000-0000-4000-8000-000000000041";
 const DEMO_ADVISORY_LOCK: i64 = 0x4352_4F4E_5944_4D4F;
 
@@ -635,6 +639,8 @@ impl PgStore {
         let manager_actor_id = parse_id(DEMO_MANAGER_ACTOR_ID)?;
         let worker_actor_id = parse_id(DEMO_WORKER_ACTOR_ID)?;
         let codex_actor_id = parse_id(DEMO_CODEX_ACTOR_ID)?;
+        let claude_actor_id = parse_id(DEMO_CLAUDE_ACTOR_ID)?;
+        let opencode_actor_id = parse_id(DEMO_OPENCODE_ACTOR_ID)?;
 
         let mut tx = self.pool.begin().await?;
         lock_demo_tx(&mut tx).await?;
@@ -656,6 +662,8 @@ impl PgStore {
             (manager_actor_id, "Margo", "agent", "manager"),
             (worker_actor_id, "Wally", "agent", "engineer"),
             (codex_actor_id, "Cody", "agent", "engineer"),
+            (claude_actor_id, "Claudia", "agent", "engineer"),
+            (opencode_actor_id, "Opal", "agent", "engineer"),
         ] {
             sqlx::query(
                 r#"
@@ -692,6 +700,8 @@ impl PgStore {
             manager_actor_id,
             worker_actor_id,
             codex_actor_id,
+            claude_actor_id,
+            opencode_actor_id,
         ] {
             sqlx::query(
                 r#"
@@ -731,6 +741,22 @@ impl PgStore {
                 "codex",
                 "signal",
             ),
+            (
+                parse_id(DEMO_CLAUDE_AGENT_ID)?,
+                claude_actor_id,
+                "Claudia",
+                "engineer",
+                "claude-code",
+                "violet",
+            ),
+            (
+                parse_id(DEMO_OPENCODE_AGENT_ID)?,
+                opencode_actor_id,
+                "Opal",
+                "engineer",
+                "opencode",
+                "mint",
+            ),
         ] {
             sqlx::query(
                 r#"
@@ -764,7 +790,7 @@ impl PgStore {
                 "demo-bootstrap-v1",
                 json!({
                     "name": "Crony Corp Demonstration Office",
-                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody"]
+                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal"]
                 }),
             ),
         )
