@@ -44,9 +44,16 @@ type Run = {
   runner_id: string
   provider_session_id: string | null
   resumed_from_run_id: string | null
+  workspace_run_id: string
   input_tokens: number
   output_tokens: number
   cost_microusd: number
+  workspace_path: string | null
+  workspace_branch: string | null
+  workspace_base_ref: string | null
+  workspace_base_commit: string | null
+  workspace_disposition: string | null
+  workspace_detail: string | null
   status: string
   summary: string | null
   artifact_path: string | null
@@ -348,6 +355,12 @@ function MissionCard({
       {run && (run.input_tokens > 0 || run.output_tokens > 0) ? (
         <div className="usage-box">
           {run.input_tokens.toLocaleString()} in · {run.output_tokens.toLocaleString()} out
+        </div>
+      ) : null}
+      {run?.workspace_branch ? (
+        <div className="workspace-box" title={run.workspace_detail ?? undefined}>
+          <span>{run.workspace_disposition ?? 'active'} worktree</span>
+          <strong>{run.workspace_branch}</strong>
         </div>
       ) : null}
       {mission.status === 'ready' ? (

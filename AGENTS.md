@@ -14,6 +14,8 @@ Before a non-trivial change, read:
 - The office is a projection of authoritative state.
 - The runner survives every UI client.
 - The server never executes untrusted agent shell commands.
+- Write-capable runs never execute in the configured source checkout.
+- Dirty, committed, or unverifiable worktrees are preserved rather than force-removed.
 - Messages are not tasks; tasks have explicit state machines.
 - Completion requires evidence.
 - Irreversible effects require authorization and idempotency.
@@ -34,4 +36,3 @@ pnpm lint:web
 
 For user-visible behavior, start the complete local stack and exercise the browser-to-server-to-runner
 path. Unit tests alone do not prove the product works.
-

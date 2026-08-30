@@ -58,6 +58,8 @@ pnpm lint:web
 ```
 
 The repository also contains `tools/e2e_smoke.ps1`, which exercises the actual running stack.
+`tools/e2e_demo_lifecycle.mjs` races bootstrap and reset requests to prove the demo lifecycle lock
+prevents transactional deadlocks during browser/server reconnects.
 `tools/e2e_replay.mjs` verifies ordered reconnect replay and proves that an up-to-date cursor
 receives no duplicate events.
 `tools/e2e_leases.mjs` races two controllers, verifies token rotation and stale-command rejection,
@@ -74,6 +76,10 @@ proves that Postgres persists one event and applies one state transition.
 `tools/e2e_codex.mjs` runs the complete server-to-runner Codex lifecycle against a deterministic
 app-server fixture. It proves start, structured stream, live steer, resume into the same workspace,
 interrupt, emergency stop, usage persistence, run ancestry, and artifact hash verification.
+`tools/e2e_worktrees.mjs` launches fake-process and Codex tasks concurrently, proves their branches
+and linked worktrees are distinct, verifies the configured checkout's HEAD and working state do not
+change, confirms dirty work is preserved, and confirms a clean evidence-only run removes both its
+worktree and branch.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
@@ -87,3 +93,8 @@ An authenticated Windows probe on August 29, 2026 validated the same path agains
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before
 its post-sleep side effect. See `docs/evidence/2026-08-29-codex-adapter-validation.md`.
+
+Worktree unit tests run in source and managed paths containing spaces. They cover distinct parallel
+worktrees, exact resume reuse, dirty and committed preservation, post-integration reclamation,
+detached-state fail-safe behavior, path/ref validation, and occupied-target rejection. See
+`docs/evidence/2026-08-29-worktree-isolation-validation.md`.

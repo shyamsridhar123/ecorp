@@ -1,4 +1,5 @@
 mod adapter;
+mod workspace;
 
 use std::{
     collections::VecDeque,
@@ -22,6 +23,7 @@ use adapter::{
     AdapterControl, AdapterEvent, AdapterEventSink, AdapterRegistry, AdapterRunRequest,
     AgentAdapter,
 };
+use workspace::{WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager};
 
 #[derive(Debug, Parser, Clone)]
 #[command(name = "crony-runner")]
@@ -42,6 +44,12 @@ struct Args {
         default_value = "./output/runner"
     )]
     workspace: PathBuf,
+
+    #[arg(long, env = "CRONY_SOURCE_REPOSITORY", default_value = ".")]
+    source_repository: PathBuf,
+
+    #[arg(long, env = "CRONY_SOURCE_BASE_REF", default_value = "HEAD")]
+    source_base_ref: String,
 
     #[arg(
         long,
@@ -144,12 +152,16 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    tokio::fs::create_dir_all(&args.workspace)
-        .await
-        .with_context(|| format!("create runner workspace {}", args.workspace.display()))?;
-
     let active_runs: ActiveRuns = Arc::new(DashMap::new());
     let outbound = OutboundBus::default();
+    let workspaces = Arc::new(
+        WorkspaceManager::initialize(
+            args.workspace.clone(),
+            args.source_repository.clone(),
+            args.source_base_ref.clone(),
+        )
+        .await?,
+    );
     let codex_command = args
         .codex_command
         .clone()
@@ -164,6 +176,7 @@ async fn main() -> Result<()> {
             active_runs.clone(),
             outbound.clone(),
             adapters.clone(),
+            workspaces.clone(),
         )
         .await
         {
@@ -182,6 +195,7 @@ async fn run_connection(
     active_runs: ActiveRuns,
     outbound: OutboundBus,
     adapters: Arc<AdapterRegistry>,
+    workspaces: Arc<WorkspaceManager>,
 ) -> Result<Duration> {
     let (socket, _) = connect_async(&args.server_ws)
         .await
@@ -225,7 +239,12 @@ async fn run_connection(
     capabilities.push(RunnerCapability {
         name: "workspace-isolation".to_owned(),
         available: true,
-        detail: Some(args.workspace.display().to_string()),
+        detail: Some(format!(
+            "root={}; repository={}; base={}",
+            workspaces.root().display(),
+            workspaces.repository().display(),
+            workspaces.base_ref()
+        )),
     });
     out_tx
         .send(RunnerToServer::Register {
@@ -323,13 +342,13 @@ async fn run_connection(
                         control: control_tx,
                     },
                 );
-                let workspace_root = args.workspace.clone();
+                let task_workspaces = workspaces.clone();
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
                 tokio::spawn(async move {
                     if let Err(error) = execute_assignment(
-                        workspace_root,
+                        task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
                         adapter,
@@ -399,13 +418,13 @@ async fn run_connection(
                         control: control_tx,
                     },
                 );
-                let workspace_root = args.workspace.clone();
+                let task_workspaces = workspaces.clone();
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
                 tokio::spawn(async move {
                     if let Err(error) = execute_assignment(
-                        workspace_root,
+                        task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
                         adapter,
@@ -478,6 +497,7 @@ struct RunnerEventSink {
     outbound: OutboundBus,
     runner_id: String,
     assignment: Assignment,
+    workspace: WorkspaceLease,
 }
 
 impl AdapterEventSink for RunnerEventSink {
@@ -493,6 +513,9 @@ impl AdapterEventSink for RunnerEventSink {
                     "mission_id": self.assignment.mission_id,
                     "task_id": self.assignment.task_id,
                     "workspace": workspace,
+                    "workspace_branch": self.workspace.branch,
+                    "workspace_base_ref": self.workspace.base_ref,
+                    "workspace_base_commit": self.workspace.base_commit,
                     "adapter": self.assignment.adapter,
                 }),
             ),
@@ -547,7 +570,7 @@ impl AdapterEventSink for RunnerEventSink {
 }
 
 async fn execute_assignment(
-    workspace_root: PathBuf,
+    workspaces: Arc<WorkspaceManager>,
     runner_id: String,
     assignment: Assignment,
     adapter: Arc<dyn AgentAdapter>,
@@ -555,25 +578,77 @@ async fn execute_assignment(
     controls: mpsc::UnboundedReceiver<AdapterControl>,
     resume_session_id: Option<String>,
 ) -> Result<()> {
+    let workspace = workspaces
+        .prepare(assignment.task_id, assignment.workspace_run_id)
+        .await
+        .context("prepare isolated task worktree")?;
     let request = AdapterRunRequest {
         run_id: assignment.run_id,
         mission_id: assignment.mission_id,
         task_id: assignment.task_id,
         agent_id: assignment.agent_id,
         mission_title: assignment.mission_title.clone(),
-        workspace: workspace_root.join(assignment.workspace_run_id.to_string()),
+        workspace: workspace.path.clone(),
     };
     let sink: Arc<dyn AdapterEventSink> = Arc::new(RunnerEventSink {
+        outbound: outbound.clone(),
+        runner_id: runner_id.clone(),
+        assignment: assignment.clone(),
+        workspace: workspace.clone(),
+    });
+    let execution = if let Some(session_id) = resume_session_id {
+        adapter.resume(request, &session_id, controls, sink).await
+    } else {
+        adapter.execute(request, controls, sink).await
+    };
+    let cleanup = workspaces.finalize(&workspace).await;
+    send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
+    execution?;
+    Ok(())
+}
+
+fn send_workspace_cleanup_event(
+    outbound: &OutboundBus,
+    runner_id: &str,
+    assignment: &Assignment,
+    workspace: &WorkspaceLease,
+    cleanup: Result<WorkspaceCleanup>,
+) {
+    let (event_type, cleanup) = match cleanup {
+        Ok(cleanup) => {
+            let event_type = match cleanup.disposition {
+                WorkspaceDisposition::Removed => "run.workspace_removed",
+                WorkspaceDisposition::Preserved => "run.workspace_preserved",
+            };
+            (event_type, cleanup)
+        }
+        Err(error) => (
+            "run.workspace_preserved",
+            WorkspaceCleanup {
+                disposition: WorkspaceDisposition::Preserved,
+                detail: format!("cleanup verification failed; worktree preserved: {error:#}"),
+                dirty: None,
+                commits_ahead: None,
+                branch_deleted: false,
+            },
+        ),
+    };
+    send_run_event(
         outbound,
         runner_id,
         assignment,
-    });
-    if let Some(session_id) = resume_session_id {
-        adapter.resume(request, &session_id, controls, sink).await?;
-    } else {
-        adapter.execute(request, controls, sink).await?;
-    }
-    Ok(())
+        event_type,
+        json!({
+            "workspace": workspace.path,
+            "workspace_branch": workspace.branch,
+            "workspace_base_ref": workspace.base_ref,
+            "workspace_base_commit": workspace.base_commit,
+            "detail": cleanup.detail,
+            "dirty": cleanup.dirty,
+            "commits_ahead": cleanup.commits_ahead,
+            "branch_deleted": cleanup.branch_deleted,
+        }),
+    );
 }
 fn send_run_event(
     outbound: &OutboundBus,

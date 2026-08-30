@@ -162,6 +162,26 @@ overwrite that terminal lost state.
 The runner keeps active process controls and a bounded outbound event queue outside any individual
 WebSocket connection, so a transport reconnect does not kill the child process or discard events.
 
+## Worktree lifecycle
+
+Every initial run receives a linked Git worktree under the configured runner workspace and a
+deterministic `crony/task-.../run-...` branch. A resumed provider session re-enters that exact
+worktree and branch through the root run ID.
+
+Provisioning is fail-closed:
+
+- the source repository and base ref are validated at runner startup
+- every resolved worktree path must remain below the configured worktree root
+- an occupied, detached, mismatched, or non-worktree path is rejected
+- provisioning never falls back to the source checkout
+- Git metadata mutations are serialized inside one runner
+
+After a process ends, cleanup checks the actual Git state. Dirty worktrees, ignored files, branches
+with commits not integrated into the current base, and any state that cannot be verified are preserved.
+Automatic removal occurs only when the tree is clean and its branch is reachable from or
+tree-equivalent to the base. The runner emits `run.workspace_preserved` or
+`run.workspace_removed`, and Postgres stores the final disposition.
+
 ## Agent adapters
 
 Provider runtimes implement one `AgentAdapter` contract:
@@ -192,8 +212,7 @@ streaming, steering, interruption, emergency stop, resume, usage, artifacts, and
 
 ## Near-term architecture work
 
-1. Add git worktree isolation.
-2. Add bounded task-graph orchestration and independent verification.
-3. Add durable approvals and policy evaluation.
-4. Add authenticated users and runner enrollment.
-5. Add artifact upload rather than host-local artifact paths.
+1. Add bounded task-graph orchestration and independent verification.
+2. Add durable approvals and policy evaluation.
+3. Add authenticated users and runner enrollment.
+4. Add artifact upload rather than host-local artifact paths.

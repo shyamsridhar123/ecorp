@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const args = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {
@@ -21,6 +21,9 @@ const emit = (event) => {
 };
 
 const slowRun = mission.includes("[slow]");
+const cleanWorktree = mission.includes("[clean-worktree]");
+const ignoredWorktree = mission.includes("[ignored-worktree]");
+const externalEvidence = cleanWorktree || ignoredWorktree;
 const briefingDelay = slowRun ? 4_000 : 700;
 const workDelay = slowRun ? 5_000 : 900;
 
@@ -95,13 +98,26 @@ const artifact = [
   "",
 ].join("\n");
 
-const artifactPath = resolve(workdir, "result.md");
+if (ignoredWorktree) {
+  await writeFile(resolve(workdir, "valuable.log"), "ignored but valuable\n", "utf8");
+}
+
+const artifactPath = externalEvidence
+  ? resolve(workdir, "..", "..", "..", "evidence", `fake-clean-${runId}.md`)
+  : resolve(workdir, "result.md");
+await mkdir(dirname(artifactPath), { recursive: true });
 await writeFile(artifactPath, artifact, "utf8");
-emit({ type: "artifact", path: "result.md", media_type: "text/markdown" });
+emit({
+  type: "artifact",
+  path: externalEvidence ? artifactPath : "result.md",
+  media_type: "text/markdown",
+});
 await wait(500);
 
 emit({
   type: "completed",
-  summary: "Created and verified result.md through the runner-owned child process.",
+  summary: externalEvidence
+    ? "Created runner evidence outside the task worktree."
+    : "Created and verified result.md through the runner-owned child process.",
 });
 input.close();

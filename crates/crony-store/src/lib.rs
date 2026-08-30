@@ -22,6 +22,7 @@ const DEMO_MANAGER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000031";
 const DEMO_WORKER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000032";
 const DEMO_CODEX_AGENT_ID: &str = "00000000-0000-4000-8000-000000000033";
 const DEMO_ROOM_ID: &str = "00000000-0000-4000-8000-000000000041";
+const DEMO_ADVISORY_LOCK: i64 = 0x4352_4F4E_5944_4D4F;
 
 #[derive(Clone)]
 pub struct PgStore {
@@ -67,6 +68,7 @@ pub struct ResumeLaunchRecord {
     pub task_id: Uuid,
     pub run_id: Uuid,
     pub source_run_id: Uuid,
+    pub workspace_run_id: Uuid,
     pub agent_id: Uuid,
     pub runner_id: String,
     pub assignment_token: Uuid,
@@ -202,6 +204,7 @@ impl PgStore {
         let codex_actor_id = parse_id(DEMO_CODEX_ACTOR_ID)?;
 
         let mut tx = self.pool.begin().await?;
+        lock_demo_tx(&mut tx).await?;
         sqlx::query(
             r#"
             INSERT INTO corps (id, slug, name)
@@ -340,6 +343,7 @@ impl PgStore {
     pub async fn reset_demo(&self) -> Result<(DemoIds, Option<DomainEvent>)> {
         let corp_id = parse_id(DEMO_CORP_ID)?;
         let mut tx = self.pool.begin().await?;
+        lock_demo_tx(&mut tx).await?;
         sqlx::query("DELETE FROM control_leases WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -474,7 +478,9 @@ impl PgStore {
             r#"
             SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id,
                    r.assignment_token, r.provider_session_id, r.resumed_from_run_id,
-                   r.input_tokens, r.output_tokens, r.cost_microusd, r.status,
+                   r.workspace_run_id, r.input_tokens, r.output_tokens, r.cost_microusd,
+                   r.workspace_path, r.workspace_branch, r.workspace_base_ref,
+                   r.workspace_base_commit, r.workspace_disposition, r.workspace_detail, r.status,
                    r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -1104,8 +1110,9 @@ impl PgStore {
         sqlx::query(
             r#"
             INSERT INTO runs
-                (id, corp_id, task_id, agent_id, runner_id, assignment_token, status)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting')
+                (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
+                 workspace_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $1)
             "#,
         )
         .bind(run_id)
@@ -1183,6 +1190,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
+                   r.workspace_run_id,
                    t.mission_id, m.room_id, a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -1203,6 +1211,7 @@ impl PgStore {
         let provider_session_id: String = row
             .try_get::<Option<String>, _>("provider_session_id")?
             .context("source run has no resumable provider session")?;
+        let workspace_run_id: Uuid = row.get("workspace_run_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let adapter: String = row.get("adapter");
@@ -1231,8 +1240,8 @@ impl PgStore {
             r#"
             INSERT INTO runs
                 (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
-                 provider_session_id, resumed_from_run_id)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8)
+                 provider_session_id, resumed_from_run_id, workspace_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9)
             "#,
         )
         .bind(run_id)
@@ -1243,6 +1252,7 @@ impl PgStore {
         .bind(assignment_token)
         .bind(&provider_session_id)
         .bind(source_run_id)
+        .bind(workspace_run_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
@@ -1275,6 +1285,7 @@ impl PgStore {
                     format!("run:{run_id}:resume-requested"),
                     json!({
                         "source_run_id": source_run_id,
+                        "workspace_run_id": workspace_run_id,
                         "task_id": task_id,
                         "agent_id": agent_id,
                         "runner_id": runner_id
@@ -1293,6 +1304,7 @@ impl PgStore {
                 task_id,
                 run_id,
                 source_run_id,
+                workspace_run_id,
                 agent_id,
                 runner_id,
                 assignment_token,
@@ -1321,8 +1333,14 @@ impl PgStore {
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
-              AND r.status IN ('provisioning', 'starting', 'running',
-                               'waiting_for_input', 'waiting_for_approval', 'verifying')
+              AND (
+                r.status IN ('provisioning', 'starting', 'running',
+                             'waiting_for_input', 'waiting_for_approval', 'verifying')
+                OR (
+                  $5::text IN ('run.workspace_preserved', 'run.workspace_removed')
+                  AND r.status IN ('completed', 'failed', 'cancelled', 'lost')
+                )
+              )
             FOR UPDATE OF r, t, m
             "#,
         )
@@ -1330,6 +1348,7 @@ impl PgStore {
         .bind(corp_id)
         .bind(agent_id)
         .bind(&runner_id)
+        .bind(&event_type)
         .fetch_one(&mut *tx)
         .await
         .context("runner event does not match an active run")?;
@@ -1375,10 +1394,32 @@ impl PgStore {
                 .await?;
             }
             "run.started" => {
-                sqlx::query("UPDATE runs SET status = 'running', updated_at = now() WHERE id = $1")
-                    .bind(run_id)
-                    .execute(&mut *tx)
-                    .await?;
+                let workspace_path = payload.get("workspace").and_then(Value::as_str);
+                let workspace_branch = payload.get("workspace_branch").and_then(Value::as_str);
+                let workspace_base_ref = payload.get("workspace_base_ref").and_then(Value::as_str);
+                let workspace_base_commit =
+                    payload.get("workspace_base_commit").and_then(Value::as_str);
+                sqlx::query(
+                    r#"
+                    UPDATE runs
+                    SET status = 'running',
+                        workspace_path = $1,
+                        workspace_branch = $2,
+                        workspace_base_ref = $3,
+                        workspace_base_commit = $4,
+                        workspace_disposition = 'active',
+                        workspace_detail = NULL,
+                        updated_at = now()
+                    WHERE id = $5
+                    "#,
+                )
+                .bind(workspace_path)
+                .bind(workspace_branch)
+                .bind(workspace_base_ref)
+                .bind(workspace_base_commit)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query(
                     "UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1",
                 )
@@ -1465,6 +1506,31 @@ impl PgStore {
                 .bind(input_tokens)
                 .bind(output_tokens)
                 .bind(cost_microusd)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.workspace_preserved" | "run.workspace_removed" => {
+                let disposition = if event_type == "run.workspace_removed" {
+                    "removed"
+                } else {
+                    "preserved"
+                };
+                let detail = payload
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runner did not provide cleanup detail");
+                sqlx::query(
+                    r#"
+                    UPDATE runs
+                    SET workspace_disposition = $1,
+                        workspace_detail = $2,
+                        updated_at = now()
+                    WHERE id = $3
+                    "#,
+                )
+                .bind(disposition)
+                .bind(detail)
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
@@ -2165,6 +2231,14 @@ impl PgStore {
     }
 }
 
+async fn lock_demo_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DEMO_ADVISORY_LOCK)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn active_runner_run_rows(
     tx: &mut Transaction<'_, Postgres>,
     runner_id: &str,
@@ -2526,9 +2600,16 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         assignment_token: row.get("assignment_token"),
         provider_session_id: row.get("provider_session_id"),
         resumed_from_run_id: row.get("resumed_from_run_id"),
+        workspace_run_id: row.get("workspace_run_id"),
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
         cost_microusd: row.get("cost_microusd"),
+        workspace_path: row.get("workspace_path"),
+        workspace_branch: row.get("workspace_branch"),
+        workspace_base_ref: row.get("workspace_base_ref"),
+        workspace_base_commit: row.get("workspace_base_commit"),
+        workspace_disposition: row.get("workspace_disposition"),
+        workspace_detail: row.get("workspace_detail"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
         artifact_path: row.get("artifact_path"),

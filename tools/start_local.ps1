@@ -76,6 +76,8 @@ try {
         -ArgumentList @(
             '--server-ws', "ws://127.0.0.1:$serverPort/ws/runner",
             '--workspace', (Join-Path $root 'output\runner'),
+            '--source-repository', $root,
+            '--source-base-ref', 'HEAD',
             '--fake-agent-script', (Join-Path $root 'scripts\fake-agent.mjs')
         ) `
         -WorkingDirectory $root `
