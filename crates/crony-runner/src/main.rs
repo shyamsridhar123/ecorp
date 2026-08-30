@@ -15,6 +15,7 @@ use crony_domain::VerificationPolicy;
 use crony_protocol::{ActiveRunClaim, RunnerCapability, RunnerToServer, ServerToRunner};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -39,6 +40,19 @@ struct Args {
 
     #[arg(long, env = "CRONY_RUNNER_ID", default_value = "runner-local")]
     runner_id: String,
+
+    #[arg(long, env = "CRONY_CORP_ID")]
+    corp_id: Uuid,
+
+    #[arg(
+        long,
+        env = "CRONY_RUNNER_CREDENTIAL_FILE",
+        default_value = "./output/runner/credential.json"
+    )]
+    credential_file: PathBuf,
+
+    #[arg(long, env = "CRONY_RUNNER_ENROLLMENT_TOKEN_FILE")]
+    enrollment_token_file: Option<PathBuf>,
 
     #[arg(
         long,
@@ -76,6 +90,14 @@ struct Assignment {
     adapter: String,
     mission_title: String,
     verification_policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CredentialFile {
+    runner_id: String,
+    corp_id: Uuid,
+    credential: String,
+    expires_at: String,
 }
 
 #[derive(Clone)]
@@ -200,6 +222,7 @@ async fn run_connection(
     adapters: Arc<AdapterRegistry>,
     workspaces: Arc<WorkspaceManager>,
 ) -> Result<Duration> {
+    let credential = load_runner_credential(&args).await?;
     let (socket, _) = connect_async(&args.server_ws)
         .await
         .with_context(|| format!("connect to {}", args.server_ws))?;
@@ -252,6 +275,8 @@ async fn run_connection(
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
+            corp_id: args.corp_id,
+            credential,
             connection_epoch,
             hostname,
             os: std::env::consts::OS.to_owned(),
@@ -296,8 +321,28 @@ async fn run_connection(
         let command: ServerToRunner =
             serde_json::from_str(text.as_str()).context("decode server command")?;
         match command {
-            ServerToRunner::Registered { runner_id } => {
-                info!(%runner_id, "runner registration accepted");
+            ServerToRunner::Registered {
+                runner_id,
+                credential,
+                expires_at,
+            } => {
+                persist_runner_credential(
+                    &args,
+                    CredentialFile {
+                        runner_id: runner_id.clone(),
+                        corp_id: args.corp_id,
+                        credential,
+                        expires_at: expires_at.clone(),
+                    },
+                )
+                .await?;
+                if let Some(enrollment_file) = &args.enrollment_token_file {
+                    let _ = tokio::fs::remove_file(enrollment_file).await;
+                }
+                info!(%runner_id, %expires_at, "runner registration accepted");
+            }
+            ServerToRunner::RegistrationRejected { reason } => {
+                return Err(anyhow!("runner registration rejected: {reason}"));
             }
             ServerToRunner::StartRun {
                 corp_id,
@@ -498,6 +543,70 @@ async fn run_connection(
     heartbeat.abort();
     writer.abort();
     Ok(reconnect_delay)
+}
+
+async fn load_runner_credential(args: &Args) -> Result<String> {
+    if let Ok(contents) = tokio::fs::read_to_string(&args.credential_file).await {
+        let credential: CredentialFile =
+            serde_json::from_str(&contents).context("decode runner credential file")?;
+        if credential.runner_id != args.runner_id || credential.corp_id != args.corp_id {
+            return Err(anyhow!(
+                "runner credential file is scoped to a different runner or Corp"
+            ));
+        }
+        if credential.credential.trim().is_empty() {
+            return Err(anyhow!(
+                "runner credential file contains an empty credential"
+            ));
+        }
+        return Ok(credential.credential);
+    }
+    let enrollment_file = args
+        .enrollment_token_file
+        .as_ref()
+        .context("runner is not enrolled; provide CRONY_RUNNER_ENROLLMENT_TOKEN_FILE")?;
+    let token = tokio::fs::read_to_string(enrollment_file)
+        .await
+        .with_context(|| {
+            format!(
+                "read runner enrollment token from {}",
+                enrollment_file.display()
+            )
+        })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(anyhow!("runner enrollment token file is empty"));
+    }
+    Ok(token.to_owned())
+}
+
+async fn persist_runner_credential(args: &Args, credential: CredentialFile) -> Result<()> {
+    if let Some(parent) = args.credential_file.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create credential directory {}", parent.display()))?;
+    }
+    let temporary = args.credential_file.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&credential).context("encode runner credential")?;
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .with_context(|| format!("write temporary credential {}", temporary.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("restrict credential permissions {}", temporary.display()))?;
+    }
+    tokio::fs::rename(&temporary, &args.credential_file)
+        .await
+        .with_context(|| {
+            format!(
+                "replace runner credential file {}",
+                args.credential_file.display()
+            )
+        })?;
+    Ok(())
 }
 
 struct RunnerEventSink {

@@ -44,6 +44,25 @@ Runner daemons:
 
 The server never executes an agent shell command.
 
+## Human identity and authorization
+
+Production mode authenticates humans with an OIDC bearer token. The server discovers the issuer's
+UserInfo endpoint, resolves `(issuer, subject)` to a Corp-local human actor, and applies a
+deny-by-default role matrix before every Corp read or mutation. An actor ID supplied by an older
+client is treated only as a consistency claim and must match the authenticated actor.
+
+Browser clients exchange their bearer token for a one-time, 30-second WebSocket ticket. The ticket
+is consumed and Corp-authorized before event replay begins, so the OIDC token is never placed in a
+URL. Development mode retains the fixed Alice, Bob, and Eve actors, but demo routes and claimed
+development identities are not registered in production mode.
+
+## Runner identity
+
+Runners are bound to one Corp. An owner or admin creates a short-lived, one-time enrollment token.
+The first successful registration consumes it and returns a rotating workload credential. Each
+later connection atomically exchanges the current credential for the next one, so replayed
+credentials fail. Revocation disconnects the live node and blocks reconnection.
+
 ## Current vertical slice
 
 ```text

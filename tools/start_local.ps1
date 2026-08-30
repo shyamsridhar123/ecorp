@@ -59,6 +59,12 @@ try {
         Remove-Item -LiteralPath (Join-Path $output $log) -Force -ErrorAction SilentlyContinue
     }
 
+    $credentialFile = Join-Path $output 'runner\credential.json'
+    $enrollmentFile = Join-Path $output 'runner\enrollment.token'
+    New-Item -ItemType Directory -Path (Split-Path $credentialFile -Parent) -Force | Out-Null
+    Remove-Item -LiteralPath $credentialFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $enrollmentFile -Force -ErrorAction SilentlyContinue
+
     $server = Start-Process `
         -FilePath (Join-Path $root 'target\debug\crony-server.exe') `
         -ArgumentList @(
@@ -70,11 +76,54 @@ try {
         -RedirectStandardError (Join-Path $output 'server.stderr.log') `
         -PassThru `
         -WindowStyle Hidden
+    @{
+        server = $server.Id
+        runner = $null
+        web = $null
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'local-pids.json')
+
+    $deadline = (Get-Date).AddMinutes(2)
+    do {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$serverPort/health" -TimeoutSec 3
+            if ($health.status -eq 'ok') {
+                break
+            }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    } while ((Get-Date) -lt $deadline)
+    if ($health.status -ne 'ok') {
+        throw 'Crony server did not become ready.'
+    }
+
+    $demo = Invoke-RestMethod `
+        -Method Post `
+        -Uri "http://127.0.0.1:$serverPort/api/demo/bootstrap" `
+        -ContentType 'application/json' `
+        -Body '{}'
+    $enrollment = Invoke-RestMethod `
+        -Method Post `
+        -Uri "http://127.0.0.1:$serverPort/api/corps/$($demo.corp_id)/runners/enroll" `
+        -ContentType 'application/json' `
+        -Body (@{
+            actor_id = $demo.alice_actor_id
+            runner_id = 'runner-local'
+            expires_in_seconds = 600
+        } | ConvertTo-Json)
+    Set-Content -LiteralPath $enrollmentFile -Value $enrollment.enrollment_token -NoNewline
+    & icacls.exe $enrollmentFile /inheritance:r /grant:r "$env:USERNAME`:F" *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not narrow the enrollment token ACL; delete $enrollmentFile after startup."
+    }
 
     $runner = Start-Process `
         -FilePath (Join-Path $root 'target\debug\crony-runner.exe') `
         -ArgumentList @(
             '--server-ws', "ws://127.0.0.1:$serverPort/ws/runner",
+            '--corp-id', $demo.corp_id,
+            '--credential-file', $credentialFile,
+            '--enrollment-token-file', $enrollmentFile,
             '--workspace', (Join-Path $root 'output\runner'),
             '--source-repository', $root,
             '--source-base-ref', 'HEAD',

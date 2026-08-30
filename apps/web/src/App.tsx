@@ -170,9 +170,10 @@ type SnapshotResponse = {
     verification_requests: VerificationRequest[]
     events: DomainEvent[]
   }
-  runners: {
-    id: string
-    hostname: string
+    runners: {
+      id: string
+      corp_id: string
+      hostname: string
     os: string
     connected: boolean
     status: 'connected' | 'grace' | 'offline'

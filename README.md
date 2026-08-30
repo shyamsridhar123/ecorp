@@ -23,6 +23,8 @@ The UI can close without terminating active work.
 - Shared demo Corp with three human actors and two agent identities
 - Durable room membership, human-agent messages, replies, mentions, and work-item links
 - Durable Postgres state and event journal
+- Production OIDC authentication with Corp-scoped, deny-by-default RBAC
+- One-time runner enrollment, rotating workload credentials, replay rejection, and revocation
 - Browser WebSocket updates
 - Resumable, room-filtered event replay
 - Outbound-connected runner daemon
@@ -60,12 +62,10 @@ pnpm install
 cargo build --workspace
 ```
 
-Start the three processes in separate terminals:
+The supported development path performs demo bootstrap and runner enrollment automatically:
 
 ```powershell
-cargo run -p crony-server -- --bind 127.0.0.1:8791
-cargo run -p crony-runner -- --server-ws ws://127.0.0.1:8791/ws/runner
-pnpm --dir apps/web dev --host 127.0.0.1 --port 5187 --strictPort
+./tools/start_local.ps1
 ```
 
 Open `http://127.0.0.1:5187`.
@@ -74,6 +74,10 @@ The runner uses the current Git repository and `HEAD` as its source by default. 
 `CRONY_SOURCE_REPOSITORY` and `CRONY_SOURCE_BASE_REF` to choose another local checkout and base.
 Agents receive linked worktrees below `CRONY_RUNNER_WORKSPACE`; they never execute in the source
 checkout itself.
+
+In production, set `CRONY_MODE=production`, configure an HTTPS `CRONY_OIDC_ISSUER`, provision
+`human_identities`, and explicitly enroll each runner. Demo endpoints and claimed demo identities
+are unavailable in production.
 
 ## Documents
 
@@ -87,6 +91,7 @@ checkout itself.
 - [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
 - [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
 - [`docs/evidence/2026-08-29-evidence-verification-validation.md`](docs/evidence/2026-08-29-evidence-verification-validation.md)
+- [`docs/evidence/2026-08-30-identity-validation.md`](docs/evidence/2026-08-30-identity-validation.md)
 
 ## License
 

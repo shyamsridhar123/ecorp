@@ -21,6 +21,8 @@ pub struct ActiveRunClaim {
 pub enum RunnerToServer {
     Register {
         runner_id: String,
+        corp_id: Uuid,
+        credential: String,
         connection_epoch: Uuid,
         hostname: String,
         os: String,
@@ -48,6 +50,11 @@ pub enum RunnerToServer {
 pub enum ServerToRunner {
     Registered {
         runner_id: String,
+        credential: String,
+        expires_at: String,
+    },
+    RegistrationRejected {
+        reason: String,
     },
     StartRun {
         corp_id: Uuid,
@@ -100,6 +107,7 @@ pub enum ServerToRunner {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerSummary {
     pub id: String,
+    pub corp_id: Uuid,
     pub hostname: String,
     pub os: String,
     pub capabilities: Vec<RunnerCapability>,
@@ -107,6 +115,37 @@ pub struct RunnerSummary {
     pub status: String,
     pub last_seen_at: String,
     pub grace_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRunnerEnrollmentRequest {
+    pub actor_id: Uuid,
+    pub runner_id: String,
+    #[serde(default = "default_runner_enrollment_ttl_seconds")]
+    pub expires_in_seconds: u64,
+}
+
+const fn default_runner_enrollment_ttl_seconds() -> u64 {
+    600
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRunnerEnrollmentResponse {
+    pub runner_id: String,
+    pub enrollment_token: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeRunnerRequest {
+    pub actor_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeRunnerResponse {
+    pub runner_id: String,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
