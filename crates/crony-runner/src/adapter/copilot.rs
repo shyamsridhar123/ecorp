@@ -858,6 +858,9 @@ fn pathless_read_only_segment(command: &str) -> bool {
     if exact.contains(&command) {
         return true;
     }
+    if pathless_directory_listing(command) {
+        return true;
+    }
     if [
         "git status",
         "git diff",
@@ -875,6 +878,24 @@ fn pathless_read_only_segment(command: &str) -> bool {
     command
         .strip_prefix("select-object ")
         .is_some_and(simple_property_list)
+}
+
+fn pathless_directory_listing(command: &str) -> bool {
+    let mut parts = command.split_ascii_whitespace();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    match program {
+        "get-childitem" => parts.all(|argument| {
+            matches!(
+                argument,
+                "-force" | "-name" | "-file" | "-directory" | "-hidden"
+            )
+        }),
+        "ls" => parts.all(|argument| matches!(argument, "-a" | "-l" | "-al" | "-la" | "-1")),
+        "dir" => parts.next().is_none(),
+        _ => false,
+    }
 }
 
 fn shell_command_is_scoped_read_only(
@@ -1290,6 +1311,22 @@ mod tests {
                 "kind":"shell",
                 "fullCommandText":"Get-Location",
                 "commands":[{"identifier":"powershell","readOnly":false}],
+                "possiblePaths":[],
+                "possibleUrls":[]
+            }),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(permission_is_automatically_safe(
+            &json!({
+                "kind":"shell",
+                "fullCommandText":"pwd; Get-ChildItem -Force -Name | Select-Object -First 200",
+                "commands":[{"identifier":"powershell","readOnly":false}],
+                "commandSegments":[
+                    {"identifier":"pwd","fullCommandText":"pwd"},
+                    {"identifier":"Get-ChildItem","fullCommandText":"Get-ChildItem -Force -Name"},
+                    {"identifier":"Select-Object","fullCommandText":"Select-Object -First 200"}
+                ],
                 "possiblePaths":[],
                 "possibleUrls":[]
             }),

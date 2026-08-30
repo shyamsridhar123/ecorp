@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -91,6 +92,11 @@ const proof = await readFile(
   'utf8',
 )
 assert.equal(proof.trim(), 'GitHub Copilot SDK live adapter verified.')
+const evidence = JSON.parse(
+  await downloadVerifiedArtifact(server, demo, completed.run),
+)
+assert.equal(evidence.provider, 'github-copilot')
+assert.equal(evidence.model, model.id)
 assert.equal(
   completed.state.snapshot.action_approvals.length,
   0,
@@ -106,6 +112,7 @@ const report = {
   run_id: completed.run.id,
   provider_session_id: completed.run.provider_session_id,
   run_status: completed.run.status,
+  artifact_uri: completed.run.artifact_uri,
   input_tokens: completed.run.input_tokens,
   output_tokens: completed.run.output_tokens,
   durable_approval_count: completed.state.snapshot.action_approvals.length,

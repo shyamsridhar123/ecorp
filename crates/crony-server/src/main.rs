@@ -1,8 +1,9 @@
+mod artifacts;
 mod auth;
 mod planning;
 mod secrets;
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -14,7 +15,9 @@ use axum::{
     },
     http::{
         HeaderValue, Method, Request, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName},
+        header::{
+            AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderName,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -53,6 +56,7 @@ use tower_http::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use artifacts::{ArtifactIdentity, ArtifactStore};
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
 use planning::{PlanningRequest, StrategyRegistry};
 use secrets::SecretCipher;
@@ -99,6 +103,43 @@ struct Args {
 
     #[arg(long, env = "CRONY_SECRET_MASTER_KEY_HEX")]
     secret_master_key_hex: Option<String>,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_BACKEND", default_value = "local")]
+    object_store_backend: String,
+
+    #[arg(
+        long,
+        env = "CRONY_OBJECT_STORE_LOCAL_ROOT",
+        default_value = "./output/artifact-objects"
+    )]
+    object_store_local_root: PathBuf,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_ENDPOINT")]
+    object_store_endpoint: Option<String>,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_BUCKET")]
+    object_store_bucket: Option<String>,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_REGION", default_value = "us-east-1")]
+    object_store_region: String,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_ACCESS_KEY")]
+    object_store_access_key: Option<String>,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_SECRET_KEY")]
+    object_store_secret_key: Option<String>,
+
+    #[arg(long, env = "CRONY_OBJECT_STORE_ALLOW_HTTP", default_value_t = false)]
+    object_store_allow_http: bool,
+
+    #[arg(long, env = "CRONY_ARTIFACT_SIGNING_KEY_HEX")]
+    artifact_signing_key_hex: Option<String>,
+
+    #[arg(long, env = "CRONY_ARTIFACT_MAX_BYTES", default_value_t = 16_777_216)]
+    artifact_max_bytes: usize,
+
+    #[arg(long, env = "CRONY_ARTIFACT_RETENTION_DAYS", default_value_t = 30)]
+    artifact_retention_days: i64,
 }
 
 #[derive(Clone)]
@@ -111,6 +152,8 @@ struct AppState {
     runner_credential_ttl_secs: i64,
     auth: AuthService,
     secret_cipher: SecretCipher,
+    artifacts: ArtifactStore,
+    artifact_retention_days: i64,
 }
 
 #[derive(Clone)]
@@ -153,6 +196,13 @@ impl ApiError {
     fn forbidden(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: error.to_string(),
+        }
+    }
+
+    fn not_found(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: error.to_string(),
         }
     }
@@ -213,6 +263,19 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let secret_cipher = SecretCipher::initialize(args.mode, args.secret_master_key_hex.as_deref())?;
+    let artifacts = ArtifactStore::initialize(
+        &args.object_store_backend,
+        args.object_store_local_root.clone(),
+        args.object_store_endpoint.as_deref(),
+        args.object_store_bucket.as_deref(),
+        Some(&args.object_store_region),
+        args.object_store_access_key.as_deref(),
+        args.object_store_secret_key.as_deref(),
+        args.object_store_allow_http,
+        args.artifact_signing_key_hex.as_deref(),
+        args.artifact_max_bytes,
+        args.mode == ServerMode::Production,
+    )?;
     let (event_tx, _) = broadcast::channel(2_048);
     let state = AppState {
         store,
@@ -223,10 +286,16 @@ async fn main() -> anyhow::Result<()> {
         runner_credential_ttl_secs: args.runner_credential_ttl_secs.clamp(300, 604_800),
         auth,
         secret_cipher,
+        artifacts,
+        artifact_retention_days: args.artifact_retention_days.clamp(1, 3_650),
     };
 
     let protected = Router::new()
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
+        .route(
+            "/api/corps/{corp_id}/artifacts/{artifact_id}",
+            get(download_artifact),
+        )
         .route("/api/corps/{corp_id}/missions", post(create_mission))
         .route(
             "/api/corps/{corp_id}/rooms/{room_id}/messages",
@@ -934,8 +1003,72 @@ async fn snapshot(
     Ok(Json(SnapshotResponse { snapshot, runners }))
 }
 
+async fn download_artifact(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ArtifactDownloadQuery>,
+) -> Result<Response, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Read,
+    )
+    .await?;
+    let artifact = state
+        .store
+        .artifact_for_download(corp_id, artifact_id, actor_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("artifact was not found"))?;
+    let bytes = state
+        .artifacts
+        .read_verified(&artifact)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut response = Response::new(Body::from(bytes.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.media_type).map_err(ApiError::internal)?,
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).map_err(ApiError::internal)?,
+    );
+    headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"artifact-{}\"",
+            artifact.id
+        ))
+        .map_err(ApiError::internal)?,
+    );
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", artifact.sha256)).map_err(ApiError::internal)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-crony-artifact-signature"),
+        HeaderValue::from_str(&artifact.provenance_signature).map_err(ApiError::internal)?,
+    );
+    Ok(response)
+}
+
 #[derive(Debug, Deserialize)]
 struct SnapshotQuery {
+    actor_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactDownloadQuery {
     actor_id: Uuid,
 }
 
@@ -2052,22 +2185,43 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     warn!(%runner_id, "run event runner id does not match registered socket");
                     continue;
                 }
-                match state
-                    .store
-                    .apply_runner_event(RunnerEventInput {
-                        event_id,
-                        runner_id: runner_id.clone(),
-                        corp_id,
-                        run_id,
-                        agent_id,
-                        event_type: event_type.clone(),
-                        payload,
-                    })
-                    .await
+                let input = RunnerEventInput {
+                    event_id,
+                    runner_id: runner_id.clone(),
+                    corp_id,
+                    run_id,
+                    agent_id,
+                    event_type: event_type.clone(),
+                    payload,
+                };
+                let mut applied_event_type = event_type.clone();
+                let mut result = process_runner_event(&state, input).await;
+                if event_type == "run.artifact_upload"
+                    && let Err(error) = &result
                 {
+                    let reason = format!("artifact upload rejected: {error}");
+                    warn!(%error, %run_id, "artifact upload failed verification");
+                    applied_event_type = "run.failed".to_owned();
+                    result = state
+                        .store
+                        .apply_runner_event(RunnerEventInput {
+                            event_id,
+                            runner_id: runner_id.clone(),
+                            corp_id,
+                            run_id,
+                            agent_id,
+                            event_type: applied_event_type.clone(),
+                            payload: json!({"error": reason}),
+                        })
+                        .await;
+                }
+                match result {
                     Ok(Some(event)) => {
                         publish(&state, event);
-                        if matches!(event_type.as_str(), "run.usage" | "run.tool_activity") {
+                        if matches!(
+                            applied_event_type.as_str(),
+                            "run.usage" | "run.tool_activity"
+                        ) {
                             match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
                                 Ok(outcome) => {
                                     if let Some(event) = outcome.event {
@@ -2086,7 +2240,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                                 }
                             }
                         }
-                        if matches!(event_type.as_str(), "run.completed" | "run.failed") {
+                        if matches!(applied_event_type.as_str(), "run.completed" | "run.failed") {
                             let schedule_state = state.clone();
                             tokio::spawn(async move {
                                 if let Err(error) =
@@ -2103,9 +2257,9 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             .to_string()
                             .contains("runner event does not match an active run")
                         {
-                            info!(%run_id, %event_type, "ignored stale runner event");
+                            info!(%run_id, event_type = %applied_event_type, "ignored stale runner event");
                         } else {
-                            warn!(%error, %run_id, %event_type, "failed to apply runner event")
+                            warn!(%error, %run_id, event_type = %applied_event_type, "failed to apply runner event")
                         }
                     }
                 }
@@ -2156,6 +2310,41 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
         info!(%runner_id, %connection_epoch, "runner disconnected into grace");
     }
     writer.abort();
+}
+
+async fn process_runner_event(
+    state: &AppState,
+    input: RunnerEventInput,
+) -> anyhow::Result<Option<DomainEvent>> {
+    if input.event_type != "run.artifact_upload" {
+        return state.store.apply_runner_event(input).await;
+    }
+    let context = state
+        .store
+        .artifact_context(
+            input.corp_id,
+            input.run_id,
+            input.agent_id,
+            &input.runner_id,
+        )
+        .await?;
+    let retention_until = Utc::now() + ChronoDuration::days(state.artifact_retention_days);
+    let artifact = state
+        .artifacts
+        .ingest(
+            ArtifactIdentity {
+                id: input.event_id,
+                corp_id: input.corp_id,
+                task_id: context.task_id,
+                run_id: input.run_id,
+                agent_id: input.agent_id,
+                runner_id: &input.runner_id,
+            },
+            &input.payload,
+            retention_until,
+        )
+        .await?;
+    state.store.record_artifact_upload(input, artifact).await
 }
 
 fn publish(state: &AppState, event: DomainEvent) {

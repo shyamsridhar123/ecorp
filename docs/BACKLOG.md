@@ -41,7 +41,7 @@ This file is the local source for the initial GitHub milestones and issues.
 | P0 | Build scoped secret broker | Agent receives references or short-lived capabilities, not long-lived secrets |
 | P0 | Implement durable approvals | Run suspends and resumes exactly once after authorized decision |
 | P0 | Add budget policy and circuit breaker | Spend, recursion, repeated tools, and no-progress are bounded |
-| P1 | Add artifact object storage and signed provenance | Host-local paths are removed from shared state |
+| P1 | ✅ Add artifact object storage and signed provenance | Host-local paths are removed from shared state |
 
 ## M4 — Alpha
 

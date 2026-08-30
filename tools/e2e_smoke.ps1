@@ -85,21 +85,36 @@ if ($run.workspace_disposition -ne 'preserved') {
     throw "Expected dirty worktree preservation, got $($run.workspace_disposition)."
 }
 
-$artifactPath = [System.IO.Path]::GetFullPath(
-    [System.IO.Path]::Combine($root, $run.artifact_path)
-)
-$runnerRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'output\runner'))
-if (-not $artifactPath.StartsWith($runnerRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Artifact escaped the runner output root: $artifactPath"
+if ($run.PSObject.Properties.Name -contains 'artifact_path') {
+    throw 'Shared run state exposed a runner-local artifact path.'
 }
-if (-not (Test-Path -LiteralPath $artifactPath)) {
-    throw "Artifact does not exist: $artifactPath"
+if (
+    -not $run.artifact_id -or
+    -not $run.artifact_uri -or
+    -not $run.artifact_media_type -or
+    -not $run.artifact_signature
+) {
+    throw 'Run omitted durable artifact metadata.'
 }
-
-$actualSha = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$downloadPath = Join-Path $root "output\artifact-$($run.artifact_id).bin"
+$artifactResponse = Invoke-WebRequest `
+    -Uri "$Server$($run.artifact_uri)?actor_id=$($demo.alice_actor_id)" `
+    -OutFile $downloadPath `
+    -PassThru
+if ($artifactResponse.StatusCode -ne 200) {
+    throw "Artifact download failed with HTTP $($artifactResponse.StatusCode)."
+}
+if ($artifactResponse.Headers.'Content-Type' -ne $run.artifact_media_type) {
+    throw 'Artifact download media type did not match the signed record.'
+}
+if ($artifactResponse.Headers.'X-Crony-Artifact-Signature' -ne $run.artifact_signature) {
+    throw 'Artifact download provenance signature did not match the run.'
+}
+$actualSha = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualSha -ne $run.artifact_sha256) {
     throw "Artifact hash mismatch: expected $($run.artifact_sha256), got $actualSha"
 }
+Remove-Item -LiteralPath $downloadPath -Force
 
 $eventTypes = @($snapshot.snapshot.events | ForEach-Object type)
 foreach ($required in @(
@@ -151,7 +166,10 @@ $report = [ordered]@{
     bob_conflict_enforced = -not $bobLease.acquired
     live_message_delivery = $message.delivery
     run_status = $run.status
-    artifact_path = $artifactPath
+    artifact_id = $run.artifact_id
+    artifact_uri = $run.artifact_uri
+    artifact_media_type = $run.artifact_media_type
+    artifact_signature = $run.artifact_signature
     artifact_sha256 = $actualSha
     event_count = $snapshot.snapshot.events.Count
     control_acknowledged = [bool]$controlOutput

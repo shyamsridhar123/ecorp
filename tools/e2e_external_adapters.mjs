@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFile, writeFile } from 'node:fs/promises'
+import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -38,7 +39,7 @@ async function runProvider(demo, adapter) {
     const state = await snapshot(demo)
     const run = state.snapshot.runs.find((candidate) => candidate.id === launch.run_id)
     if (run?.status === 'completed') {
-      const bytes = await readFile(run.artifact_path)
+      const bytes = await downloadVerifiedArtifact(server, demo, run)
       const evidence = JSON.parse(bytes)
       assert.equal(evidence.provider, adapter)
       assert.equal(evidence.exit_success, true)

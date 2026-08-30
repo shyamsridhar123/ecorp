@@ -149,3 +149,8 @@ depth bounds, retry bounds, per-task budgets, and total mission budgets. See
 Runner verifier tests cover valid and missing files, artifact hashes, commands, tests, JSON
 required-key schemas, screenshot signatures, and path traversal. See
 `docs/evidence/2026-08-29-evidence-verification-validation.md`.
+
+`tools/e2e_artifacts.mjs` verifies server-mediated upload, content-addressed storage, normalized
+media type, signed producer/run/task/verifier/retention provenance, path-free shared state,
+authorized download, and non-member denial. The same flow was exercised against MinIO as the
+S3-compatible backend. See `docs/evidence/2026-08-30-artifact-storage-validation.md`.

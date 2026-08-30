@@ -3,14 +3,13 @@
 ## Current status
 
 The current implementation has production authentication, workload identity, and scoped secret
-boundaries, but it is not yet suitable for an untrusted network until durable artifact storage and
-stronger process isolation land.
+boundaries plus durable artifact storage, but it is not yet suitable for fully untrusted child
+processes until stronger OS/container isolation lands.
 
 Known development-only shortcuts:
 
 - fixed demo identities
 - permissive CORS
-- host-local artifact paths
 - fake process runs with the local user's permissions
 - no network sandbox
 
@@ -41,6 +40,12 @@ generic action label.
 
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
+
+Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
+declared media type before object commit, stores objects under Corp-namespaced content-addressed
+keys, signs provenance with a deployment key, and never exposes backend bucket URLs. Downloads
+require Corp authorization and room membership, then revalidate signature, retention, digest,
+length, and media type before returning an attachment with content sniffing disabled.
 
 ## Required production boundaries
 

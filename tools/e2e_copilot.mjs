@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFile, writeFile } from 'node:fs/promises'
+import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -109,8 +110,9 @@ assert.equal(completed.run.reasoning_effort, 'high')
 assert.ok(completed.run.provider_session_id)
 assert.equal(completed.run.input_tokens, 321)
 assert.equal(completed.run.output_tokens, 123)
-assert.ok(completed.run.artifact_path)
-const evidence = JSON.parse(await readFile(completed.run.artifact_path, 'utf8'))
+const evidence = JSON.parse(
+  await downloadVerifiedArtifact(server, demo, completed.run),
+)
 assert.equal(evidence.provider, 'github-copilot')
 assert.equal(evidence.model, 'copilot-test-reasoning')
 assert.equal(evidence.discovered_model_count, 3)
@@ -131,6 +133,7 @@ assert.equal(
   resumedRun.run.provider_session_id,
   completed.run.provider_session_id,
 )
+await downloadVerifiedArtifact(server, demo, resumedRun.run)
 
 const report = {
   checked_at: new Date().toISOString(),
@@ -147,6 +150,7 @@ const report = {
   reasoning_effort: completed.run.reasoning_effort,
   provider_session_id: completed.run.provider_session_id,
   resumed_same_session: true,
+  artifact_uri: completed.run.artifact_uri,
   input_tokens: completed.run.input_tokens,
   output_tokens: completed.run.output_tokens,
 }

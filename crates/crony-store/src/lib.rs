@@ -250,6 +250,31 @@ pub struct CircuitBreakerOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct ArtifactContext {
+    pub task_id: Uuid,
+    pub mission_id: Uuid,
+    pub room_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredArtifact {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub producer_agent_id: Uuid,
+    pub producer_runner_id: String,
+    pub verifier: String,
+    pub object_key: String,
+    pub uri: String,
+    pub sha256: String,
+    pub media_type: String,
+    pub bytes: i64,
+    pub provenance_signature: String,
+    pub retention_until: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerEventInput {
     pub event_id: Uuid,
     pub runner_id: String,
@@ -993,7 +1018,9 @@ impl PgStore {
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
                    r.verification_status, r.verification_summary, r.status,
-                   r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
+                   r.summary, r.artifact_id, r.artifact_uri, r.artifact_media_type,
+                   r.artifact_signature, r.artifact_path, r.artifact_sha256,
+                   r.created_at, r.updated_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -2552,6 +2579,213 @@ impl PgStore {
         Ok(event)
     }
 
+    pub async fn artifact_context(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        agent_id: Uuid,
+        runner_id: &str,
+    ) -> Result<ArtifactContext> {
+        let row = sqlx::query(
+            r#"
+            SELECT r.task_id, t.mission_id, m.room_id
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.status IN ('provisioning', 'starting', 'running',
+                               'waiting_for_input', 'waiting_for_approval', 'verifying')
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .bind(agent_id)
+        .bind(runner_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("artifact upload does not match an active run")?;
+        Ok(ArtifactContext {
+            task_id: row.get("task_id"),
+            mission_id: row.get("mission_id"),
+            room_id: row.get("room_id"),
+        })
+    }
+
+    pub async fn record_artifact_upload(
+        &self,
+        input: RunnerEventInput,
+        artifact: StoredArtifact,
+    ) -> Result<Option<DomainEvent>> {
+        let RunnerEventInput {
+            event_id,
+            runner_id,
+            corp_id,
+            run_id,
+            agent_id,
+            event_type,
+            ..
+        } = input;
+        if event_type != "run.artifact_upload"
+            || artifact.id != event_id
+            || artifact.corp_id != corp_id
+            || artifact.run_id != run_id
+            || artifact.producer_agent_id != agent_id
+            || artifact.producer_runner_id != runner_id
+        {
+            return Err(anyhow!("artifact metadata does not match the runner event"));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT r.task_id, t.mission_id, m.room_id
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.status IN ('provisioning', 'starting', 'running',
+                               'waiting_for_input', 'waiting_for_approval', 'verifying')
+            FOR UPDATE OF r, t, m
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .bind(agent_id)
+        .bind(&runner_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("artifact upload does not match an active run")?;
+        let task_id: Uuid = row.get("task_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        if artifact.task_id != task_id {
+            return Err(anyhow!("artifact task does not match the active run"));
+        }
+
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                id: event_id,
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "run.artifact",
+                    "run",
+                    run_id,
+                    format!("runner:{runner_id}:event:{event_id}"),
+                    json!({
+                        "artifact_id": artifact.id,
+                        "uri": artifact.uri,
+                        "sha256": artifact.sha256,
+                        "bytes": artifact.bytes,
+                        "media_type": artifact.media_type,
+                        "producer_agent_id": artifact.producer_agent_id,
+                        "producer_runner_id": artifact.producer_runner_id,
+                        "verifier": artifact.verifier,
+                        "retention_until": artifact.retention_until,
+                        "provenance_signature": artifact.provenance_signature,
+                    }),
+                )
+            },
+        )
+        .await?;
+        let Some(event) = event else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+                 verifier, object_key, uri, sha256, media_type, bytes,
+                 retention_until, provenance_signature)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            "#,
+        )
+        .bind(artifact.id)
+        .bind(artifact.corp_id)
+        .bind(artifact.task_id)
+        .bind(artifact.run_id)
+        .bind(artifact.producer_agent_id)
+        .bind(&artifact.producer_runner_id)
+        .bind(&artifact.verifier)
+        .bind(&artifact.object_key)
+        .bind(&artifact.uri)
+        .bind(&artifact.sha256)
+        .bind(&artifact.media_type)
+        .bind(artifact.bytes)
+        .bind(artifact.retention_until)
+        .bind(&artifact.provenance_signature)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET artifact_id = $1,
+                artifact_uri = $2,
+                artifact_media_type = $3,
+                artifact_signature = $4,
+                artifact_path = NULL,
+                artifact_sha256 = $5,
+                status = 'verifying',
+                updated_at = now()
+            WHERE id = $6
+            "#,
+        )
+        .bind(artifact.id)
+        .bind(&artifact.uri)
+        .bind(&artifact.media_type)
+        .bind(&artifact.provenance_signature)
+        .bind(&artifact.sha256)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET status = 'review', updated_at = now() WHERE id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'reviewing', station = 'review', current_run_id = NULL WHERE id = $1",
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(event))
+    }
+
+    pub async fn artifact_for_download(
+        &self,
+        corp_id: Uuid,
+        artifact_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<Option<StoredArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact.id, artifact.corp_id, artifact.task_id, artifact.run_id,
+                   artifact.producer_agent_id, artifact.producer_runner_id,
+                   artifact.verifier, artifact.object_key, artifact.uri,
+                   artifact.sha256, artifact.media_type, artifact.bytes,
+                   artifact.provenance_signature, artifact.retention_until
+            FROM artifacts artifact
+            JOIN tasks task ON task.id = artifact.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN room_memberships membership
+              ON membership.room_id = mission.room_id AND membership.actor_id = $3
+            WHERE artifact.id = $1 AND artifact.corp_id = $2
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .bind(actor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(map_stored_artifact))
+    }
+
     pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {
         let RunnerEventInput {
             event_id,
@@ -2560,7 +2794,7 @@ impl PgStore {
             run_id,
             agent_id,
             event_type,
-            payload,
+            mut payload,
         } = input;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
@@ -2600,6 +2834,9 @@ impl PgStore {
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode task verification policy")?;
+        if event_type == "run.verification_evidence" {
+            payload = sanitize_verification_evidence_tx(&mut tx, run_id, payload).await?;
+        }
 
         let event = append_event_tx(
             &mut tx,
@@ -2874,27 +3111,10 @@ impl PgStore {
                     }
                 }
             }
-            "run.artifact" => {
-                let path = payload.get("path").and_then(Value::as_str);
-                let sha = payload.get("sha256").and_then(Value::as_str);
-                sqlx::query(
-                    "UPDATE runs SET artifact_path = $1, artifact_sha256 = $2, status = 'verifying', updated_at = now() WHERE id = $3",
-                )
-                .bind(path)
-                .bind(sha)
-                .bind(run_id)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query("UPDATE tasks SET status = 'review', updated_at = now() WHERE id = $1")
-                    .bind(task_id)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query(
-                    "UPDATE agents SET status = 'reviewing', station = 'review', current_run_id = NULL WHERE id = $1",
-                )
-                .bind(agent_id)
-                .execute(&mut *tx)
-                .await?;
+            "run.artifact" | "run.artifact_upload" => {
+                return Err(anyhow!(
+                    "artifact events must pass through server-side object storage verification"
+                ));
             }
             "run.usage" => {
                 let input_tokens = payload
@@ -3011,6 +3231,23 @@ impl PgStore {
                 .await?;
             }
             "run.verification_passed" => {
+                let requires_artifact = verification_policy
+                    .checks
+                    .iter()
+                    .any(|check| matches!(check, crony_domain::VerifierCheck::Artifact { .. }));
+                if requires_artifact {
+                    let artifact_exists: bool = sqlx::query_scalar(
+                        "SELECT artifact_id IS NOT NULL FROM runs WHERE id = $1",
+                    )
+                    .bind(run_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !artifact_exists {
+                        return Err(anyhow!(
+                            "artifact verification passed before durable artifact storage"
+                        ));
+                    }
+                }
                 let evidence_rows = sqlx::query(
                     r#"
                     SELECT check_index, kind, status
@@ -4969,11 +5206,12 @@ async fn validate_room_link_tx(
             sqlx::query_scalar(
                 r#"
                 SELECT EXISTS(
-                    SELECT 1 FROM runs r
-                    JOIN tasks t ON t.id = r.task_id
+                    SELECT 1 FROM artifacts artifact
+                    JOIN tasks t ON t.id = artifact.task_id
                     JOIN missions m ON m.id = t.mission_id
-                    WHERE r.id = $1 AND r.corp_id = $2 AND m.room_id = $3
-                      AND r.artifact_sha256 IS NOT NULL
+                    WHERE artifact.id = $1
+                      AND artifact.corp_id = $2
+                      AND m.room_id = $3
                 )
                 "#,
             )
@@ -4989,6 +5227,161 @@ async fn validate_room_link_tx(
         return Err(anyhow!("linked entity is not visible in this room"));
     }
     Ok(())
+}
+
+async fn sanitize_verification_evidence_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    mut payload: Value,
+) -> Result<Value> {
+    if payload.get("kind").and_then(Value::as_str) != Some("artifact") {
+        return Ok(payload);
+    }
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .context("artifact verification evidence omitted status")?;
+    let artifact = sqlx::query(
+        r#"
+        SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+               verifier, object_key, uri, sha256, media_type, bytes,
+               provenance_signature, retention_until
+        FROM artifacts
+        WHERE run_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(map_stored_artifact);
+
+    let sanitized = match artifact {
+        Some(artifact) => {
+            if status == "passed" {
+                let evidence = payload
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .context("artifact verification evidence omitted payload")?;
+                let evidence_sha = evidence
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .context("artifact verification evidence omitted sha256")?;
+                let evidence_bytes = evidence
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .context("artifact verification evidence omitted bytes")?;
+                let evidence_media_type = evidence
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .context("artifact verification evidence omitted media_type")?;
+                if evidence_sha != artifact.sha256
+                    || i64::try_from(evidence_bytes).ok() != Some(artifact.bytes)
+                    || evidence_media_type != artifact.media_type
+                {
+                    return Err(anyhow!(
+                        "artifact verification evidence does not match durable storage"
+                    ));
+                }
+            }
+            payload
+                .as_object_mut()
+                .context("verification evidence payload is not an object")?
+                .insert(
+                    "summary".to_owned(),
+                    Value::String(format!(
+                        "durable artifact {} has {} verified bytes",
+                        artifact.id, artifact.bytes
+                    )),
+                );
+            json!({
+                "artifact_id": artifact.id,
+                "uri": artifact.uri,
+                "sha256": artifact.sha256,
+                "bytes": artifact.bytes,
+                "media_type": artifact.media_type,
+                "producer_agent_id": artifact.producer_agent_id,
+                "producer_runner_id": artifact.producer_runner_id,
+                "verifier": artifact.verifier,
+                "retention_until": artifact.retention_until,
+                "provenance_signature": artifact.provenance_signature,
+            })
+        }
+        None if status == "passed" => {
+            return Err(anyhow!(
+                "artifact verification evidence passed without durable storage"
+            ));
+        }
+        None => {
+            payload
+                .as_object_mut()
+                .context("verification evidence payload is not an object")?
+                .insert(
+                    "summary".to_owned(),
+                    Value::String("durable artifact verification failed".to_owned()),
+                );
+            json!({"stored": false})
+        }
+    };
+    payload
+        .as_object_mut()
+        .context("verification evidence payload is not an object")?
+        .insert("payload".to_owned(), sanitized);
+    Ok(payload)
+}
+
+fn redact_artifact_event_payload(event_type: &str, payload: &mut Value) {
+    match event_type {
+        "run.artifact" | "run.artifact_upload" => redact_path_fields(payload),
+        "run.verification_evidence"
+            if payload.get("kind").and_then(Value::as_str) == Some("artifact") =>
+        {
+            if let Some(evidence) = payload.get_mut("payload") {
+                redact_path_fields(evidence);
+            }
+            if payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(looks_like_local_path)
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    "summary".to_owned(),
+                    Value::String(
+                        "artifact verification evidence (local path redacted)".to_owned(),
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_path_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in ["path", "artifact_path", "content_base64", "object_key"] {
+                object.remove(key);
+            }
+            for value in object.values_mut() {
+                redact_path_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_path_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_local_path(value: &str) -> bool {
+    value.contains(":\\")
+        || value.contains(":/")
+        || value.contains("/output/runner/")
+        || value.contains("\\output\\runner\\")
 }
 
 async fn append_event_tx(
@@ -5149,6 +5542,10 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         verification_summary: row.get("verification_summary"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
+        artifact_id: row.get("artifact_id"),
+        artifact_uri: row.get("artifact_uri"),
+        artifact_media_type: row.get("artifact_media_type"),
+        artifact_signature: row.get("artifact_signature"),
         artifact_path: row.get("artifact_path"),
         artifact_sha256: row.get("artifact_sha256"),
         created_at: row.get("created_at"),
@@ -5156,17 +5553,46 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
     })
 }
 
+fn map_stored_artifact(row: sqlx::postgres::PgRow) -> StoredArtifact {
+    StoredArtifact {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        task_id: row.get("task_id"),
+        run_id: row.get("run_id"),
+        producer_agent_id: row.get("producer_agent_id"),
+        producer_runner_id: row.get("producer_runner_id"),
+        verifier: row.get("verifier"),
+        object_key: row.get("object_key"),
+        uri: row.get("uri"),
+        sha256: row.get("sha256"),
+        media_type: row.get("media_type"),
+        bytes: row.get("bytes"),
+        provenance_signature: row.get("provenance_signature"),
+        retention_until: row.get("retention_until"),
+    }
+}
+
 fn map_verification_evidence(row: sqlx::postgres::PgRow) -> VerificationEvidence {
+    let kind: String = row.get("kind");
+    let mut payload: Value = row.get("payload");
+    if kind == "artifact" {
+        redact_path_fields(&mut payload);
+    }
+    let summary: String = row.get("summary");
     VerificationEvidence {
         id: row.get("id"),
         corp_id: row.get("corp_id"),
         task_id: row.get("task_id"),
         run_id: row.get("run_id"),
         check_index: row.get("check_index"),
-        kind: row.get("kind"),
+        kind: kind.clone(),
         status: row.get("status"),
-        summary: row.get("summary"),
-        payload: row.get("payload"),
+        summary: if kind == "artifact" && looks_like_local_path(&summary) {
+            "artifact verification evidence (local path redacted)".to_owned()
+        } else {
+            summary
+        },
+        payload,
         created_at: row.get("created_at"),
     }
 }
@@ -5281,6 +5707,9 @@ fn map_runner(row: sqlx::postgres::PgRow) -> RunnerRecord {
 }
 
 fn map_event(row: sqlx::postgres::PgRow) -> DomainEvent {
+    let event_type: String = row.get("type");
+    let mut payload: Value = row.get("payload");
+    redact_artifact_event_payload(&event_type, &mut payload);
     DomainEvent {
         seq: row.get("seq"),
         id: row.get("id"),
@@ -5288,7 +5717,7 @@ fn map_event(row: sqlx::postgres::PgRow) -> DomainEvent {
         corp_id: row.get("corp_id"),
         room_id: row.get("room_id"),
         actor_id: row.get("actor_id"),
-        event_type: row.get("type"),
+        event_type,
         aggregate_type: row.get("aggregate_type"),
         aggregate_id: row.get("aggregate_id"),
         aggregate_version: row.get("aggregate_version"),
@@ -5296,7 +5725,7 @@ fn map_event(row: sqlx::postgres::PgRow) -> DomainEvent {
         causation_id: row.get("causation_id"),
         idempotency_key: row.get("idempotency_key"),
         visibility: row.get("visibility"),
-        payload: row.get("payload"),
+        payload,
         created_at: row.get("created_at"),
     }
 }

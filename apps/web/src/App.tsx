@@ -86,7 +86,10 @@ type Run = {
   verification_summary: string | null
   status: string
   summary: string | null
-  artifact_path: string | null
+  artifact_id: string | null
+  artifact_uri: string | null
+  artifact_media_type: string | null
+  artifact_signature: string | null
   artifact_sha256: string | null
 }
 
@@ -412,6 +415,7 @@ function MissionCard({
   runs,
   evidence,
   verificationRequests,
+  actorId,
   onLaunch,
   onResume,
   onVerificationDecision,
@@ -421,6 +425,7 @@ function MissionCard({
   runs: Run[]
   evidence: VerificationEvidence[]
   verificationRequests: VerificationRequest[]
+  actorId: string
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
@@ -477,10 +482,17 @@ function MissionCard({
           </div>
         ))}
       </div>
-      {latestRun?.artifact_sha256 ? (
+      {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
         <div className="evidence-box">
           <strong>Artifact recorded</strong>
           <span>{shortId(latestRun.artifact_sha256)}…</span>
+          <a
+            href={`${API_URL}${latestRun.artifact_uri}?actor_id=${actorId}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Download verified artifact
+          </a>
         </div>
       ) : null}
       {latestRun ? (
@@ -620,8 +632,11 @@ function RoomPanel({
     })),
     ...runs.slice(0, 2).flatMap((run) => [
       { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
-      ...(run.artifact_sha256
-        ? [{ value: `artifact:${run.id}`, label: `Artifact · ${shortId(run.artifact_sha256)}` }]
+      ...(run.artifact_sha256 && run.artifact_id
+        ? [{
+            value: `artifact:${run.artifact_id}`,
+            label: `Artifact · ${shortId(run.artifact_sha256)}`,
+          }]
         : []),
     ]),
   ]
@@ -1420,6 +1435,7 @@ function App() {
                     runs={runs}
                     evidence={data.snapshot.verification_evidence}
                     verificationRequests={data.snapshot.verification_requests}
+                    actorId={selectedActor.id}
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
                     onVerificationDecision={decideVerification}

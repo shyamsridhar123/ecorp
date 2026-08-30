@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use crony_domain::VerificationPolicy;
 use crony_protocol::{
@@ -860,20 +861,28 @@ impl AdapterEventSink for RunnerEventSink {
                     "text": text,
                 }),
             ),
-            AdapterEvent::Artifact(artifact) => {
-                if let Ok(mut artifacts) = self.artifacts.lock() {
-                    artifacts.push(artifact.clone());
+            AdapterEvent::Artifact(artifact) => match std::fs::read(&artifact.path) {
+                Ok(bytes) => {
+                    if let Ok(mut artifacts) = self.artifacts.lock() {
+                        artifacts.push(artifact.clone());
+                    }
+                    (
+                        "run.artifact_upload",
+                        json!({
+                            "sha256": artifact.sha256,
+                            "bytes": artifact.bytes,
+                            "media_type": artifact.media_type,
+                            "content_base64": BASE64.encode(bytes),
+                        }),
+                    )
                 }
-                (
-                    "run.artifact",
+                Err(error) => (
+                    "run.failed",
                     json!({
-                        "path": artifact.path,
-                        "sha256": artifact.sha256,
-                        "bytes": artifact.bytes,
-                        "media_type": artifact.media_type,
+                        "error": format!("artifact upload preparation failed: {error}"),
                     }),
-                )
-            }
+                ),
+            },
             AdapterEvent::Usage(usage) => (
                 "run.usage",
                 json!({

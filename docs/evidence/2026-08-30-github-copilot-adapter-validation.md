@@ -23,10 +23,11 @@ isolated Git worktree, verified the evidence, and completed the run.
 
 Recorded result:
 
-- run: `6e8122cf-c632-44c4-85b7-810c3e6845aa`
-- provider session: `5418ecd4-d23d-4c36-bdd6-756539277f32`
-- input tokens: 42,866
-- output tokens: 1,048
+- run: `c5e758a5-abd8-4673-86cc-d15165918f59`
+- provider session: `98ae4d6d-a463-4e02-b09e-d9c3ae453ab7`
+- artifact URI: `/api/corps/00000000-0000-4000-8000-000000000001/artifacts/177cb755-6d4d-43e9-b2cc-d281015db448`
+- input tokens: 45,006
+- output tokens: 1,802
 - durable approvals: 0
 - proof: `copilot-live-proof.txt`
 
