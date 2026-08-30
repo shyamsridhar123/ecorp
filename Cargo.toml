@@ -6,6 +6,7 @@ members = [
   "crates/crony-server",
   "crates/crony-runner",
   "crates/crony-cli",
+  "crates/crony-gateways",
 ]
 exclude = ["apps/desktop/src-tauri"]
 resolver = "2"

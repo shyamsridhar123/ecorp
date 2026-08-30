@@ -59,7 +59,7 @@ jobs:
           cache: pnpm
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
-      - run: cargo build -p crony-server -p crony-runner
+      - run: cargo build -p crony-server -p crony-runner -p crony-gateways
       - name: Start control and execution planes
         shell: bash
         run: |
@@ -126,6 +126,8 @@ jobs:
         run: node tools/e2e_codex.mjs
       - name: Verify Claude Code and OpenCode normalized lifecycle evidence
         run: node tools/e2e_external_adapters.mjs
+      - name: Verify MCP, ACP, and A2A gateway conformance
+        run: node tools/e2e_gateways.mjs
       - name: Verify parallel worktree isolation and source-checkout preservation
         run: node tools/e2e_worktrees.mjs
       - name: Verify bounded task-graph planning, scheduling, and retries
@@ -164,6 +166,7 @@ jobs:
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
             output/e2e-external-adapters.json
+            output/e2e-gateways.json
             output/e2e-worktrees.json
             output/e2e-task-graph.json
             output/e2e-verification.json

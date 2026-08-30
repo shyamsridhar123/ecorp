@@ -121,6 +121,10 @@ The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run 
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
 completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
 
+`tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
+version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
+methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before
