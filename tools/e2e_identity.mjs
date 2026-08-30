@@ -177,6 +177,8 @@ try {
       '--oidc-issuer',
       issuer,
       '--allow-insecure-oidc',
+      '--secret-master-key-hex',
+      'a5c3f1458279dfb241239378dbefa6b8d2ab32703cba1768343712fd37ac1f04',
     ],
     { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] },
   )

@@ -143,6 +143,7 @@ impl CodexAdapter {
             .arg("features.apps=false")
             .arg("-c")
             .arg("hooks={}")
+            .envs(&request.environment)
             .current_dir(&request.workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1183,6 +1184,7 @@ mod tests {
             workspace: std::env::temp_dir()
                 .join("crony-codex-adapter-tests")
                 .join(run_id.to_string()),
+            environment: std::collections::HashMap::new(),
         }
     }
 

@@ -72,7 +72,7 @@ impl AdapterCapabilities {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdapterRunRequest {
     pub run_id: Uuid,
     pub mission_id: Uuid,
@@ -80,8 +80,26 @@ pub struct AdapterRunRequest {
     pub agent_id: Uuid,
     pub mission_title: String,
     pub workspace: PathBuf,
+    pub environment: HashMap<String, String>,
 }
 
+impl std::fmt::Debug for AdapterRunRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdapterRunRequest")
+            .field("run_id", &self.run_id)
+            .field("mission_id", &self.mission_id)
+            .field("task_id", &self.task_id)
+            .field("agent_id", &self.agent_id)
+            .field("mission_title", &self.mission_title)
+            .field("workspace", &self.workspace)
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
 #[derive(Debug, Clone)]
 pub enum AdapterControl {
     Steer {
@@ -274,6 +292,7 @@ mod tests {
             workspace: std::env::temp_dir()
                 .join("crony-adapter-tests")
                 .join(run_id.to_string()),
+            environment: HashMap::new(),
         }
     }
 

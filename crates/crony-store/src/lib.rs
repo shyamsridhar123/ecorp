@@ -5,8 +5,8 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     Actor, ActorKind, Agent, AgentStatus, ControlLease, Corp, CorpSnapshot, DomainEvent,
     EntityLink, ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage, Room,
-    RoomMessage, Run, RunStatus, Task, TaskContract, TaskGraphPlan, TaskStatus,
-    VerificationEvidence, VerificationPolicy, VerificationRequest,
+    RoomMessage, Run, RunStatus, Task, TaskContract, TaskGraphPlan, TaskSecretReference,
+    TaskStatus, VerificationEvidence, VerificationPolicy, VerificationRequest,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -61,6 +61,7 @@ pub struct LaunchRecord {
     pub adapter: String,
     pub mission_title: String,
     pub verification_policy: VerificationPolicy,
+    pub secret_refs: Vec<TaskSecretReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,7 @@ pub struct ResumeLaunchRecord {
     pub adapter: String,
     pub provider_session_id: String,
     pub verification_policy: VerificationPolicy,
+    pub secret_refs: Vec<TaskSecretReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +197,19 @@ pub struct RunnerAuthenticationOutcome {
 pub struct RunnerRevocationOutcome {
     pub revoked: bool,
     pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretGrantRecord {
+    pub grant_id: Uuid,
+    pub secret_id: Uuid,
+    pub name: String,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub env_name: String,
+    pub tool: String,
+    pub resource: String,
+    pub expires_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +331,251 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_secret(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        secret_id: Uuid,
+        name: &str,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        allowed_actor_ids: &[Uuid],
+        allowed_tools: &[String],
+        resource_prefix: &str,
+        max_ttl_seconds: i32,
+    ) -> Result<DomainEvent> {
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can create secrets"
+            ));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO secrets
+                (id, corp_id, name, ciphertext, nonce, allowed_actor_ids, allowed_tools,
+                 resource_prefix, max_ttl_seconds, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(secret_id)
+        .bind(corp_id)
+        .bind(name)
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(allowed_actor_ids)
+        .bind(allowed_tools)
+        .bind(resource_prefix)
+        .bind(max_ttl_seconds)
+        .bind(actor_id)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "secret.created",
+                "secret",
+                secret_id,
+                format!("secret-created:{secret_id}"),
+                json!({
+                    "name": name,
+                    "allowed_actor_count": allowed_actor_ids.len(),
+                    "allowed_tools": allowed_tools,
+                    "resource_prefix": resource_prefix,
+                    "max_ttl_seconds": max_ttl_seconds,
+                }),
+            ),
+        )
+        .await?
+        .context("secret created event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    pub async fn revoke_secret(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        secret_id: Uuid,
+        reason: &str,
+    ) -> Result<Option<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can revoke secrets"
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE secrets SET revoked_at = now() WHERE id = $1 AND corp_id = $2 AND revoked_at IS NULL RETURNING id",
+        )
+        .bind(secret_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if updated.is_none() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "secret.revoked",
+                "secret",
+                secret_id,
+                format!("secret-revoked:{secret_id}"),
+                json!({"reason": reason}),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    pub async fn grant_run_secrets(
+        &self,
+        corp_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        runner_id: &str,
+        refs: &[TaskSecretReference],
+    ) -> Result<(Vec<SecretGrantRecord>, Vec<DomainEvent>)> {
+        if refs.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut tx = self.pool.begin().await?;
+        let requester: Uuid = sqlx::query_scalar(
+            r#"
+            SELECT mission.requested_by
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1
+              AND run.task_id = $2
+              AND run.corp_id = $3
+              AND run.runner_id = $4
+              AND run.status IN ('provisioning', 'starting')
+            FOR UPDATE OF run
+            "#,
+        )
+        .bind(run_id)
+        .bind(task_id)
+        .bind(corp_id)
+        .bind(runner_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("active run is not eligible for secret grants")?;
+
+        let mut grants = Vec::with_capacity(refs.len());
+        let mut events = Vec::with_capacity(refs.len());
+        for reference in refs {
+            let row = sqlx::query(
+                r#"
+                SELECT id, name, ciphertext, nonce, max_ttl_seconds
+                FROM secrets
+                WHERE id = $1
+                  AND corp_id = $2
+                  AND revoked_at IS NULL
+                  AND $3 = ANY(allowed_actor_ids)
+                  AND $4 = ANY(allowed_tools)
+                  AND left($5, char_length(resource_prefix)) = resource_prefix
+                "#,
+            )
+            .bind(reference.secret_id)
+            .bind(corp_id)
+            .bind(requester)
+            .bind(&reference.tool)
+            .bind(&reference.resource)
+            .fetch_optional(&mut *tx)
+            .await?
+            .with_context(|| {
+                format!(
+                    "forbidden: secret {} is not authorized for this actor, task, tool, or resource",
+                    reference.secret_id
+                )
+            })?;
+            let grant_id = Uuid::new_v4();
+            let max_ttl_seconds: i32 = row.get("max_ttl_seconds");
+            let expires_at = Utc::now() + Duration::seconds(i64::from(max_ttl_seconds.min(300)));
+            sqlx::query(
+                r#"
+                INSERT INTO secret_access_grants
+                    (id, corp_id, secret_id, task_id, run_id, actor_id, runner_id,
+                     tool, resource, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#,
+            )
+            .bind(grant_id)
+            .bind(corp_id)
+            .bind(reference.secret_id)
+            .bind(task_id)
+            .bind(run_id)
+            .bind(requester)
+            .bind(runner_id)
+            .bind(&reference.tool)
+            .bind(&reference.resource)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(event) = append_event_tx(
+                &mut tx,
+                NewEvent::new(
+                    corp_id,
+                    Some(requester),
+                    "secret.access_granted",
+                    "secret_grant",
+                    grant_id,
+                    format!("secret-grant:{grant_id}"),
+                    json!({
+                        "secret_id": reference.secret_id,
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "runner_id": runner_id,
+                        "tool": reference.tool,
+                        "resource": reference.resource,
+                        "expires_at": expires_at,
+                        "assurance": "environment_reduced_assurance",
+                    }),
+                ),
+            )
+            .await?
+            {
+                events.push(event);
+            }
+            grants.push(SecretGrantRecord {
+                grant_id,
+                secret_id: reference.secret_id,
+                name: row.get("name"),
+                ciphertext: row.get("ciphertext"),
+                nonce: row.get("nonce"),
+                env_name: reference.env_name.clone(),
+                tool: reference.tool.clone(),
+                resource: reference.resource.clone(),
+                expires_at,
+            });
+        }
+        tx.commit().await?;
+        Ok((grants, events))
     }
 
     pub async fn agents_for_planning(&self, corp_id: Uuid) -> Result<Vec<Agent>> {
@@ -1925,6 +2185,7 @@ impl PgStore {
                 adapter,
                 mission_title: task_prompt,
                 verification_policy,
+                secret_refs: contract.secret_refs,
             },
             event,
         ))
@@ -1941,7 +2202,7 @@ impl PgStore {
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id,
-                   t.mission_id, t.verification_policy, m.room_id, a.adapter
+                   t.mission_id, t.contract, t.verification_policy, m.room_id, a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -1965,6 +2226,8 @@ impl PgStore {
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode verification policy")?;
+        let contract: TaskContract =
+            serde_json::from_value(row.get("contract")).context("decode task contract")?;
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let adapter: String = row.get("adapter");
@@ -2066,9 +2329,80 @@ impl PgStore {
                 adapter,
                 provider_session_id,
                 verification_policy,
+                secret_refs: contract.secret_refs,
             },
             event,
         ))
+    }
+
+    pub async fn fail_run_before_dispatch(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        reason: &str,
+    ) -> Result<DomainEvent> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT run.task_id, run.agent_id, task.mission_id, mission.room_id
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            FOR UPDATE OF run, task, mission
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("run not found for dispatch failure")?;
+        let task_id: Uuid = row.get("task_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        sqlx::query(
+            "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+        )
+        .bind(reason)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1")
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1 AND current_run_id = $2",
+        )
+        .bind(agent_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "run.failed",
+                    "run",
+                    run_id,
+                    format!("run:{run_id}:dispatch-failed"),
+                    json!({"error": reason}),
+                )
+            },
+        )
+        .await?
+        .context("dispatch failure event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(event)
     }
 
     pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {

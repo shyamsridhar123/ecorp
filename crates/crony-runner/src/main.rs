@@ -12,7 +12,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use crony_domain::VerificationPolicy;
-use crony_protocol::{ActiveRunClaim, RunnerCapability, RunnerToServer, ServerToRunner};
+use crony_protocol::{
+    ActiveRunClaim, ResolvedSecret, RunnerCapability, RunnerToServer, ServerToRunner,
+};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -90,9 +92,10 @@ struct Assignment {
     adapter: String,
     mission_title: String,
     verification_policy: VerificationPolicy,
+    secrets: Vec<ResolvedSecret>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CredentialFile {
     runner_id: String,
     corp_id: Uuid,
@@ -272,6 +275,14 @@ async fn run_connection(
             workspaces.base_ref()
         )),
     });
+    capabilities.push(RunnerCapability {
+        name: "secret-delivery".to_owned(),
+        available: true,
+        detail: Some(
+            "task-scoped, expiring broker grants; environment injection is reduced assurance"
+                .to_owned(),
+        ),
+    });
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
@@ -355,6 +366,7 @@ async fn run_connection(
                 adapter,
                 mission_title,
                 verification_policy,
+                secrets,
             } => {
                 let assignment = Assignment {
                     corp_id,
@@ -367,6 +379,7 @@ async fn run_connection(
                     adapter,
                     mission_title,
                     verification_policy,
+                    secrets,
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate start command ignored");
@@ -433,6 +446,7 @@ async fn run_connection(
                 provider_session_id,
                 prompt,
                 verification_policy,
+                secrets,
             } => {
                 let assignment = Assignment {
                     corp_id,
@@ -445,6 +459,7 @@ async fn run_connection(
                     adapter,
                     mission_title: prompt,
                     verification_policy,
+                    secrets,
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate resume command ignored");
@@ -734,6 +749,11 @@ async fn execute_assignment(
         agent_id: assignment.agent_id,
         mission_title: assignment.mission_title.clone(),
         workspace: workspace.path.clone(),
+        environment: assignment
+            .secrets
+            .iter()
+            .map(|secret| (secret.env_name.clone(), secret.value.clone()))
+            .collect(),
     };
     let artifacts = Arc::new(Mutex::new(Vec::<AdapterArtifact>::new()));
     let terminal = Arc::new(Mutex::new(None::<BufferedTerminal>));

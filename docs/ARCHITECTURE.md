@@ -63,6 +63,17 @@ The first successful registration consumes it and returns a rotating workload cr
 later connection atomically exchanges the current credential for the next one, so replayed
 credentials fail. Revocation disconnects the live node and blocks reconnection.
 
+## Scoped secrets
+
+Secret plaintext is encrypted at rest and never embedded in a task prompt, event, artifact, command
+argument, or shared snapshot. Task contracts carry only typed secret references. At dispatch, the
+server checks the mission requester, task, run, enrolled runner, tool, resource prefix, and expiry,
+then records a metadata-only grant.
+
+Current process adapters receive the short-lived value through their environment and advertise
+`environment_reduced_assurance`. The boundary is explicit: this mode protects shared state and
+logs, but a compromised child process can still inspect its own environment.
+
 ## Current vertical slice
 
 ```text

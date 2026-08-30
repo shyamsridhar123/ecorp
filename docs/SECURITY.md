@@ -2,8 +2,9 @@
 
 ## Current status
 
-The current implementation has production authentication and workload identity boundaries, but it
-is not yet suitable for an untrusted network until scoped secrets and durable artifact storage land.
+The current implementation has production authentication, workload identity, and scoped secret
+boundaries, but it is not yet suitable for an untrusted network until durable artifact storage and
+stronger process isolation land.
 
 Known development-only shortcuts:
 
@@ -23,6 +24,10 @@ missions, tasks, runs, messages, and events are not returned.
 
 Runner nodes require one-time enrollment followed by rotating, expiring workload credentials.
 Only credential hashes are stored. Replayed, expired, unknown, and revoked credentials are denied.
+
+Secrets are encrypted with ChaCha20-Poly1305 and authenticated associated data. The broker checks
+actor, task, run, runner, tool, resource, and expiry scope before dispatch. Events and snapshots
+contain grant metadata only. Environment injection is labeled reduced assurance.
 
 ## Required production boundaries
 

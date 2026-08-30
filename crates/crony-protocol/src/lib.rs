@@ -1,4 +1,6 @@
-use crony_domain::{CorpSnapshot, DomainEvent, EntityLink, VerificationPolicy};
+use crony_domain::{
+    CorpSnapshot, DomainEvent, EntityLink, TaskSecretReference, VerificationPolicy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -67,6 +69,7 @@ pub enum ServerToRunner {
         adapter: String,
         mission_title: String,
         verification_policy: VerificationPolicy,
+        secrets: Vec<ResolvedSecret>,
     },
     ResumeRun {
         corp_id: Uuid,
@@ -81,6 +84,7 @@ pub enum ServerToRunner {
         provider_session_id: String,
         prompt: String,
         verification_policy: VerificationPolicy,
+        secrets: Vec<ResolvedSecret>,
     },
     ControlMessage {
         corp_id: Uuid,
@@ -199,6 +203,80 @@ pub struct CreateMissionRequest {
     pub requested_by: Uuid,
     pub preferred_adapter: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default)]
+    pub secret_refs: Vec<TaskSecretReference>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ResolvedSecret {
+    pub grant_id: Uuid,
+    pub secret_id: Uuid,
+    pub env_name: String,
+    pub value: String,
+    pub tool: String,
+    pub resource: String,
+    pub expires_at: String,
+    pub assurance: String,
+}
+
+impl std::fmt::Debug for ResolvedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedSecret")
+            .field("grant_id", &self.grant_id)
+            .field("secret_id", &self.secret_id)
+            .field("env_name", &self.env_name)
+            .field("value", &"[REDACTED]")
+            .field("tool", &self.tool)
+            .field("resource", &self.resource)
+            .field("expires_at", &self.expires_at)
+            .field("assurance", &self.assurance)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreateSecretRequest {
+    pub actor_id: Uuid,
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub allowed_actor_ids: Vec<Uuid>,
+    pub allowed_tools: Vec<String>,
+    pub resource_prefix: String,
+    #[serde(default = "default_secret_ttl_seconds")]
+    pub max_ttl_seconds: u64,
+}
+
+impl std::fmt::Debug for CreateSecretRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreateSecretRequest")
+            .field("actor_id", &self.actor_id)
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("allowed_actor_ids", &self.allowed_actor_ids)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("resource_prefix", &self.resource_prefix)
+            .field("max_ttl_seconds", &self.max_ttl_seconds)
+            .finish()
+    }
+}
+
+const fn default_secret_ttl_seconds() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSecretResponse {
+    pub secret_id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeSecretRequest {
+    pub actor_id: Uuid,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

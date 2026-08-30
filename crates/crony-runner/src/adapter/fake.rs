@@ -79,6 +79,7 @@ impl AgentAdapter for FakeProcessAdapter {
             .env("CRONY_MISSION_ID", request.mission_id.to_string())
             .env("CRONY_TASK_ID", request.task_id.to_string())
             .env("CRONY_AGENT_ID", request.agent_id.to_string())
+            .envs(&request.environment)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
