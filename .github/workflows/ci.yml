@@ -103,6 +103,7 @@ jobs:
             --claude-command-arg "$PWD/scripts/fake-external-agent.mjs" \
             --opencode-command node \
             --opencode-command-arg "$PWD/scripts/fake-external-agent.mjs" \
+            --copilot-fixture \
             > output/runner-ci.log 2>&1 &
           echo $! > output/runner-ci.pid
       - name: Wait for runner
@@ -128,6 +129,8 @@ jobs:
         run: node tools/e2e_codex.mjs
       - name: Verify Claude Code and OpenCode normalized lifecycle evidence
         run: node tools/e2e_external_adapters.mjs
+      - name: Verify GitHub Copilot harness, model discovery, selection, and resume
+        run: node tools/e2e_copilot.mjs
       - name: Verify MCP, ACP, and A2A gateway conformance
         run: node tools/e2e_gateways.mjs
       - name: Verify parallel worktree isolation and source-checkout preservation
@@ -169,6 +172,7 @@ jobs:
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
             output/e2e-external-adapters.json
+            output/e2e-copilot.json
             output/e2e-gateways.json
             output/e2e-worktrees.json
             output/e2e-task-graph.json

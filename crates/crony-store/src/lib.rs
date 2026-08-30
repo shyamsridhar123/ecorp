@@ -21,11 +21,13 @@ const DEMO_WORKER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000022";
 const DEMO_CODEX_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000023";
 const DEMO_CLAUDE_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000024";
 const DEMO_OPENCODE_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000025";
+const DEMO_COPILOT_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000026";
 const DEMO_MANAGER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000031";
 const DEMO_WORKER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000032";
 const DEMO_CODEX_AGENT_ID: &str = "00000000-0000-4000-8000-000000000033";
 const DEMO_CLAUDE_AGENT_ID: &str = "00000000-0000-4000-8000-000000000034";
 const DEMO_OPENCODE_AGENT_ID: &str = "00000000-0000-4000-8000-000000000035";
+const DEMO_COPILOT_AGENT_ID: &str = "00000000-0000-4000-8000-000000000036";
 const DEMO_ROOM_ID: &str = "00000000-0000-4000-8000-000000000041";
 const DEMO_ADVISORY_LOCK: i64 = 0x4352_4F4E_5944_4D4F;
 
@@ -64,6 +66,8 @@ pub struct LaunchRecord {
     pub attempt: i32,
     pub adapter: String,
     pub mission_title: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
 }
@@ -72,6 +76,8 @@ pub struct LaunchRecord {
 pub struct SchedulableTask {
     pub task_id: Uuid,
     pub required_adapter: String,
+    pub required_model: Option<String>,
+    pub required_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +94,8 @@ pub struct ResumeLaunchRecord {
     pub assignment_token: Uuid,
     pub adapter: String,
     pub provider_session_id: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
 }
@@ -666,6 +674,7 @@ impl PgStore {
         let codex_actor_id = parse_id(DEMO_CODEX_ACTOR_ID)?;
         let claude_actor_id = parse_id(DEMO_CLAUDE_ACTOR_ID)?;
         let opencode_actor_id = parse_id(DEMO_OPENCODE_ACTOR_ID)?;
+        let copilot_actor_id = parse_id(DEMO_COPILOT_ACTOR_ID)?;
 
         let mut tx = self.pool.begin().await?;
         lock_demo_tx(&mut tx).await?;
@@ -689,6 +698,7 @@ impl PgStore {
             (codex_actor_id, "Cody", "agent", "engineer"),
             (claude_actor_id, "Claudia", "agent", "engineer"),
             (opencode_actor_id, "Opal", "agent", "engineer"),
+            (copilot_actor_id, "Piper", "agent", "engineer"),
         ] {
             sqlx::query(
                 r#"
@@ -727,6 +737,7 @@ impl PgStore {
             codex_actor_id,
             claude_actor_id,
             opencode_actor_id,
+            copilot_actor_id,
         ] {
             sqlx::query(
                 r#"
@@ -782,6 +793,14 @@ impl PgStore {
                 "opencode",
                 "mint",
             ),
+            (
+                parse_id(DEMO_COPILOT_AGENT_ID)?,
+                copilot_actor_id,
+                "Piper",
+                "engineer",
+                "github-copilot",
+                "violet",
+            ),
         ] {
             sqlx::query(
                 r#"
@@ -815,7 +834,7 @@ impl PgStore {
                 "demo-bootstrap-v1",
                 json!({
                     "name": "Crony Corp Demonstration Office",
-                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal"]
+                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal", "Piper"]
                 }),
             ),
         )
@@ -992,7 +1011,8 @@ impl PgStore {
             r#"
             SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id,
                    r.assignment_token, r.provider_session_id, r.resumed_from_run_id,
-                   r.workspace_run_id, r.input_tokens, r.output_tokens, r.cost_microusd,
+                   r.workspace_run_id, r.model, r.reasoning_effort,
+                   r.input_tokens, r.output_tokens, r.cost_microusd,
                    r.budget_tokens_limit, r.budget_cost_microusd_limit, r.breaker_stage,
                    r.no_progress_events, r.repeated_tool_count,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
@@ -2071,7 +2091,10 @@ impl PgStore {
     ) -> Result<Vec<SchedulableTask>> {
         sqlx::query(
             r#"
-            SELECT t.id AS task_id, COALESCE(t.required_adapter, a.adapter) AS required_adapter
+            SELECT t.id AS task_id,
+                   COALESCE(t.required_adapter, a.adapter) AS required_adapter,
+                   t.contract->>'model' AS required_model,
+                   t.contract->>'reasoning_effort' AS required_reasoning_effort
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -2110,6 +2133,8 @@ impl PgStore {
             Ok(SchedulableTask {
                 task_id: row.get("task_id"),
                 required_adapter: row.get("required_adapter"),
+                required_model: row.get("required_model"),
+                required_reasoning_effort: row.get("required_reasoning_effort"),
             })
         })
         .collect()
@@ -2232,6 +2257,8 @@ impl PgStore {
         let mission_title: String = row.get("mission_title");
         let task_title: String = row.get("task_title");
         let task_prompt = format_task_prompt(&mission_title, &task_title, &contract, attempt);
+        let model = contract.model.clone();
+        let reasoning_effort = contract.reasoning_effort.clone();
 
         let run_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
@@ -2239,8 +2266,9 @@ impl PgStore {
             r#"
             INSERT INTO runs
                 (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
-                 workspace_run_id, budget_tokens_limit, budget_cost_microusd_limit)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $1, $7, $8)
+                 workspace_run_id, budget_tokens_limit, budget_cost_microusd_limit,
+                 model, reasoning_effort)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $1, $7, $8, $9, $10)
             "#,
         )
         .bind(run_id)
@@ -2251,6 +2279,8 @@ impl PgStore {
         .bind(assignment_token)
         .bind(contract.budget_tokens)
         .bind(contract.budget_cost_microusd)
+        .bind(&model)
+        .bind(&reasoning_effort)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -2292,6 +2322,8 @@ impl PgStore {
                         "runner_id": runner_id,
                         "attempt": attempt,
                         "max_attempts": max_attempts,
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
                         "status": "starting"
                     }),
                 )
@@ -2313,6 +2345,8 @@ impl PgStore {
                 attempt,
                 adapter,
                 mission_title: task_prompt,
+                model,
+                reasoning_effort,
                 verification_policy,
                 secret_refs: contract.secret_refs,
             },
@@ -2360,6 +2394,8 @@ impl PgStore {
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let adapter: String = row.get("adapter");
+        let model = contract.model.clone();
+        let reasoning_effort = contract.reasoning_effort.clone();
         assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
 
         let active: bool = sqlx::query_scalar(
@@ -2386,8 +2422,8 @@ impl PgStore {
             INSERT INTO runs
                 (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
                  provider_session_id, resumed_from_run_id, workspace_run_id,
-                 budget_tokens_limit, budget_cost_microusd_limit)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9, $10, $11)
+                 budget_tokens_limit, budget_cost_microusd_limit, model, reasoning_effort)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(run_id)
@@ -2401,6 +2437,8 @@ impl PgStore {
         .bind(workspace_run_id)
         .bind(contract.budget_tokens)
         .bind(contract.budget_cost_microusd)
+        .bind(&model)
+        .bind(&reasoning_effort)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
@@ -2438,7 +2476,9 @@ impl PgStore {
                         "workspace_run_id": workspace_run_id,
                         "task_id": task_id,
                         "agent_id": agent_id,
-                        "runner_id": runner_id
+                        "runner_id": runner_id,
+                        "model": model,
+                        "reasoning_effort": reasoning_effort
                     }),
                 )
             },
@@ -2460,6 +2500,8 @@ impl PgStore {
                 assignment_token,
                 adapter,
                 provider_session_id,
+                model,
+                reasoning_effort,
                 verification_policy,
                 secret_refs: contract.secret_refs,
             },
@@ -4903,6 +4945,8 @@ fn format_task_prompt(
          WRITE SCOPE:\n{}\n\
          TOKEN BUDGET: {}\n\
          COST BUDGET (MICROUSD): {}\n\
+         MODEL: {}\n\
+         REASONING EFFORT: {}\n\
          SECRET CAPABILITIES:\n{}\n\
          DEADLINE: {}\n\
          ESCALATION: {}",
@@ -4919,6 +4963,11 @@ fn format_task_prompt(
         list(&contract.write_scope),
         contract.budget_tokens,
         contract.budget_cost_microusd,
+        contract.model.as_deref().unwrap_or("provider default"),
+        contract
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("provider default"),
         secret_refs,
         contract
             .deadline_at
@@ -5473,6 +5522,8 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         provider_session_id: row.get("provider_session_id"),
         resumed_from_run_id: row.get("resumed_from_run_id"),
         workspace_run_id: row.get("workspace_run_id"),
+        model: row.get("model"),
+        reasoning_effort: row.get("reasoning_effort"),
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
         cost_microusd: row.get("cost_microusd"),

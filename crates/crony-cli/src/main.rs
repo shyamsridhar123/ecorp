@@ -165,6 +165,8 @@ async fn main() -> Result<()> {
                     title,
                     requested_by: actor_id,
                     preferred_adapter: adapter,
+                    preferred_model: None,
+                    reasoning_effort: None,
                     strategy,
                     secret_refs: Vec::new(),
                     budget_tokens: None,

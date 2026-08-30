@@ -121,6 +121,13 @@ The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run 
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
 completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
 
+`tools/e2e_copilot.mjs` uses a deterministic Copilot fixture to verify model discovery, disabled
+policy states, model and reasoning validation, persisted selection, evidence, and same-session
+resume without requiring an account. `tools/probe_copilot_live.mjs` is the separate authenticated
+lane; it must use the official SDK, expose the live account catalog, run a selected real model, and
+finish with verified worktree evidence. See
+`docs/evidence/2026-08-30-github-copilot-adapter-validation.md`.
+
 `tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
 methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.
