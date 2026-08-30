@@ -71,6 +71,8 @@ jobs:
           target/debug/crony-runner \
             --server-ws ws://127.0.0.1:8791/ws/runner \
             --workspace "$PWD/output/runner" \
+            --source-repository "$PWD" \
+            --source-base-ref HEAD \
             --fake-agent-script "$PWD/scripts/fake-agent.mjs" \
             --codex-command "$PWD/scripts/fake-codex-app-server.mjs" \
             > output/runner-ci.log 2>&1 &
@@ -87,11 +89,15 @@ jobs:
           cat output/server-ci.log || true
           cat output/runner-ci.log || true
           exit 1
+      - name: Race demo bootstrap and reset lifecycle
+        run: node tools/e2e_demo_lifecycle.mjs
       - name: Exercise the real server-to-runner path
         shell: pwsh
         run: ./tools/e2e_smoke.ps1
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
+      - name: Verify parallel worktree isolation and source-checkout preservation
+        run: node tools/e2e_worktrees.mjs
       - name: Verify resumable event replay
         run: node tools/e2e_replay.mjs
       - name: Verify control fencing and emergency stop
@@ -109,8 +115,10 @@ jobs:
           name: integration-evidence
           path: |
             output/e2e-smoke.json
+            output/e2e-demo-lifecycle.json
             output/e2e-codex.json
+            output/e2e-worktrees.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md
-            output/runner/evidence/*.json
+            output/runner/**/evidence/*.json

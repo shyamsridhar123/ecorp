@@ -32,6 +32,8 @@ The UI can close without terminating active work.
 - Native OpenAI Codex app-server adapter with structured lifecycle streaming
 - Durable Codex provider sessions with start, live steer, interrupt, stop, and resume
 - Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
+- Dedicated Git branch and linked worktree for every write-capable task lineage
+- Fail-safe worktree cleanup that preserves dirty, committed, or uncertain work
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens
 - Explicit release and transfer, queued messages, and role-gated emergency stop
@@ -64,6 +66,11 @@ pnpm --dir apps/web dev --host 127.0.0.1 --port 5187 --strictPort
 
 Open `http://127.0.0.1:5187`.
 
+The runner uses the current Git repository and `HEAD` as its source by default. Set
+`CRONY_SOURCE_REPOSITORY` and `CRONY_SOURCE_BASE_REF` to choose another local checkout and base.
+Agents receive linked worktrees below `CRONY_RUNNER_WORKSPACE`; they never execute in the source
+checkout itself.
+
 ## Documents
 
 - [`docs/PRODUCT_AND_TECHNICAL_PLAN.md`](docs/PRODUCT_AND_TECHNICAL_PLAN.md)
@@ -73,6 +80,7 @@ Open `http://127.0.0.1:5187`.
 - [`docs/EVALS.md`](docs/EVALS.md)
 - [`docs/BACKLOG.md`](docs/BACKLOG.md)
 - [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
+- [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
 
 ## License
 

@@ -24,8 +24,9 @@
 - The shared adapter contract and first real OpenAI Codex app-server adapter are implemented.
 - Authenticated probes have validated live steer, interrupt, emergency stop, resume, usage, and
   evidence across the browser/server/runner/provider boundary.
-- The next critical-path item is per-task git worktree isolation, followed by bounded task graphs
-  and evidence-gated verification.
+- Per-task Git worktree isolation now provisions deterministic branches, reuses the exact worktree
+  for resume, and preserves every dirty, committed, or uncertain result.
+- The next critical-path items are bounded task graphs and evidence-gated verification.
 
 ---
 

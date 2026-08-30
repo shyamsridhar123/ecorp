@@ -40,6 +40,13 @@ async function waitForRun(demo, runId, predicate, timeoutMs = 15_000) {
   throw new Error(`timed out waiting for run ${runId}`)
 }
 
+function isSettled(run) {
+  return (
+    ['completed', 'failed', 'cancelled', 'lost'].includes(run.status) &&
+    ['preserved', 'removed'].includes(run.workspace_disposition)
+  )
+}
+
 async function assertArtifact(run) {
   assert.ok(run.artifact_path, 'run omitted artifact path')
   const artifactPath = path.isAbsolute(run.artifact_path)
@@ -97,12 +104,16 @@ async function startSteerResumeScenario() {
   const completed = await waitForRun(
     demo,
     launch.run_id,
-    (run) => ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+    isSettled,
   )
   assert.equal(completed.run.status, 'completed')
   assert.ok(completed.run.input_tokens > 0)
   assert.ok(completed.run.output_tokens > 0)
-  const workspace = path.join(root, 'output', 'runner', launch.run_id)
+  assert.ok(completed.run.workspace_path, 'run omitted worktree path')
+  const workspace = completed.run.workspace_path
+  assert.equal(completed.run.workspace_run_id, launch.run_id)
+  assert.equal(completed.run.workspace_disposition, 'preserved')
+  assert.ok(completed.run.workspace_branch?.startsWith('crony/task-'))
   assert.equal(await readFile(path.join(workspace, 'base.txt'), 'utf8'), 'base\n')
   assert.equal(
     await readFile(path.join(workspace, 'steered.txt'), 'utf8'),
@@ -120,11 +131,15 @@ async function startSteerResumeScenario() {
   const resumed = await waitForRun(
     demo,
     resume.run_id,
-    (run) => ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+    isSettled,
   )
   assert.equal(resumed.run.status, 'completed')
   assert.equal(resumed.run.provider_session_id, started.run.provider_session_id)
   assert.equal(resumed.run.resumed_from_run_id, launch.run_id)
+  assert.equal(resumed.run.workspace_path, workspace)
+  assert.equal(resumed.run.workspace_branch, completed.run.workspace_branch)
+  assert.equal(resumed.run.workspace_run_id, launch.run_id)
+  assert.equal(resumed.run.workspace_disposition, 'preserved')
   assert.ok(resumed.run.input_tokens > 0)
   assert.equal(
     await readFile(path.join(workspace, 'resumed.txt'), 'utf8'),
@@ -132,15 +147,36 @@ async function startSteerResumeScenario() {
   )
   const resumeArtifact = await assertArtifact(resumed.run)
 
+  const secondResume = await post(
+    `/api/corps/${demo.corp_id}/runs/${resume.run_id}/resume`,
+    {
+      requested_by: demo.alice_actor_id,
+      prompt: 'resume the task lineage again',
+    },
+  )
+  const resumedAgain = await waitForRun(
+    demo,
+    secondResume.run_id,
+    isSettled,
+  )
+  assert.equal(resumedAgain.run.status, 'completed')
+  assert.equal(resumedAgain.run.workspace_run_id, launch.run_id)
+  assert.equal(resumedAgain.run.workspace_path, workspace)
+  assert.equal(resumedAgain.run.workspace_branch, completed.run.workspace_branch)
+  assert.equal(resumedAgain.run.resumed_from_run_id, resume.run_id)
+  const secondResumeArtifact = await assertArtifact(resumedAgain.run)
+
   return {
     corp_id: demo.corp_id,
     mission_id: mission.mission_id,
     run_id: launch.run_id,
     resume_run_id: resume.run_id,
+    second_resume_run_id: secondResume.run_id,
     provider_session_id: resumed.run.provider_session_id,
     steer_delivery: message.delivery,
     start_status: completed.run.status,
     resume_status: resumed.run.status,
+    second_resume_status: resumedAgain.run.status,
     start_usage: {
       input_tokens: completed.run.input_tokens,
       output_tokens: completed.run.output_tokens,
@@ -151,6 +187,7 @@ async function startSteerResumeScenario() {
     },
     start_artifact: startArtifact,
     resume_artifact: resumeArtifact,
+    second_resume_artifact: secondResumeArtifact,
   }
 }
 
@@ -182,7 +219,7 @@ async function interruptScenario() {
   const terminal = await waitForRun(
     demo,
     launch.run_id,
-    (run) => ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+    isSettled,
   )
   assert.equal(terminal.run.status, 'cancelled')
   const artifact = await assertArtifact(terminal.run)
@@ -216,7 +253,7 @@ async function stopScenario() {
   const terminal = await waitForRun(
     demo,
     launch.run_id,
-    (run) => ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+    isSettled,
   )
   assert.equal(terminal.run.status, 'cancelled')
   const artifact = await assertArtifact(terminal.run)

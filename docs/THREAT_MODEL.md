@@ -18,9 +18,9 @@
 | Cross-Corp access | Corp IDs on tables | authorization before query/subscription plus isolation tests |
 | Duplicate effects | event idempotency key | effect ledger and fencing token |
 | Runner impersonation | local-only deployment | enrollment and short-lived mTLS certificate |
-| Malicious agent process | dedicated run directory | container/user isolation and deny-by-default network |
+| Malicious agent process | dedicated branch and worktree | container/user isolation and deny-by-default network |
 | Secret exfiltration | fake adapter has no secrets | secret broker with short-lived capability |
-| Path traversal | generated run directory | canonical path validation and mount boundary |
+| Path traversal | canonical worktree-root validation | mount boundary and sandbox policy |
 | Prompt injection | deterministic adapter | trust labels, tool policy, and source-aware context |
 | Memory poisoning | no persistent memory yet | provenance, scope, expiry, and admission policy |
 | Runaway spend | deterministic local adapter | task/run/Corp budgets and breaker |
@@ -41,4 +41,3 @@ Update this model when adding:
 - artifact downloads
 - autonomous deployments
 - persistent memory
-

@@ -66,7 +66,10 @@ $deadline = (Get-Date).AddMinutes(2)
 do {
     $snapshot = Invoke-RestMethod -Uri "$Server/api/corps/$($demo.corp_id)/snapshot?actor_id=$($demo.alice_actor_id)"
     $run = $snapshot.snapshot.runs | Where-Object id -eq $launch.run_id
-    if ($run.status -in @('completed', 'failed', 'cancelled')) {
+    if (
+        $run.status -in @('completed', 'failed', 'cancelled') -and
+        $run.workspace_disposition -in @('preserved', 'removed')
+    ) {
         break
     }
     Start-Sleep -Milliseconds 500
@@ -74,6 +77,12 @@ do {
 
 if ($run.status -ne 'completed') {
     throw "Run did not complete successfully: $($run | ConvertTo-Json -Depth 10)"
+}
+if (-not $run.workspace_path -or -not $run.workspace_branch) {
+    throw 'Run did not persist isolated worktree metadata.'
+}
+if ($run.workspace_disposition -ne 'preserved') {
+    throw "Expected dirty worktree preservation, got $($run.workspace_disposition)."
 }
 
 $artifactPath = [System.IO.Path]::GetFullPath(
@@ -147,6 +156,9 @@ $report = [ordered]@{
     event_count = $snapshot.snapshot.events.Count
     control_acknowledged = [bool]$controlOutput
     adapter_capability = $adapterCapability.detail
+    workspace_path = $run.workspace_path
+    workspace_branch = $run.workspace_branch
+    workspace_disposition = $run.workspace_disposition
 }
 
 $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath

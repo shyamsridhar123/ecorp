@@ -449,7 +449,7 @@ async fn resume_run(
             mission_id: record.mission_id,
             task_id: record.task_id,
             run_id: record.run_id,
-            workspace_run_id: record.source_run_id,
+            workspace_run_id: record.workspace_run_id,
             agent_id: record.agent_id,
             assignment_token: record.assignment_token,
             adapter: record.adapter,
