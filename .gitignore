@@ -1,4 +1,4 @@
-/target/
+**/target/
 /node_modules/
 **/node_modules/
 **/dist/
@@ -17,3 +17,4 @@ Thumbs.db
 
 .playwright-cli/
 .gstack/
+apps/desktop/src-tauri/gen/

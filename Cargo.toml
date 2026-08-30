@@ -7,6 +7,7 @@ members = [
   "crates/crony-runner",
   "crates/crony-cli",
 ]
+exclude = ["apps/desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

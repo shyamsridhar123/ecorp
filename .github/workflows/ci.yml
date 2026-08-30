@@ -202,3 +202,22 @@ jobs:
         with:
           name: runner-platform-${{ matrix.os }}
           path: output/platform/*
+
+  desktop-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:web
+      - run: cargo install tauri-cli --version 2.11.4 --locked
+      - run: cargo tauri build --debug --no-bundle
+        working-directory: apps/desktop
