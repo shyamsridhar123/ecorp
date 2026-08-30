@@ -16,3 +16,4 @@ output/playwright/*
 Thumbs.db
 
 .playwright-cli/
+.gstack/

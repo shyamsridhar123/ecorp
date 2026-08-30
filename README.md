@@ -29,6 +29,9 @@ The UI can close without terminating active work.
 - Persisted runner heartbeats, disconnect grace, and active-run reconciliation
 - Pluggable `AgentAdapter` lifecycle contract with explicit feature capabilities
 - Real child-process execution through a deterministic fake-agent adapter
+- Native OpenAI Codex app-server adapter with structured lifecycle streaming
+- Durable Codex provider sessions with start, live steer, interrupt, stop, and resume
+- Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens
 - Explicit release and transfer, queued messages, and role-gated emergency stop
@@ -42,6 +45,7 @@ Prerequisites:
 - Rust
 - Node.js and pnpm
 - Docker
+- An authenticated `codex` CLI for real Codex missions (optional; the fake adapter works offline)
 
 ```powershell
 Copy-Item .env.example .env
@@ -68,6 +72,7 @@ Open `http://127.0.0.1:5187`.
 - [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
 - [`docs/EVALS.md`](docs/EVALS.md)
 - [`docs/BACKLOG.md`](docs/BACKLOG.md)
+- [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
 
 ## License
 

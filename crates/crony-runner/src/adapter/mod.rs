@@ -1,3 +1,4 @@
+mod codex;
 mod fake;
 
 use std::{
@@ -10,6 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub use codex::CodexAdapter;
 pub use fake::FakeProcessAdapter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,9 @@ pub struct AdapterArtifact {
 
 #[derive(Debug, Clone)]
 pub enum AdapterEvent {
+    Session {
+        session_id: String,
+    },
     Started {
         workspace: PathBuf,
     },
@@ -209,12 +214,15 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    pub fn new(fake_agent_script: impl AsRef<Path>) -> Self {
+    pub fn new(fake_agent_script: impl AsRef<Path>, codex_command: impl AsRef<Path>) -> Self {
         let fake: Arc<dyn AgentAdapter> = Arc::new(FakeProcessAdapter::new(
             fake_agent_script.as_ref().to_path_buf(),
         ));
+        let codex: Arc<dyn AgentAdapter> =
+            Arc::new(CodexAdapter::new(codex_command.as_ref().to_path_buf()));
         let mut adapters = HashMap::new();
         adapters.insert(fake.id().to_owned(), fake);
+        adapters.insert(codex.id().to_owned(), codex);
         Self {
             adapters: Arc::new(adapters),
         }

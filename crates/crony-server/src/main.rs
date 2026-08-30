@@ -16,9 +16,10 @@ use crony_domain::DomainEvent;
 use crony_protocol::{
     BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
     CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
-    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, QueueMessageRequest, QueueMessageResponse,
-    ReleaseLeaseRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
+    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResumeRunRequest,
+    ResumeRunResponse, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SnapshotResponse, TransferLeaseRequest,
 };
 use crony_store::{NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput};
@@ -169,6 +170,10 @@ async fn main() -> anyhow::Result<()> {
             post(launch_mission),
         )
         .route(
+            "/api/corps/{corp_id}/runs/{run_id}/resume",
+            post(resume_run),
+        )
+        .route(
             "/api/corps/{corp_id}/agents/{agent_id}/lease",
             post(claim_lease),
         )
@@ -187,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/agents/{agent_id}/emergency-stop",
             post(emergency_stop),
+        )
+        .route(
+            "/api/corps/{corp_id}/agents/{agent_id}/interrupt",
+            post(interrupt_run),
         )
         .route("/ws/corps/{corp_id}", get(browser_websocket))
         .route("/ws/runner", get(runner_websocket))
@@ -234,6 +243,7 @@ async fn bootstrap_demo(
         eve_actor_id: ids.eve_actor_id,
         manager_agent_id: ids.manager_agent_id,
         worker_agent_id: ids.worker_agent_id,
+        codex_agent_id: ids.codex_agent_id,
     }))
 }
 
@@ -252,6 +262,7 @@ async fn reset_demo(
         eve_actor_id: ids.eve_actor_id,
         manager_agent_id: ids.manager_agent_id,
         worker_agent_id: ids.worker_agent_id,
+        codex_agent_id: ids.codex_agent_id,
     }))
 }
 
@@ -326,7 +337,12 @@ async fn create_mission(
 ) -> Result<Json<CreateMissionResponse>, ApiError> {
     let (ids, events) = state
         .store
-        .create_mission(corp_id, request.requested_by, &request.title)
+        .create_mission(
+            corp_id,
+            request.requested_by,
+            &request.title,
+            request.preferred_adapter.as_deref(),
+        )
         .await
         .map_err(map_store_error)?;
     for event in events {
@@ -399,6 +415,53 @@ async fn launch_mission(
     Ok(Json(LaunchMissionResponse {
         run_id: record.run_id,
         runner_id: runner.0,
+    }))
+}
+
+async fn resume_run(
+    State(state): State<AppState>,
+    Path((corp_id, source_run_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ResumeRunRequest>,
+) -> Result<Json<ResumeRunResponse>, ApiError> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request("resume prompt cannot be empty"));
+    }
+    if prompt.len() > 8_000 {
+        return Err(ApiError::bad_request(
+            "resume prompt cannot exceed 8,000 characters",
+        ));
+    }
+    let (record, event) = state
+        .store
+        .create_resume_run(corp_id, source_run_id, request.requested_by)
+        .await
+        .map_err(ApiError::conflict)?;
+    let runner = state
+        .runners
+        .get(&record.runner_id)
+        .ok_or_else(|| ApiError::conflict("source run's runner is disconnected"))?;
+    runner
+        .tx
+        .send(ServerToRunner::ResumeRun {
+            corp_id: record.corp_id,
+            room_id: record.room_id,
+            mission_id: record.mission_id,
+            task_id: record.task_id,
+            run_id: record.run_id,
+            workspace_run_id: record.source_run_id,
+            agent_id: record.agent_id,
+            assignment_token: record.assignment_token,
+            adapter: record.adapter,
+            provider_session_id: record.provider_session_id.clone(),
+            prompt: prompt.to_owned(),
+        })
+        .map_err(|_| ApiError::conflict("runner disconnected before accepting resume"))?;
+    publish(&state, event);
+    Ok(Json(ResumeRunResponse {
+        run_id: record.run_id,
+        runner_id: record.runner_id,
+        provider_session_id: record.provider_session_id,
     }))
 }
 
@@ -537,6 +600,40 @@ async fn emergency_stop(
         .map_err(|_| ApiError::conflict("runner disconnected before stop delivery"))?;
     publish(&state, outcome.event);
     Ok(Json(EmergencyStopResponse {
+        run_id: outcome.run_id,
+        requested: true,
+    }))
+}
+
+async fn interrupt_run(
+    State(state): State<AppState>,
+    Path((corp_id, agent_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<InterruptRunRequest>,
+) -> Result<Json<InterruptRunResponse>, ApiError> {
+    let outcome = state
+        .store
+        .request_interrupt(
+            corp_id,
+            agent_id,
+            request.actor_id,
+            request.lease_token,
+            &request.reason,
+        )
+        .await
+        .map_err(ApiError::conflict)?;
+    let runner = state
+        .runners
+        .get(&outcome.runner_id)
+        .ok_or_else(|| ApiError::conflict("run's runner is disconnected"))?;
+    runner
+        .tx
+        .send(ServerToRunner::InterruptRun {
+            run_id: outcome.run_id,
+            reason: request.reason,
+        })
+        .map_err(|_| ApiError::conflict("runner disconnected before interrupt delivery"))?;
+    publish(&state, outcome.event);
+    Ok(Json(InterruptRunResponse {
         run_id: outcome.run_id,
         requested: true,
     }))

@@ -60,6 +60,19 @@ pub enum ServerToRunner {
         adapter: String,
         mission_title: String,
     },
+    ResumeRun {
+        corp_id: Uuid,
+        room_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        workspace_run_id: Uuid,
+        agent_id: Uuid,
+        assignment_token: Uuid,
+        adapter: String,
+        provider_session_id: String,
+        prompt: String,
+    },
     ControlMessage {
         corp_id: Uuid,
         run_id: Uuid,
@@ -69,6 +82,10 @@ pub enum ServerToRunner {
         text: String,
     },
     StopRun {
+        run_id: Uuid,
+        reason: String,
+    },
+    InterruptRun {
         run_id: Uuid,
         reason: String,
     },
@@ -117,6 +134,7 @@ pub struct DemoBootstrapResponse {
     pub eve_actor_id: Uuid,
     pub manager_agent_id: Uuid,
     pub worker_agent_id: Uuid,
+    pub codex_agent_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +156,7 @@ pub struct CreateRoomMessageResponse {
 pub struct CreateMissionRequest {
     pub title: String,
     pub requested_by: Uuid,
+    pub preferred_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +174,19 @@ pub struct LaunchMissionRequest {
 pub struct LaunchMissionResponse {
     pub run_id: Uuid,
     pub runner_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeRunRequest {
+    pub requested_by: Uuid,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeRunResponse {
+    pub run_id: Uuid,
+    pub runner_id: String,
+    pub provider_session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +243,19 @@ pub struct EmergencyStopRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmergencyStopResponse {
+    pub run_id: Uuid,
+    pub requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterruptRunRequest {
+    pub actor_id: Uuid,
+    pub lease_token: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterruptRunResponse {
     pub run_id: Uuid,
     pub requested: bool,
 }

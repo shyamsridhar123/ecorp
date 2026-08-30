@@ -197,6 +197,11 @@ pub struct Run {
     pub runner_id: String,
     #[serde(skip_serializing)]
     pub assignment_token: Uuid,
+    pub provider_session_id: Option<String>,
+    pub resumed_from_run_id: Option<Uuid>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_microusd: i64,
     pub status: RunStatus,
     pub summary: Option<String>,
     pub artifact_path: Option<String>,
