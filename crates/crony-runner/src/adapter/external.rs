@@ -385,6 +385,8 @@ mod tests {
             task_id: uuid::Uuid::new_v4(),
             agent_id: uuid::Uuid::new_v4(),
             mission_title: format!("common {provider} sample"),
+            model: None,
+            reasoning_effort: None,
             workspace: std::env::temp_dir()
                 .join("crony-external-adapter-tests")
                 .join(run_id.to_string()),

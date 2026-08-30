@@ -10,6 +10,24 @@ pub struct RunnerCapability {
     pub name: String,
     pub available: bool,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub models: Vec<RunnerModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerModel {
+    pub id: String,
+    pub name: String,
+    pub policy_state: Option<String>,
+    pub policy_terms: Option<String>,
+    pub supports_vision: bool,
+    pub supports_reasoning_effort: bool,
+    pub max_prompt_tokens: Option<u64>,
+    pub max_context_window_tokens: Option<u64>,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub billing_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +86,8 @@ pub enum ServerToRunner {
         assignment_token: Uuid,
         adapter: String,
         mission_title: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -83,6 +103,8 @@ pub enum ServerToRunner {
         adapter: String,
         provider_session_id: String,
         prompt: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -215,6 +237,8 @@ pub struct CreateMissionRequest {
     pub title: String,
     pub requested_by: Uuid,
     pub preferred_adapter: Option<String>,
+    pub preferred_model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,

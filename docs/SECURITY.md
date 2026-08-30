@@ -32,6 +32,13 @@ contain grant metadata only. Environment injection is labeled reduced assurance.
 Risky action approvals are Corp-scoped, role-gated, expiring, and idempotent. Approval decisions
 transactionally enqueue durable runner commands, and command IDs fence duplicate delivery.
 
+The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
+read-only operations it can prove are scoped to that worktree, and reads from the SDK state
+directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.
+External paths, network URLs, sandbox bypass, managed-policy approvals, and ambiguous shell
+commands suspend durably. Shell approval cards include the bounded command text rather than only a
+generic action label.
+
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
 

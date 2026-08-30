@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use crony_domain::VerificationPolicy;
 use crony_protocol::{
-    ActiveRunClaim, ResolvedSecret, RunnerCapability, RunnerToServer, ServerToRunner,
+    ActiveRunClaim, ResolvedSecret, RunnerCapability, RunnerModel, RunnerToServer, ServerToRunner,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -22,11 +22,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
+use url::Url;
 use uuid::Uuid;
 
 use adapter::{
     AdapterArtifact, AdapterControl, AdapterEvent, AdapterEventSink, AdapterExit, AdapterRegistry,
-    AdapterRunRequest, AgentAdapter,
+    AdapterRunRequest, AgentAdapter, CopilotSdkConfig,
 };
 use workspace::{WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager};
 
@@ -98,6 +99,37 @@ struct Args {
         value_delimiter = ';'
     )]
     opencode_command_args: Vec<std::ffi::OsString>,
+
+    #[arg(long, env = "CRONY_COPILOT_RUNTIME_URL")]
+    copilot_runtime_url: Option<String>,
+
+    #[arg(long, env = "CRONY_COPILOT_CLI_PATH")]
+    copilot_cli_path: Option<PathBuf>,
+
+    #[arg(
+        long = "copilot-cli-prefix-arg",
+        env = "CRONY_COPILOT_CLI_PREFIX_ARGS",
+        value_delimiter = ';'
+    )]
+    copilot_cli_prefix_args: Vec<std::ffi::OsString>,
+
+    #[arg(long, env = "CRONY_COPILOT_GITHUB_TOKEN_FILE")]
+    copilot_github_token_file: Option<PathBuf>,
+
+    #[arg(long, env = "CRONY_COPILOT_CONNECTION_TOKEN_FILE")]
+    copilot_connection_token_file: Option<PathBuf>,
+
+    #[arg(long, env = "CRONY_COPILOT_HOME")]
+    copilot_home: Option<PathBuf>,
+
+    #[arg(long, env = "CRONY_COPILOT_USE_LOGGED_IN_USER", default_value_t = true)]
+    copilot_use_logged_in_user: bool,
+
+    #[arg(long, env = "CRONY_COPILOT_LOG_LEVEL", default_value = "warning")]
+    copilot_log_level: String,
+
+    #[arg(long, env = "CRONY_COPILOT_FIXTURE", default_value_t = false)]
+    copilot_fixture: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +143,8 @@ struct Assignment {
     agent_id: Uuid,
     adapter: String,
     mission_title: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
     verification_policy: VerificationPolicy,
     secrets: Vec<ResolvedSecret>,
 }
@@ -145,6 +179,42 @@ fn default_provider_command(name: &str) -> PathBuf {
     } else {
         PathBuf::from(name)
     }
+}
+
+fn copilot_config(args: &Args) -> Result<CopilotSdkConfig> {
+    if args.copilot_runtime_url.is_some() && args.copilot_cli_path.is_some() {
+        return Err(anyhow!(
+            "configure either CRONY_COPILOT_RUNTIME_URL or CRONY_COPILOT_CLI_PATH, not both"
+        ));
+    }
+    let (external_host, external_port) = if let Some(value) = &args.copilot_runtime_url {
+        let url = Url::parse(value).context("parse CRONY_COPILOT_RUNTIME_URL")?;
+        let host = url
+            .host_str()
+            .context("Copilot runtime URL omitted a host")?
+            .to_owned();
+        let port = url
+            .port()
+            .context("Copilot runtime URL must include an explicit port")?;
+        (Some(host), Some(port))
+    } else {
+        (None, None)
+    };
+    Ok(CopilotSdkConfig {
+        cli_path: args.copilot_cli_path.clone(),
+        cli_prefix_args: args.copilot_cli_prefix_args.clone(),
+        external_host,
+        external_port,
+        github_token_file: args.copilot_github_token_file.clone(),
+        connection_token_file: args.copilot_connection_token_file.clone(),
+        base_directory: args
+            .copilot_home
+            .clone()
+            .unwrap_or_else(|| args.workspace.join("copilot-home")),
+        use_logged_in_user: args.copilot_use_logged_in_user,
+        log_level: args.copilot_log_level.clone(),
+        fixture: args.copilot_fixture,
+    })
 }
 
 #[derive(Clone, Default)]
@@ -223,6 +293,7 @@ async fn main() -> Result<()> {
         .codex_command
         .clone()
         .unwrap_or_else(default_codex_command);
+    let copilot_config = copilot_config(&args)?;
     let adapters = Arc::new(AdapterRegistry::new(
         args.fake_agent_script.clone(),
         codex_command,
@@ -234,6 +305,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| default_provider_command("opencode")),
         args.opencode_command_args.clone(),
+        copilot_config,
     ));
     loop {
         let delay = match run_connection(
@@ -291,19 +363,49 @@ async fn run_connection(
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned());
     let claims = active_run_claims(&active_runs);
-    let mut capabilities = adapters
-        .all()
-        .into_iter()
-        .map(|adapter| RunnerCapability {
+    let mut capabilities = Vec::new();
+    for adapter in adapters.all() {
+        let adapter_capabilities = adapter.capabilities();
+        let mut available = adapter_capabilities.spawn.supported();
+        let mut detail = format!(
+            "{}; {}",
+            adapter.display_name(),
+            adapter_capabilities.summary()
+        );
+        let models = if available {
+            match adapter.list_models().await {
+                Ok(models) => models
+                    .into_iter()
+                    .map(|model| RunnerModel {
+                        id: model.id,
+                        name: model.name,
+                        policy_state: model.policy_state,
+                        policy_terms: model.policy_terms,
+                        supports_vision: model.supports_vision,
+                        supports_reasoning_effort: model.supports_reasoning_effort,
+                        max_prompt_tokens: model.max_prompt_tokens,
+                        max_context_window_tokens: model.max_context_window_tokens,
+                        supported_reasoning_efforts: model.supported_reasoning_efforts,
+                        default_reasoning_effort: model.default_reasoning_effort,
+                        billing_multiplier: model.billing_multiplier,
+                    })
+                    .collect(),
+                Err(error) => {
+                    available = false;
+                    detail.push_str(&format!("; model discovery failed: {error}"));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        capabilities.push(RunnerCapability {
             name: adapter.id().to_owned(),
-            available: adapter.capabilities().spawn.supported(),
-            detail: Some(format!(
-                "{}; {}",
-                adapter.display_name(),
-                adapter.capabilities().summary()
-            )),
-        })
-        .collect::<Vec<_>>();
+            available,
+            detail: Some(detail),
+            models,
+        });
+    }
     capabilities.push(RunnerCapability {
         name: "workspace-isolation".to_owned(),
         available: true,
@@ -313,6 +415,7 @@ async fn run_connection(
             workspaces.repository().display(),
             workspaces.base_ref()
         )),
+        models: Vec::new(),
     });
     capabilities.push(RunnerCapability {
         name: "secret-delivery".to_owned(),
@@ -321,6 +424,7 @@ async fn run_connection(
             "task-scoped, expiring broker grants; environment injection is reduced assurance"
                 .to_owned(),
         ),
+        models: Vec::new(),
     });
     out_tx
         .send(RunnerToServer::Register {
@@ -404,6 +508,8 @@ async fn run_connection(
                 assignment_token,
                 adapter,
                 mission_title,
+                model,
+                reasoning_effort,
                 verification_policy,
                 secrets,
             } => {
@@ -417,6 +523,8 @@ async fn run_connection(
                     agent_id,
                     adapter,
                     mission_title,
+                    model,
+                    reasoning_effort,
                     verification_policy,
                     secrets,
                 };
@@ -484,6 +592,8 @@ async fn run_connection(
                 adapter,
                 provider_session_id,
                 prompt,
+                model,
+                reasoning_effort,
                 verification_policy,
                 secrets,
             } => {
@@ -497,6 +607,8 @@ async fn run_connection(
                     agent_id,
                     adapter,
                     mission_title: prompt,
+                    model,
+                    reasoning_effort,
                     verification_policy,
                     secrets,
                 };
@@ -850,6 +962,8 @@ async fn execute_assignment(
         task_id: assignment.task_id,
         agent_id: assignment.agent_id,
         mission_title: assignment.mission_title.clone(),
+        model: assignment.model.clone(),
+        reasoning_effort: assignment.reasoning_effort.clone(),
         workspace: workspace.path.clone(),
         environment: assignment
             .secrets

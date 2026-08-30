@@ -44,6 +44,8 @@ The UI can close without terminating active work.
 - Real child-process execution through a deterministic fake-agent adapter
 - Native OpenAI Codex app-server adapter with structured lifecycle streaming
 - Normalized Claude Code and OpenCode CLI adapters with common evidence
+- Official GitHub Copilot SDK adapter with live account model discovery, explicit model and
+  reasoning selection, durable permission handoff, and resumable sessions
 - Durable Codex provider sessions with start, live steer, interrupt, stop, and resume
 - Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
 - Dedicated Git branch and linked worktree for every write-capable task lineage
@@ -66,6 +68,8 @@ Prerequisites:
 - Node.js and pnpm
 - Docker
 - An authenticated `codex` CLI for real Codex missions (optional; the fake adapter works offline)
+- A GitHub Copilot subscription/login for real Copilot missions (optional; CI uses a deterministic
+  Copilot fixture and does not consume account quota)
 
 ```powershell
 Copy-Item .env.example .env
@@ -86,6 +90,12 @@ The runner uses the current Git repository and `HEAD` as its source by default. 
 `CRONY_SOURCE_REPOSITORY` and `CRONY_SOURCE_BASE_REF` to choose another local checkout and base.
 Agents receive linked worktrees below `CRONY_RUNNER_WORKSPACE`; they never execute in the source
 checkout itself.
+
+The `fake-process` adapter is a deterministic test harness, not an AI provider. It launches
+`scripts/fake-agent.mjs` as a real child process and emits predictable lifecycle, steering, and
+artifact events so orchestration can be tested offline. It remains registered beside real
+providers; selecting `github-copilot`, `codex`, `claude-code`, or `opencode` does not route through
+the fake harness. `CRONY_COPILOT_FIXTURE=true` is a separate CI-only Copilot simulator.
 
 In production, set `CRONY_MODE=production`, configure an HTTPS `CRONY_OIDC_ISSUER`, provision
 `human_identities`, and explicitly enroll each runner. Demo endpoints and claimed demo identities
@@ -110,6 +120,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
 - [`docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`](docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md)
 - [`docs/evidence/2026-08-30-external-adapter-validation.md`](docs/evidence/2026-08-30-external-adapter-validation.md)
+- [`docs/evidence/2026-08-30-github-copilot-adapter-validation.md`](docs/evidence/2026-08-30-github-copilot-adapter-validation.md)
 - [`docs/evidence/2026-08-30-protocol-gateway-validation.md`](docs/evidence/2026-08-30-protocol-gateway-validation.md)
 - [`docs/evidence/2026-08-30-tauri-desktop-validation.md`](docs/evidence/2026-08-30-tauri-desktop-validation.md)
 

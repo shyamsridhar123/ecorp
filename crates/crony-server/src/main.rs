@@ -959,6 +959,13 @@ async fn create_mission(
             "secret references currently require the single-task strategy",
         ));
     }
+    validate_requested_model(
+        &state,
+        corp_id,
+        request.preferred_adapter.as_deref(),
+        request.preferred_model.as_deref(),
+        request.reasoning_effort.as_deref(),
+    )?;
     let agents = state
         .store
         .agents_for_planning(corp_id)
@@ -971,6 +978,8 @@ async fn create_mission(
             &PlanningRequest {
                 mission_title: &request.title,
                 preferred_adapter: request.preferred_adapter.as_deref(),
+                preferred_model: request.preferred_model.as_deref(),
+                reasoning_effort: request.reasoning_effort.as_deref(),
                 secret_refs: &request.secret_refs,
                 budget_tokens: request.budget_tokens,
                 budget_cost_microusd: request.budget_cost_microusd,
@@ -1069,9 +1078,13 @@ async fn schedule_ready_tasks(
     let candidates = state.store.schedulable_tasks(corp_id, mission_id).await?;
     let mut scheduled = Vec::new();
     for candidate in candidates {
-        let Some((runner_id, runner_tx)) =
-            select_runner(state, corp_id, &candidate.required_adapter)
-        else {
+        let Some((runner_id, runner_tx)) = select_runner(
+            state,
+            corp_id,
+            &candidate.required_adapter,
+            candidate.required_model.as_deref(),
+            candidate.required_reasoning_effort.as_deref(),
+        ) else {
             continue;
         };
         let Ok((record, event)) = state
@@ -1115,6 +1128,8 @@ async fn schedule_ready_tasks(
                 assignment_token: record.assignment_token,
                 adapter: record.adapter.clone(),
                 mission_title: record.mission_title.clone(),
+                model: record.model.clone(),
+                reasoning_effort: record.reasoning_effort.clone(),
                 verification_policy: record.verification_policy.clone(),
                 secrets,
             })
@@ -1178,21 +1193,84 @@ fn select_runner(
     state: &AppState,
     corp_id: Uuid,
     required_adapter: &str,
+    required_model: Option<&str>,
+    required_reasoning_effort: Option<&str>,
 ) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
     let mut runners = state
         .runners
         .iter()
         .filter(|entry| {
             entry.corp_id == corp_id
-                && entry
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability.name == required_adapter && capability.available)
+                && entry.capabilities.iter().any(|capability| {
+                    capability.name == required_adapter
+                        && capability.available
+                        && required_model.is_none_or(|required_model| {
+                            capability.models.iter().any(|model| {
+                                model.id == required_model
+                                    && model.policy_state.as_deref() != Some("disabled")
+                                    && required_reasoning_effort.is_none_or(|effort| {
+                                        model.supports_reasoning_effort
+                                            && model
+                                                .supported_reasoning_efforts
+                                                .iter()
+                                                .any(|supported| supported == effort)
+                                    })
+                            })
+                        })
+                })
         })
         .map(|entry| (entry.key().clone(), entry.tx.clone()))
         .collect::<Vec<_>>();
     runners.sort_by(|left, right| left.0.cmp(&right.0));
     runners.into_iter().next()
+}
+
+fn validate_requested_model(
+    state: &AppState,
+    corp_id: Uuid,
+    adapter: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(model_id) = model else {
+        if reasoning_effort.is_some() {
+            return Err(ApiError::bad_request(
+                "reasoning effort requires an explicit model",
+            ));
+        }
+        return Ok(());
+    };
+    let adapter = adapter.ok_or_else(|| {
+        ApiError::bad_request("model selection requires an explicit agent runtime")
+    })?;
+    let models = state
+        .runners
+        .iter()
+        .filter(|entry| entry.corp_id == corp_id)
+        .flat_map(|entry| entry.capabilities.clone())
+        .filter(|capability| capability.available && capability.name == adapter)
+        .flat_map(|capability| capability.models)
+        .filter(|model| model.id == model_id && model.policy_state.as_deref() != Some("disabled"))
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "model {model_id} is not available from a connected {adapter} runner"
+        )));
+    }
+    if let Some(effort) = reasoning_effort
+        && !models.iter().any(|model| {
+            model.supports_reasoning_effort
+                && model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|supported| supported == effort)
+        })
+    {
+        return Err(ApiError::bad_request(format!(
+            "model {model_id} does not support reasoning effort {effort} on a connected {adapter} runner"
+        )));
+    }
+    Ok(())
 }
 
 async fn resume_run(
@@ -1243,6 +1321,8 @@ async fn resume_run(
         attempt: 0,
         adapter: record.adapter.clone(),
         mission_title: prompt.to_owned(),
+        model: record.model.clone(),
+        reasoning_effort: record.reasoning_effort.clone(),
         verification_policy: record.verification_policy.clone(),
         secret_refs: record.secret_refs.clone(),
     };
@@ -1278,6 +1358,8 @@ async fn resume_run(
             adapter: record.adapter,
             provider_session_id: record.provider_session_id.clone(),
             prompt: prompt.to_owned(),
+            model: record.model,
+            reasoning_effort: record.reasoning_effort,
             verification_policy: record.verification_policy,
             secrets,
         })

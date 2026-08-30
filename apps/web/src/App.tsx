@@ -71,6 +71,8 @@ type Run = {
   provider_session_id: string | null
   resumed_from_run_id: string | null
   workspace_run_id: string
+  model: string | null
+  reasoning_effort: string | null
   input_tokens: number
   output_tokens: number
   cost_microusd: number
@@ -173,6 +175,27 @@ type BrowserSocketMessage =
   | { type: 'ready'; corp_id: string; replayed_through: number }
   | { type: 'event'; event: DomainEvent }
 
+type RunnerModel = {
+  id: string
+  name: string
+  policy_state: string | null
+  policy_terms: string | null
+  supports_vision: boolean
+  supports_reasoning_effort: boolean
+  max_prompt_tokens: number | null
+  max_context_window_tokens: number | null
+  supported_reasoning_efforts: string[]
+  default_reasoning_effort: string | null
+  billing_multiplier: number | null
+}
+
+type RunnerCapability = {
+  name: string
+  available: boolean
+  detail: string | null
+  models: RunnerModel[]
+}
+
 type SnapshotResponse = {
   snapshot: {
     corp: { id: string; name: string }
@@ -200,11 +223,7 @@ type SnapshotResponse = {
     status: 'connected' | 'grace' | 'offline'
     last_seen_at: string
     grace_expires_at: string | null
-    capabilities: {
-      name: string
-      available: boolean
-      detail: string | null
-    }[]
+    capabilities: RunnerCapability[]
   }[]
 }
 
@@ -478,6 +497,12 @@ function MissionCard({
           {latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out
         </div>
       ) : null}
+      {latestRun?.model ? (
+        <div className="usage-box">
+          {latestRun.model}
+          {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
+        </div>
+      ) : null}
       {latestRun?.workspace_branch ? (
         <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
           <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
@@ -723,6 +748,8 @@ function App() {
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
   const [missionAdapter, setMissionAdapter] = useState('fake-process')
+  const [missionModel, setMissionModel] = useState('')
+  const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
   const [missionStrategy, setMissionStrategy] = useState('single')
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
@@ -879,6 +906,8 @@ function App() {
           title: missionTitle,
           requested_by: selectedActor.id,
           preferred_adapter: missionAdapter,
+          preferred_model: missionModel || null,
+          reasoning_effort: missionReasoningEffort || null,
           strategy: missionStrategy,
         }),
       })
@@ -1147,13 +1176,43 @@ function App() {
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
   const room = data.snapshot.rooms[0]
   const connectedRunners = data.runners.filter((runner) => runner.connected)
+  const agentAdapters = new Set(data.snapshot.agents.map((agent) => agent.adapter))
   const availableAdapters = Array.from(
-    new Map(
-      connectedRunners
-        .flatMap((runner) => runner.capabilities)
-        .filter((capability) => capability.available && capability.name !== 'workspace-isolation')
-        .map((capability) => [capability.name, capability]),
-    ).values(),
+    connectedRunners
+      .flatMap((runner) => runner.capabilities)
+      .filter(
+        (capability) =>
+          capability.available && agentAdapters.has(capability.name),
+      )
+      .reduce((adapters, capability) => {
+        const existing = adapters.get(capability.name)
+        const modelsById = new Map(
+          (existing?.models ?? []).map((model) => [model.id, model]),
+        )
+        for (const model of capability.models) {
+          const prior = modelsById.get(model.id)
+          if (
+            !prior ||
+            (prior.policy_state === 'disabled' &&
+              model.policy_state !== 'disabled')
+          ) {
+            modelsById.set(model.id, model)
+          }
+        }
+        adapters.set(capability.name, {
+          ...capability,
+          detail: existing?.detail ?? capability.detail,
+          models: Array.from(modelsById.values()),
+        })
+        return adapters
+      }, new Map<string, RunnerCapability>())
+      .values(),
+  )
+  const selectedAdapter = availableAdapters.find(
+    (adapter) => adapter.name === missionAdapter,
+  )
+  const selectedModel = selectedAdapter?.models.find(
+    (model) => model.id === missionModel,
   )
   const runnerLabel = connectedRunners.length
     ? `${connectedRunners.length} runner online`
@@ -1263,14 +1322,73 @@ function App() {
             <select
               id="mission-adapter"
               value={missionAdapter}
-              onChange={(event) => setMissionAdapter(event.target.value)}
+              onChange={(event) => {
+                setMissionAdapter(event.target.value)
+                setMissionModel('')
+                setMissionReasoningEffort('')
+              }}
             >
               {availableAdapters.map((adapter) => (
                 <option key={adapter.name} value={adapter.name}>
-                  {adapter.name === 'codex' ? 'OpenAI Codex' : adapter.name}
+                  {adapter.name === 'codex'
+                    ? 'OpenAI Codex'
+                    : adapter.name === 'fake-process'
+                      ? 'Deterministic test harness (no AI)'
+                    : adapter.name === 'github-copilot'
+                      ? `GitHub Copilot (${adapter.models.filter((model) => model.policy_state !== 'disabled').length} models)`
+                      : adapter.name}
                 </option>
               ))}
             </select>
+            {selectedAdapter?.models.length ? (
+              <>
+                <label htmlFor="mission-model">Model</label>
+                <select
+                  id="mission-model"
+                  value={missionModel}
+                  onChange={(event) => {
+                    const nextModel = selectedAdapter.models.find(
+                      (model) => model.id === event.target.value,
+                    )
+                    setMissionModel(event.target.value)
+                    setMissionReasoningEffort(
+                      nextModel?.default_reasoning_effort ?? '',
+                    )
+                  }}
+                >
+                  <option value="">Provider default</option>
+                  {selectedAdapter.models.map((model) => (
+                    <option
+                      key={model.id}
+                      value={model.id}
+                      disabled={model.policy_state === 'disabled'}
+                    >
+                      {model.name} · {model.id}
+                      {model.policy_state === 'disabled' ? ' · disabled by policy' : ''}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : null}
+            {selectedModel?.supports_reasoning_effort ? (
+              <>
+                <label htmlFor="mission-reasoning">Reasoning effort</label>
+                <select
+                  id="mission-reasoning"
+                  value={missionReasoningEffort}
+                  onChange={(event) =>
+                    setMissionReasoningEffort(event.target.value)
+                  }
+                >
+                  <option value="">Provider default</option>
+                  {selectedModel.supported_reasoning_efforts.map((effort) => (
+                    <option key={effort} value={effort}>
+                      {effort}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : null}
             <label htmlFor="mission-strategy">Manager strategy</label>
             <select
               id="mission-strategy"

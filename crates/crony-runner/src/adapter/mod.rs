@@ -1,4 +1,5 @@
 mod codex;
+mod copilot;
 mod external;
 mod fake;
 
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub use codex::CodexAdapter;
+pub use copilot::{CopilotSdkAdapter, CopilotSdkConfig};
 pub use external::{ExternalCliAdapter, ExternalFlavor};
 pub use fake::FakeProcessAdapter;
 
@@ -81,6 +83,8 @@ pub struct AdapterRunRequest {
     pub task_id: Uuid,
     pub agent_id: Uuid,
     pub mission_title: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub workspace: PathBuf,
     pub environment: HashMap<String, String>,
 }
@@ -94,6 +98,8 @@ impl std::fmt::Debug for AdapterRunRequest {
             .field("task_id", &self.task_id)
             .field("agent_id", &self.agent_id)
             .field("mission_title", &self.mission_title)
+            .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("workspace", &self.workspace)
             .field(
                 "environment_keys",
@@ -132,6 +138,21 @@ pub struct AdapterArtifact {
     pub sha256: String,
     pub bytes: usize,
     pub media_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdapterModel {
+    pub id: String,
+    pub name: String,
+    pub policy_state: Option<String>,
+    pub policy_terms: Option<String>,
+    pub supports_vision: bool,
+    pub supports_reasoning_effort: bool,
+    pub max_prompt_tokens: Option<u64>,
+    pub max_context_window_tokens: Option<u64>,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub billing_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +238,10 @@ pub trait AgentAdapter: Send + Sync {
     fn display_name(&self) -> &'static str;
     fn capabilities(&self) -> AdapterCapabilities;
 
+    async fn list_models(&self) -> Result<Vec<AdapterModel>, AdapterError> {
+        Ok(Vec::new())
+    }
+
     async fn execute(
         &self,
         request: AdapterRunRequest,
@@ -264,6 +289,7 @@ impl AdapterRegistry {
         claude_prefix_args: Vec<std::ffi::OsString>,
         opencode_command: impl AsRef<Path>,
         opencode_prefix_args: Vec<std::ffi::OsString>,
+        copilot_config: CopilotSdkConfig,
     ) -> Self {
         let fake: Arc<dyn AgentAdapter> = Arc::new(FakeProcessAdapter::new(
             fake_agent_script.as_ref().to_path_buf(),
@@ -280,11 +306,13 @@ impl AdapterRegistry {
             opencode_command.as_ref().to_path_buf(),
             opencode_prefix_args,
         ));
+        let copilot: Arc<dyn AgentAdapter> = Arc::new(CopilotSdkAdapter::new(copilot_config));
         let mut adapters = HashMap::new();
         adapters.insert(fake.id().to_owned(), fake);
         adapters.insert(codex.id().to_owned(), codex);
         adapters.insert(claude.id().to_owned(), claude);
         adapters.insert(opencode.id().to_owned(), opencode);
+        adapters.insert(copilot.id().to_owned(), copilot);
         Self {
             adapters: Arc::new(adapters),
         }
@@ -333,6 +361,8 @@ mod tests {
             task_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             mission_title: title.to_owned(),
+            model: None,
+            reasoning_effort: None,
             workspace: std::env::temp_dir()
                 .join("crony-adapter-tests")
                 .join(run_id.to_string()),

@@ -291,7 +291,9 @@ Provider runtimes implement one `AgentAdapter` contract:
 - optionally collect usage after a session
 
 Every feature is reported as supported or unsupported with a reason. The deterministic
-`fake-process` and real `codex` implementations use the same contract.
+`fake-process` and real provider implementations use the same contract. The fake process is an
+offline lifecycle simulator, not an inference provider; it remains registered beside the real
+adapters so orchestration can be tested without credentials or quota.
 
 The Codex adapter:
 
@@ -309,6 +311,14 @@ Claude Code and OpenCode use a shared normalized external-CLI adapter. Provider-
 flags are isolated at the boundary, while JSONL output, sessions, usage, cancellation, and
 provider-neutral evidence map into the same lifecycle. Batch-mode steering limitations are
 reported explicitly rather than hidden.
+
+The GitHub Copilot adapter uses the official Rust SDK. A runner discovers the signed-in account's
+model catalog at registration and advertises policy state, model limits, vision support, reasoning
+levels, and billing multiplier metadata. The selected model and reasoning effort are persisted in
+the task contract and run, survive resume, and participate in runner matching. Copilot may write
+inside the assigned worktree and read its per-worktree isolated SDK state automatically. Network,
+sandbox bypass, external paths, and shell commands that cannot be proven scoped suspend through
+Crony's durable approval flow.
 
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.

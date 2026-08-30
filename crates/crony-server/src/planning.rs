@@ -19,6 +19,8 @@ pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 500_000;
 pub struct PlanningRequest<'a> {
     pub mission_title: &'a str,
     pub preferred_adapter: Option<&'a str>,
+    pub preferred_model: Option<&'a str>,
+    pub reasoning_effort: Option<&'a str>,
     pub secret_refs: &'a [TaskSecretReference],
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
@@ -103,6 +105,8 @@ impl ManagerStrategy for SingleTaskStrategy {
         );
         task_contract.budget_cost_microusd = budget_cost_microusd;
         task_contract.secret_refs = request.secret_refs.to_vec();
+        task_contract.model = request.preferred_model.map(str::to_owned);
+        task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
         Ok(TaskGraphPlan {
             strategy: self.id().to_owned(),
             max_nodes: 1,
@@ -171,6 +175,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             synthesis_budget,
         );
         synthesis_contract.budget_cost_microusd = synthesis_cost_budget;
+        synthesis_contract.model = request.preferred_model.map(str::to_owned);
+        synthesis_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
         synthesis_contract.references = vec![
             "task:specialist-a".to_owned(),
             "task:specialist-b".to_owned(),
@@ -195,6 +201,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                             specialist_budget,
                         );
                         contract.budget_cost_microusd = specialist_cost_budget;
+                        contract.model = request.preferred_model.map(str::to_owned);
+                        contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
                         contract
                     },
                     assigned_agent_id: first.id,
@@ -217,6 +225,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                             specialist_budget,
                         );
                         contract.budget_cost_microusd = specialist_cost_budget;
+                        contract.model = request.preferred_model.map(str::to_owned);
+                        contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
                         contract
                     },
                     assigned_agent_id: second.id,
@@ -388,6 +398,8 @@ fn verification_plan(
         budget_tokens,
     );
     task_contract.budget_cost_microusd = budget_cost_microusd;
+    task_contract.model = request.preferred_model.map(str::to_owned);
+    task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
     Ok(TaskGraphPlan {
         strategy: strategy.to_owned(),
         max_nodes: 1,
@@ -453,6 +465,8 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         deadline_at: None,
         escalation: "ask the current human controller or mission owner".to_owned(),
         secret_refs: Vec::new(),
+        model: None,
+        reasoning_effort: None,
     }
 }
 
@@ -577,6 +591,21 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
     }
     if !(1..=10_000_000).contains(&contract.budget_cost_microusd) {
         return Err(anyhow!("task {task_key} cost budget is invalid"));
+    }
+    if contract
+        .model
+        .as_ref()
+        .is_some_and(|model| model.trim().is_empty() || model.len() > 128)
+    {
+        return Err(anyhow!("task {task_key} model is invalid"));
+    }
+    if contract.reasoning_effort.as_ref().is_some_and(|effort| {
+        !matches!(
+            effort.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    }) {
+        return Err(anyhow!("task {task_key} reasoning effort is invalid"));
     }
     for value in contract
         .acceptance_tests
@@ -801,6 +830,8 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "ship the bounded graph",
             preferred_adapter: Some("codex"),
+            preferred_model: None,
+            reasoning_effort: None,
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
@@ -835,6 +866,8 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "bounded plan",
             preferred_adapter: None,
+            preferred_model: None,
+            reasoning_effort: None,
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
@@ -908,6 +941,8 @@ mod tests {
                 &PlanningRequest {
                     mission_title: "use Codex",
                     preferred_adapter: Some("codex"),
+                    preferred_model: None,
+                    reasoning_effort: None,
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
@@ -925,6 +960,8 @@ mod tests {
         let request = PlanningRequest {
             mission_title: "verify safely",
             preferred_adapter: Some("fake-process"),
+            preferred_model: None,
+            reasoning_effort: None,
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,

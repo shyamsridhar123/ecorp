@@ -9,6 +9,11 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $output = Join-Path $root 'output'
 $serverPort = 8791
 $webPort = 5187
+$databaseUrl = if ($env:DATABASE_URL) {
+    $env:DATABASE_URL
+} else {
+    'postgres://crony:crony@127.0.0.1:54329/crony'
+}
 
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 
@@ -69,7 +74,7 @@ try {
         -FilePath (Join-Path $root 'target\debug\crony-server.exe') `
         -ArgumentList @(
             '--bind', "127.0.0.1:$serverPort",
-            '--database-url', 'postgres://crony:crony@127.0.0.1:54329/crony'
+            '--database-url', $databaseUrl
         ) `
         -WorkingDirectory $root `
         -RedirectStandardOutput (Join-Path $output 'server.stdout.log') `

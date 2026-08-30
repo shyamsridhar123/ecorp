@@ -200,6 +200,10 @@ pub struct TaskContract {
     pub escalation: String,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +341,8 @@ pub struct Run {
     pub provider_session_id: Option<String>,
     pub resumed_from_run_id: Option<Uuid>,
     pub workspace_run_id: Uuid,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_microusd: i64,
