@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --dir ../web dev --host 127.0.0.1 --port 5187 --strictPort",
     "devUrl": "http://127.0.0.1:5187",
-    "beforeBuildCommand": "pnpm --dir ../web build",
+    "beforeBuildCommand": "node ../web/node_modules/typescript/bin/tsc -b ../web/tsconfig.json && node ../web/node_modules/vite/bin/vite.js build ../web",
     "frontendDist": "../../web/dist"
   },
   "app": {
