@@ -101,6 +101,14 @@ proves spend, repeated-tool, rolling requester/Corp budgets, all four breaker st
 healthy-conversation exemption. See
 `docs/evidence/2026-08-30-approval-and-budget-validation.md`.
 
+`tests/scenarios/v1.jsonl` is a versioned 100-scenario corpus. `tools/run_evals.mjs` keeps
+deterministic and real-provider lanes separate and reports success, verified completion, rework,
+cost, latency, safety, and intervention metrics with regression thresholds.
+
+`tools/e2e_chaos_report.mjs` consolidates server-restart, runner-reconnect, duplicate-delivery, and
+browser-replay evidence. The `runner-platforms` CI matrix runs the runner contract on Windows,
+macOS, and Linux. See `docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`.
+
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
 typed errors for unsupported resume and usage operations.
