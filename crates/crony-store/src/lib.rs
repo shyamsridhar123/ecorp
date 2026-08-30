@@ -17,8 +17,10 @@ const DEMO_BOB_ID: &str = "00000000-0000-4000-8000-000000000012";
 const DEMO_EVE_ID: &str = "00000000-0000-4000-8000-000000000013";
 const DEMO_MANAGER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000021";
 const DEMO_WORKER_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000022";
+const DEMO_CODEX_ACTOR_ID: &str = "00000000-0000-4000-8000-000000000023";
 const DEMO_MANAGER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000031";
 const DEMO_WORKER_AGENT_ID: &str = "00000000-0000-4000-8000-000000000032";
+const DEMO_CODEX_AGENT_ID: &str = "00000000-0000-4000-8000-000000000033";
 const DEMO_ROOM_ID: &str = "00000000-0000-4000-8000-000000000041";
 
 #[derive(Clone)]
@@ -35,6 +37,7 @@ pub struct DemoIds {
     pub eve_actor_id: Uuid,
     pub manager_agent_id: Uuid,
     pub worker_agent_id: Uuid,
+    pub codex_agent_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,21 @@ pub struct LaunchRecord {
     pub assignment_token: Uuid,
     pub adapter: String,
     pub mission_title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeLaunchRecord {
+    pub corp_id: Uuid,
+    pub room_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub source_run_id: Uuid,
+    pub agent_id: Uuid,
+    pub runner_id: String,
+    pub assignment_token: Uuid,
+    pub adapter: String,
+    pub provider_session_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -176,10 +194,12 @@ impl PgStore {
             eve_actor_id: parse_id(DEMO_EVE_ID)?,
             manager_agent_id: parse_id(DEMO_MANAGER_AGENT_ID)?,
             worker_agent_id: parse_id(DEMO_WORKER_AGENT_ID)?,
+            codex_agent_id: parse_id(DEMO_CODEX_AGENT_ID)?,
             room_id: parse_id(DEMO_ROOM_ID)?,
         };
         let manager_actor_id = parse_id(DEMO_MANAGER_ACTOR_ID)?;
         let worker_actor_id = parse_id(DEMO_WORKER_ACTOR_ID)?;
+        let codex_actor_id = parse_id(DEMO_CODEX_ACTOR_ID)?;
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -199,6 +219,7 @@ impl PgStore {
             (ids.eve_actor_id, "Eve", "human", "guest"),
             (manager_actor_id, "Margo", "agent", "manager"),
             (worker_actor_id, "Wally", "agent", "engineer"),
+            (codex_actor_id, "Cody", "agent", "engineer"),
         ] {
             sqlx::query(
                 r#"
@@ -234,6 +255,7 @@ impl PgStore {
             ids.bob_actor_id,
             manager_actor_id,
             worker_actor_id,
+            codex_actor_id,
         ] {
             sqlx::query(
                 r#"
@@ -248,12 +270,13 @@ impl PgStore {
             .await?;
         }
 
-        for (id, actor_id, name, role, accent) in [
+        for (id, actor_id, name, role, adapter, accent) in [
             (
                 ids.manager_agent_id,
                 manager_actor_id,
                 "Margo",
                 "manager",
+                "fake-process",
                 "marigold",
             ),
             (
@@ -261,14 +284,23 @@ impl PgStore {
                 worker_actor_id,
                 "Wally",
                 "engineer",
+                "fake-process",
                 "cobalt",
+            ),
+            (
+                ids.codex_agent_id,
+                codex_actor_id,
+                "Cody",
+                "engineer",
+                "codex",
+                "signal",
             ),
         ] {
             sqlx::query(
                 r#"
                 INSERT INTO agents
                     (id, corp_id, actor_id, name, role, adapter, status, accent)
-                VALUES ($1, $2, $3, $4, $5, 'fake-process', 'idle', $6)
+                VALUES ($1, $2, $3, $4, $5, $6, 'idle', $7)
                 ON CONFLICT (id) DO UPDATE
                 SET name = EXCLUDED.name, role = EXCLUDED.role, adapter = EXCLUDED.adapter,
                     accent = EXCLUDED.accent
@@ -279,6 +311,7 @@ impl PgStore {
             .bind(actor_id)
             .bind(name)
             .bind(role)
+            .bind(adapter)
             .bind(accent)
             .execute(&mut *tx)
             .await?;
@@ -295,7 +328,7 @@ impl PgStore {
                 "demo-bootstrap-v1",
                 json!({
                     "name": "Crony Corp Demonstration Office",
-                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally"]
+                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody"]
                 }),
             ),
         )
@@ -440,8 +473,9 @@ impl PgStore {
         let runs = sqlx::query(
             r#"
             SELECT r.id, r.corp_id, r.task_id, r.agent_id, r.runner_id,
-                   r.assignment_token, r.status, r.summary, r.artifact_path,
-                   r.artifact_sha256, r.created_at, r.updated_at
+                   r.assignment_token, r.provider_session_id, r.resumed_from_run_id,
+                   r.input_tokens, r.output_tokens, r.cost_microusd, r.status,
+                   r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -889,6 +923,7 @@ impl PgStore {
         corp_id: Uuid,
         requested_by: Uuid,
         title: &str,
+        preferred_adapter: Option<&str>,
     ) -> Result<(MissionTaskIds, Vec<DomainEvent>)> {
         let title = title.trim();
         if title.is_empty() {
@@ -908,12 +943,26 @@ impl PgStore {
         .context("corp has no room")?;
         assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
         let worker_agent_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM agents WHERE corp_id = $1 AND role <> 'manager' ORDER BY created_at LIMIT 1",
+            r#"
+            SELECT id FROM agents
+            WHERE corp_id = $1 AND role <> 'manager'
+              AND ($2::text IS NULL OR adapter = $2)
+            ORDER BY
+              CASE WHEN adapter = 'fake-process' THEN 0 ELSE 1 END,
+              created_at
+            LIMIT 1
+            "#,
         )
         .bind(corp_id)
+        .bind(preferred_adapter)
         .fetch_one(&mut *tx)
         .await
-        .context("corp has no worker agent")?;
+        .with_context(|| {
+            format!(
+                "corp has no worker agent for adapter {}",
+                preferred_adapter.unwrap_or("default")
+            )
+        })?;
 
         let mission_id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
@@ -1124,6 +1173,136 @@ impl PgStore {
         ))
     }
 
+    pub async fn create_resume_run(
+        &self,
+        corp_id: Uuid,
+        source_run_id: Uuid,
+        requested_by: Uuid,
+    ) -> Result<(ResumeLaunchRecord, DomainEvent)> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
+                   t.mission_id, m.room_id, a.adapter
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            JOIN agents a ON a.id = r.agent_id
+            WHERE r.id = $1 AND r.corp_id = $2
+            FOR UPDATE OF r, t, m, a
+            "#,
+        )
+        .bind(source_run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("source run not found")?;
+        let task_id: Uuid = row.get("task_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let runner_id: String = row.get("runner_id");
+        let provider_session_id: String = row
+            .try_get::<Option<String>, _>("provider_session_id")?
+            .context("source run has no resumable provider session")?;
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        let adapter: String = row.get("adapter");
+        assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
+
+        let active: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM runs
+                WHERE task_id = $1
+                  AND status IN ('provisioning', 'starting', 'running',
+                                 'waiting_for_input', 'waiting_for_approval', 'verifying')
+            )
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active {
+            return Err(anyhow!("task already has an active run"));
+        }
+
+        let run_id = Uuid::new_v4();
+        let assignment_token = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO runs
+                (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
+                 provider_session_id, resumed_from_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8)
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .bind(task_id)
+        .bind(agent_id)
+        .bind(&runner_id)
+        .bind(assignment_token)
+        .bind(&provider_session_id)
+        .bind(source_run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE tasks SET status = 'claimed', updated_at = now() WHERE id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'starting', station = 'dispatch', current_run_id = $1 WHERE id = $2",
+        )
+        .bind(run_id)
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(requested_by),
+                    "run.resume_requested",
+                    "run",
+                    run_id,
+                    format!("run:{run_id}:resume-requested"),
+                    json!({
+                        "source_run_id": source_run_id,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "runner_id": runner_id
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("run resume event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok((
+            ResumeLaunchRecord {
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                source_run_id,
+                agent_id,
+                runner_id,
+                assignment_token,
+                adapter,
+                provider_session_id,
+            },
+            event,
+        ))
+    }
+
     pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {
         let RunnerEventInput {
             event_id,
@@ -1182,6 +1361,19 @@ impl PgStore {
         };
 
         match event_type.as_str() {
+            "run.session" => {
+                let session_id = payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .context("run.session event omitted session_id")?;
+                sqlx::query(
+                    "UPDATE runs SET provider_session_id = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(session_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             "run.started" => {
                 sqlx::query("UPDATE runs SET status = 'running', updated_at = now() WHERE id = $1")
                     .bind(run_id)
@@ -1241,6 +1433,39 @@ impl PgStore {
                     "UPDATE agents SET status = 'reviewing', station = 'review' WHERE id = $1",
                 )
                 .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.usage" => {
+                let input_tokens = payload
+                    .get("input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0);
+                let output_tokens = payload
+                    .get("output_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0);
+                let cost_microusd = payload
+                    .get("cost_microusd")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0);
+                sqlx::query(
+                    r#"
+                    UPDATE runs
+                    SET input_tokens = input_tokens + $1,
+                        output_tokens = output_tokens + $2,
+                        cost_microusd = cost_microusd + $3,
+                        updated_at = now()
+                    WHERE id = $4
+                    "#,
+                )
+                .bind(input_tokens)
+                .bind(output_tokens)
+                .bind(cost_microusd)
+                .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1771,6 +1996,94 @@ impl PgStore {
         Ok(RoomMessageOutcome { message, event })
     }
 
+    pub async fn request_interrupt(
+        &self,
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        lease_token: Uuid,
+        reason: &str,
+    ) -> Result<StopRequestOutcome> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(anyhow!("interrupt reason cannot be empty"));
+        }
+        if reason.len() > 500 {
+            return Err(anyhow!("interrupt reason cannot exceed 500 characters"));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        let lease = sqlx::query(
+            r#"
+            SELECT agent_id, corp_id, actor_id, token, expires_at
+            FROM control_leases
+            WHERE agent_id = $1 AND corp_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(agent_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_lease)
+        .context("agent has no active control lease")?;
+        if lease.actor_id != actor_id
+            || lease.token != lease_token
+            || lease.expires_at <= Utc::now()
+        {
+            return Err(anyhow!("stale or unauthorized control lease token"));
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT r.id, r.runner_id, t.mission_id, m.room_id
+            FROM runs r
+            JOIN tasks t ON t.id = r.task_id
+            JOIN missions m ON m.id = t.mission_id
+            WHERE r.agent_id = $1 AND r.corp_id = $2
+              AND r.status IN ('provisioning', 'starting', 'running',
+                               'waiting_for_input', 'waiting_for_approval', 'verifying')
+            ORDER BY r.created_at DESC
+            LIMIT 1
+            FOR UPDATE OF r
+            "#,
+        )
+        .bind(agent_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("agent has no active run to interrupt")?;
+        let run_id: Uuid = row.get("id");
+        let runner_id: String = row.get("runner_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "run.interrupt_requested",
+                    "run",
+                    run_id,
+                    format!("run-interrupt:{run_id}:{}", Uuid::new_v4()),
+                    json!({"agent_id": agent_id, "reason": reason}),
+                )
+            },
+        )
+        .await?
+        .context("run interrupt event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(StopRequestOutcome {
+            run_id,
+            runner_id,
+            event,
+        })
+    }
+
     pub async fn request_emergency_stop(
         &self,
         corp_id: Uuid,
@@ -2211,6 +2524,11 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         agent_id: row.get("agent_id"),
         runner_id: row.get("runner_id"),
         assignment_token: row.get("assignment_token"),
+        provider_session_id: row.get("provider_session_id"),
+        resumed_from_run_id: row.get("resumed_from_run_id"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cost_microusd: row.get("cost_microusd"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
         artifact_path: row.get("artifact_path"),

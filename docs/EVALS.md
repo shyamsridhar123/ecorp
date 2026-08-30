@@ -71,7 +71,19 @@ short-disconnect process survival, assignment-token reconciliation, deterministi
 lost-run state, and rejection of a later stale claim.
 `tools/e2e_idempotency.mjs` makes the runner deliver the exact same `run.started` event twice and
 proves that Postgres persists one event and applies one state transition.
+`tools/e2e_codex.mjs` runs the complete server-to-runner Codex lifecycle against a deterministic
+app-server fixture. It proves start, structured stream, live steer, resume into the same workspace,
+interrupt, emergency stop, usage persistence, run ancestry, and artifact hash verification.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
 typed errors for unsupported resume and usage operations.
+
+The Codex adapter suite uses a protocol-faithful fake app-server to verify availability reporting,
+start, streaming, usage de-duplication, live `turn/steer`, graceful `turn/interrupt`, stop, durable
+resume, completed evidence, cancelled evidence, and failed evidence without requiring credentials.
+
+An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
+`0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
+resumed in the same provider thread and repository, and a third run was emergency-stopped before
+its post-sleep side effect. See `docs/evidence/2026-08-29-codex-adapter-validation.md`.

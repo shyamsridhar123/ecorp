@@ -42,6 +42,11 @@ type Run = {
   task_id: string
   agent_id: string
   runner_id: string
+  provider_session_id: string | null
+  resumed_from_run_id: string | null
+  input_tokens: number
+  output_tokens: number
+  cost_microusd: number
   status: string
   summary: string | null
   artifact_path: string | null
@@ -117,6 +122,11 @@ type SnapshotResponse = {
     status: 'connected' | 'grace' | 'offline'
     last_seen_at: string
     grace_expires_at: string | null
+    capabilities: {
+      name: string
+      available: boolean
+      detail: string | null
+    }[]
   }[]
 }
 
@@ -128,6 +138,7 @@ type BootstrapResponse = {
   eve_actor_id: string
   manager_agent_id: string
   worker_agent_id: string
+  codex_agent_id: string
 }
 
 const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
@@ -188,6 +199,7 @@ function AgentDesk({
   onClaim,
   onRelease,
   onTransfer,
+  onInterrupt,
   onEmergencyStop,
   onMessage,
 }: {
@@ -200,6 +212,7 @@ function AgentDesk({
   onClaim: (agent: Agent) => Promise<void>
   onRelease: (agent: Agent, token: string) => Promise<void>
   onTransfer: (agent: Agent, token: string, toActor: Actor) => Promise<void>
+  onInterrupt: (agent: Agent, token: string) => Promise<void>
   onEmergencyStop: (agent: Agent) => Promise<void>
   onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
 }) {
@@ -272,6 +285,15 @@ function AgentDesk({
           Emergency stop
         </button>
       ) : null}
+      {agent.current_run_id && ownsLease && leaseToken ? (
+        <button
+          type="button"
+          className="interrupt-run"
+          onClick={() => onInterrupt(agent, leaseToken)}
+        >
+          Interrupt turn
+        </button>
+      ) : null}
       <form className="agent-message" onSubmit={submit}>
         <input
           aria-label={`Message ${agent.name}`}
@@ -292,11 +314,13 @@ function MissionCard({
   task,
   run,
   onLaunch,
+  onResume,
 }: {
   mission: Mission
   task: Task | undefined
   run: Run | undefined
   onLaunch: (mission: Mission) => Promise<void>
+  onResume: (run: Run) => Promise<void>
 }) {
   return (
     <article className="mission-card" data-testid={`mission-${mission.id}`}>
@@ -321,9 +345,19 @@ function MissionCard({
           <span>{shortId(run.artifact_sha256)}…</span>
         </div>
       ) : null}
+      {run && (run.input_tokens > 0 || run.output_tokens > 0) ? (
+        <div className="usage-box">
+          {run.input_tokens.toLocaleString()} in · {run.output_tokens.toLocaleString()} out
+        </div>
+      ) : null}
       {mission.status === 'ready' ? (
         <button className="button button-primary mission-launch" type="button" onClick={() => onLaunch(mission)}>
           Dispatch mission
+        </button>
+      ) : null}
+      {run?.provider_session_id && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status) ? (
+        <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(run)}>
+          Resume agent session
         </button>
       ) : null}
     </article>
@@ -535,6 +569,7 @@ function App() {
   const [data, setData] = useState<SnapshotResponse | null>(null)
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
+  const [missionAdapter, setMissionAdapter] = useState('fake-process')
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -653,7 +688,11 @@ function App() {
     try {
       await api(`/api/corps/${bootstrap.corp_id}/missions`, {
         method: 'POST',
-        body: JSON.stringify({ title: missionTitle, requested_by: selectedActor.id }),
+        body: JSON.stringify({
+          title: missionTitle,
+          requested_by: selectedActor.id,
+          preferred_adapter: missionAdapter,
+        }),
       })
       setMissionTitle('')
       await refresh(bootstrap.corp_id, selectedActor.id)
@@ -672,6 +711,27 @@ function App() {
       await api(`/api/corps/${bootstrap.corp_id}/missions/${mission.id}/launch`, {
         method: 'POST',
         body: JSON.stringify({ requested_by: selectedActor.id }),
+      })
+      await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const resumeAgentRun = async (run: Run) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/runs/${run.id}/resume`, {
+        method: 'POST',
+        body: JSON.stringify({
+          requested_by: selectedActor.id,
+          prompt:
+            'Continue the prior session in the same repository. Inspect the current state, complete any remaining mission work, and verify the result.',
+        }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
@@ -773,6 +833,24 @@ function App() {
     }
   }
 
+  const interruptRun = async (agent: Agent, token: string) => {
+    if (!bootstrap || !selectedActor) return
+    setError(null)
+    try {
+      await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/interrupt`, {
+        method: 'POST',
+        body: JSON.stringify({
+          actor_id: selectedActor.id,
+          lease_token: token,
+          reason: `${selectedActor.name} interrupted the active turn from the operations floor.`,
+        }),
+      })
+      await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
   const sendMessage = async (agent: Agent, text: string, token: string | undefined) => {
     if (!bootstrap || !selectedActor) return
     setError(null)
@@ -831,6 +909,14 @@ function App() {
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
   const room = data.snapshot.rooms[0]
   const connectedRunners = data.runners.filter((runner) => runner.connected)
+  const availableAdapters = Array.from(
+    new Map(
+      connectedRunners
+        .flatMap((runner) => runner.capabilities)
+        .filter((capability) => capability.available && capability.name !== 'workspace-isolation')
+        .map((capability) => [capability.name, capability]),
+    ).values(),
+  )
   const runnerLabel = connectedRunners.length
     ? `${connectedRunners.length} runner online`
     : data.runners.some((runner) => runner.status === 'grace')
@@ -910,6 +996,7 @@ function App() {
                 onClaim={claimLease}
                 onRelease={releaseLease}
                 onTransfer={transferLease}
+                onInterrupt={interruptRun}
                 onEmergencyStop={emergencyStop}
                 onMessage={sendMessage}
               />
@@ -934,6 +1021,18 @@ function App() {
               placeholder="Describe the outcome the Corp should produce."
               rows={4}
             />
+            <label htmlFor="mission-adapter">Agent runtime</label>
+            <select
+              id="mission-adapter"
+              value={missionAdapter}
+              onChange={(event) => setMissionAdapter(event.target.value)}
+            >
+              {availableAdapters.map((adapter) => (
+                <option key={adapter.name} value={adapter.name}>
+                  {adapter.name === 'codex' ? 'OpenAI Codex' : adapter.name}
+                </option>
+              ))}
+            </select>
             <button className="button button-primary" type="submit" disabled={busy || !missionTitle.trim()}>
               File mission
             </button>
@@ -950,6 +1049,7 @@ function App() {
                     task={task}
                     run={run}
                     onLaunch={launchMission}
+                    onResume={resumeAgentRun}
                   />
                 )
               })

@@ -544,7 +544,8 @@
 }
 
 .agent-message input,
-.mission-form textarea {
+.mission-form textarea,
+.mission-form select {
   width: 100%;
   color: var(--ink);
   border: 1px solid var(--ink);
@@ -610,7 +611,8 @@ select:focus-visible {
 }
 
 .transfer-control,
-.emergency-stop {
+.emergency-stop,
+.interrupt-run {
   width: 100%;
   margin-top: 8px;
   padding: 7px 9px;
@@ -629,6 +631,11 @@ select:focus-visible {
 .emergency-stop {
   color: var(--paper-light);
   background: var(--signal);
+}
+
+.interrupt-run {
+  color: var(--ink);
+  background: #efcc7d;
 }
 
 .mission-panel {
@@ -749,6 +756,20 @@ select:focus-visible {
   color: var(--mint);
   font: 10px/1.2 var(--mono);
   border: 1px solid var(--mint);
+}
+
+.mission-form select {
+  padding: 9px 10px;
+}
+
+.usage-box {
+  margin-top: 8px;
+  padding: 6px 8px;
+  color: var(--cobalt-dark);
+  font: 9px/1.2 var(--mono);
+  border: 1px solid var(--cobalt);
+  background: #dce7e4;
+  text-align: right;
 }
 
 .empty-state {

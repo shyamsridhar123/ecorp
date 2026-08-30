@@ -56,13 +56,13 @@ crony-server ------ Postgres
     v
 crony-runner
     |
-    | child process
-    v
-scripts/fake-agent.mjs ---> output/runner/<run-id>/result.md
+    +-- deterministic process ---> output/runner/<run-id>/result.md
+    |
+    +-- Codex app-server JSON-RPC ---> provider thread + repository changes
 ```
 
-The deterministic fake-agent adapter is intentional. It proves the complete execution contract
-before provider-specific behavior is introduced.
+The deterministic process remains the offline systems fixture. The first real provider adapter
+uses Codex app-server over stdio JSON-RPC rather than scraping terminal text.
 
 ## State and events
 
@@ -124,8 +124,9 @@ lease rotates that token, so delayed commands from an earlier controller fail cl
 without the lease may still leave a durable queued message without a token.
 
 Owners, admins, and managers may issue an emergency stop independently of ordinary control
-ownership. The request is audited, delivered to the runner, kills the active child process, and
-ends the mission, task, and run as cancelled.
+ownership. The request is audited and delivered to the runner. Adapters first receive a graceful
+turn interruption and are force-terminated after a bounded timeout. The mission, task, and run end
+as cancelled.
 
 Messages from the current controller can be delivered to the active process. Other messages are
 durably queued.
@@ -172,14 +173,27 @@ Provider runtimes implement one `AgentAdapter` contract:
 - optionally collect usage after a session
 
 Every feature is reported as supported or unsupported with a reason. The deterministic
-`fake-process` implementation now uses the same contract as future Codex, Claude Code, and OpenCode
-adapters. Provider-independent conformance tests prove spawn, streaming, steering, artifact
-delivery, stop, and typed unsupported behavior.
+`fake-process` and real `codex` implementations use the same contract.
+
+The Codex adapter:
+
+- starts one app-server process per active turn
+- uses `thread/start`, `turn/start`, `turn/steer`, and `turn/interrupt`
+- resumes durable provider state with `thread/resume`
+- converts structured item and turn notifications into Crony events
+- records token usage without double-counting cumulative notifications
+- denies unexpected interactive provider requests
+- applies a workspace-write, network-disabled sandbox policy
+- disables user-configured MCP servers, apps, and hooks for supervised runs
+- fingerprints tracked and untracked changed files in the evidence artifact
+
+Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
+streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.
 
 ## Near-term architecture work
 
-1. Add the first real Codex adapter.
-2. Add git worktree isolation.
+1. Add git worktree isolation.
+2. Add bounded task-graph orchestration and independent verification.
 3. Add durable approvals and policy evaluation.
 4. Add authenticated users and runner enrollment.
 5. Add artifact upload rather than host-local artifact paths.

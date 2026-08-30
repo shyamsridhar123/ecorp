@@ -15,6 +15,18 @@
   - Local research checkout: `C:\Users\shyamsridhar\code\_research\buzz3`
   - Reviewed commit: `00e61eafa917d296104006576b7a2ddbfd58bb5a`
 
+### Implementation checkpoint — August 29, 2026
+
+- The greenfield repository, ADR set, Postgres event journal, server, runner, CLI, and React client
+  are operational.
+- The multiplayer vertical slice has durable rooms, replay, fenced control leases, runner grace,
+  reconciliation, and duplicate-delivery protection.
+- The shared adapter contract and first real OpenAI Codex app-server adapter are implemented.
+- Authenticated probes have validated live steer, interrupt, emergency stop, resume, usage, and
+  evidence across the browser/server/runner/provider boundary.
+- The next critical-path item is per-task git worktree isolation, followed by bounded task graphs
+  and evidence-gated verification.
+
 ---
 
 # 1. Executive recommendation
@@ -621,7 +633,7 @@ trait AgentAdapter {
 
 Initial adapters:
 
-- OpenAI Codex
+- OpenAI Codex — implemented with the native app-server JSON-RPC protocol
 - Claude Code
 - OpenCode
 
@@ -1398,4 +1410,3 @@ This scenario proves implementation, multiplayer delivery, agent coordination, h
 - Agent Orchestrator: https://github.com/Untrivial-ai/agent-orchestrator
 - Omnigent: https://github.com/omnigent-ai/omnigent
 - AWS Labs CLI Agent Orchestrator: https://github.com/awslabs/cli-agent-orchestrator
-

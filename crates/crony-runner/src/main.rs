@@ -49,6 +49,9 @@ struct Args {
         default_value = "./scripts/fake-agent.mjs"
     )]
     fake_agent_script: PathBuf,
+
+    #[arg(long, env = "CRONY_CODEX_COMMAND")]
+    codex_command: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,7 @@ struct Assignment {
     mission_id: Uuid,
     task_id: Uuid,
     run_id: Uuid,
+    workspace_run_id: Uuid,
     agent_id: Uuid,
     adapter: String,
     mission_title: String,
@@ -70,6 +74,14 @@ struct ActiveRunControl {
 }
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
+
+fn default_codex_command() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("codex.exe")
+    } else {
+        PathBuf::from("codex")
+    }
+}
 
 #[derive(Clone, Default)]
 struct OutboundBus {
@@ -138,7 +150,14 @@ async fn main() -> Result<()> {
 
     let active_runs: ActiveRuns = Arc::new(DashMap::new());
     let outbound = OutboundBus::default();
-    let adapters = Arc::new(AdapterRegistry::new(args.fake_agent_script.clone()));
+    let codex_command = args
+        .codex_command
+        .clone()
+        .unwrap_or_else(default_codex_command);
+    let adapters = Arc::new(AdapterRegistry::new(
+        args.fake_agent_script.clone(),
+        codex_command,
+    ));
     loop {
         let delay = match run_connection(
             args.clone(),
@@ -275,6 +294,7 @@ async fn run_connection(
                     mission_id,
                     task_id,
                     run_id,
+                    workspace_run_id: run_id,
                     agent_id,
                     adapter,
                     mission_title,
@@ -315,10 +335,87 @@ async fn run_connection(
                         adapter,
                         task_outbound.clone(),
                         control_rx,
+                        None,
                     )
                     .await
                     {
                         error!(%error, run_id = %assignment.run_id, "run execution failed");
+                        send_run_event(
+                            &task_outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": error.to_string()}),
+                        );
+                    }
+                    task_runs.remove(&assignment.run_id);
+                });
+            }
+            ServerToRunner::ResumeRun {
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                workspace_run_id,
+                agent_id,
+                assignment_token,
+                adapter,
+                provider_session_id,
+                prompt,
+            } => {
+                let assignment = Assignment {
+                    corp_id,
+                    room_id,
+                    mission_id,
+                    task_id,
+                    run_id,
+                    workspace_run_id,
+                    agent_id,
+                    adapter,
+                    mission_title: prompt,
+                };
+                if active_runs.contains_key(&assignment.run_id) {
+                    warn!(run_id = %assignment.run_id, "duplicate resume command ignored");
+                    continue;
+                }
+                let Some(adapter) = adapters.get(&assignment.adapter) else {
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({
+                            "error": format!("adapter {} is not installed", assignment.adapter)
+                        }),
+                    );
+                    continue;
+                };
+                let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                active_runs.insert(
+                    assignment.run_id,
+                    ActiveRunControl {
+                        assignment_token,
+                        control: control_tx,
+                    },
+                );
+                let workspace_root = args.workspace.clone();
+                let runner_id = args.runner_id.clone();
+                let task_outbound = outbound.clone();
+                let task_runs = active_runs.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = execute_assignment(
+                        workspace_root,
+                        runner_id.clone(),
+                        assignment.clone(),
+                        adapter,
+                        task_outbound.clone(),
+                        control_rx,
+                        Some(provider_session_id),
+                    )
+                    .await
+                    {
+                        error!(%error, run_id = %assignment.run_id, "resumed run execution failed");
                         send_run_event(
                             &task_outbound,
                             &runner_id,
@@ -353,6 +450,13 @@ async fn run_connection(
                     warn!(%run_id, "stop command arrived for inactive run");
                 }
             }
+            ServerToRunner::InterruptRun { run_id, reason } => {
+                if let Some(active) = active_runs.get(&run_id) {
+                    let _ = active.control.send(AdapterControl::Interrupt { reason });
+                } else {
+                    warn!(%run_id, "interrupt command arrived for inactive run");
+                }
+            }
             ServerToRunner::Disconnect {
                 reason,
                 reconnect_delay_ms,
@@ -379,6 +483,9 @@ struct RunnerEventSink {
 impl AdapterEventSink for RunnerEventSink {
     fn emit(&self, event: AdapterEvent) {
         let (event_type, payload) = match event {
+            AdapterEvent::Session { session_id } => {
+                ("run.session", json!({"session_id": session_id}))
+            }
             AdapterEvent::Started { workspace } => (
                 "run.started",
                 json!({
@@ -446,6 +553,7 @@ async fn execute_assignment(
     adapter: Arc<dyn AgentAdapter>,
     outbound: OutboundBus,
     controls: mpsc::UnboundedReceiver<AdapterControl>,
+    resume_session_id: Option<String>,
 ) -> Result<()> {
     let request = AdapterRunRequest {
         run_id: assignment.run_id,
@@ -453,14 +561,18 @@ async fn execute_assignment(
         task_id: assignment.task_id,
         agent_id: assignment.agent_id,
         mission_title: assignment.mission_title.clone(),
-        workspace: workspace_root.join(assignment.run_id.to_string()),
+        workspace: workspace_root.join(assignment.workspace_run_id.to_string()),
     };
     let sink: Arc<dyn AdapterEventSink> = Arc::new(RunnerEventSink {
         outbound,
         runner_id,
         assignment,
     });
-    adapter.execute(request, controls, sink).await?;
+    if let Some(session_id) = resume_session_id {
+        adapter.resume(request, &session_id, controls, sink).await?;
+    } else {
+        adapter.execute(request, controls, sink).await?;
+    }
     Ok(())
 }
 fn send_run_event(

@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use crony_domain::EntityLink;
 use crony_protocol::{
     ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
-    LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest, TransferLeaseRequest,
+    InterruptRunRequest, LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest,
+    ResumeRunRequest, TransferLeaseRequest,
 };
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -34,6 +35,8 @@ enum Command {
     Mission {
         corp_id: Uuid,
         actor_id: Uuid,
+        #[arg(long)]
+        adapter: Option<String>,
         title: String,
     },
     RoomMessage {
@@ -54,6 +57,12 @@ enum Command {
         corp_id: Uuid,
         mission_id: Uuid,
         actor_id: Uuid,
+    },
+    Resume {
+        corp_id: Uuid,
+        run_id: Uuid,
+        actor_id: Uuid,
+        prompt: String,
     },
     Lease {
         corp_id: Uuid,
@@ -85,6 +94,13 @@ enum Command {
         corp_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
+        reason: String,
+    },
+    Interrupt {
+        corp_id: Uuid,
+        agent_id: Uuid,
+        actor_id: Uuid,
+        token: Uuid,
         reason: String,
     },
 }
@@ -127,6 +143,7 @@ async fn main() -> Result<()> {
         Command::Mission {
             corp_id,
             actor_id,
+            adapter,
             title,
         } => {
             request(
@@ -136,6 +153,7 @@ async fn main() -> Result<()> {
                 Some(serde_json::to_value(CreateMissionRequest {
                     title,
                     requested_by: actor_id,
+                    preferred_adapter: adapter,
                 })?),
             )
             .await?
@@ -186,6 +204,23 @@ async fn main() -> Result<()> {
                 ),
                 Some(serde_json::to_value(LaunchMissionRequest {
                     requested_by: actor_id,
+                })?),
+            )
+            .await?
+        }
+        Command::Resume {
+            corp_id,
+            run_id,
+            actor_id,
+            prompt,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!("{}/api/corps/{corp_id}/runs/{run_id}/resume", args.server),
+                Some(serde_json::to_value(ResumeRunRequest {
+                    requested_by: actor_id,
+                    prompt,
                 })?),
             )
             .await?
@@ -285,6 +320,28 @@ async fn main() -> Result<()> {
                 ),
                 Some(serde_json::to_value(EmergencyStopRequest {
                     actor_id,
+                    reason,
+                })?),
+            )
+            .await?
+        }
+        Command::Interrupt {
+            corp_id,
+            agent_id,
+            actor_id,
+            token,
+            reason,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/agents/{agent_id}/interrupt",
+                    args.server
+                ),
+                Some(serde_json::to_value(InterruptRunRequest {
+                    actor_id,
+                    lease_token: token,
                     reason,
                 })?),
             )
