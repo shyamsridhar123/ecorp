@@ -1,5 +1,9 @@
 # Crony Corp
 
+> **Naming status:** Crony Corp is the internal repository codename. The preliminary public-name
+> recommendation is **Guildframe**, pending legal clearance. See
+> `docs/BRAND_NAME_AND_LICENSING_REVIEW.md`.
+
 **A multiplayer command center where humans and autonomous agents run a persistent company together.**
 
 Crony Corp combines a real-time shared office, durable missions and approvals, isolated agent
@@ -93,6 +97,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
 - [`docs/EVALS.md`](docs/EVALS.md)
 - [`docs/BACKLOG.md`](docs/BACKLOG.md)
+- [`docs/BRAND_NAME_AND_LICENSING_REVIEW.md`](docs/BRAND_NAME_AND_LICENSING_REVIEW.md)
 - [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
 - [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
 - [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
