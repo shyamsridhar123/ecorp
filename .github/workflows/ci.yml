@@ -140,6 +140,10 @@ jobs:
         run: node tools/e2e_identity.mjs
       - name: Verify scoped secret brokering without plaintext leakage
         run: node tools/e2e_secrets.mjs
+      - name: Verify durable risky-action approvals and exactly-once decision effects
+        run: node tools/e2e_approvals.mjs
+      - name: Verify budget and loop circuit-breaker stages
+        run: node tools/e2e_budgets.mjs
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,6 +158,8 @@ jobs:
             output/e2e-verification.json
             output/e2e-identity.json
             output/e2e-secrets.json
+            output/e2e-approvals.json
+            output/e2e-budgets.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md

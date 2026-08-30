@@ -167,6 +167,8 @@ async fn main() -> Result<()> {
                     preferred_adapter: adapter,
                     strategy,
                     secret_refs: Vec::new(),
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
                 })?),
             )
             .await?

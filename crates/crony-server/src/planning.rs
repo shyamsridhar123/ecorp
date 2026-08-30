@@ -20,6 +20,8 @@ pub struct PlanningRequest<'a> {
     pub mission_title: &'a str,
     pub preferred_adapter: Option<&'a str>,
     pub secret_refs: &'a [TaskSecretReference],
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_microusd: Option<i64>,
 }
 
 pub trait ManagerStrategy: Send + Sync {
@@ -92,18 +94,21 @@ impl ManagerStrategy for SingleTaskStrategy {
                         .is_none_or(|adapter| agent.adapter == adapter)
             })
             .context("no worker agent satisfies the requested adapter")?;
-        let budget_tokens = 100_000;
+        let budget_tokens = request.budget_tokens.unwrap_or(100_000);
+        let budget_cost_microusd = request.budget_cost_microusd.unwrap_or(1_000_000);
         let mut task_contract = contract(
             format!("Complete the mission outcome: {}", request.mission_title),
             "A source-backed, verified mission artifact",
             budget_tokens,
         );
+        task_contract.budget_cost_microusd = budget_cost_microusd;
         task_contract.secret_refs = request.secret_refs.to_vec();
         Ok(TaskGraphPlan {
             strategy: self.id().to_owned(),
             max_nodes: 1,
             max_depth: 0,
             budget_tokens,
+            budget_cost_microusd,
             tasks: vec![PlannedTask {
                 key: "deliver".to_owned(),
                 title: "Produce the mission outcome".to_owned(),
@@ -151,8 +156,12 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             .find(|agent| agent.role == "manager")
             .unwrap_or(first);
 
-        let specialist_budget = 80_000;
-        let synthesis_budget = 120_000;
+        let total_budget = request.budget_tokens.unwrap_or(280_000);
+        let total_cost_budget = request.budget_cost_microusd.unwrap_or(3_000_000);
+        let specialist_budget = (total_budget * 2 / 7).max(1);
+        let synthesis_budget = (total_budget - specialist_budget * 2).max(1);
+        let specialist_cost_budget = (total_cost_budget * 2 / 7).max(1);
+        let synthesis_cost_budget = (total_cost_budget - specialist_cost_budget * 2).max(1);
         let mut synthesis_contract = contract(
             format!(
                 "Produce the final bounded outcome for this mission after both specialist tasks finish: {}",
@@ -161,6 +170,7 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             "A final synthesis artifact that addresses the mission and acceptance tests",
             synthesis_budget,
         );
+        synthesis_contract.budget_cost_microusd = synthesis_cost_budget;
         synthesis_contract.references = vec![
             "task:specialist-a".to_owned(),
             "task:specialist-b".to_owned(),
@@ -169,19 +179,24 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             strategy: self.id().to_owned(),
             max_nodes: 3,
             max_depth: 1,
-            budget_tokens: specialist_budget * 2 + synthesis_budget,
+            budget_tokens: total_budget,
+            budget_cost_microusd: total_cost_budget,
             tasks: vec![
                 PlannedTask {
                     key: "specialist-a".to_owned(),
                     title: format!("{} specialist pass", first.name),
-                    contract: contract(
-                        format!(
-                            "Independently produce one concrete approach for this mission: {}",
-                            request.mission_title
-                        ),
-                        "A concrete specialist artifact with assumptions and verification",
-                        specialist_budget,
-                    ),
+                    contract: {
+                        let mut contract = contract(
+                            format!(
+                                "Independently produce one concrete approach for this mission: {}",
+                                request.mission_title
+                            ),
+                            "A concrete specialist artifact with assumptions and verification",
+                            specialist_budget,
+                        );
+                        contract.budget_cost_microusd = specialist_cost_budget;
+                        contract
+                    },
                     assigned_agent_id: first.id,
                     required_adapter: first.adapter.clone(),
                     depends_on: Vec::new(),
@@ -192,14 +207,18 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                 PlannedTask {
                     key: "specialist-b".to_owned(),
                     title: format!("{} specialist pass", second.name),
-                    contract: contract(
-                        format!(
-                            "Independently produce a distinct approach for this mission: {}",
-                            request.mission_title
-                        ),
-                        "A second specialist artifact with tradeoffs and verification",
-                        specialist_budget,
-                    ),
+                    contract: {
+                        let mut contract = contract(
+                            format!(
+                                "Independently produce a distinct approach for this mission: {}",
+                                request.mission_title
+                            ),
+                            "A second specialist artifact with tradeoffs and verification",
+                            specialist_budget,
+                        );
+                        contract.budget_cost_microusd = specialist_cost_budget;
+                        contract
+                    },
                     assigned_agent_id: second.id,
                     required_adapter: second.adapter.clone(),
                     depends_on: Vec::new(),
@@ -361,20 +380,24 @@ fn verification_plan(
         .into_iter()
         .find(|agent| agent.role != "manager" && agent.adapter == "fake-process")
         .context("verification strategy requires a fake-process worker")?;
-    let budget_tokens = 50_000;
+    let budget_tokens = request.budget_tokens.unwrap_or(50_000);
+    let budget_cost_microusd = request.budget_cost_microusd.unwrap_or(500_000);
+    let mut task_contract = contract(
+        format!("{instruction}\nMission: {}", request.mission_title),
+        "An artifact and every file required by the verifier policy",
+        budget_tokens,
+    );
+    task_contract.budget_cost_microusd = budget_cost_microusd;
     Ok(TaskGraphPlan {
         strategy: strategy.to_owned(),
         max_nodes: 1,
         max_depth: 0,
         budget_tokens,
+        budget_cost_microusd,
         tasks: vec![PlannedTask {
             key: "verify".to_owned(),
             title: "Produce verifier evidence".to_owned(),
-            contract: contract(
-                format!("{instruction}\nMission: {}", request.mission_title),
-                "An artifact and every file required by the verifier policy",
-                budget_tokens,
-            ),
+            contract: task_contract,
             assigned_agent_id: agent.id,
             required_adapter: agent.adapter.clone(),
             depends_on: Vec::new(),
@@ -426,6 +449,7 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         references: Vec::new(),
         write_scope: vec!["**".to_owned()],
         budget_tokens,
+        budget_cost_microusd: 1_000_000,
         deadline_at: None,
         escalation: "ask the current human controller or mission owner".to_owned(),
         secret_refs: Vec::new(),
@@ -446,6 +470,9 @@ pub fn validate_plan(plan: &TaskGraphPlan, agents: &[Agent]) -> Result<()> {
     }
     if !(1..=MAX_GRAPH_BUDGET_TOKENS).contains(&plan.budget_tokens) {
         return Err(anyhow!("task graph budget is invalid"));
+    }
+    if !(1..=50_000_000).contains(&plan.budget_cost_microusd) {
+        return Err(anyhow!("task graph cost budget is invalid"));
     }
 
     let agents = agents
@@ -495,6 +522,17 @@ pub fn validate_plan(plan: &TaskGraphPlan, agents: &[Agent]) -> Result<()> {
             plan.budget_tokens
         ));
     }
+    let total_cost_budget = plan.tasks.iter().try_fold(0_i64, |total, task| {
+        total
+            .checked_add(task.contract.budget_cost_microusd)
+            .context("task graph cost budget overflow")
+    })?;
+    if total_cost_budget > plan.budget_cost_microusd {
+        return Err(anyhow!(
+            "task cost budgets total {total_cost_budget}, above mission cost budget {}",
+            plan.budget_cost_microusd
+        ));
+    }
 
     let mut visiting = HashSet::new();
     let mut depths = HashMap::new();
@@ -536,6 +574,9 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
     }
     if !(1..=MAX_TASK_BUDGET_TOKENS).contains(&contract.budget_tokens) {
         return Err(anyhow!("task {task_key} budget is invalid"));
+    }
+    if !(1..=10_000_000).contains(&contract.budget_cost_microusd) {
+        return Err(anyhow!("task {task_key} cost budget is invalid"));
     }
     for value in contract
         .acceptance_tests
@@ -761,6 +802,8 @@ mod tests {
             mission_title: "ship the bounded graph",
             preferred_adapter: Some("codex"),
             secret_refs: &[],
+            budget_tokens: None,
+            budget_cost_microusd: None,
         };
         let agents = agents();
         let first = registry
@@ -793,6 +836,8 @@ mod tests {
             mission_title: "bounded plan",
             preferred_adapter: None,
             secret_refs: &[],
+            budget_tokens: None,
+            budget_cost_microusd: None,
         };
         let mut plan = registry
             .plan("parallel-specialists", &request, &agents)
@@ -864,6 +909,8 @@ mod tests {
                     mission_title: "use Codex",
                     preferred_adapter: Some("codex"),
                     secret_refs: &[],
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
                 },
                 &agents,
             )
@@ -879,6 +926,8 @@ mod tests {
             mission_title: "verify safely",
             preferred_adapter: Some("fake-process"),
             secret_refs: &[],
+            budget_tokens: None,
+            budget_cost_microusd: None,
         };
 
         let mut plan = registry

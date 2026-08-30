@@ -18,6 +18,7 @@ use tokio::{
     sync::mpsc,
     time::Instant,
 };
+use uuid::Uuid;
 
 use super::{
     AdapterArtifact, AdapterCapabilities, AdapterControl, AdapterError, AdapterEvent,
@@ -261,6 +262,38 @@ impl CodexAdapter {
                                     reason,
                                     sent: false,
                                 });
+                            }
+                        }
+                        Some(AdapterControl::ApprovalDecision {
+                            approval_id,
+                            approved,
+                            note,
+                        }) => {
+                            let text = if approved {
+                                format!(
+                                    "Approval {approval_id} was granted. Continue the suspended action. Decision note: {note}"
+                                )
+                            } else {
+                                format!(
+                                    "Approval {approval_id} was rejected. Do not perform the action. Decision note: {note}"
+                                )
+                            };
+                            pending_steers.push_back((Uuid::nil(), text));
+                        }
+                        Some(AdapterControl::CircuitBreaker { stage, reason }) => {
+                            if stage == "stop" {
+                                if termination.is_none() {
+                                    termination = Some(TerminationRequest {
+                                        kind: TerminationKind::Stop,
+                                        reason,
+                                        sent: false,
+                                    });
+                                }
+                            } else {
+                                pending_steers.push_back((
+                                    Uuid::nil(),
+                                    format!("Circuit breaker stage {stage}: {reason}"),
+                                ));
                             }
                         }
                         None => controls_open = false,

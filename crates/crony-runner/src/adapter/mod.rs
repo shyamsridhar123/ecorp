@@ -113,6 +113,15 @@ pub enum AdapterControl {
     Stop {
         reason: String,
     },
+    ApprovalDecision {
+        approval_id: Uuid,
+        approved: bool,
+        note: String,
+    },
+    CircuitBreaker {
+        stage: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +152,20 @@ pub enum AdapterEvent {
     Artifact(AdapterArtifact),
     #[allow(dead_code)] // Real model adapters emit usage; fake-process reports it unsupported.
     Usage(UsageSnapshot),
+    ApprovalRequested {
+        approval_id: Uuid,
+        action_key: String,
+        action: String,
+        risk: String,
+        rationale: String,
+        required_roles: Vec<String>,
+        expires_in_seconds: u64,
+    },
+    ToolActivity {
+        signature: String,
+        progressed: bool,
+        human_conversation: bool,
+    },
     Completed {
         summary: String,
     },

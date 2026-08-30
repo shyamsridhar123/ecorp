@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let active_runs: ActiveRuns = Arc::new(DashMap::new());
+    let seen_commands = Arc::new(DashMap::<Uuid, ()>::new());
     let outbound = OutboundBus::default();
     let workspaces = Arc::new(
         WorkspaceManager::initialize(
@@ -202,6 +203,7 @@ async fn main() -> Result<()> {
         let delay = match run_connection(
             args.clone(),
             active_runs.clone(),
+            seen_commands.clone(),
             outbound.clone(),
             adapters.clone(),
             workspaces.clone(),
@@ -221,6 +223,7 @@ async fn main() -> Result<()> {
 async fn run_connection(
     args: Args,
     active_runs: ActiveRuns,
+    seen_commands: Arc<DashMap<Uuid, ()>>,
     outbound: OutboundBus,
     adapters: Arc<AdapterRegistry>,
     workspaces: Arc<WorkspaceManager>,
@@ -543,6 +546,37 @@ async fn run_connection(
                     warn!(%run_id, "interrupt command arrived for inactive run");
                 }
             }
+            ServerToRunner::ApprovalDecision {
+                command_id,
+                run_id,
+                approval_id,
+                approved,
+                note,
+            } => {
+                if seen_commands.insert(command_id, ()).is_none()
+                    && let Some(active) = active_runs.get(&run_id)
+                {
+                    let _ = active.control.send(AdapterControl::ApprovalDecision {
+                        approval_id,
+                        approved,
+                        note,
+                    });
+                }
+            }
+            ServerToRunner::CircuitBreaker {
+                command_id,
+                run_id,
+                stage,
+                reason,
+            } => {
+                if seen_commands.insert(command_id, ()).is_none()
+                    && let Some(active) = active_runs.get(&run_id)
+                {
+                    let _ = active
+                        .control
+                        .send(AdapterControl::CircuitBreaker { stage, reason });
+                }
+            }
             ServerToRunner::Disconnect {
                 reason,
                 reconnect_delay_ms,
@@ -698,6 +732,38 @@ impl AdapterEventSink for RunnerEventSink {
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
                     "cost_microusd": usage.cost_microusd,
+                }),
+            ),
+            AdapterEvent::ApprovalRequested {
+                approval_id,
+                action_key,
+                action,
+                risk,
+                rationale,
+                required_roles,
+                expires_in_seconds,
+            } => (
+                "run.approval_requested",
+                json!({
+                    "approval_id": approval_id,
+                    "action_key": action_key,
+                    "action": action,
+                    "risk": risk,
+                    "rationale": rationale,
+                    "required_roles": required_roles,
+                    "expires_in_seconds": expires_in_seconds,
+                }),
+            ),
+            AdapterEvent::ToolActivity {
+                signature,
+                progressed,
+                human_conversation,
+            } => (
+                "run.tool_activity",
+                json!({
+                    "signature": signature,
+                    "progressed": progressed,
+                    "human_conversation": human_conversation,
                 }),
             ),
             AdapterEvent::Completed { summary } => {

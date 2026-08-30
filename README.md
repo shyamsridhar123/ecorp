@@ -26,6 +26,8 @@ The UI can close without terminating active work.
 - Production OIDC authentication with Corp-scoped, deny-by-default RBAC
 - One-time runner enrollment, rotating workload credentials, replay rejection, and revocation
 - Encrypted, actor/task/tool/resource-scoped secret delivery with metadata-only audit events
+- Durable risky-action suspension with role-gated, idempotent decisions
+- Run, mission, requester, and Corp budgets with steer-constrain-suspend-stop incidents
 - Browser WebSocket updates
 - Resumable, room-filtered event replay
 - Outbound-connected runner daemon
@@ -95,6 +97,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/evidence/2026-08-29-evidence-verification-validation.md`](docs/evidence/2026-08-29-evidence-verification-validation.md)
 - [`docs/evidence/2026-08-30-identity-validation.md`](docs/evidence/2026-08-30-identity-validation.md)
 - [`docs/evidence/2026-08-30-secret-broker-validation.md`](docs/evidence/2026-08-30-secret-broker-validation.md)
+- [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
 
 ## License
 

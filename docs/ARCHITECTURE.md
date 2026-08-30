@@ -74,6 +74,21 @@ Current process adapters receive the short-lived value through their environment
 `environment_reduced_assurance`. The boundary is explicit: this mode protects shared state and
 logs, but a compromised child process can still inspect its own environment.
 
+## Durable action approvals
+
+Agents can request a typed action approval while remaining supervised by the runner. The server
+stores risk, action, rationale, required roles, expiry, and process lineage. Decisions use a
+client-generated idempotency key and transactionally enqueue a durable runner command. Pending
+commands are retried after server or runner reconnect, while runner command IDs suppress duplicate
+process effects.
+
+## Budgets and circuit breaking
+
+Run, mission, requester, and Corp token/cost limits are evaluated after usage events. Explicit
+tool-activity events feed no-progress and repeated-tool counters; human conversation is exempt.
+Monotonic steer, constrain, suspend, and stop transitions create immutable incidents and durable
+runner directives.
+
 ## Current vertical slice
 
 ```text

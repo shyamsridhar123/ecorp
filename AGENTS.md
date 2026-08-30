@@ -25,6 +25,8 @@ Before a non-trivial change, read:
 - Never put long-lived secrets in prompts, logs, command arguments, or agent-readable files.
 - Secret values must be brokered against actor, task, run, runner, tool, resource, and expiry scope.
 - Environment-only secret delivery must remain explicitly labeled reduced assurance.
+- Risky effects must suspend through durable approvals and idempotent runner commands.
+- Budget and loop breaker transitions must remain monotonic, auditable, and conversation-aware.
 
 ## Validation
 

@@ -122,6 +122,25 @@ type VerificationRequest = {
   decision_note: string | null
 }
 
+type ActionApproval = {
+  id: string
+  run_id: string
+  action: string
+  risk: 'low' | 'medium' | 'high' | 'critical'
+  rationale: string
+  required_roles: string[]
+  status: 'pending' | 'approved' | 'rejected' | 'expired'
+  expires_at: string
+}
+
+type CircuitBreakerIncident = {
+  id: string
+  run_id: string
+  stage: 'steer' | 'constrain' | 'suspend' | 'stop'
+  reason: string
+  created_at: string
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -168,6 +187,8 @@ type SnapshotResponse = {
     queued_messages: QueuedMessage[]
     verification_evidence: VerificationEvidence[]
     verification_requests: VerificationRequest[]
+    action_approvals: ActionApproval[]
+    circuit_breaker_incidents: CircuitBreakerIncident[]
     events: DomainEvent[]
   }
     runners: {
@@ -893,6 +914,33 @@ function App() {
     }
   }
 
+  const decideActionApproval = async (approval: ActionApproval, approved: boolean) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/approvals/${approval.id}/decision`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            approved,
+            note: approved
+              ? `${selectedActor.name} approved the scoped action.`
+              : `${selectedActor.name} rejected the scoped action.`,
+            decision_key: crypto.randomUUID(),
+          }),
+        },
+      )
+      await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const claimLease = async (agent: Agent) => {
     if (!bootstrap || !selectedActor) return
     setError(null)
@@ -1252,9 +1300,42 @@ function App() {
           <div className="operations-summary">
             <span>{data.snapshot.missions.length} missions</span>
             <span>{data.snapshot.runs.length} runs</span>
+            <span>{data.snapshot.circuit_breaker_incidents.length} breaker events</span>
             <span>{data.snapshot.events.length} events loaded</span>
           </div>
         </div>
+        {data.snapshot.action_approvals.some((approval) => approval.status === 'pending') ? (
+          <div className="approval-queue" data-testid="action-approval-queue">
+            {data.snapshot.action_approvals
+              .filter((approval) => approval.status === 'pending')
+              .map((approval) => (
+                <article className="verification-card" key={approval.id}>
+                  <div>
+                    <strong>{approval.action}</strong>
+                    <span>{approval.risk} risk · {approval.rationale}</span>
+                  </div>
+                  <div className="verification-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={busy || !approval.required_roles.includes(selectedActor.role)}
+                      onClick={() => void decideActionApproval(approval, true)}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={busy || !approval.required_roles.includes(selectedActor.role)}
+                      onClick={() => void decideActionApproval(approval, false)}
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </article>
+              ))}
+          </div>
+        ) : null}
         <ol className="event-list" data-testid="event-list">
           {latestEvents.map((event) => (
             <EventRow key={event.id} event={event} actors={data.snapshot.actors} />

@@ -102,6 +102,19 @@ pub enum ServerToRunner {
         run_id: Uuid,
         reason: String,
     },
+    ApprovalDecision {
+        command_id: Uuid,
+        run_id: Uuid,
+        approval_id: Uuid,
+        approved: bool,
+        note: String,
+    },
+    CircuitBreaker {
+        command_id: Uuid,
+        run_id: Uuid,
+        stage: String,
+        reason: String,
+    },
     Disconnect {
         reason: String,
         reconnect_delay_ms: u64,
@@ -205,6 +218,8 @@ pub struct CreateMissionRequest {
     pub strategy: Option<String>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_microusd: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -395,4 +410,30 @@ pub struct VerificationDecisionRequest {
 pub struct VerificationDecisionResponse {
     pub run_id: Uuid,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionApprovalDecisionRequest {
+    pub actor_id: Uuid,
+    pub approved: bool,
+    pub note: String,
+    pub decision_key: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionApprovalDecisionResponse {
+    pub approval_id: Uuid,
+    pub status: String,
+    pub effect_queued: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetBudgetPolicyRequest {
+    pub actor_id: Uuid,
+    pub actor_tokens_per_24h: i64,
+    pub actor_cost_microusd_per_24h: i64,
+    pub corp_tokens_per_24h: i64,
+    pub corp_cost_microusd_per_24h: i64,
+    pub no_progress_event_limit: i32,
+    pub repeated_tool_limit: i32,
 }
