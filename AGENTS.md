@@ -17,6 +17,7 @@ Before a non-trivial change, read:
 - Write-capable runs never execute in the configured source checkout.
 - Dirty, committed, or unverifiable worktrees are preserved rather than force-removed.
 - Messages are not tasks; tasks have explicit state machines.
+- Task graphs are bounded, acyclic, dependency-aware, and explicit about contracts and retries.
 - Completion requires evidence.
 - Irreversible effects require authorization and idempotency.
 - Tenant and Corp scope must be explicit on every stored object.

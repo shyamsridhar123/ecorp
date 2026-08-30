@@ -62,14 +62,15 @@ const second = await collectReplay(
   first.replayedThrough,
 );
 const types = second.events.map((event) => event.type);
-if (types.join(",") !== "mission.created,task.created") {
+if (types.join(",") !== "mission.created,task.created,mission.planned") {
   throw new Error(`unexpected reconnect replay: ${JSON.stringify(second)}`);
 }
-if (
-  second.events[0].seq <= first.replayedThrough ||
-  second.events[1].seq <= second.events[0].seq ||
-  second.replayedThrough !== second.events[1].seq
-) {
+const ordered = second.events.every(
+  (event, index) =>
+    event.seq >
+    (index === 0 ? first.replayedThrough : second.events[index - 1].seq),
+);
+if (!ordered || second.replayedThrough !== second.events.at(-1).seq) {
   throw new Error(`replay sequence is not strictly ordered: ${JSON.stringify(second)}`);
 }
 

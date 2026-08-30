@@ -24,7 +24,7 @@
 | Prompt injection | deterministic adapter | trust labels, tool policy, and source-aware context |
 | Memory poisoning | no persistent memory yet | provenance, scope, expiry, and admission policy |
 | Runaway spend | deterministic local adapter | task/run/Corp budgets and breaker |
-| Recursive delegation | one task in first slice | causal-depth and task-generation limits |
+| Recursive delegation | bounded acyclic task graphs | causal-depth and task-generation limits |
 | Conflicting human control | expiring agent lease | authenticated lease, transfer, and emergency-stop policy |
 | Forged artifact | runner SHA-256 | object-store digest, provenance, verifier attestation |
 | Event replay | unique idempotency | signed runner events and replay window |

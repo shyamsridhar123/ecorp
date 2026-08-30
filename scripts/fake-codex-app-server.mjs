@@ -172,7 +172,11 @@ function startTurn(message) {
   } else {
     completionTimer = setTimeout(
       () => finish('completed'),
-      prompt.includes('[slow]') ? 700 : 80,
+      prompt.includes('[slow]')
+        ? 700
+        : prompt.includes('[graph-slow]')
+          ? 1_500
+          : 80,
     )
   }
 }

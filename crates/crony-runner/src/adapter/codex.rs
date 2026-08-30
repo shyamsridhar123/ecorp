@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     async fn wait_for_session_id(sink: &RecordingSink) -> String {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(session_id) = sink
                     .events

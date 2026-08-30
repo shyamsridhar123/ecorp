@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
     Actor, ActorKind, Agent, AgentStatus, ControlLease, Corp, CorpSnapshot, DomainEvent,
     EntityLink, Mission, MissionStatus, NewEvent, QueuedMessage, Room, RoomMessage, Run, RunStatus,
-    Task, TaskStatus,
+    Task, TaskContract, TaskGraphPlan, TaskStatus,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -42,9 +42,9 @@ pub struct DemoIds {
 }
 
 #[derive(Debug, Clone)]
-pub struct MissionTaskIds {
+pub struct MissionPlanIds {
     pub mission_id: Uuid,
-    pub task_id: Uuid,
+    pub task_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +56,15 @@ pub struct LaunchRecord {
     pub run_id: Uuid,
     pub agent_id: Uuid,
     pub assignment_token: Uuid,
+    pub attempt: i32,
     pub adapter: String,
     pub mission_title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulableTask {
+    pub task_id: Uuid,
+    pub required_adapter: String,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +193,24 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn agents_for_planning(&self, corp_id: Uuid) -> Result<Vec<Agent>> {
+        sqlx::query(
+            r#"
+            SELECT id, corp_id, actor_id, name, role, adapter, status, station,
+                   current_run_id, accent, created_at
+            FROM agents
+            WHERE corp_id = $1
+            ORDER BY role, adapter, name, id
+            "#,
+        )
+        .bind(corp_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_agent)
+        .collect()
     }
 
     pub async fn bootstrap_demo(&self) -> Result<(DemoIds, Option<DomainEvent>)> {
@@ -439,7 +464,8 @@ impl PgStore {
 
         let missions = sqlx::query(
             r#"
-            SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title, m.status,
+            SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title, m.strategy,
+                   m.max_nodes, m.max_depth, m.budget_tokens, m.status,
                    m.created_at, m.updated_at
             FROM missions m
             JOIN room_memberships rm ON rm.room_id = m.room_id
@@ -455,10 +481,12 @@ impl PgStore {
         .map(map_mission)
         .collect::<Result<Vec<_>>>()?;
 
-        let tasks = sqlx::query(
+        let mut tasks = sqlx::query(
             r#"
-            SELECT t.id, t.mission_id, t.corp_id, t.title, t.objective, t.status,
-                   t.assigned_agent_id, t.created_at, t.updated_at
+            SELECT t.id, t.mission_id, t.corp_id, t.title, t.objective, t.plan_key,
+                   t.contract, t.depth, t.max_attempts, t.attempt_count,
+                   t.required_adapter, t.status, t.assigned_agent_id,
+                   t.created_at, t.updated_at
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN room_memberships rm ON rm.room_id = m.room_id
@@ -473,6 +501,32 @@ impl PgStore {
         .into_iter()
         .map(map_task)
         .collect::<Result<Vec<_>>>()?;
+
+        let dependency_rows = sqlx::query(
+            r#"
+            SELECT dependency.task_id, dependency.depends_on_task_id
+            FROM task_dependencies dependency
+            JOIN tasks task ON task.id = dependency.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE task.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY dependency.task_id, dependency.depends_on_task_id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut dependencies = HashMap::<Uuid, Vec<Uuid>>::new();
+        for row in dependency_rows {
+            dependencies
+                .entry(row.get("task_id"))
+                .or_default()
+                .push(row.get("depends_on_task_id"));
+        }
+        for task in &mut tasks {
+            task.depends_on = dependencies.remove(&task.id).unwrap_or_default();
+        }
 
         let runs = sqlx::query(
             r#"
@@ -929,8 +983,8 @@ impl PgStore {
         corp_id: Uuid,
         requested_by: Uuid,
         title: &str,
-        preferred_adapter: Option<&str>,
-    ) -> Result<(MissionTaskIds, Vec<DomainEvent>)> {
+        plan: &TaskGraphPlan,
+    ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
         let title = title.trim();
         if title.is_empty() {
             return Err(anyhow!("mission title cannot be empty"));
@@ -948,35 +1002,14 @@ impl PgStore {
         .await
         .context("corp has no room")?;
         assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
-        let worker_agent_id: Uuid = sqlx::query_scalar(
-            r#"
-            SELECT id FROM agents
-            WHERE corp_id = $1 AND role <> 'manager'
-              AND ($2::text IS NULL OR adapter = $2)
-            ORDER BY
-              CASE WHEN adapter = 'fake-process' THEN 0 ELSE 1 END,
-              created_at
-            LIMIT 1
-            "#,
-        )
-        .bind(corp_id)
-        .bind(preferred_adapter)
-        .fetch_one(&mut *tx)
-        .await
-        .with_context(|| {
-            format!(
-                "corp has no worker agent for adapter {}",
-                preferred_adapter.unwrap_or("default")
-            )
-        })?;
 
         let mission_id = Uuid::new_v4();
-        let task_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO missions
-                (id, corp_id, room_id, requested_by, title, status)
-            VALUES ($1, $2, $3, $4, $5, 'ready')
+                (id, corp_id, room_id, requested_by, title, strategy,
+                 max_nodes, max_depth, budget_tokens, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready')
             "#,
         )
         .bind(mission_id)
@@ -984,24 +1017,10 @@ impl PgStore {
         .bind(room_id)
         .bind(requested_by)
         .bind(title)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO tasks
-                (id, mission_id, corp_id, title, objective, status, assigned_agent_id)
-            VALUES ($1, $2, $3, $4, $5, 'ready', $6)
-            "#,
-        )
-        .bind(task_id)
-        .bind(mission_id)
-        .bind(corp_id)
-        .bind("Produce a verified mission artifact")
-        .bind(format!(
-            "OBJECTIVE: {title}\nOUTPUT: a source-backed markdown artifact\nTOOLS: local process and filesystem\nBOUNDARIES: stay inside the assigned run workspace"
-        ))
-        .bind(worker_agent_id)
+        .bind(&plan.strategy)
+        .bind(plan.max_nodes)
+        .bind(plan.max_depth)
+        .bind(plan.budget_tokens)
         .execute(&mut *tx)
         .await?;
 
@@ -1017,13 +1036,131 @@ impl PgStore {
                     "mission",
                     mission_id,
                     format!("mission:{mission_id}:created"),
-                    json!({"title": title, "status": "ready"}),
+                    json!({
+                        "title": title,
+                        "strategy": plan.strategy,
+                        "max_nodes": plan.max_nodes,
+                        "max_depth": plan.max_depth,
+                        "budget_tokens": plan.budget_tokens,
+                        "status": "ready"
+                    }),
                 )
             },
         )
         .await?
         .context("mission created event unexpectedly existed")?;
-        let task_event = append_event_tx(
+
+        let mut task_ids = HashMap::new();
+        for task in &plan.tasks {
+            task_ids.insert(task.key.clone(), Uuid::new_v4());
+        }
+        let mut events = vec![mission_event.clone()];
+        for task in &plan.tasks {
+            let task_id = *task_ids
+                .get(&task.key)
+                .context("planned task id unexpectedly missing")?;
+            let adapter: String =
+                sqlx::query_scalar("SELECT adapter FROM agents WHERE id = $1 AND corp_id = $2")
+                    .bind(task.assigned_agent_id)
+                    .bind(corp_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "planned task {} references an agent outside the Corp",
+                            task.key
+                        )
+                    })?;
+            if adapter != task.required_adapter {
+                return Err(anyhow!(
+                    "planned task {} requires adapter {} but assigned agent uses {adapter}",
+                    task.key,
+                    task.required_adapter
+                ));
+            }
+            let status = if task.depends_on.is_empty() {
+                "ready"
+            } else {
+                "pending"
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO tasks
+                    (id, mission_id, corp_id, title, objective, plan_key, contract,
+                     depth, max_attempts, attempt_count, required_adapter, status,
+                     assigned_agent_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12)
+                "#,
+            )
+            .bind(task_id)
+            .bind(mission_id)
+            .bind(corp_id)
+            .bind(&task.title)
+            .bind(&task.contract.objective)
+            .bind(&task.key)
+            .bind(serde_json::to_value(&task.contract)?)
+            .bind(task.depth)
+            .bind(task.max_attempts)
+            .bind(&task.required_adapter)
+            .bind(status)
+            .bind(task.assigned_agent_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let event = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: Some(room_id),
+                    correlation_id: Some(mission_id),
+                    causation_id: Some(mission_event.id),
+                    ..NewEvent::new(
+                        corp_id,
+                        Some(requested_by),
+                        "task.created",
+                        "task",
+                        task_id,
+                        format!("task:{task_id}:created"),
+                        json!({
+                            "plan_key": task.key,
+                            "title": task.title,
+                            "assigned_agent_id": task.assigned_agent_id,
+                            "required_adapter": task.required_adapter,
+                            "depends_on": task.depends_on,
+                            "depth": task.depth,
+                            "max_attempts": task.max_attempts,
+                            "budget_tokens": task.contract.budget_tokens,
+                            "status": status
+                        }),
+                    )
+                },
+            )
+            .await?
+            .context("task created event unexpectedly existed")?;
+            events.push(event);
+        }
+
+        for task in &plan.tasks {
+            let task_id = *task_ids
+                .get(&task.key)
+                .context("planned task id unexpectedly missing")?;
+            for dependency in &task.depends_on {
+                let dependency_id = *task_ids
+                    .get(dependency)
+                    .with_context(|| format!("unknown planned dependency {dependency}"))?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO task_dependencies (task_id, depends_on_task_id)
+                    VALUES ($1, $2)
+                    "#,
+                )
+                .bind(task_id)
+                .bind(dependency_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let planned_event = append_event_tx(
             &mut tx,
             NewEvent {
                 room_id: Some(room_id),
@@ -1032,63 +1169,199 @@ impl PgStore {
                 ..NewEvent::new(
                     corp_id,
                     Some(requested_by),
-                    "task.created",
-                    "task",
-                    task_id,
-                    format!("task:{task_id}:created"),
+                    "mission.planned",
+                    "mission",
+                    mission_id,
+                    format!("mission:{mission_id}:planned"),
                     json!({
-                        "title": "Produce a verified mission artifact",
-                        "assigned_agent_id": worker_agent_id,
-                        "status": "ready"
+                        "strategy": plan.strategy,
+                        "task_count": plan.tasks.len(),
+                        "task_ids": plan.tasks.iter().filter_map(|task| {
+                            task_ids.get(&task.key).copied()
+                        }).collect::<Vec<_>>()
                     }),
                 )
             },
         )
         .await?
-        .context("task created event unexpectedly existed")?;
+        .context("mission planned event unexpectedly existed")?;
+        events.push(planned_event);
         tx.commit().await?;
 
         Ok((
-            MissionTaskIds {
+            MissionPlanIds {
                 mission_id,
-                task_id,
+                task_ids: plan
+                    .tasks
+                    .iter()
+                    .filter_map(|task| task_ids.get(&task.key).copied())
+                    .collect(),
             },
-            vec![mission_event, task_event],
+            events,
         ))
     }
 
-    pub async fn create_run(
+    pub async fn schedulable_mission_ids(&self, corp_id: Uuid) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT t.mission_id
+            FROM tasks t
+            JOIN missions m ON m.id = t.mission_id
+            JOIN agents a ON a.id = t.assigned_agent_id
+            WHERE t.corp_id = $1
+              AND m.status IN ('ready', 'running')
+              AND t.status IN ('pending', 'ready')
+              AND a.status = 'idle'
+              AND t.attempt_count < t.max_attempts
+              AND NOT EXISTS (
+                SELECT 1 FROM task_dependencies dependency
+                JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                WHERE dependency.task_id = t.id
+                  AND parent.status <> 'completed'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM runs task_run
+                WHERE task_run.task_id = t.id
+                  AND task_run.status IN ('provisioning', 'starting', 'running',
+                                          'waiting_for_input', 'waiting_for_approval', 'verifying')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM runs agent_run
+                WHERE agent_run.agent_id = t.assigned_agent_id
+                  AND agent_run.status IN ('provisioning', 'starting', 'running',
+                                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+              )
+            ORDER BY t.mission_id
+            "#,
+        )
+        .bind(corp_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn schedulable_tasks(
         &self,
         corp_id: Uuid,
         mission_id: Uuid,
-        requested_by: Uuid,
+    ) -> Result<Vec<SchedulableTask>> {
+        sqlx::query(
+            r#"
+            SELECT t.id AS task_id, COALESCE(t.required_adapter, a.adapter) AS required_adapter
+            FROM tasks t
+            JOIN missions m ON m.id = t.mission_id
+            JOIN agents a ON a.id = t.assigned_agent_id
+            WHERE t.corp_id = $1 AND t.mission_id = $2
+              AND m.status IN ('ready', 'running')
+              AND t.status IN ('pending', 'ready')
+              AND a.status = 'idle'
+              AND t.attempt_count < t.max_attempts
+              AND NOT EXISTS (
+                SELECT 1 FROM task_dependencies dependency
+                JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                WHERE dependency.task_id = t.id
+                  AND parent.status <> 'completed'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM runs task_run
+                WHERE task_run.task_id = t.id
+                  AND task_run.status IN ('provisioning', 'starting', 'running',
+                                          'waiting_for_input', 'waiting_for_approval', 'verifying')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM runs agent_run
+                WHERE agent_run.agent_id = t.assigned_agent_id
+                  AND agent_run.status IN ('provisioning', 'starting', 'running',
+                                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+              )
+            ORDER BY t.depth, t.created_at, t.id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(mission_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(SchedulableTask {
+                task_id: row.get("task_id"),
+                required_adapter: row.get("required_adapter"),
+            })
+        })
+        .collect()
+    }
+
+    pub async fn create_task_run(
+        &self,
+        corp_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        requested_by: Option<Uuid>,
         runner_id: &str,
     ) -> Result<(LaunchRecord, DomainEvent)> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT m.room_id, m.title, t.id AS task_id, t.assigned_agent_id, a.adapter
+            SELECT m.room_id, m.title AS mission_title, m.status AS mission_status,
+                   t.title AS task_title, t.contract, t.status AS task_status,
+                   t.assigned_agent_id, t.attempt_count, t.max_attempts,
+                   COALESCE(t.required_adapter, a.adapter) AS required_adapter,
+                   a.adapter
             FROM missions m
             JOIN tasks t ON t.mission_id = m.id
             JOIN agents a ON a.id = t.assigned_agent_id
-            WHERE m.id = $1 AND m.corp_id = $2
-            ORDER BY t.created_at LIMIT 1
-            FOR UPDATE OF m, t
+            WHERE m.id = $1 AND m.corp_id = $2 AND t.id = $3
+            FOR UPDATE OF m, t, a
             "#,
         )
         .bind(mission_id)
         .bind(corp_id)
+        .bind(task_id)
         .fetch_one(&mut *tx)
         .await
         .context("mission or task not found")?;
 
-        let task_id: Uuid = row.get("task_id");
+        let room_id: Uuid = row.get("room_id");
+        if let Some(actor_id) = requested_by {
+            assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
+        }
+        let mission_status: String = row.get("mission_status");
+        if matches!(
+            mission_status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Err(anyhow!("mission is already {mission_status}"));
+        }
+        let task_status: String = row.get("task_status");
+        if !matches!(task_status.as_str(), "pending" | "ready") {
+            return Err(anyhow!("task is not schedulable from status {task_status}"));
+        }
         let agent_id: Uuid = row
             .try_get::<Option<Uuid>, _>("assigned_agent_id")?
             .context("task has no assigned agent")?;
-        let room_id: Uuid = row.get("room_id");
-        let mission_title: String = row.get("title");
         let adapter: String = row.get("adapter");
+        let required_adapter: String = row.get("required_adapter");
+        if adapter != required_adapter {
+            return Err(anyhow!(
+                "assigned agent adapter {adapter} does not satisfy {required_adapter}"
+            ));
+        }
+        let dependencies_ready: bool = sqlx::query_scalar(
+            r#"
+            SELECT NOT EXISTS (
+                SELECT 1 FROM task_dependencies dependency
+                JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                WHERE dependency.task_id = $1
+                  AND parent.status <> 'completed'
+            )
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !dependencies_ready {
+            return Err(anyhow!("task dependencies are not complete"));
+        }
 
         let active: Option<Uuid> = sqlx::query_scalar(
             r#"
@@ -1104,6 +1377,33 @@ impl PgStore {
         if let Some(active_run) = active {
             return Err(anyhow!("task already has active run {active_run}"));
         }
+        let agent_active: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM runs
+            WHERE agent_id = $1 AND status IN ('provisioning', 'starting', 'running',
+                                              'waiting_for_input', 'waiting_for_approval', 'verifying')
+            LIMIT 1
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(active_run) = agent_active {
+            return Err(anyhow!(
+                "assigned agent already has active run {active_run}"
+            ));
+        }
+        let attempt_count: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
+        if attempt_count >= max_attempts {
+            return Err(anyhow!("task exhausted its retry limit"));
+        }
+        let attempt = attempt_count + 1;
+        let contract: TaskContract =
+            serde_json::from_value(row.get("contract")).context("decode task contract")?;
+        let mission_title: String = row.get("mission_title");
+        let task_title: String = row.get("task_title");
+        let task_prompt = format_task_prompt(&mission_title, &task_title, &contract, attempt);
 
         let run_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
@@ -1123,11 +1423,16 @@ impl PgStore {
         .bind(assignment_token)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
+        sqlx::query(
+            "UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
+        )
             .bind(mission_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE tasks SET status = 'claimed', updated_at = now() WHERE id = $1")
+        sqlx::query(
+            "UPDATE tasks SET status = 'claimed', attempt_count = $1, updated_at = now() WHERE id = $2",
+        )
+            .bind(attempt)
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
@@ -1146,7 +1451,7 @@ impl PgStore {
                 correlation_id: Some(mission_id),
                 ..NewEvent::new(
                     corp_id,
-                    Some(requested_by),
+                    requested_by,
                     "run.requested",
                     "run",
                     run_id,
@@ -1155,6 +1460,8 @@ impl PgStore {
                         "task_id": task_id,
                         "agent_id": agent_id,
                         "runner_id": runner_id,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
                         "status": "starting"
                     }),
                 )
@@ -1173,8 +1480,9 @@ impl PgStore {
                 run_id,
                 agent_id,
                 assignment_token,
+                attempt,
                 adapter,
-                mission_title,
+                mission_title: task_prompt,
             },
             event,
         ))
@@ -1328,7 +1636,7 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT r.task_id, t.mission_id, m.room_id
+            SELECT r.task_id, t.mission_id, m.room_id, t.attempt_count, t.max_attempts
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -1355,6 +1663,8 @@ impl PgStore {
         let task_id: Uuid = row.get("task_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
+        let attempt_count: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
 
         let event = append_event_tx(
             &mut tx,
@@ -1554,8 +1864,39 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
                 sqlx::query(
-                    "UPDATE missions SET status = 'completed', updated_at = now() WHERE id = $1",
+                    r#"
+                    UPDATE tasks child
+                    SET status = 'ready', updated_at = now()
+                    WHERE child.mission_id = $1 AND child.status = 'pending'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM task_dependencies dependency
+                        JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                        WHERE dependency.task_id = child.id
+                          AND parent.status <> 'completed'
+                      )
+                    "#,
                 )
+                .bind(mission_id)
+                .execute(&mut *tx)
+                .await?;
+                let mission_complete: bool = sqlx::query_scalar(
+                    "SELECT NOT EXISTS(SELECT 1 FROM tasks WHERE mission_id = $1 AND status <> 'completed')",
+                )
+                .bind(mission_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                sqlx::query(
+                    r#"
+                    UPDATE missions
+                    SET status = $1, updated_at = now()
+                    WHERE id = $2 AND status IN ('ready', 'running')
+                    "#,
+                )
+                .bind(if mission_complete {
+                    "completed"
+                } else {
+                    "running"
+                })
                 .bind(mission_id)
                 .execute(&mut *tx)
                 .await?;
@@ -1578,13 +1919,16 @@ impl PgStore {
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query("UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1")
+                let retry = attempt_count < max_attempts;
+                sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
+                    .bind(if retry { "ready" } else { "failed" })
                     .bind(task_id)
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query(
-                    "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1",
+                    "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
                 )
+                .bind(if retry { "running" } else { "failed" })
                 .bind(mission_id)
                 .execute(&mut *tx)
                 .await?;
@@ -2231,6 +2575,54 @@ impl PgStore {
     }
 }
 
+fn format_task_prompt(
+    mission_title: &str,
+    task_title: &str,
+    contract: &TaskContract,
+    attempt: i32,
+) -> String {
+    let list = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "MISSION: {mission_title}\n\
+         TASK: {task_title}\n\
+         ATTEMPT: {attempt}\n\
+         OBJECTIVE: {}\n\
+         EXPECTED OUTPUT: {}\n\
+         ACCEPTANCE TESTS:\n{}\n\
+         ALLOWED TOOLS:\n{}\n\
+         PROHIBITED ACTIONS:\n{}\n\
+         REFERENCES:\n{}\n\
+         WRITE SCOPE:\n{}\n\
+         TOKEN BUDGET: {}\n\
+         DEADLINE: {}\n\
+         ESCALATION: {}",
+        contract.objective,
+        contract.expected_output,
+        list(&contract.acceptance_tests),
+        list(&contract.allowed_tools),
+        list(&contract.prohibited_actions),
+        if contract.references.is_empty() {
+            "- none".to_owned()
+        } else {
+            list(&contract.references)
+        },
+        list(&contract.write_scope),
+        contract.budget_tokens,
+        contract
+            .deadline_at
+            .as_ref()
+            .map(|deadline| deadline.to_rfc3339())
+            .unwrap_or_else(|| "none".to_owned()),
+        contract.escalation,
+    )
+}
+
 async fn lock_demo_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(DEMO_ADVISORY_LOCK)
@@ -2570,6 +2962,10 @@ fn map_mission(row: sqlx::postgres::PgRow) -> Result<Mission> {
         room_id: row.get("room_id"),
         requested_by: row.get("requested_by"),
         title: row.get("title"),
+        strategy: row.get("strategy"),
+        max_nodes: row.get("max_nodes"),
+        max_depth: row.get("max_depth"),
+        budget_tokens: row.get("budget_tokens"),
         status: parse_mission_status(row.get::<String, _>("status").as_str())?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -2583,6 +2979,13 @@ fn map_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         corp_id: row.get("corp_id"),
         title: row.get("title"),
         objective: row.get("objective"),
+        plan_key: row.get("plan_key"),
+        contract: serde_json::from_value(row.get("contract")).context("decode task contract")?,
+        depth: row.get("depth"),
+        max_attempts: row.get("max_attempts"),
+        attempt_count: row.get("attempt_count"),
+        required_adapter: row.get("required_adapter"),
+        depends_on: Vec::new(),
         status: parse_task_status(row.get::<String, _>("status").as_str())?,
         assigned_agent_id: row.get("assigned_agent_id"),
         created_at: row.get("created_at"),
@@ -2731,6 +3134,7 @@ fn parse_mission_status(value: &str) -> Result<MissionStatus> {
 
 fn parse_task_status(value: &str) -> Result<TaskStatus> {
     match value {
+        "pending" => Ok(TaskStatus::Pending),
         "ready" => Ok(TaskStatus::Ready),
         "claimed" => Ok(TaskStatus::Claimed),
         "running" => Ok(TaskStatus::Running),

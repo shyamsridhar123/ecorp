@@ -26,7 +26,9 @@
   evidence across the browser/server/runner/provider boundary.
 - Per-task Git worktree isolation now provisions deterministic branches, reuses the exact worktree
   for resume, and preserves every dirty, committed, or uncertain result.
-- The next critical-path items are bounded task graphs and evidence-gated verification.
+- Replaceable manager strategies now persist bounded task contracts and dependency graphs; the
+  scheduler dispatches parallel roots, releases downstream tasks, and enforces retry limits.
+- The next critical-path item is evidence-gated verification.
 
 ---
 

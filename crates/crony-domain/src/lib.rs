@@ -62,6 +62,7 @@ impl MissionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    Pending,
     Ready,
     Claimed,
     Running,
@@ -76,6 +77,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Ready => "ready",
             Self::Claimed => "claimed",
             Self::Running => "running",
@@ -170,9 +172,48 @@ pub struct Mission {
     pub room_id: Uuid,
     pub requested_by: Uuid,
     pub title: String,
+    pub strategy: String,
+    pub max_nodes: i32,
+    pub max_depth: i32,
+    pub budget_tokens: i64,
     pub status: MissionStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContract {
+    pub objective: String,
+    pub expected_output: String,
+    pub acceptance_tests: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub prohibited_actions: Vec<String>,
+    pub references: Vec<String>,
+    pub write_scope: Vec<String>,
+    pub budget_tokens: i64,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub escalation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedTask {
+    pub key: String,
+    pub title: String,
+    pub contract: TaskContract,
+    pub assigned_agent_id: Uuid,
+    pub required_adapter: String,
+    pub depends_on: Vec<String>,
+    pub depth: i32,
+    pub max_attempts: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskGraphPlan {
+    pub strategy: String,
+    pub max_nodes: i32,
+    pub max_depth: i32,
+    pub budget_tokens: i64,
+    pub tasks: Vec<PlannedTask>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +223,13 @@ pub struct Task {
     pub corp_id: Uuid,
     pub title: String,
     pub objective: String,
+    pub plan_key: String,
+    pub contract: TaskContract,
+    pub depth: i32,
+    pub max_attempts: i32,
+    pub attempt_count: i32,
+    pub required_adapter: Option<String>,
+    pub depends_on: Vec<Uuid>,
     pub status: TaskStatus,
     pub assigned_agent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,

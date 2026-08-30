@@ -157,12 +157,15 @@ pub struct CreateMissionRequest {
     pub title: String,
     pub requested_by: Uuid,
     pub preferred_adapter: Option<String>,
+    pub strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMissionResponse {
     pub mission_id: Uuid,
     pub task_id: Uuid,
+    pub task_ids: Vec<Uuid>,
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +177,8 @@ pub struct LaunchMissionRequest {
 pub struct LaunchMissionResponse {
     pub run_id: Uuid,
     pub runner_id: String,
+    pub run_ids: Vec<Uuid>,
+    pub runner_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

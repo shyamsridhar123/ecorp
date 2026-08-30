@@ -37,6 +37,8 @@ enum Command {
         actor_id: Uuid,
         #[arg(long)]
         adapter: Option<String>,
+        #[arg(long)]
+        strategy: Option<String>,
         title: String,
     },
     RoomMessage {
@@ -144,6 +146,7 @@ async fn main() -> Result<()> {
             corp_id,
             actor_id,
             adapter,
+            strategy,
             title,
         } => {
             request(
@@ -154,6 +157,7 @@ async fn main() -> Result<()> {
                     title,
                     requested_by: actor_id,
                     preferred_adapter: adapter,
+                    strategy,
                 })?),
             )
             .await?

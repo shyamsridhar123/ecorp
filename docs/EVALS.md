@@ -80,6 +80,9 @@ interrupt, emergency stop, usage persistence, run ancestry, and artifact hash ve
 and linked worktrees are distinct, verifies the configured checkout's HEAD and working state do not
 change, confirms dirty work is preserved, and confirms a clean evidence-only run removes both its
 worktree and branch.
+`tools/e2e_task_graph.mjs` validates a three-node graph with two parallel specialist roots and a
+dependency-gated synthesis task, then proves an always-failing task stops exactly at its retry
+limit.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
@@ -98,3 +101,7 @@ Worktree unit tests run in source and managed paths containing spaces. They cove
 worktrees, exact resume reuse, dirty and committed preservation, post-integration reclamation,
 detached-state fail-safe behavior, path/ref validation, and occupied-target rejection. See
 `docs/evidence/2026-08-29-worktree-isolation-validation.md`.
+
+Planning unit tests prove strategy replacement, deterministic adapter matching, cycle rejection,
+depth bounds, retry bounds, per-task budgets, and total mission budgets. See
+`docs/evidence/2026-08-29-task-graph-validation.md`.

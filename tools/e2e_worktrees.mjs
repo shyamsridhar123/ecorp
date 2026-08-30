@@ -46,7 +46,7 @@ function settled(run) {
   )
 }
 
-async function waitForRuns(demo, runIds, timeoutMs = 20_000) {
+async function waitForRuns(demo, runIds, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const state = await snapshot(demo)

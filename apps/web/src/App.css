@@ -688,6 +688,16 @@ select:focus-visible {
   font: 700 18px/1.15 var(--sans);
 }
 
+.strategy-chip {
+  width: fit-content;
+  margin: -6px 0 12px;
+  padding: 3px 6px;
+  color: var(--cobalt-dark);
+  font: 8px/1 var(--mono);
+  border: 1px solid var(--cobalt);
+  text-transform: uppercase;
+}
+
 .mission-id {
   color: var(--ink-soft);
   font: 10px/1 var(--mono);
@@ -740,6 +750,39 @@ select:focus-visible {
 .mission-card dd {
   margin: 6px 0 0;
   font: 700 12px/1 var(--mono);
+}
+
+.task-graph-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 9px;
+}
+
+.task-graph-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  padding: 6px 8px;
+  font: 9px/1.2 var(--mono);
+  border-left: 3px solid var(--marigold);
+  background: var(--paper-light);
+}
+
+.task-graph-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-graph-row strong {
+  color: var(--cobalt-dark);
+  text-transform: uppercase;
+}
+
+.task-graph-row small {
+  grid-column: 1 / -1;
+  color: var(--ink-soft);
+  font: inherit;
 }
 
 .mission-launch {
