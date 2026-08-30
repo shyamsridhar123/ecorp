@@ -207,6 +207,27 @@ The scheduler:
 - launches downstream tasks after committed completion events
 - marks the mission complete only after every task completes
 
+## Evidence-gated completion
+
+Every task stores a typed verification policy. Automated checks execute on the runner, never on the
+server, and currently support:
+
+- recorded artifact existence, byte floor, and SHA-256 integrity
+- worktree-relative files
+- direct command execution without a shell
+- test commands
+- JSON object required-key schemas
+- PNG or JPEG screenshot evidence
+
+The runner buffers an adapter's completion signal, emits one evidence record per check, and sends
+`run.completed` only after every automated check passes. The server rejects completion events that
+arrive before complete passing evidence or while a manual gate is required.
+
+Failed verification sets the task to `verification_failed` and the mission to failed. A successful
+automated policy can instead enter `waiting_for_approval`. Human-approval gates enforce configured
+roles. Independent-review gates additionally reject the mission requester and producing agent.
+Decisions are durable, actor-attributed, and can release downstream scheduler work.
+
 ## Agent adapters
 
 Provider runtimes implement one `AgentAdapter` contract:
@@ -237,7 +258,8 @@ streaming, steering, interruption, emergency stop, resume, usage, artifacts, and
 
 ## Near-term architecture work
 
-1. Add independent evidence-gated verification.
-2. Add durable approvals and policy evaluation.
-3. Add authenticated users and runner enrollment.
-4. Add artifact upload rather than host-local artifact paths.
+1. Add authenticated users and runner enrollment.
+2. Add the scoped secret broker.
+3. Generalize durable approval suspension for risky side effects.
+4. Add budgets and circuit-breaker policy.
+5. Add artifact upload rather than host-local artifact paths.

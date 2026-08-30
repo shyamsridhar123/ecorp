@@ -22,7 +22,8 @@ use crony_protocol::{
     InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
     QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResumeRunRequest,
     ResumeRunResponse, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SnapshotResponse, TransferLeaseRequest,
+    SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
+    VerificationDecisionResponse,
 };
 use crony_store::{
     LaunchRecord, NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput,
@@ -181,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/runs/{run_id}/resume",
             post(resume_run),
+        )
+        .route(
+            "/api/corps/{corp_id}/runs/{run_id}/verification-decision",
+            post(decide_verification),
         )
         .route(
             "/api/corps/{corp_id}/agents/{agent_id}/lease",
@@ -461,6 +466,7 @@ async fn schedule_ready_tasks(
                 assignment_token: record.assignment_token,
                 adapter: record.adapter.clone(),
                 mission_title: record.mission_title.clone(),
+                verification_policy: record.verification_policy.clone(),
             })
             .map_err(|_| anyhow::anyhow!("runner disconnected before accepting the run"))?;
         publish(state, event);
@@ -532,6 +538,7 @@ async fn resume_run(
             adapter: record.adapter,
             provider_session_id: record.provider_session_id.clone(),
             prompt: prompt.to_owned(),
+            verification_policy: record.verification_policy,
         })
         .map_err(|_| ApiError::conflict("runner disconnected before accepting resume"))?;
     publish(&state, event);
@@ -539,6 +546,34 @@ async fn resume_run(
         run_id: record.run_id,
         runner_id: record.runner_id,
         provider_session_id: record.provider_session_id,
+    }))
+}
+
+async fn decide_verification(
+    State(state): State<AppState>,
+    Path((corp_id, run_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<VerificationDecisionRequest>,
+) -> Result<Json<VerificationDecisionResponse>, ApiError> {
+    let outcome = state
+        .store
+        .decide_verification(
+            corp_id,
+            run_id,
+            request.actor_id,
+            request.approved,
+            &request.note,
+        )
+        .await
+        .map_err(map_store_error)?;
+    publish(&state, outcome.event);
+    if request.approved {
+        schedule_ready_corp(&state, outcome.corp_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(Json(VerificationDecisionResponse {
+        run_id: outcome.run_id,
+        status: outcome.status,
     }))
 }
 

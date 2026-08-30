@@ -25,6 +25,7 @@ const graphSlowRun = mission.includes("[graph-slow]");
 const failRun = mission.includes("[always-fail]");
 const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
+const verificationMatrix = mission.includes("[verification-matrix]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
 const briefingDelay = slowRun ? 4_000 : graphSlowRun ? 1_200 : 700;
 const workDelay = slowRun ? 5_000 : graphSlowRun ? 1_200 : 900;
@@ -82,6 +83,19 @@ if (failRun) {
   emit({ type: "failed", error: "Synthetic bounded task failure." });
   input.close();
   process.exit(0);
+}
+
+if (verificationMatrix) {
+  await writeFile(resolve(workdir, "verify.txt"), "VERIFIED\n", "utf8");
+  await writeFile(
+    resolve(workdir, "schema.json"),
+    `${JSON.stringify({ status: "ok", count: 1 })}\n`,
+    "utf8",
+  );
+  await writeFile(
+    resolve(workdir, "screenshot.png"),
+    Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), Buffer.from("CRONY_SCREENSHOT")]),
+  );
 }
 
 const artifact = [

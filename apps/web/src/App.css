@@ -599,6 +599,11 @@ select:focus-visible {
   background: var(--marigold);
 }
 
+.button-danger {
+  color: var(--paper-light);
+  background: var(--signal);
+}
+
 .button-ink {
   color: var(--paper-light);
   background: var(--ink);
@@ -799,6 +804,48 @@ select:focus-visible {
   color: var(--mint);
   font: 10px/1.2 var(--mono);
   border: 1px solid var(--mint);
+}
+
+.verification-box {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 8px;
+  font: 9px/1.2 var(--mono);
+  border: 1px solid var(--line);
+  text-transform: uppercase;
+}
+
+.verification-passed {
+  color: #244d3c;
+  border-color: var(--mint);
+  background: #dce9e4;
+}
+
+.verification-failed {
+  color: #6f1c15;
+  border-color: var(--signal);
+  background: #f0d4c7;
+}
+
+.verification-waiting_for_approval {
+  color: var(--ink);
+  border-color: var(--marigold);
+  background: #f6e4b7;
+}
+
+.verification-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.verification-actions span {
+  grid-column: 1 / -1;
+  font: 9px/1.2 var(--mono);
+  text-transform: uppercase;
 }
 
 .mission-form select {

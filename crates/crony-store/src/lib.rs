@@ -4,8 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
     Actor, ActorKind, Agent, AgentStatus, ControlLease, Corp, CorpSnapshot, DomainEvent,
-    EntityLink, Mission, MissionStatus, NewEvent, QueuedMessage, Room, RoomMessage, Run, RunStatus,
-    Task, TaskContract, TaskGraphPlan, TaskStatus,
+    EntityLink, ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage, Room,
+    RoomMessage, Run, RunStatus, Task, TaskContract, TaskGraphPlan, TaskStatus,
+    VerificationEvidence, VerificationPolicy, VerificationRequest,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -59,6 +60,7 @@ pub struct LaunchRecord {
     pub attempt: i32,
     pub adapter: String,
     pub mission_title: String,
+    pub verification_policy: VerificationPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,7 @@ pub struct ResumeLaunchRecord {
     pub assignment_token: Uuid,
     pub adapter: String,
     pub provider_session_id: String,
+    pub verification_policy: VerificationPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +112,15 @@ pub struct MessageOutcome {
 pub struct StopRequestOutcome {
     pub run_id: Uuid,
     pub runner_id: String,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationDecisionOutcome {
+    pub run_id: Uuid,
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub status: String,
     pub event: DomainEvent,
 }
 
@@ -485,7 +497,8 @@ impl PgStore {
             r#"
             SELECT t.id, t.mission_id, t.corp_id, t.title, t.objective, t.plan_key,
                    t.contract, t.depth, t.max_attempts, t.attempt_count,
-                   t.required_adapter, t.status, t.assigned_agent_id,
+                   t.required_adapter, t.verification_policy, t.verification_status,
+                   t.status, t.assigned_agent_id,
                    t.created_at, t.updated_at
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
@@ -534,7 +547,8 @@ impl PgStore {
                    r.assignment_token, r.provider_session_id, r.resumed_from_run_id,
                    r.workspace_run_id, r.input_tokens, r.output_tokens, r.cost_microusd,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
-                   r.workspace_base_commit, r.workspace_disposition, r.workspace_detail, r.status,
+                   r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
+                   r.verification_status, r.verification_summary, r.status,
                    r.summary, r.artifact_path, r.artifact_sha256, r.created_at, r.updated_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -599,6 +613,50 @@ impl PgStore {
         .map(map_room_message)
         .collect();
 
+        let verification_evidence = sqlx::query(
+            r#"
+            SELECT evidence.id, evidence.corp_id, evidence.task_id, evidence.run_id,
+                   evidence.check_index, evidence.kind, evidence.status, evidence.summary,
+                   evidence.payload, evidence.created_at
+            FROM verification_evidence evidence
+            JOIN tasks task ON task.id = evidence.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE evidence.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY evidence.created_at, evidence.check_index
+            LIMIT 1000
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_verification_evidence)
+        .collect();
+
+        let verification_requests = sqlx::query(
+            r#"
+            SELECT request.run_id, request.corp_id, request.task_id, request.gate_type,
+                   request.gate, request.status, request.requested_at, request.decided_by,
+                   request.decision_note, request.decided_at
+            FROM verification_requests request
+            JOIN tasks task ON task.id = request.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE request.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY request.requested_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_verification_request)
+        .collect::<Result<Vec<_>>>()?;
+
         let mut events = sqlx::query(
             r#"
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
@@ -637,6 +695,8 @@ impl PgStore {
             room_messages,
             leases,
             queued_messages,
+            verification_evidence,
+            verification_requests,
             events,
         })
     }
@@ -1088,8 +1148,8 @@ impl PgStore {
                 INSERT INTO tasks
                     (id, mission_id, corp_id, title, objective, plan_key, contract,
                      depth, max_attempts, attempt_count, required_adapter, status,
-                     assigned_agent_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12)
+                     assigned_agent_id, verification_policy, verification_status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, 'pending')
                 "#,
             )
             .bind(task_id)
@@ -1104,6 +1164,7 @@ impl PgStore {
             .bind(&task.required_adapter)
             .bind(status)
             .bind(task.assigned_agent_id)
+            .bind(serde_json::to_value(&task.verification_policy)?)
             .execute(&mut *tx)
             .await?;
 
@@ -1303,7 +1364,8 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT m.room_id, m.title AS mission_title, m.status AS mission_status,
-                   t.title AS task_title, t.contract, t.status AS task_status,
+                   t.title AS task_title, t.contract, t.verification_policy,
+                   t.status AS task_status,
                    t.assigned_agent_id, t.attempt_count, t.max_attempts,
                    COALESCE(t.required_adapter, a.adapter) AS required_adapter,
                    a.adapter
@@ -1401,6 +1463,9 @@ impl PgStore {
         let attempt = attempt_count + 1;
         let contract: TaskContract =
             serde_json::from_value(row.get("contract")).context("decode task contract")?;
+        let verification_policy: VerificationPolicy =
+            serde_json::from_value(row.get("verification_policy"))
+                .context("decode verification policy")?;
         let mission_title: String = row.get("mission_title");
         let task_title: String = row.get("task_title");
         let task_prompt = format_task_prompt(&mission_title, &task_title, &contract, attempt);
@@ -1430,7 +1495,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE tasks SET status = 'claimed', attempt_count = $1, updated_at = now() WHERE id = $2",
+            "UPDATE tasks SET status = 'claimed', attempt_count = $1, verification_status = 'pending', updated_at = now() WHERE id = $2",
         )
             .bind(attempt)
             .bind(task_id)
@@ -1483,6 +1548,7 @@ impl PgStore {
                 attempt,
                 adapter,
                 mission_title: task_prompt,
+                verification_policy,
             },
             event,
         ))
@@ -1499,7 +1565,7 @@ impl PgStore {
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id,
-                   t.mission_id, m.room_id, a.adapter
+                   t.mission_id, t.verification_policy, m.room_id, a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -1520,6 +1586,9 @@ impl PgStore {
             .try_get::<Option<String>, _>("provider_session_id")?
             .context("source run has no resumable provider session")?;
         let workspace_run_id: Uuid = row.get("workspace_run_id");
+        let verification_policy: VerificationPolicy =
+            serde_json::from_value(row.get("verification_policy"))
+                .context("decode verification policy")?;
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let adapter: String = row.get("adapter");
@@ -1567,7 +1636,9 @@ impl PgStore {
             .bind(mission_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE tasks SET status = 'claimed', updated_at = now() WHERE id = $1")
+        sqlx::query(
+            "UPDATE tasks SET status = 'claimed', verification_status = 'pending', updated_at = now() WHERE id = $1",
+        )
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
@@ -1618,6 +1689,7 @@ impl PgStore {
                 assignment_token,
                 adapter,
                 provider_session_id,
+                verification_policy,
             },
             event,
         ))
@@ -1636,7 +1708,9 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT r.task_id, t.mission_id, m.room_id, t.attempt_count, t.max_attempts
+            SELECT r.task_id, r.verification_status AS run_verification_status,
+                   t.mission_id, t.verification_policy, m.room_id,
+                   t.attempt_count, t.max_attempts
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -1665,6 +1739,10 @@ impl PgStore {
         let room_id: Uuid = row.get("room_id");
         let attempt_count: i32 = row.get("attempt_count");
         let max_attempts: i32 = row.get("max_attempts");
+        let run_verification_status: String = row.get("run_verification_status");
+        let verification_policy: VerificationPolicy =
+            serde_json::from_value(row.get("verification_policy"))
+                .context("decode task verification policy")?;
 
         let event = append_event_tx(
             &mut tx,
@@ -1781,7 +1859,7 @@ impl PgStore {
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query(
-                    "UPDATE agents SET status = 'reviewing', station = 'review' WHERE id = $1",
+                    "UPDATE agents SET status = 'reviewing', station = 'review', current_run_id = NULL WHERE id = $1",
                 )
                 .bind(agent_id)
                 .execute(&mut *tx)
@@ -1820,6 +1898,246 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            "run.verification_started" => {
+                sqlx::query(
+                    "UPDATE runs SET status = 'verifying', verification_status = 'running', verification_summary = NULL, updated_at = now() WHERE id = $1",
+                )
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE tasks SET status = 'review', verification_status = 'running', updated_at = now() WHERE id = $1",
+                )
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE agents SET status = 'reviewing', station = 'review' WHERE id = $1",
+                )
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.verification_evidence" => {
+                let evidence_id = payload
+                    .get("evidence_id")
+                    .and_then(Value::as_str)
+                    .context("verification evidence omitted evidence_id")
+                    .and_then(|value| {
+                        Uuid::parse_str(value).context("verification evidence id is invalid")
+                    })?;
+                let check_index = payload
+                    .get("check_index")
+                    .and_then(Value::as_i64)
+                    .context("verification evidence omitted check_index")?;
+                let check_index = i32::try_from(check_index)
+                    .context("verification check index is out of range")?;
+                let expected = verification_policy
+                    .checks
+                    .get(check_index as usize)
+                    .context("verification evidence references an unknown check")?;
+                let kind = payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .context("verification evidence omitted kind")?;
+                if kind != expected.kind() {
+                    return Err(anyhow!(
+                        "verification evidence kind {kind} does not match policy {}",
+                        expected.kind()
+                    ));
+                }
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .context("verification evidence omitted status")?;
+                if !matches!(status, "passed" | "failed") {
+                    return Err(anyhow!("verification evidence status is invalid"));
+                }
+                let summary = payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .context("verification evidence omitted summary")?;
+                if summary.len() > 4_000 {
+                    return Err(anyhow!("verification evidence summary is too long"));
+                }
+                sqlx::query(
+                    r#"
+                    INSERT INTO verification_evidence
+                        (id, corp_id, task_id, run_id, check_index, kind, status, summary, payload)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    "#,
+                )
+                .bind(evidence_id)
+                .bind(corp_id)
+                .bind(task_id)
+                .bind(run_id)
+                .bind(check_index)
+                .bind(kind)
+                .bind(status)
+                .bind(summary)
+                .bind(payload.get("payload").cloned().unwrap_or_else(|| json!({})))
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.verification_passed" => {
+                let evidence_rows = sqlx::query(
+                    r#"
+                    SELECT check_index, kind, status
+                    FROM verification_evidence
+                    WHERE run_id = $1
+                    ORDER BY check_index
+                    "#,
+                )
+                .bind(run_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                if evidence_rows.len() != verification_policy.checks.len() {
+                    return Err(anyhow!(
+                        "verification passed without complete evidence: expected {}, found {}",
+                        verification_policy.checks.len(),
+                        evidence_rows.len()
+                    ));
+                }
+                for (index, row) in evidence_rows.into_iter().enumerate() {
+                    let check_index: i32 = row.get("check_index");
+                    let kind: String = row.get("kind");
+                    let status: String = row.get("status");
+                    let expected = &verification_policy.checks[index];
+                    if check_index != index as i32 || kind != expected.kind() || status != "passed"
+                    {
+                        return Err(anyhow!("verification evidence does not satisfy policy"));
+                    }
+                }
+                let summary = payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("all verifier checks passed");
+                sqlx::query(
+                    "UPDATE runs SET verification_status = 'passed', verification_summary = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(summary)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE tasks SET verification_status = 'passed', updated_at = now() WHERE id = $1",
+                )
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.verification_waiting" => {
+                if run_verification_status != "passed" {
+                    return Err(anyhow!(
+                        "manual verification gate requested before automated checks passed"
+                    ));
+                }
+                let gate: ManualVerificationGate = serde_json::from_value(
+                    payload
+                        .get("gate")
+                        .cloned()
+                        .context("verification waiting event omitted gate")?,
+                )
+                .context("decode manual verification gate")?;
+                if verification_policy.manual_gate.as_ref() != Some(&gate) {
+                    return Err(anyhow!(
+                        "manual verification gate does not match task policy"
+                    ));
+                }
+                let gate_type = payload
+                    .get("gate_type")
+                    .and_then(Value::as_str)
+                    .context("verification waiting event omitted gate_type")?;
+                if gate.kind() != gate_type {
+                    return Err(anyhow!("manual verification gate type mismatch"));
+                }
+                let verification_summary = payload
+                    .get("verification_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("automated verification passed");
+                let completion_summary = payload
+                    .get("completion_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Agent completed pending approval");
+                sqlx::query(
+                    r#"
+                    INSERT INTO verification_requests
+                        (run_id, corp_id, task_id, gate_type, gate, status)
+                    VALUES ($1, $2, $3, $4, $5, 'pending')
+                    "#,
+                )
+                .bind(run_id)
+                .bind(corp_id)
+                .bind(task_id)
+                .bind(gate_type)
+                .bind(serde_json::to_value(&gate)?)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE runs SET status = 'waiting_for_approval', verification_status = 'waiting_for_approval', verification_summary = $1, summary = $2, updated_at = now() WHERE id = $3",
+                )
+                .bind(verification_summary)
+                .bind(completion_summary)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE tasks SET status = 'awaiting_approval', verification_status = 'waiting_for_approval', updated_at = now() WHERE id = $1",
+                )
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE agents SET status = 'reviewing', station = 'review' WHERE id = $1",
+                )
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "run.verification_failed" => {
+                let evidence_statuses: Vec<String> = sqlx::query_scalar(
+                    "SELECT status FROM verification_evidence WHERE run_id = $1 ORDER BY check_index",
+                )
+                .bind(run_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                if evidence_statuses.len() != verification_policy.checks.len()
+                    || !evidence_statuses.iter().any(|status| status == "failed")
+                {
+                    return Err(anyhow!(
+                        "verification failure does not have complete failing evidence"
+                    ));
+                }
+                let summary = payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("verification policy failed");
+                sqlx::query(
+                    "UPDATE runs SET status = 'failed', verification_status = 'failed', verification_summary = $1, summary = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(summary)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE tasks SET status = 'verification_failed', verification_status = 'failed', updated_at = now() WHERE id = $1",
+                )
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
+                )
+                .bind(mission_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
+                )
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             "run.workspace_preserved" | "run.workspace_removed" => {
                 let disposition = if event_type == "run.workspace_removed" {
                     "removed"
@@ -1846,6 +2164,14 @@ impl PgStore {
                 .await?;
             }
             "run.completed" => {
+                if run_verification_status != "passed" {
+                    return Err(anyhow!("run cannot complete before verification passes"));
+                }
+                if verification_policy.manual_gate.is_some() {
+                    return Err(anyhow!(
+                        "run cannot complete before its manual verification gate"
+                    ));
+                }
                 let summary = payload
                     .get("summary")
                     .and_then(Value::as_str)
@@ -1858,7 +2184,7 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
                 sqlx::query(
-                    "UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1",
+                    "UPDATE tasks SET status = 'completed', verification_status = 'passed', updated_at = now() WHERE id = $1",
                 )
                 .bind(task_id)
                 .execute(&mut *tx)
@@ -1975,6 +2301,230 @@ impl PgStore {
 
         tx.commit().await?;
         Ok(Some(event))
+    }
+
+    pub async fn decide_verification(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        actor_id: Uuid,
+        approved: bool,
+        note: &str,
+    ) -> Result<VerificationDecisionOutcome> {
+        let note = note.trim();
+        if note.len() > 1_000 {
+            return Err(anyhow!(
+                "verification decision note cannot exceed 1,000 characters"
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT request.task_id, request.gate_type, request.gate,
+                   request.status AS request_status,
+                   task.mission_id, task.status AS task_status,
+                   mission.room_id, mission.requested_by, mission.status AS mission_status,
+                   run.status AS run_status, run.agent_id,
+                   producer.actor_id AS producer_actor_id
+            FROM verification_requests request
+            JOIN runs run ON run.id = request.run_id
+            JOIN tasks task ON task.id = request.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN agents producer ON producer.id = run.agent_id
+            WHERE request.run_id = $1 AND request.corp_id = $2
+            FOR UPDATE OF request, run, task, mission
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("pending verification request not found")?;
+        let task_id: Uuid = row.get("task_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
+        let actor = sqlx::query("SELECT kind, role FROM actors WHERE id = $1 AND corp_id = $2")
+            .bind(actor_id)
+            .bind(corp_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("verification actor not found")?;
+        let actor_kind: String = actor.get("kind");
+        let actor_role: String = actor.get("role");
+        if actor_kind != "human" {
+            return Err(anyhow!(
+                "forbidden: manual verification decisions require a human actor"
+            ));
+        }
+        let gate: ManualVerificationGate =
+            serde_json::from_value(row.get("gate")).context("decode verification gate")?;
+        let roles = match &gate {
+            ManualVerificationGate::HumanApproval { roles }
+            | ManualVerificationGate::IndependentReview { roles, .. } => roles,
+        };
+        if !roles.iter().any(|role| role == &actor_role) {
+            return Err(anyhow!(
+                "forbidden: actor role {actor_role} cannot decide this verification"
+            ));
+        }
+        if let ManualVerificationGate::IndependentReview {
+            exclude_requester, ..
+        } = &gate
+        {
+            let requester: Uuid = row.get("requested_by");
+            let producer_actor_id: Uuid = row.get("producer_actor_id");
+            if (*exclude_requester && actor_id == requester) || actor_id == producer_actor_id {
+                return Err(anyhow!(
+                    "forbidden: independent review requires a different actor"
+                ));
+            }
+        }
+        let request_status: String = row.get("request_status");
+        let run_status: String = row.get("run_status");
+        let task_status: String = row.get("task_status");
+        if request_status != "pending"
+            || run_status != "waiting_for_approval"
+            || task_status != "awaiting_approval"
+        {
+            return Err(anyhow!("verification request is no longer pending"));
+        }
+        let mission_status: String = row.get("mission_status");
+        if matches!(
+            mission_status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Err(anyhow!("mission is already {mission_status}"));
+        }
+        let agent_id: Uuid = row.get("agent_id");
+        let decision_status = if approved { "approved" } else { "rejected" };
+        sqlx::query(
+            r#"
+            UPDATE verification_requests
+            SET status = $1, decided_by = $2, decision_note = $3, decided_at = now()
+            WHERE run_id = $4
+            "#,
+        )
+        .bind(decision_status)
+        .bind(actor_id)
+        .bind((!note.is_empty()).then_some(note))
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if approved {
+            sqlx::query(
+                "UPDATE runs SET status = 'completed', verification_status = 'passed', updated_at = now() WHERE id = $1",
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE tasks SET status = 'completed', verification_status = 'passed', updated_at = now() WHERE id = $1",
+            )
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                UPDATE tasks child
+                SET status = 'ready', updated_at = now()
+                WHERE child.mission_id = $1 AND child.status = 'pending'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM task_dependencies dependency
+                    JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                    WHERE dependency.task_id = child.id
+                      AND parent.status <> 'completed'
+                  )
+                "#,
+            )
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+            let mission_complete: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(SELECT 1 FROM tasks WHERE mission_id = $1 AND status <> 'completed')",
+            )
+            .bind(mission_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
+            )
+            .bind(if mission_complete {
+                "completed"
+            } else {
+                "running"
+            })
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let rejection = if note.is_empty() {
+                "verification rejected by an authorized reviewer"
+            } else {
+                note
+            };
+            sqlx::query(
+                "UPDATE runs SET status = 'failed', verification_status = 'failed', verification_summary = $1, summary = $1, updated_at = now() WHERE id = $2",
+            )
+            .bind(rejection)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE tasks SET status = 'verification_failed', verification_status = 'failed', updated_at = now() WHERE id = $1",
+            )
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
+            )
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    if approved {
+                        "verification.approved"
+                    } else {
+                        "verification.rejected"
+                    },
+                    "run",
+                    run_id,
+                    format!("verification-decision:{run_id}:{decision_status}"),
+                    json!({
+                        "task_id": task_id,
+                        "gate_type": row.get::<String, _>("gate_type"),
+                        "status": decision_status,
+                        "note": note
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("verification decision event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(VerificationDecisionOutcome {
+            run_id,
+            corp_id,
+            mission_id,
+            status: decision_status.to_owned(),
+            event,
+        })
     }
 
     pub async fn acquire_lease(
@@ -2986,6 +3536,9 @@ fn map_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         attempt_count: row.get("attempt_count"),
         required_adapter: row.get("required_adapter"),
         depends_on: Vec::new(),
+        verification_policy: serde_json::from_value(row.get("verification_policy"))
+            .context("decode verification policy")?,
+        verification_status: row.get("verification_status"),
         status: parse_task_status(row.get::<String, _>("status").as_str())?,
         assigned_agent_id: row.get("assigned_agent_id"),
         created_at: row.get("created_at"),
@@ -3013,12 +3566,44 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         workspace_base_commit: row.get("workspace_base_commit"),
         workspace_disposition: row.get("workspace_disposition"),
         workspace_detail: row.get("workspace_detail"),
+        verification_status: row.get("verification_status"),
+        verification_summary: row.get("verification_summary"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
         artifact_path: row.get("artifact_path"),
         artifact_sha256: row.get("artifact_sha256"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_verification_evidence(row: sqlx::postgres::PgRow) -> VerificationEvidence {
+    VerificationEvidence {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        task_id: row.get("task_id"),
+        run_id: row.get("run_id"),
+        check_index: row.get("check_index"),
+        kind: row.get("kind"),
+        status: row.get("status"),
+        summary: row.get("summary"),
+        payload: row.get("payload"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn map_verification_request(row: sqlx::postgres::PgRow) -> Result<VerificationRequest> {
+    Ok(VerificationRequest {
+        run_id: row.get("run_id"),
+        corp_id: row.get("corp_id"),
+        task_id: row.get("task_id"),
+        gate_type: row.get("gate_type"),
+        gate: serde_json::from_value(row.get("gate")).context("decode verification gate")?,
+        status: row.get("status"),
+        requested_at: row.get("requested_at"),
+        decided_by: row.get("decided_by"),
+        decision_note: row.get("decision_note"),
+        decided_at: row.get("decided_at"),
     })
 }
 
@@ -3140,6 +3725,7 @@ fn parse_task_status(value: &str) -> Result<TaskStatus> {
         "running" => Ok(TaskStatus::Running),
         "blocked" => Ok(TaskStatus::Blocked),
         "awaiting_approval" => Ok(TaskStatus::AwaitingApproval),
+        "verification_failed" => Ok(TaskStatus::VerificationFailed),
         "review" => Ok(TaskStatus::Review),
         "completed" => Ok(TaskStatus::Completed),
         "failed" => Ok(TaskStatus::Failed),

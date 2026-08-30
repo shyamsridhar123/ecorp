@@ -4,7 +4,7 @@ use crony_domain::EntityLink;
 use crony_protocol::{
     ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
     InterruptRunRequest, LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest,
-    ResumeRunRequest, TransferLeaseRequest,
+    ResumeRunRequest, TransferLeaseRequest, VerificationDecisionRequest,
 };
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -104,6 +104,14 @@ enum Command {
         actor_id: Uuid,
         token: Uuid,
         reason: String,
+    },
+    VerificationDecision {
+        corp_id: Uuid,
+        run_id: Uuid,
+        actor_id: Uuid,
+        #[arg(long)]
+        approve: bool,
+        note: String,
     },
 }
 
@@ -347,6 +355,28 @@ async fn main() -> Result<()> {
                     actor_id,
                     lease_token: token,
                     reason,
+                })?),
+            )
+            .await?
+        }
+        Command::VerificationDecision {
+            corp_id,
+            run_id,
+            actor_id,
+            approve,
+            note,
+        } => {
+            request(
+                &client,
+                Method::POST,
+                format!(
+                    "{}/api/corps/{corp_id}/runs/{run_id}/verification-decision",
+                    args.server
+                ),
+                Some(serde_json::to_value(VerificationDecisionRequest {
+                    actor_id,
+                    approved: approve,
+                    note,
                 })?),
             )
             .await?

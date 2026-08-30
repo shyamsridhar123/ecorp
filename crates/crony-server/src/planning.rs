@@ -1,10 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::{Component, Path},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
-use crony_domain::{Agent, AgentStatus, PlannedTask, TaskContract, TaskGraphPlan};
+use crony_domain::{
+    Agent, AgentStatus, ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan,
+    VerificationPolicy, VerifierCheck,
+};
 
 pub const MAX_GRAPH_NODES: usize = 8;
 pub const MAX_GRAPH_DEPTH: i32 = 4;
@@ -32,6 +36,10 @@ impl StrategyRegistry {
         let strategies: Vec<Arc<dyn ManagerStrategy>> = vec![
             Arc::new(SingleTaskStrategy),
             Arc::new(ParallelSpecialistsStrategy),
+            Arc::new(VerificationMatrixStrategy),
+            Arc::new(VerificationFailureStrategy),
+            Arc::new(HumanApprovalStrategy),
+            Arc::new(IndependentReviewStrategy),
         ];
         Self {
             strategies: Arc::new(
@@ -102,6 +110,7 @@ impl ManagerStrategy for SingleTaskStrategy {
                 depends_on: Vec::new(),
                 depth: 0,
                 max_attempts: 2,
+                verification_policy: artifact_policy(),
             }],
         })
     }
@@ -175,6 +184,7 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                     depends_on: Vec::new(),
                     depth: 0,
                     max_attempts: 2,
+                    verification_policy: artifact_policy(),
                 },
                 PlannedTask {
                     key: "specialist-b".to_owned(),
@@ -192,6 +202,7 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                     depends_on: Vec::new(),
                     depth: 0,
                     max_attempts: 2,
+                    verification_policy: artifact_policy(),
                 },
                 PlannedTask {
                     key: "synthesis".to_owned(),
@@ -202,10 +213,177 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                     depends_on: vec!["specialist-a".to_owned(), "specialist-b".to_owned()],
                     depth: 1,
                     max_attempts: 2,
+                    verification_policy: artifact_policy(),
                 },
             ],
         })
     }
+}
+
+struct VerificationMatrixStrategy;
+
+impl ManagerStrategy for VerificationMatrixStrategy {
+    fn id(&self) -> &'static str {
+        "verification-matrix"
+    }
+
+    fn plan(&self, request: &PlanningRequest<'_>, agents: &[Agent]) -> Result<TaskGraphPlan> {
+        verification_plan(
+            self.id(),
+            request,
+            agents,
+            "[verification-matrix] Produce every automated verification fixture.",
+            VerificationPolicy {
+                checks: vec![
+                    VerifierCheck::Artifact { min_bytes: 1 },
+                    VerifierCheck::File {
+                        path: "verify.txt".to_owned(),
+                        min_bytes: 9,
+                    },
+                    VerifierCheck::Command {
+                        program: "node".to_owned(),
+                        args: vec![
+                            "-e".to_owned(),
+                            "const fs=require('fs');process.exit(fs.existsSync('verify.txt')?0:1)"
+                                .to_owned(),
+                        ],
+                        timeout_ms: 5_000,
+                    },
+                    VerifierCheck::Test {
+                        program: "node".to_owned(),
+                        args: vec![
+                            "-e".to_owned(),
+                            "const fs=require('fs');process.exit(fs.readFileSync('verify.txt','utf8').trim()==='VERIFIED'?0:1)"
+                                .to_owned(),
+                        ],
+                        timeout_ms: 5_000,
+                    },
+                    VerifierCheck::JsonSchema {
+                        path: "schema.json".to_owned(),
+                        required_keys: vec!["status".to_owned(), "count".to_owned()],
+                    },
+                    VerifierCheck::Screenshot {
+                        path: "screenshot.png".to_owned(),
+                        min_bytes: 16,
+                    },
+                ],
+                manual_gate: None,
+            },
+        )
+    }
+}
+
+struct VerificationFailureStrategy;
+
+impl ManagerStrategy for VerificationFailureStrategy {
+    fn id(&self) -> &'static str {
+        "verification-failure"
+    }
+
+    fn plan(&self, request: &PlanningRequest<'_>, agents: &[Agent]) -> Result<TaskGraphPlan> {
+        verification_plan(
+            self.id(),
+            request,
+            agents,
+            "Produce an artifact that intentionally lacks missing-required.txt.",
+            VerificationPolicy {
+                checks: vec![
+                    VerifierCheck::Artifact { min_bytes: 1 },
+                    VerifierCheck::File {
+                        path: "missing-required.txt".to_owned(),
+                        min_bytes: 1,
+                    },
+                ],
+                manual_gate: None,
+            },
+        )
+    }
+}
+
+struct HumanApprovalStrategy;
+
+impl ManagerStrategy for HumanApprovalStrategy {
+    fn id(&self) -> &'static str {
+        "human-approval"
+    }
+
+    fn plan(&self, request: &PlanningRequest<'_>, agents: &[Agent]) -> Result<TaskGraphPlan> {
+        verification_plan(
+            self.id(),
+            request,
+            agents,
+            "Produce an artifact and wait for an authorized human approval.",
+            VerificationPolicy {
+                checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+                manual_gate: Some(ManualVerificationGate::HumanApproval {
+                    roles: vec!["owner".to_owned(), "admin".to_owned(), "manager".to_owned()],
+                }),
+            },
+        )
+    }
+}
+
+struct IndependentReviewStrategy;
+
+impl ManagerStrategy for IndependentReviewStrategy {
+    fn id(&self) -> &'static str {
+        "independent-review"
+    }
+
+    fn plan(&self, request: &PlanningRequest<'_>, agents: &[Agent]) -> Result<TaskGraphPlan> {
+        verification_plan(
+            self.id(),
+            request,
+            agents,
+            "Produce an artifact and wait for an independent reviewer.",
+            VerificationPolicy {
+                checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+                manual_gate: Some(ManualVerificationGate::IndependentReview {
+                    roles: vec![
+                        "reviewer".to_owned(),
+                        "owner".to_owned(),
+                        "admin".to_owned(),
+                    ],
+                    exclude_requester: true,
+                }),
+            },
+        )
+    }
+}
+
+fn verification_plan(
+    strategy: &str,
+    request: &PlanningRequest<'_>,
+    agents: &[Agent],
+    instruction: &str,
+    verification_policy: VerificationPolicy,
+) -> Result<TaskGraphPlan> {
+    let agent = ordered_candidates(agents)
+        .into_iter()
+        .find(|agent| agent.role != "manager" && agent.adapter == "fake-process")
+        .context("verification strategy requires a fake-process worker")?;
+    let budget_tokens = 50_000;
+    Ok(TaskGraphPlan {
+        strategy: strategy.to_owned(),
+        max_nodes: 1,
+        max_depth: 0,
+        budget_tokens,
+        tasks: vec![PlannedTask {
+            key: "verify".to_owned(),
+            title: "Produce verifier evidence".to_owned(),
+            contract: contract(
+                format!("{instruction}\nMission: {}", request.mission_title),
+                "An artifact and every file required by the verifier policy",
+                budget_tokens,
+            ),
+            assigned_agent_id: agent.id,
+            required_adapter: agent.adapter.clone(),
+            depends_on: Vec::new(),
+            depth: 0,
+            max_attempts: 1,
+            verification_policy,
+        }],
+    })
 }
 
 fn ordered_candidates(agents: &[Agent]) -> Vec<&Agent> {
@@ -224,6 +402,13 @@ fn ordered_candidates(agents: &[Agent]) -> Vec<&Agent> {
         )
     });
     candidates
+}
+
+fn artifact_policy() -> VerificationPolicy {
+    VerificationPolicy {
+        checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+        manual_gate: None,
+    }
 }
 
 fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> TaskContract {
@@ -296,6 +481,7 @@ pub fn validate_plan(plan: &TaskGraphPlan, agents: &[Agent]) -> Result<()> {
             return Err(anyhow!("task {} retry limit is invalid", task.key));
         }
         validate_contract(&task.key, &task.contract)?;
+        validate_verification_policy(&task.key, &task.verification_policy)?;
     }
 
     let total_budget = plan.tasks.iter().try_fold(0_i64, |total, task| {
@@ -364,6 +550,97 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
                 "task {task_key} contains an invalid contract entry"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_verification_policy(task_key: &str, policy: &VerificationPolicy) -> Result<()> {
+    if policy.checks.is_empty() || policy.checks.len() > 16 {
+        return Err(anyhow!(
+            "task {task_key} verifier must contain between 1 and 16 checks"
+        ));
+    }
+    for check in &policy.checks {
+        match check {
+            VerifierCheck::Artifact { min_bytes } => {
+                if *min_bytes == 0 {
+                    return Err(anyhow!("task {task_key} artifact check has no byte floor"));
+                }
+            }
+            VerifierCheck::File { path, min_bytes }
+            | VerifierCheck::Screenshot { path, min_bytes } => {
+                validate_relative_path(task_key, path)?;
+                if *min_bytes == 0 {
+                    return Err(anyhow!("task {task_key} file check has no byte floor"));
+                }
+            }
+            VerifierCheck::JsonSchema {
+                path,
+                required_keys,
+            } => {
+                validate_relative_path(task_key, path)?;
+                if required_keys.is_empty()
+                    || required_keys.len() > 32
+                    || required_keys
+                        .iter()
+                        .any(|key| key.trim().is_empty() || key.len() > 128)
+                {
+                    return Err(anyhow!("task {task_key} JSON schema check is invalid"));
+                }
+            }
+            VerifierCheck::Command {
+                program,
+                args,
+                timeout_ms,
+            }
+            | VerifierCheck::Test {
+                program,
+                args,
+                timeout_ms,
+            } => {
+                if program.trim().is_empty()
+                    || program.len() > 256
+                    || program.starts_with('-')
+                    || args.len() > 32
+                    || args.iter().any(|arg| arg.len() > 2_000)
+                    || !(100..=60_000).contains(timeout_ms)
+                {
+                    return Err(anyhow!("task {task_key} command verifier is invalid"));
+                }
+            }
+        }
+    }
+    if let Some(gate) = &policy.manual_gate {
+        let roles = match gate {
+            ManualVerificationGate::HumanApproval { roles }
+            | ManualVerificationGate::IndependentReview { roles, .. } => roles,
+        };
+        if roles.is_empty()
+            || roles.len() > 16
+            || roles
+                .iter()
+                .any(|role| role.trim().is_empty() || role.len() > 64)
+        {
+            return Err(anyhow!(
+                "task {task_key} manual verification gate is invalid"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_path(task_key: &str, value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 500
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(anyhow!(
+            "task {task_key} verifier path must stay inside the worktree"
+        ));
     }
     Ok(())
 }
@@ -440,7 +717,14 @@ mod tests {
         let registry = StrategyRegistry::new();
         assert_eq!(
             registry.ids(),
-            vec!["parallel-specialists".to_owned(), "single".to_owned()]
+            vec![
+                "human-approval".to_owned(),
+                "independent-review".to_owned(),
+                "parallel-specialists".to_owned(),
+                "single".to_owned(),
+                "verification-failure".to_owned(),
+                "verification-matrix".to_owned(),
+            ]
         );
         let request = PlanningRequest {
             mission_title: "ship the bounded graph",
@@ -551,5 +835,47 @@ mod tests {
             )
             .expect("single plan");
         assert_eq!(plan.tasks[0].required_adapter, "codex");
+    }
+
+    #[test]
+    fn verifier_policies_reject_unsafe_paths_commands_and_gates() {
+        let agents = agents();
+        let registry = StrategyRegistry::new();
+        let request = PlanningRequest {
+            mission_title: "verify safely",
+            preferred_adapter: Some("fake-process"),
+        };
+
+        let mut plan = registry
+            .plan("verification-matrix", &request, &agents)
+            .expect("valid matrix");
+        plan.tasks[0].verification_policy.checks[1] = VerifierCheck::File {
+            path: "../escape".to_owned(),
+            min_bytes: 1,
+        };
+        assert!(validate_plan(&plan, &agents).is_err());
+
+        let mut plan = registry
+            .plan("verification-matrix", &request, &agents)
+            .expect("valid matrix");
+        plan.tasks[0].verification_policy.checks[2] = VerifierCheck::Command {
+            program: "node".to_owned(),
+            args: Vec::new(),
+            timeout_ms: 1,
+        };
+        assert!(validate_plan(&plan, &agents).is_err());
+
+        let mut plan = registry
+            .plan("human-approval", &request, &agents)
+            .expect("valid human gate");
+        plan.tasks[0].verification_policy.manual_gate =
+            Some(ManualVerificationGate::HumanApproval { roles: Vec::new() });
+        assert!(validate_plan(&plan, &agents).is_err());
+
+        let mut plan = registry
+            .plan("verification-matrix", &request, &agents)
+            .expect("valid matrix");
+        plan.tasks[0].verification_policy.checks.clear();
+        assert!(validate_plan(&plan, &agents).is_err());
     }
 }

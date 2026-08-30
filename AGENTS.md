@@ -19,6 +19,7 @@ Before a non-trivial change, read:
 - Messages are not tasks; tasks have explicit state machines.
 - Task graphs are bounded, acyclic, dependency-aware, and explicit about contracts and retries.
 - Completion requires evidence.
+- A run cannot emit accepted completion until its persisted verifier policy passes.
 - Irreversible effects require authorization and idempotency.
 - Tenant and Corp scope must be explicit on every stored object.
 - Never put long-lived secrets in prompts, logs, command arguments, or agent-readable files.

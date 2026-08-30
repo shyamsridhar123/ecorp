@@ -68,6 +68,7 @@ pub enum TaskStatus {
     Running,
     Blocked,
     AwaitingApproval,
+    VerificationFailed,
     Review,
     Completed,
     Failed,
@@ -83,6 +84,7 @@ impl TaskStatus {
             Self::Running => "running",
             Self::Blocked => "blocked",
             Self::AwaitingApproval => "awaiting_approval",
+            Self::VerificationFailed => "verification_failed",
             Self::Review => "review",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -205,6 +207,7 @@ pub struct PlannedTask {
     pub depends_on: Vec<String>,
     pub depth: i32,
     pub max_attempts: i32,
+    pub verification_policy: VerificationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +217,76 @@ pub struct TaskGraphPlan {
     pub max_depth: i32,
     pub budget_tokens: i64,
     pub tasks: Vec<PlannedTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VerifierCheck {
+    Artifact {
+        min_bytes: u64,
+    },
+    File {
+        path: String,
+        min_bytes: u64,
+    },
+    Command {
+        program: String,
+        args: Vec<String>,
+        timeout_ms: u64,
+    },
+    Test {
+        program: String,
+        args: Vec<String>,
+        timeout_ms: u64,
+    },
+    JsonSchema {
+        path: String,
+        required_keys: Vec<String>,
+    },
+    Screenshot {
+        path: String,
+        min_bytes: u64,
+    },
+}
+
+impl VerifierCheck {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Artifact { .. } => "artifact",
+            Self::File { .. } => "file",
+            Self::Command { .. } => "command",
+            Self::Test { .. } => "test",
+            Self::JsonSchema { .. } => "json_schema",
+            Self::Screenshot { .. } => "screenshot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ManualVerificationGate {
+    HumanApproval {
+        roles: Vec<String>,
+    },
+    IndependentReview {
+        roles: Vec<String>,
+        exclude_requester: bool,
+    },
+}
+
+impl ManualVerificationGate {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::HumanApproval { .. } => "human_approval",
+            Self::IndependentReview { .. } => "independent_review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPolicy {
+    pub checks: Vec<VerifierCheck>,
+    pub manual_gate: Option<ManualVerificationGate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +303,8 @@ pub struct Task {
     pub attempt_count: i32,
     pub required_adapter: Option<String>,
     pub depends_on: Vec<Uuid>,
+    pub verification_policy: VerificationPolicy,
+    pub verification_status: String,
     pub status: TaskStatus,
     pub assigned_agent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -257,6 +332,8 @@ pub struct Run {
     pub workspace_base_commit: Option<String>,
     pub workspace_disposition: Option<String>,
     pub workspace_detail: Option<String>,
+    pub verification_status: String,
+    pub verification_summary: Option<String>,
     pub status: RunStatus,
     pub summary: Option<String>,
     pub artifact_path: Option<String>,
@@ -304,6 +381,34 @@ pub struct RoomMessage {
     pub mentions: Vec<Uuid>,
     pub link: Option<EntityLink>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationEvidence {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub check_index: i32,
+    pub kind: String,
+    pub status: String,
+    pub summary: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationRequest {
+    pub run_id: Uuid,
+    pub corp_id: Uuid,
+    pub task_id: Uuid,
+    pub gate_type: String,
+    pub gate: ManualVerificationGate,
+    pub status: String,
+    pub requested_at: DateTime<Utc>,
+    pub decided_by: Option<Uuid>,
+    pub decision_note: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +489,8 @@ pub struct CorpSnapshot {
     pub room_messages: Vec<RoomMessage>,
     pub leases: Vec<ControlLease>,
     pub queued_messages: Vec<QueuedMessage>,
+    pub verification_evidence: Vec<VerificationEvidence>,
+    pub verification_requests: Vec<VerificationRequest>,
     pub events: Vec<DomainEvent>,
 }
 
