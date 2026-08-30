@@ -34,6 +34,7 @@ The UI can close without terminating active work.
 - Run, mission, requester, and Corp budgets with steer-constrain-suspend-stop incidents
 - Versioned 100-scenario evaluation corpus with deterministic regression metrics
 - Consolidated chaos evidence and Windows/macOS/Linux runner CI
+- Thin Tauri 2 desktop shell with `crony://` deep links and Windows build smoke coverage
 - Browser WebSocket updates
 - Resumable, room-filtered event replay
 - Outbound-connected runner daemon
@@ -108,6 +109,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
 - [`docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`](docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md)
 - [`docs/evidence/2026-08-30-external-adapter-validation.md`](docs/evidence/2026-08-30-external-adapter-validation.md)
+- [`docs/evidence/2026-08-30-tauri-desktop-validation.md`](docs/evidence/2026-08-30-tauri-desktop-validation.md)
 
 ## License
 

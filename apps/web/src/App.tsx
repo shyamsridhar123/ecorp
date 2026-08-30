@@ -427,7 +427,12 @@ function MissionCard({
     ? evidence.filter((item) => item.run_id === latestRun.id)
     : []
   return (
-    <article className="mission-card" data-testid={`mission-${mission.id}`}>
+    <article
+      className="mission-card"
+      data-testid={`mission-${mission.id}`}
+      data-mission-id={mission.id}
+      data-run-id={latestRun?.id}
+    >
       <div className="mission-card-top">
         <span className={`status-chip status-chip-${mission.status}`}>{mission.status}</span>
         <span className="mission-id">#{shortId(mission.id)}</span>
@@ -446,7 +451,7 @@ function MissionCard({
       </dl>
       <div className="task-graph-list">
         {orderedTasks.map((task) => (
-          <div className="task-graph-row" key={task.id}>
+          <div className="task-graph-row" key={task.id} data-task-id={task.id}>
             <span>{task.plan_key}</span>
             <strong>{task.status}</strong>
             <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
@@ -627,7 +632,7 @@ function RoomPanel({
   }
 
   return (
-    <section className="room-panel panel">
+    <section className="room-panel panel" data-room-id={room.id}>
       <div className="panel-heading">
         <div>
           <span className="section-code">ROOM / 03</span>
@@ -724,6 +729,39 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
+
+  useEffect(() => {
+    const focus = (raw: string) => {
+      try {
+        const url = new URL(raw)
+        const segments = [url.host, ...url.pathname.split('/').filter(Boolean)]
+        const keys = ['corp', 'room', 'mission', 'task', 'run']
+        const values = new Map<string, string>()
+        for (let index = 0; index < segments.length - 1; index += 2) {
+          if (keys.includes(segments[index])) values.set(segments[index], segments[index + 1])
+        }
+        const corp = values.get('corp')
+        if (corp && bootstrap && corp !== bootstrap.corp_id) {
+          setError(`Deep link targets a different Corp: ${corp}`)
+          return
+        }
+        const target = (['run', 'task', 'mission', 'room'] as const)
+          .map((kind) => {
+            const id = values.get(kind)
+            return id ? document.querySelector(`[data-${kind}-id="${CSS.escape(id)}"]`) : null
+          })
+          .find(Boolean)
+        target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      } catch {
+        setError('The desktop deep link is invalid.')
+      }
+    }
+    const listener = (event: Event) => {
+      focus((event as CustomEvent<string>).detail)
+    }
+    window.addEventListener('crony-deep-link', listener)
+    return () => window.removeEventListener('crony-deep-link', listener)
+  }, [bootstrap])
   const lastEventSeq = useRef<Record<string, number>>({})
 
   const refresh = useCallback(async (corpId: string, actorId: string) => {
