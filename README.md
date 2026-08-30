@@ -41,6 +41,7 @@ The UI can close without terminating active work.
 - Pluggable `AgentAdapter` lifecycle contract with explicit feature capabilities
 - Real child-process execution through a deterministic fake-agent adapter
 - Native OpenAI Codex app-server adapter with structured lifecycle streaming
+- Normalized Claude Code and OpenCode CLI adapters with common evidence
 - Durable Codex provider sessions with start, live steer, interrupt, stop, and resume
 - Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
 - Dedicated Git branch and linked worktree for every write-capable task lineage
@@ -106,6 +107,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/evidence/2026-08-30-secret-broker-validation.md`](docs/evidence/2026-08-30-secret-broker-validation.md)
 - [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
 - [`docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`](docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md)
+- [`docs/evidence/2026-08-30-external-adapter-validation.md`](docs/evidence/2026-08-30-external-adapter-validation.md)
 
 ## License
 

@@ -298,6 +298,11 @@ The Codex adapter:
 - disables user-configured MCP servers, apps, and hooks for supervised runs
 - fingerprints tracked and untracked changed files in the evidence artifact
 
+Claude Code and OpenCode use a shared normalized external-CLI adapter. Provider-specific launch
+flags are isolated at the boundary, while JSONL output, sessions, usage, cancellation, and
+provider-neutral evidence map into the same lifecycle. Batch-mode steering limitations are
+reported explicitly rather than hidden.
+
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.
 

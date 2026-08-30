@@ -99,6 +99,10 @@ jobs:
             --source-base-ref HEAD \
             --fake-agent-script "$PWD/scripts/fake-agent.mjs" \
             --codex-command "$PWD/scripts/fake-codex-app-server.mjs" \
+            --claude-command node \
+            --claude-command-arg "$PWD/scripts/fake-external-agent.mjs" \
+            --opencode-command node \
+            --opencode-command-arg "$PWD/scripts/fake-external-agent.mjs" \
             > output/runner-ci.log 2>&1 &
           echo $! > output/runner-ci.pid
       - name: Wait for runner
@@ -120,6 +124,8 @@ jobs:
         run: ./tools/e2e_smoke.ps1
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
+      - name: Verify Claude Code and OpenCode normalized lifecycle evidence
+        run: node tools/e2e_external_adapters.mjs
       - name: Verify parallel worktree isolation and source-checkout preservation
         run: node tools/e2e_worktrees.mjs
       - name: Verify bounded task-graph planning, scheduling, and retries
@@ -157,6 +163,7 @@ jobs:
             output/e2e-smoke.json
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
+            output/e2e-external-adapters.json
             output/e2e-worktrees.json
             output/e2e-task-graph.json
             output/e2e-verification.json
