@@ -848,6 +848,34 @@ select:focus-visible {
   text-transform: uppercase;
 }
 
+.approval-queue {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  background: #f6e4b7;
+}
+
+.approval-queue .verification-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--marigold);
+  background: var(--paper);
+}
+
+.approval-queue .verification-card span {
+  display: block;
+  margin-top: 4px;
+  font: 10px/1.35 var(--mono);
+}
+
+.approval-queue .verification-actions {
+  margin-top: 0;
+}
+
 .mission-form select {
   padding: 9px 10px;
 }

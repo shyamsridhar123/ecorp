@@ -9,6 +9,7 @@ use tokio::{
     process::Command,
     sync::mpsc,
 };
+use uuid::Uuid;
 
 use super::{
     AdapterArtifact, AdapterCapabilities, AdapterControl, AdapterError, AdapterEvent,
@@ -138,6 +139,21 @@ impl AgentAdapter for FakeProcessAdapter {
                             cancelled = true;
                             break;
                         }
+                        Some(AdapterControl::ApprovalDecision { approval_id, approved, note }) => {
+                            let _ = input_tx.send(json!({
+                                "type": "approval_decision",
+                                "approval_id": approval_id,
+                                "approved": approved,
+                                "note": note,
+                            }).to_string());
+                        }
+                        Some(AdapterControl::CircuitBreaker { stage, reason }) => {
+                            let _ = input_tx.send(json!({
+                                "type": "circuit_breaker",
+                                "stage": stage,
+                                "reason": reason,
+                            }).to_string());
+                        }
                         None => {}
                     }
                 }
@@ -197,6 +213,79 @@ impl AgentAdapter for FakeProcessAdapter {
                                     .to_owned(),
                             }));
                         }
+                        "usage" => sink.emit(AdapterEvent::Usage(super::UsageSnapshot {
+                            input_tokens: event
+                                .get("input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                            output_tokens: event
+                                .get("output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                            cost_microusd: event
+                                .get("cost_microusd")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                        })),
+                        "approval_requested" => {
+                            let approval_id = event
+                                .get("approval_id")
+                                .and_then(Value::as_str)
+                                .context("approval event omitted approval_id")
+                                .and_then(|value| {
+                                    Uuid::parse_str(value).context("approval id is invalid")
+                                })?;
+                            sink.emit(AdapterEvent::ApprovalRequested {
+                                approval_id,
+                                action_key: event
+                                    .get("action_key")
+                                    .and_then(Value::as_str)
+                                    .context("approval event omitted action_key")?
+                                    .to_owned(),
+                                action: event
+                                    .get("action")
+                                    .and_then(Value::as_str)
+                                    .context("approval event omitted action")?
+                                    .to_owned(),
+                                risk: event
+                                    .get("risk")
+                                    .and_then(Value::as_str)
+                                    .context("approval event omitted risk")?
+                                    .to_owned(),
+                                rationale: event
+                                    .get("rationale")
+                                    .and_then(Value::as_str)
+                                    .context("approval event omitted rationale")?
+                                    .to_owned(),
+                                required_roles: event
+                                    .get("required_roles")
+                                    .and_then(Value::as_array)
+                                    .context("approval event omitted required_roles")?
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect(),
+                                expires_in_seconds: event
+                                    .get("expires_in_seconds")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(300),
+                            });
+                        }
+                        "tool_activity" => sink.emit(AdapterEvent::ToolActivity {
+                            signature: event
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_owned(),
+                            progressed: event
+                                .get("progressed")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            human_conversation: event
+                                .get("human_conversation")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        }),
                         "completed" => {
                             terminal_event = true;
                             sink.emit(AdapterEvent::Completed {
@@ -215,6 +304,17 @@ impl AgentAdapter for FakeProcessAdapter {
                                     .get("error")
                                     .and_then(Value::as_str)
                                     .unwrap_or("Fake agent reported failure")
+                                    .to_owned(),
+                            });
+                        }
+                        "cancelled" => {
+                            terminal_event = true;
+                            cancelled = true;
+                            sink.emit(AdapterEvent::Cancelled {
+                                reason: event
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Fake agent cancelled")
                                     .to_owned(),
                             });
                         }

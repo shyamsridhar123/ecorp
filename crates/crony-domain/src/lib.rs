@@ -178,6 +178,7 @@ pub struct Mission {
     pub max_nodes: i32,
     pub max_depth: i32,
     pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
     pub status: MissionStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -193,6 +194,8 @@ pub struct TaskContract {
     pub references: Vec<String>,
     pub write_scope: Vec<String>,
     pub budget_tokens: i64,
+    #[serde(default = "default_task_cost_budget")]
+    pub budget_cost_microusd: i64,
     pub deadline_at: Option<DateTime<Utc>>,
     pub escalation: String,
     #[serde(default)]
@@ -226,6 +229,7 @@ pub struct TaskGraphPlan {
     pub max_nodes: i32,
     pub max_depth: i32,
     pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
     pub tasks: Vec<PlannedTask>,
 }
 
@@ -336,6 +340,11 @@ pub struct Run {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_microusd: i64,
+    pub budget_tokens_limit: i64,
+    pub budget_cost_microusd_limit: i64,
+    pub breaker_stage: String,
+    pub no_progress_events: i32,
+    pub repeated_tool_count: i32,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
     pub workspace_base_ref: Option<String>,
@@ -421,6 +430,45 @@ pub struct VerificationRequest {
     pub decided_at: Option<DateTime<Utc>>,
 }
 
+const fn default_task_cost_budget() -> i64 {
+    1_000_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionApproval {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub room_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub agent_id: Uuid,
+    pub action_key: String,
+    pub action: String,
+    pub risk: String,
+    pub rationale: String,
+    pub required_roles: Vec<String>,
+    pub status: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub decided_by: Option<Uuid>,
+    pub decision_note: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerIncident {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub stage: String,
+    pub reason: String,
+    pub input: Value,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainEvent {
     pub seq: i64,
@@ -501,6 +549,8 @@ pub struct CorpSnapshot {
     pub queued_messages: Vec<QueuedMessage>,
     pub verification_evidence: Vec<VerificationEvidence>,
     pub verification_requests: Vec<VerificationRequest>,
+    pub action_approvals: Vec<ActionApproval>,
+    pub circuit_breaker_incidents: Vec<CircuitBreakerIncident>,
     pub events: Vec<DomainEvent>,
 }
 

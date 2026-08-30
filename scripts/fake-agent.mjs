@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -27,6 +28,9 @@ const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
 const secretProbe = mission.includes("[secret-probe]");
+const approvalAction = mission.includes("[approval-action]");
+const budgetLoop = mission.includes("[budget-loop]");
+const healthyConversation = mission.includes("[healthy-conversation]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
 const briefingDelay = slowRun ? 4_000 : graphSlowRun ? 1_200 : 700;
 const workDelay = slowRun ? 5_000 : graphSlowRun ? 1_200 : 900;
@@ -35,10 +39,32 @@ const wait = (milliseconds) =>
   new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 
 const controls = [];
+let approvalResolver;
+let breakerStopped = false;
+let breakerStopResolver;
+const breakerStopPromise = new Promise((resolvePromise) => {
+  breakerStopResolver = resolvePromise;
+});
 const input = createInterface({ input: process.stdin });
 input.on("line", (line) => {
   try {
     const message = JSON.parse(line);
+    if (message.type === "approval_decision") {
+      approvalResolver?.(message);
+      return;
+    }
+    if (message.type === "circuit_breaker") {
+      if (message.stage === "stop") {
+        breakerStopped = true;
+        breakerStopResolver();
+      }
+      emit({
+        type: "output",
+        stream: "control",
+        text: `Circuit breaker entered ${message.stage}.`,
+      });
+      return;
+    }
     controls.push(message);
     emit({
       type: "output",
@@ -58,6 +84,75 @@ emit({
   message: "Reading the mission contract",
 });
 await wait(briefingDelay);
+
+if (approvalAction) {
+  const approvalId = randomUUID();
+  emit({
+    type: "approval_requested",
+    approval_id: approvalId,
+    action_key: "publish-release",
+    action: "Publish the prepared release artifact",
+    risk: "high",
+    rationale: "Publishing is an externally visible side effect.",
+    required_roles: ["owner", "admin", "member"],
+    expires_in_seconds: 300,
+  });
+  const decision = await new Promise((resolvePromise) => {
+    approvalResolver = resolvePromise;
+  });
+  approvalResolver = null;
+  if (!decision.approved) {
+    emit({ type: "cancelled", reason: "Risky action was rejected." });
+    input.close();
+    process.exit(0);
+  }
+  emit({
+    type: "status",
+    status: "working",
+    station: "terminal",
+    message: "Authorized action resumed exactly once",
+  });
+}
+
+if (healthyConversation) {
+  for (let index = 0; index < 12; index += 1) {
+    emit({
+      type: "tool_activity",
+      signature: "human-conversation",
+      progressed: false,
+      human_conversation: true,
+    });
+  }
+}
+
+if (budgetLoop) {
+  for (let index = 0; index < 12; index += 1) {
+    emit({
+      type: "usage",
+      input_tokens: 5_000,
+      output_tokens: 5_000,
+      cost_microusd: 100_000,
+    });
+    emit({
+      type: "tool_activity",
+      signature: "search:unchanged-query",
+      progressed: false,
+      human_conversation: false,
+    });
+    await wait(700);
+    if (breakerStopped) {
+      emit({ type: "cancelled", reason: "Circuit breaker stopped the run." });
+      input.close();
+      process.exit(0);
+    }
+  }
+  await Promise.race([breakerStopPromise, wait(15_000)]);
+  if (breakerStopped) {
+    emit({ type: "cancelled", reason: "Circuit breaker stopped the run." });
+    input.close();
+    process.exit(0);
+  }
+}
 
 emit({
   type: "output",

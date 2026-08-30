@@ -30,9 +30,9 @@
   scheduler dispatches parallel roots, releases downstream tasks, and enforces retry limits.
 - Evidence-gated completion now verifies artifacts, files, commands, tests, JSON schemas, and
   screenshots on the runner, with durable human and independent-review decisions.
-- OIDC-backed production authentication, Corp-scoped RBAC, rotating runner workload identity, and
-  scoped encrypted secret delivery are implemented. The next critical-path items are durable
-  action approvals and budget circuit breakers.
+- OIDC-backed production authentication, Corp-scoped RBAC, rotating runner workload identity,
+  scoped encrypted secret delivery, durable action approvals, and budget circuit breakers are
+  implemented. The next critical-path work is artifact storage and alpha-scale evaluation.
 
 ---
 

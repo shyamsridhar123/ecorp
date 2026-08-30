@@ -95,6 +95,12 @@ rejection, and revocation. See `docs/evidence/2026-08-30-identity-validation.md`
 an unauthorized requester, revocation, and absence of plaintext canaries from shared state and
 logs. See `docs/evidence/2026-08-30-secret-broker-validation.md`.
 
+`tools/e2e_approvals.mjs` restarts the server during a suspended risky action, approves from a
+second actor, and proves duplicate decisions do not duplicate effects. `tools/e2e_budgets.mjs`
+proves spend, repeated-tool, rolling requester/Corp budgets, all four breaker stages, and the
+healthy-conversation exemption. See
+`docs/evidence/2026-08-30-approval-and-budget-validation.md`.
+
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
 typed errors for unsupported resume and usage operations.

@@ -29,6 +29,12 @@ Secrets are encrypted with ChaCha20-Poly1305 and authenticated associated data. 
 actor, task, run, runner, tool, resource, and expiry scope before dispatch. Events and snapshots
 contain grant metadata only. Environment injection is labeled reduced assurance.
 
+Risky action approvals are Corp-scoped, role-gated, expiring, and idempotent. Approval decisions
+transactionally enqueue durable runner commands, and command IDs fence duplicate delivery.
+
+Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
+no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.

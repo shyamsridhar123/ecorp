@@ -24,19 +24,21 @@ use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::DomainEvent;
 use crony_protocol::{
-    BrowserSocketMessage, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
-    CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
-    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, CreateSecretRequest,
-    CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
-    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
-    LeaseMutationResponse, QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest,
-    ResolvedSecret, ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
+    ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
+    ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest, CreateMissionResponse,
+    CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
+    CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
+    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResolvedSecret,
+    ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
+    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
     VerificationDecisionResponse,
 };
 use crony_store::{
-    LaunchRecord, NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput,
+    LaunchRecord, NewRoomMessageInput, PendingRunnerCommand, PgStore, RunClaim, RunnerConnectInput,
+    RunnerEventInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -282,6 +284,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/secrets/{secret_id}/revoke",
             post(revoke_secret),
+        )
+        .route(
+            "/api/corps/{corp_id}/approvals/{approval_id}/decision",
+            post(decide_action_approval),
+        )
+        .route(
+            "/api/corps/{corp_id}/budget-policy",
+            post(set_budget_policy),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -738,12 +748,149 @@ async fn revoke_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn decide_action_approval(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, approval_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ActionApprovalDecisionRequest>,
+) -> Result<Json<ActionApprovalDecisionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Approve,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .decide_action_approval(
+            corp_id,
+            approval_id,
+            actor_id,
+            request.approved,
+            &request.note,
+            request.decision_key,
+        )
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.effect_queued {
+        dispatch_pending_runner_commands(&state, &outcome.runner_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(Json(ActionApprovalDecisionResponse {
+        approval_id: outcome.approval_id,
+        status: outcome.status,
+        effect_queued: outcome.effect_queued,
+    }))
+}
+
+async fn set_budget_policy(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<SetBudgetPolicyRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let event = state
+        .store
+        .set_budget_policy(
+            corp_id,
+            actor_id,
+            request.actor_tokens_per_24h,
+            request.actor_cost_microusd_per_24h,
+            request.corp_tokens_per_24h,
+            request.corp_cost_microusd_per_24h,
+            request.no_progress_event_limit,
+            request.repeated_tool_limit,
+        )
+        .await
+        .map_err(map_store_error)?;
+    publish(&state, event);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn valid_scope_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+}
+
+async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> anyhow::Result<()> {
+    let Some(sender) = state
+        .runners
+        .get(runner_id)
+        .map(|connection| connection.tx.clone())
+    else {
+        return Ok(());
+    };
+    for command in state.store.pending_runner_commands(runner_id).await? {
+        let outgoing = decode_runner_command(&command)?;
+        if sender.send(outgoing).is_err() {
+            break;
+        }
+        state
+            .store
+            .mark_runner_command_dispatched(command.id)
+            .await?;
+    }
+    Ok(())
+}
+
+fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
+    match command.command_kind.as_str() {
+        "approval_decision" => Ok(ServerToRunner::ApprovalDecision {
+            command_id: command.id,
+            run_id: command.run_id,
+            approval_id: command
+                .payload
+                .get("approval_id")
+                .and_then(serde_json::Value::as_str)
+                .context("approval command omitted approval_id")
+                .and_then(|value| Uuid::parse_str(value).context("approval id is invalid"))?,
+            approved: command
+                .payload
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .context("approval command omitted approved")?,
+            note: command
+                .payload
+                .get("note")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        }),
+        "circuit_breaker" => Ok(ServerToRunner::CircuitBreaker {
+            command_id: command.id,
+            run_id: command.run_id,
+            stage: command
+                .payload
+                .get("stage")
+                .and_then(serde_json::Value::as_str)
+                .context("breaker command omitted stage")?
+                .to_owned(),
+            reason: command
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .context("breaker command omitted reason")?
+                .to_owned(),
+        }),
+        other => Err(anyhow::anyhow!("unknown runner command kind {other}")),
+    }
 }
 
 async fn snapshot(
@@ -825,6 +972,8 @@ async fn create_mission(
                 mission_title: &request.title,
                 preferred_adapter: request.preferred_adapter.as_deref(),
                 secret_refs: &request.secret_refs,
+                budget_tokens: request.budget_tokens,
+                budget_cost_microusd: request.budget_cost_microusd,
             },
             &agents,
         )
@@ -1763,6 +1912,9 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                         warn!(%error, %runner_id, "runner active-run reconciliation failed")
                     }
                 }
+                if let Err(error) = dispatch_pending_runner_commands(&state, &runner_id).await {
+                    warn!(%error, %runner_id, "failed to dispatch durable runner commands");
+                }
                 info!(
                     %runner_id,
                     %connection_epoch,
@@ -1822,7 +1974,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     .store
                     .apply_runner_event(RunnerEventInput {
                         event_id,
-                        runner_id,
+                        runner_id: runner_id.clone(),
                         corp_id,
                         run_id,
                         agent_id,
@@ -1833,6 +1985,25 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 {
                     Ok(Some(event)) => {
                         publish(&state, event);
+                        if matches!(event_type.as_str(), "run.usage" | "run.tool_activity") {
+                            match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
+                                Ok(outcome) => {
+                                    if let Some(event) = outcome.event {
+                                        publish(&state, event);
+                                    }
+                                    if outcome.command.is_some()
+                                        && let Err(error) =
+                                            dispatch_pending_runner_commands(&state, &runner_id)
+                                                .await
+                                    {
+                                        warn!(%error, %runner_id, %run_id, "failed to dispatch circuit-breaker command");
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(%error, %run_id, "circuit-breaker evaluation failed")
+                                }
+                            }
+                        }
                         if matches!(event_type.as_str(), "run.completed" | "run.failed") {
                             let schedule_state = state.clone();
                             tokio::spawn(async move {
