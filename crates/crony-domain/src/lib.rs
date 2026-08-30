@@ -355,6 +355,11 @@ pub struct Run {
     pub verification_summary: Option<String>,
     pub status: RunStatus,
     pub summary: Option<String>,
+    pub artifact_id: Option<Uuid>,
+    pub artifact_uri: Option<String>,
+    pub artifact_media_type: Option<String>,
+    pub artifact_signature: Option<String>,
+    #[serde(skip_serializing)]
     pub artifact_path: Option<String>,
     pub artifact_sha256: Option<String>,
     pub created_at: DateTime<Utc>,

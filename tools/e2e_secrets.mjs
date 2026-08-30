@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -94,8 +95,9 @@ const launch = await post(
 )
 const completed = await waitForRun(demo, launch.run_id)
 assert.equal(completed.run.status, 'completed')
-assert.ok(completed.run.artifact_path)
-const artifact = await readFile(completed.run.artifact_path, 'utf8')
+const artifact = (
+  await downloadVerifiedArtifact(server, demo, completed.run)
+).toString('utf8')
 assert.ok(artifact.includes('Task-scoped secret available: yes.'))
 assert.ok(!artifact.includes(canary))
 assert.ok(!JSON.stringify(completed.state).includes(canary))
