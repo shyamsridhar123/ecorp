@@ -34,6 +34,8 @@ The UI can close without terminating active work.
 - Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
 - Dedicated Git branch and linked worktree for every write-capable task lineage
 - Fail-safe worktree cleanup that preserves dirty, committed, or uncertain work
+- Replaceable manager strategies that produce bounded, dependency-aware task graphs
+- Deterministic capability matching, parallel root dispatch, dependency release, and bounded retries
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens
 - Explicit release and transfer, queued messages, and role-gated emergency stop
@@ -81,6 +83,7 @@ checkout itself.
 - [`docs/BACKLOG.md`](docs/BACKLOG.md)
 - [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
 - [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
+- [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
 
 ## License
 

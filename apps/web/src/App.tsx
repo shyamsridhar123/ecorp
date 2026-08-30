@@ -24,8 +24,25 @@ type Agent = {
 type Mission = {
   id: string
   title: string
+  strategy: string
+  max_nodes: number
+  max_depth: number
+  budget_tokens: number
   status: 'draft' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
   created_at: string
+}
+
+type TaskContract = {
+  objective: string
+  expected_output: string
+  acceptance_tests: string[]
+  allowed_tools: string[]
+  prohibited_actions: string[]
+  references: string[]
+  write_scope: string[]
+  budget_tokens: number
+  deadline_at: string | null
+  escalation: string
 }
 
 type Task = {
@@ -33,6 +50,13 @@ type Task = {
   mission_id: string
   title: string
   objective: string
+  plan_key: string
+  contract: TaskContract
+  depth: number
+  max_attempts: number
+  attempt_count: number
+  required_adapter: string | null
+  depends_on: string[]
   status: string
   assigned_agent_id: string | null
 }
@@ -318,17 +342,28 @@ function AgentDesk({
 
 function MissionCard({
   mission,
-  task,
-  run,
+  tasks,
+  runs,
   onLaunch,
   onResume,
 }: {
   mission: Mission
-  task: Task | undefined
-  run: Run | undefined
+  tasks: Task[]
+  runs: Run[]
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
 }) {
+  const orderedTasks = tasks.toSorted((left, right) =>
+    left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
+  )
+  const latestRun = runs[0]
+  const completedTasks = tasks.filter((task) => task.status === 'completed').length
+  const activeRuns = runs.filter((run) =>
+    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
+  ).length
+  const resumableRun = runs.find(
+    (run) => run.provider_session_id && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+  )
   return (
     <article className="mission-card" data-testid={`mission-${mission.id}`}>
       <div className="mission-card-top">
@@ -336,31 +371,41 @@ function MissionCard({
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
+      <div className="strategy-chip">{mission.strategy}</div>
       <dl>
         <div>
-          <dt>Task</dt>
-          <dd>{task?.status ?? 'planning'}</dd>
+          <dt>Tasks</dt>
+          <dd>{completedTasks}/{tasks.length} complete</dd>
         </div>
         <div>
-          <dt>Run</dt>
-          <dd>{run?.status ?? 'not started'}</dd>
+          <dt>Runs</dt>
+          <dd>{activeRuns ? `${activeRuns} active` : `${runs.length} attempts`}</dd>
         </div>
       </dl>
-      {run?.artifact_sha256 ? (
+      <div className="task-graph-list">
+        {orderedTasks.map((task) => (
+          <div className="task-graph-row" key={task.id}>
+            <span>{task.plan_key}</span>
+            <strong>{task.status}</strong>
+            <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
+          </div>
+        ))}
+      </div>
+      {latestRun?.artifact_sha256 ? (
         <div className="evidence-box">
           <strong>Verified artifact</strong>
-          <span>{shortId(run.artifact_sha256)}…</span>
+          <span>{shortId(latestRun.artifact_sha256)}…</span>
         </div>
       ) : null}
-      {run && (run.input_tokens > 0 || run.output_tokens > 0) ? (
+      {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
         <div className="usage-box">
-          {run.input_tokens.toLocaleString()} in · {run.output_tokens.toLocaleString()} out
+          {latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out
         </div>
       ) : null}
-      {run?.workspace_branch ? (
-        <div className="workspace-box" title={run.workspace_detail ?? undefined}>
-          <span>{run.workspace_disposition ?? 'active'} worktree</span>
-          <strong>{run.workspace_branch}</strong>
+      {latestRun?.workspace_branch ? (
+        <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
+          <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
+          <strong>{latestRun.workspace_branch}</strong>
         </div>
       ) : null}
       {mission.status === 'ready' ? (
@@ -368,8 +413,8 @@ function MissionCard({
           Dispatch mission
         </button>
       ) : null}
-      {run?.provider_session_id && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status) ? (
-        <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(run)}>
+      {resumableRun && activeRuns === 0 ? (
+        <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(resumableRun)}>
           Resume agent session
         </button>
       ) : null}
@@ -583,6 +628,7 @@ function App() {
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
   const [missionAdapter, setMissionAdapter] = useState('fake-process')
+  const [missionStrategy, setMissionStrategy] = useState('single')
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -705,6 +751,7 @@ function App() {
           title: missionTitle,
           requested_by: selectedActor.id,
           preferred_adapter: missionAdapter,
+          strategy: missionStrategy,
         }),
       })
       setMissionTitle('')
@@ -1046,6 +1093,15 @@ function App() {
                 </option>
               ))}
             </select>
+            <label htmlFor="mission-strategy">Manager strategy</label>
+            <select
+              id="mission-strategy"
+              value={missionStrategy}
+              onChange={(event) => setMissionStrategy(event.target.value)}
+            >
+              <option value="single">Single delivery</option>
+              <option value="parallel-specialists">Parallel specialists + synthesis</option>
+            </select>
             <button className="button button-primary" type="submit" disabled={busy || !missionTitle.trim()}>
               File mission
             </button>
@@ -1053,14 +1109,15 @@ function App() {
           <div className="mission-list">
             {latestMissions.length ? (
               latestMissions.map((mission) => {
-                const task = data.snapshot.tasks.find((candidate) => candidate.mission_id === mission.id)
-                const run = task ? data.snapshot.runs.find((candidate) => candidate.task_id === task.id) : undefined
+                const tasks = data.snapshot.tasks.filter((candidate) => candidate.mission_id === mission.id)
+                const taskIds = new Set(tasks.map((task) => task.id))
+                const runs = data.snapshot.runs.filter((candidate) => taskIds.has(candidate.task_id))
                 return (
                   <MissionCard
                     key={mission.id}
                     mission={mission}
-                    task={task}
-                    run={run}
+                    tasks={tasks}
+                    runs={runs}
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
                   />

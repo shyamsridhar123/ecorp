@@ -21,11 +21,13 @@ const emit = (event) => {
 };
 
 const slowRun = mission.includes("[slow]");
+const graphSlowRun = mission.includes("[graph-slow]");
+const failRun = mission.includes("[always-fail]");
 const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
-const briefingDelay = slowRun ? 4_000 : 700;
-const workDelay = slowRun ? 5_000 : 900;
+const briefingDelay = slowRun ? 4_000 : graphSlowRun ? 1_200 : 700;
+const workDelay = slowRun ? 5_000 : graphSlowRun ? 1_200 : 900;
 
 const wait = (milliseconds) =>
   new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
@@ -75,6 +77,12 @@ emit({
   message: "Producing the artifact in an isolated workspace",
 });
 await wait(workDelay);
+
+if (failRun) {
+  emit({ type: "failed", error: "Synthetic bounded task failure." });
+  input.close();
+  process.exit(0);
+}
 
 const artifact = [
   "# Verified mission artifact",

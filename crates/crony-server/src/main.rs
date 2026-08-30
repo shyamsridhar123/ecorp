@@ -1,3 +1,5 @@
+mod planning;
+
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
@@ -22,7 +24,9 @@ use crony_protocol::{
     ResumeRunResponse, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SnapshotResponse, TransferLeaseRequest,
 };
-use crony_store::{NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput};
+use crony_store::{
+    LaunchRecord, NewRoomMessageInput, PgStore, RunClaim, RunnerConnectInput, RunnerEventInput,
+};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -34,6 +38,8 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+use planning::{PlanningRequest, StrategyRegistry};
 
 #[derive(Debug, Parser)]
 #[command(name = "crony-server")]
@@ -57,6 +63,7 @@ struct AppState {
     store: PgStore,
     event_tx: broadcast::Sender<DomainEvent>,
     runners: Arc<DashMap<String, RunnerConnection>>,
+    strategies: StrategyRegistry,
     runner_grace_secs: i64,
 }
 
@@ -64,6 +71,7 @@ struct AppState {
 struct RunnerConnection {
     connection_epoch: Uuid,
     tx: mpsc::UnboundedSender<ServerToRunner>,
+    capabilities: Vec<RunnerCapability>,
 }
 
 #[derive(Debug)]
@@ -148,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         event_tx,
         runners: Arc::new(DashMap::new()),
+        strategies: StrategyRegistry::new(),
         runner_grace_secs: args.runner_grace_secs.max(1),
     };
 
@@ -335,14 +344,26 @@ async fn create_mission(
     Path(corp_id): Path<Uuid>,
     Json(request): Json<CreateMissionRequest>,
 ) -> Result<Json<CreateMissionResponse>, ApiError> {
+    let strategy = request.strategy.as_deref().unwrap_or("single");
+    let agents = state
+        .store
+        .agents_for_planning(corp_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let plan = state
+        .strategies
+        .plan(
+            strategy,
+            &PlanningRequest {
+                mission_title: &request.title,
+                preferred_adapter: request.preferred_adapter.as_deref(),
+            },
+            &agents,
+        )
+        .map_err(ApiError::bad_request)?;
     let (ids, events) = state
         .store
-        .create_mission(
-            corp_id,
-            request.requested_by,
-            &request.title,
-            request.preferred_adapter.as_deref(),
-        )
+        .create_mission(corp_id, request.requested_by, &request.title, &plan)
         .await
         .map_err(map_store_error)?;
     for event in events {
@@ -350,7 +371,9 @@ async fn create_mission(
     }
     Ok(Json(CreateMissionResponse {
         mission_id: ids.mission_id,
-        task_id: ids.task_id,
+        task_id: ids.task_ids[0],
+        task_ids: ids.task_ids,
+        strategy: plan.strategy,
     }))
 }
 
@@ -383,39 +406,93 @@ async fn launch_mission(
     Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<LaunchMissionRequest>,
 ) -> Result<Json<LaunchMissionResponse>, ApiError> {
-    let runner = state
-        .runners
-        .iter()
-        .next()
-        .map(|entry| (entry.key().clone(), entry.tx.clone()))
-        .ok_or_else(|| ApiError::conflict("no runner is connected"))?;
-
-    let (record, event) = state
-        .store
-        .create_run(corp_id, mission_id, request.requested_by, &runner.0)
+    let records = schedule_ready_tasks(&state, corp_id, mission_id, Some(request.requested_by))
         .await
         .map_err(ApiError::conflict)?;
-    publish(&state, event);
-
-    runner
-        .1
-        .send(ServerToRunner::StartRun {
-            corp_id: record.corp_id,
-            room_id: record.room_id,
-            mission_id: record.mission_id,
-            task_id: record.task_id,
-            run_id: record.run_id,
-            agent_id: record.agent_id,
-            assignment_token: record.assignment_token,
-            adapter: record.adapter,
-            mission_title: record.mission_title,
-        })
-        .map_err(|_| ApiError::conflict("runner disconnected before accepting the run"))?;
+    let first = records
+        .first()
+        .context("mission has no ready tasks with a compatible runner")
+        .map_err(ApiError::conflict)?;
 
     Ok(Json(LaunchMissionResponse {
-        run_id: record.run_id,
-        runner_id: runner.0,
+        run_id: first.0.run_id,
+        runner_id: first.1.clone(),
+        run_ids: records.iter().map(|(record, _)| record.run_id).collect(),
+        runner_ids: records
+            .iter()
+            .map(|(_, runner_id)| runner_id.clone())
+            .collect(),
     }))
+}
+
+async fn schedule_ready_tasks(
+    state: &AppState,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    requested_by: Option<Uuid>,
+) -> anyhow::Result<Vec<(LaunchRecord, String)>> {
+    let candidates = state.store.schedulable_tasks(corp_id, mission_id).await?;
+    let mut scheduled = Vec::new();
+    for candidate in candidates {
+        let Some((runner_id, runner_tx)) = select_runner(state, &candidate.required_adapter) else {
+            continue;
+        };
+        let Ok((record, event)) = state
+            .store
+            .create_task_run(
+                corp_id,
+                mission_id,
+                candidate.task_id,
+                requested_by,
+                &runner_id,
+            )
+            .await
+        else {
+            continue;
+        };
+        runner_tx
+            .send(ServerToRunner::StartRun {
+                corp_id: record.corp_id,
+                room_id: record.room_id,
+                mission_id: record.mission_id,
+                task_id: record.task_id,
+                run_id: record.run_id,
+                agent_id: record.agent_id,
+                assignment_token: record.assignment_token,
+                adapter: record.adapter.clone(),
+                mission_title: record.mission_title.clone(),
+            })
+            .map_err(|_| anyhow::anyhow!("runner disconnected before accepting the run"))?;
+        publish(state, event);
+        scheduled.push((record, runner_id));
+    }
+    Ok(scheduled)
+}
+
+async fn schedule_ready_corp(state: &AppState, corp_id: Uuid) -> anyhow::Result<()> {
+    for mission_id in state.store.schedulable_mission_ids(corp_id).await? {
+        schedule_ready_tasks(state, corp_id, mission_id, None).await?;
+    }
+    Ok(())
+}
+
+fn select_runner(
+    state: &AppState,
+    required_adapter: &str,
+) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
+    let mut runners = state
+        .runners
+        .iter()
+        .filter(|entry| {
+            entry
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == required_adapter && capability.available)
+        })
+        .map(|entry| (entry.key().clone(), entry.tx.clone()))
+        .collect::<Vec<_>>();
+    runners.sort_by(|left, right| left.0.cmp(&right.0));
+    runners.into_iter().next()
 }
 
 async fn resume_run(
@@ -864,6 +941,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     RunnerConnection {
                         connection_epoch,
                         tx: command_tx.clone(),
+                        capabilities: capabilities.clone(),
                     },
                 );
                 if let Some(previous) = previous
@@ -990,7 +1068,19 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     })
                     .await
                 {
-                    Ok(Some(event)) => publish(&state, event),
+                    Ok(Some(event)) => {
+                        publish(&state, event);
+                        if matches!(event_type.as_str(), "run.completed" | "run.failed") {
+                            let schedule_state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) =
+                                    schedule_ready_corp(&schedule_state, corp_id).await
+                                {
+                                    warn!(%error, %corp_id, "automatic Corp scheduling failed");
+                                }
+                            });
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         if error

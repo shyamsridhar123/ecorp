@@ -98,6 +98,8 @@ jobs:
         run: node tools/e2e_codex.mjs
       - name: Verify parallel worktree isolation and source-checkout preservation
         run: node tools/e2e_worktrees.mjs
+      - name: Verify bounded task-graph planning, scheduling, and retries
+        run: node tools/e2e_task_graph.mjs
       - name: Verify resumable event replay
         run: node tools/e2e_replay.mjs
       - name: Verify control fencing and emergency stop
@@ -118,6 +120,7 @@ jobs:
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
             output/e2e-worktrees.json
+            output/e2e-task-graph.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md

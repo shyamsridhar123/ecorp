@@ -182,6 +182,31 @@ Automatic removal occurs only when the tree is clean and its branch is reachable
 tree-equivalent to the base. The runner emits `run.workspace_preserved` or
 `run.workspace_removed`, and Postgres stores the final disposition.
 
+## Planning and scheduling
+
+Mission decomposition is a replaceable server-side strategy, not a privileged singleton agent.
+The initial registry includes:
+
+- `single`: one bounded delivery task
+- `parallel-specialists`: two independent specialist roots followed by one synthesis task
+
+Every planned task persists a self-contained contract: objective, expected output, acceptance
+tests, allowed tools, prohibited actions, references, write scope, token budget, deadline, and
+escalation path. Validation rejects unknown agents, adapter mismatches, missing contract fields,
+cycles, excessive depth, node fan-out, retry counts, and budgets.
+
+The scheduler:
+
+- releases only tasks whose dependencies are completed
+- requires the assigned agent to be idle
+- chooses a connected runner advertising the required adapter
+- orders tasks and runner IDs deterministically
+- dispatches independent roots in parallel
+- increments attempts transactionally
+- retries failed tasks only while attempts remain
+- launches downstream tasks after committed completion events
+- marks the mission complete only after every task completes
+
 ## Agent adapters
 
 Provider runtimes implement one `AgentAdapter` contract:
@@ -212,7 +237,7 @@ streaming, steering, interruption, emergency stop, resume, usage, artifacts, and
 
 ## Near-term architecture work
 
-1. Add bounded task-graph orchestration and independent verification.
+1. Add independent evidence-gated verification.
 2. Add durable approvals and policy evaluation.
 3. Add authenticated users and runner enrollment.
 4. Add artifact upload rather than host-local artifact paths.
