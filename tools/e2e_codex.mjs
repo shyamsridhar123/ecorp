@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -47,18 +47,9 @@ function isSettled(run) {
   )
 }
 
-async function assertArtifact(run) {
-  assert.ok(run.artifact_path, 'run omitted artifact path')
-  const artifactPath = path.isAbsolute(run.artifact_path)
-    ? run.artifact_path
-    : path.join(root, run.artifact_path)
-  const bytes = await readFile(artifactPath)
-  assert.equal(
-    createHash('sha256').update(bytes).digest('hex'),
-    run.artifact_sha256,
-    'artifact hash mismatch',
-  )
-  return artifactPath
+async function assertArtifact(demo, run) {
+  await downloadVerifiedArtifact(server, demo, run)
+  return run.artifact_uri
 }
 
 async function createCodexMission(demo, title) {
@@ -119,7 +110,7 @@ async function startSteerResumeScenario() {
     await readFile(path.join(workspace, 'steered.txt'), 'utf8'),
     'create the steered file\n',
   )
-  const startArtifact = await assertArtifact(completed.run)
+  const startArtifact = await assertArtifact(demo, completed.run)
 
   const resume = await post(
     `/api/corps/${demo.corp_id}/runs/${launch.run_id}/resume`,
@@ -145,7 +136,7 @@ async function startSteerResumeScenario() {
     await readFile(path.join(workspace, 'resumed.txt'), 'utf8'),
     'resumed\n',
   )
-  const resumeArtifact = await assertArtifact(resumed.run)
+  const resumeArtifact = await assertArtifact(demo, resumed.run)
 
   const secondResume = await post(
     `/api/corps/${demo.corp_id}/runs/${resume.run_id}/resume`,
@@ -164,7 +155,7 @@ async function startSteerResumeScenario() {
   assert.equal(resumedAgain.run.workspace_path, workspace)
   assert.equal(resumedAgain.run.workspace_branch, completed.run.workspace_branch)
   assert.equal(resumedAgain.run.resumed_from_run_id, resume.run_id)
-  const secondResumeArtifact = await assertArtifact(resumedAgain.run)
+  const secondResumeArtifact = await assertArtifact(demo, resumedAgain.run)
 
   return {
     corp_id: demo.corp_id,
@@ -222,7 +213,7 @@ async function interruptScenario() {
     isSettled,
   )
   assert.equal(terminal.run.status, 'cancelled')
-  const artifact = await assertArtifact(terminal.run)
+  const artifact = await assertArtifact(demo, terminal.run)
   return {
     run_id: launch.run_id,
     provider_session_id: started.run.provider_session_id,
@@ -256,7 +247,7 @@ async function stopScenario() {
     isSettled,
   )
   assert.equal(terminal.run.status, 'cancelled')
-  const artifact = await assertArtifact(terminal.run)
+  const artifact = await assertArtifact(demo, terminal.run)
   return {
     run_id: launch.run_id,
     status: terminal.run.status,

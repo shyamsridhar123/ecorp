@@ -55,7 +55,8 @@ The UI can close without terminating active work.
 - Mission creation and launch
 - Agent control leasing with private rotating fencing tokens
 - Explicit release and transfer, queued messages, and role-gated emergency stop
-- Artifact creation and SHA-256 evidence
+- Server-mediated content-addressed artifact storage with digest/media verification, HMAC-signed
+  provenance, retention metadata, and Corp-authorized downloads
 - Live office, operations panel, and activity replay
 
 ## Run locally
@@ -90,7 +91,9 @@ checkout itself.
 In production, set `CRONY_MODE=production`, configure an HTTPS `CRONY_OIDC_ISSUER`, provision
 `human_identities`, and explicitly enroll each runner. Demo endpoints and claimed demo identities
 are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a deployment-managed
-32-byte key encoded as 64 hexadecimal characters.
+32-byte key encoded as 64 hexadecimal characters. Production also requires
+`CRONY_ARTIFACT_SIGNING_KEY_HEX` and a private S3-compatible bucket. Shared snapshots contain only
+the authorized artifact API URI and signed metadata, never runner-local paths or direct bucket URLs.
 
 ## Documents
 
@@ -109,6 +112,7 @@ are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a depl
 - [`docs/evidence/2026-08-30-secret-broker-validation.md`](docs/evidence/2026-08-30-secret-broker-validation.md)
 - [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
 - [`docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`](docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md)
+- [`docs/evidence/2026-08-30-artifact-storage-validation.md`](docs/evidence/2026-08-30-artifact-storage-validation.md)
 - [`docs/evidence/2026-08-30-external-adapter-validation.md`](docs/evidence/2026-08-30-external-adapter-validation.md)
 - [`docs/evidence/2026-08-30-protocol-gateway-validation.md`](docs/evidence/2026-08-30-protocol-gateway-validation.md)
 - [`docs/evidence/2026-08-30-tauri-desktop-validation.md`](docs/evidence/2026-08-30-tauri-desktop-validation.md)

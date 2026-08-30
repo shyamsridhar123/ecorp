@@ -122,6 +122,8 @@ jobs:
       - name: Exercise the real server-to-runner path
         shell: pwsh
         run: ./tools/e2e_smoke.ps1
+      - name: Verify content-addressed artifacts, provenance, and Corp-scoped download
+        run: node tools/e2e_artifacts.mjs
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
       - name: Verify Claude Code and OpenCode normalized lifecycle evidence
@@ -163,6 +165,7 @@ jobs:
           name: integration-evidence
           path: |
             output/e2e-smoke.json
+            output/e2e-artifacts.json
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
             output/e2e-external-adapters.json

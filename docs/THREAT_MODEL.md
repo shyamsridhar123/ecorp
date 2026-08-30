@@ -26,7 +26,7 @@
 | Runaway spend | deterministic local adapter | task/run/Corp budgets and breaker |
 | Recursive delegation | bounded acyclic task graphs | causal-depth and task-generation limits |
 | Conflicting human control | expiring agent lease | authenticated lease, transfer, and emergency-stop policy |
-| Forged artifact | runner policy checks plus SHA-256 evidence | object-store digest, provenance, verifier attestation |
+| Forged artifact | server-side byte, digest, and media verification | private object store, HMAC provenance, verifier identity, retention, and authorized revalidation on download |
 | Event replay | unique idempotency | signed runner events and replay window |
 | Plugin supply chain | no plugins yet | signed manifests, allowlists, and isolated permissions |
 

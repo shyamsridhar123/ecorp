@@ -40,9 +40,22 @@ Runner daemons:
 - create isolated workspaces
 - spawn and supervise child processes
 - stream structured lifecycle events
-- upload artifact metadata and evidence
+- upload bounded artifact bytes, digest, and declared media type to the server
 
 The server never executes an agent shell command.
+
+## Artifact storage and provenance
+
+The runner reads the adapter artifact from its isolated worktree and sends a bounded base64 upload
+over the authenticated runner channel. The server revalidates the declared byte count, SHA-256, and
+media type before writing a Corp-namespaced content-addressed object. Production uses an
+S3-compatible private bucket; development can use the same object-store interface on local disk.
+
+The server records artifact ID, Corp, task, run, producing agent, producing runner, verifier,
+digest, normalized media type, byte count, retention deadline, and an HMAC-SHA256 provenance
+signature. The shared `Run` projection exposes an API URI and signed metadata, not a runner path or
+bucket URL. Downloads re-check the signature, retention, object bytes, digest, and media type, then
+enforce Corp and room membership before returning an attachment with `nosniff`.
 
 ## Human identity and authorization
 
@@ -315,8 +328,6 @@ streaming, steering, interruption, emergency stop, resume, usage, artifacts, and
 
 ## Near-term architecture work
 
-1. Add authenticated users and runner enrollment.
-2. Add the scoped secret broker.
-3. Generalize durable approval suspension for risky side effects.
-4. Add budgets and circuit-breaker policy.
-5. Add artifact upload rather than host-local artifact paths.
+1. Add stronger OS/container isolation for untrusted child processes.
+2. Add artifact retention sweeping and signing-key rotation.
+3. Add multi-region control-plane and object-store recovery drills.

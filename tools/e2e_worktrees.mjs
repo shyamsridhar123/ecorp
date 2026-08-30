@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
 import { readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -59,13 +59,8 @@ async function waitForRuns(demo, runIds, timeoutMs = 45_000) {
   throw new Error(`timed out waiting for runs ${runIds.join(', ')}`)
 }
 
-async function verifyArtifact(run) {
-  assert.ok(run.artifact_path)
-  const bytes = await readFile(run.artifact_path)
-  assert.equal(
-    createHash('sha256').update(bytes).digest('hex'),
-    run.artifact_sha256,
-  )
+async function verifyArtifact(demo, run) {
+  await downloadVerifiedArtifact(server, demo, run)
 }
 
 function assertManagedPath(workspace) {
@@ -135,7 +130,10 @@ assert.equal(
     .catch(() => false),
   false,
 )
-await Promise.all([verifyArtifact(fakeRun), verifyArtifact(codexRun)])
+await Promise.all([
+  verifyArtifact(demo, fakeRun),
+  verifyArtifact(demo, codexRun),
+])
 
 const worktreeList = git(['worktree', 'list', '--porcelain'])
 assert.ok(worktreeList.includes(fakeRun.workspace_path.replaceAll('\\', '/')))
@@ -181,7 +179,7 @@ assert.equal(
   ).status,
   1,
 )
-await verifyArtifact(cleanRun)
+await verifyArtifact(demo, cleanRun)
 
 const ignored = await createMission(
   'fake-process',
@@ -196,7 +194,7 @@ assert.equal(
   await readFile(path.join(ignoredRun.workspace_path, 'valuable.log'), 'utf8'),
   'ignored but valuable\n',
 )
-await verifyArtifact(ignoredRun)
+await verifyArtifact(demo, ignoredRun)
 
 const sourceHeadAfter = git(['rev-parse', 'HEAD']).trim()
 const sourceStatusAfter = git(['status', '--porcelain=v1', '--untracked-files=all'])
