@@ -437,6 +437,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crony-gateways"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
 name = "crony-protocol"
 version = "0.1.0"
 dependencies = [

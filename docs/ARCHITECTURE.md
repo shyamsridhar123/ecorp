@@ -184,6 +184,13 @@ durably queued.
 - `crony-server`: APIs, realtime gateway, and orchestration host
 - `crony-runner`: process supervision and isolation
 - `crony-cli`: scriptable operator interface
+- `crony-gateways`: MCP, ACP, and A2A translation without leaking internal schemas
+
+## External protocol gateways
+
+MCP, ACP, and A2A remain adapters over authenticated Crony APIs. They negotiate explicit versions
+and expose bounded context, mission, message, task, and streaming operations. Assignment fencing,
+control leases, approval tables, budgets, and secret records remain private Crony concepts.
 
 ## Runner liveness and reconciliation
 
