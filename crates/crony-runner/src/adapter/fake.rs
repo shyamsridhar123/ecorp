@@ -148,6 +148,15 @@ impl AgentAdapter for FakeProcessAdapter {
                             }).to_string());
                         }
                         Some(AdapterControl::CircuitBreaker { stage, reason }) => {
+                            if matches!(stage.as_str(), "suspend" | "stop") {
+                                let reason =
+                                    format!("Circuit breaker {stage} checkpoint: {reason}");
+                                child.kill().await.context("kill breaker-stopped agent process")?;
+                                sink.emit(AdapterEvent::Cancelled { reason });
+                                terminal_event = true;
+                                cancelled = true;
+                                break;
+                            }
                             let _ = input_tx.send(json!({
                                 "type": "circuit_breaker",
                                 "stage": stage,

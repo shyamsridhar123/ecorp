@@ -28,7 +28,8 @@ const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
 const secretProbe = mission.includes("[secret-probe]");
-const approvalAction = mission.includes("[approval-action]");
+const approvalExpiry = mission.includes("[approval-expiry]");
+const approvalAction = mission.includes("[approval-action]") || approvalExpiry;
 const budgetLoop = mission.includes("[budget-loop]");
 const healthyConversation = mission.includes("[healthy-conversation]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
@@ -95,7 +96,7 @@ if (approvalAction) {
     risk: "high",
     rationale: "Publishing is an externally visible side effect.",
     required_roles: ["owner", "admin", "member"],
-    expires_in_seconds: 300,
+    expires_in_seconds: approvalExpiry ? 1 : 300,
   });
   const decision = await new Promise((resolvePromise) => {
     approvalResolver = resolvePromise;

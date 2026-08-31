@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use crony_domain::VerificationPolicy;
 use crony_protocol::{
@@ -28,7 +29,7 @@ use uuid::Uuid;
 
 use adapter::{
     AdapterArtifact, AdapterControl, AdapterEvent, AdapterEventSink, AdapterExit, AdapterRegistry,
-    AdapterRunRequest, AgentAdapter, CopilotSdkConfig,
+    AdapterRegistryConfig, AdapterRunRequest, AgentAdapter, CopilotSdkConfig,
 };
 use workspace::{WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager};
 
@@ -80,6 +81,13 @@ struct Args {
 
     #[arg(long, env = "CRONY_CODEX_COMMAND")]
     codex_command: Option<PathBuf>,
+
+    #[arg(
+        long = "codex-command-arg",
+        env = "CRONY_CODEX_COMMAND_ARGS",
+        value_delimiter = ';'
+    )]
+    codex_command_args: Vec<std::ffi::OsString>,
 
     #[arg(long, env = "CRONY_CLAUDE_COMMAND")]
     claude_command: Option<PathBuf>,
@@ -136,12 +144,14 @@ struct Args {
 #[derive(Debug, Clone)]
 struct Assignment {
     corp_id: Uuid,
+    connection_epoch: Uuid,
     room_id: Uuid,
     mission_id: Uuid,
     task_id: Uuid,
     run_id: Uuid,
     workspace_run_id: Uuid,
     agent_id: Uuid,
+    assignment_token: Uuid,
     adapter: String,
     mission_title: String,
     model: Option<String>,
@@ -226,19 +236,23 @@ struct OutboundBus {
 #[derive(Default)]
 struct OutboundState {
     connection: Option<mpsc::UnboundedSender<RunnerToServer>>,
+    connection_epoch: Option<Uuid>,
     pending: VecDeque<RunnerToServer>,
 }
 
 impl OutboundBus {
-    fn attach(&self, connection: mpsc::UnboundedSender<RunnerToServer>) {
+    fn attach(&self, connection: mpsc::UnboundedSender<RunnerToServer>, connection_epoch: Uuid) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         state.connection = Some(connection.clone());
-        while let Some(message) = state.pending.pop_front() {
+        state.connection_epoch = Some(connection_epoch);
+        while let Some(mut message) = state.pending.pop_front() {
+            bind_connection_epoch(&mut message, connection_epoch);
             if connection.send(message.clone()).is_err() {
                 state.pending.push_front(message);
                 state.connection = None;
+                state.connection_epoch = None;
                 break;
             }
         }
@@ -247,13 +261,17 @@ impl OutboundBus {
     fn detach(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.connection = None;
+            state.connection_epoch = None;
         }
     }
 
-    fn send(&self, message: RunnerToServer) {
+    fn send(&self, mut message: RunnerToServer) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if let Some(connection_epoch) = state.connection_epoch {
+            bind_connection_epoch(&mut message, connection_epoch);
+        }
         let delivered = state
             .connection
             .as_ref()
@@ -262,10 +280,27 @@ impl OutboundBus {
             return;
         }
         state.connection = None;
-        if state.pending.len() >= 2_000 {
-            state.pending.pop_front();
+        if state.pending.len() == 2_000 {
+            warn!(
+                buffered_events = state.pending.len(),
+                "runner transport is offline; preserving the complete outbound event buffer"
+            );
         }
         state.pending.push_back(message);
+    }
+}
+
+fn bind_connection_epoch(message: &mut RunnerToServer, connection_epoch: Uuid) {
+    match message {
+        RunnerToServer::RunEvent {
+            connection_epoch: event_epoch,
+            ..
+        }
+        | RunnerToServer::CommandAck {
+            connection_epoch: event_epoch,
+            ..
+        } => *event_epoch = connection_epoch,
+        _ => {}
     }
 }
 
@@ -295,19 +330,22 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(default_codex_command);
     let copilot_config = copilot_config(&args)?;
-    let adapters = Arc::new(AdapterRegistry::new(
-        args.fake_agent_script.clone(),
+    let adapters = Arc::new(AdapterRegistry::new(AdapterRegistryConfig {
+        fake_agent_script: args.fake_agent_script.clone(),
         codex_command,
-        args.claude_command
+        codex_prefix_args: args.codex_command_args.clone(),
+        claude_command: args
+            .claude_command
             .clone()
             .unwrap_or_else(|| default_provider_command("claude")),
-        args.claude_command_args.clone(),
-        args.opencode_command
+        claude_prefix_args: args.claude_command_args.clone(),
+        opencode_command: args
+            .opencode_command
             .clone()
             .unwrap_or_else(|| default_provider_command("opencode")),
-        args.opencode_command_args.clone(),
-        copilot_config,
-    ));
+        opencode_prefix_args: args.opencode_command_args.clone(),
+        copilot: copilot_config,
+    }));
     loop {
         let delay = match run_connection(
             args.clone(),
@@ -439,7 +477,7 @@ async fn run_connection(
             active_runs: claims,
         })
         .map_err(|_| anyhow!("runner writer stopped before registration"))?;
-    outbound.attach(out_tx.clone());
+    outbound.attach(out_tx.clone(), connection_epoch);
 
     let heartbeat_tx = out_tx.clone();
     let heartbeat_runner_id = args.runner_id.clone();
@@ -516,18 +554,33 @@ async fn run_connection(
             } => {
                 let assignment = Assignment {
                     corp_id,
+                    connection_epoch,
                     room_id,
                     mission_id,
                     task_id,
                     run_id,
                     workspace_run_id: run_id,
                     agent_id,
+                    assignment_token,
                     adapter,
                     mission_title,
                     model,
                     reasoning_effort,
                     verification_policy,
                     secrets,
+                };
+                let secret_ttl = match secret_expiry_delay(&assignment.secrets) {
+                    Ok(ttl) => ttl,
+                    Err(error) => {
+                        send_run_event(
+                            &outbound,
+                            &args.runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": error.to_string()}),
+                        );
+                        continue;
+                    }
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate start command ignored");
@@ -546,6 +599,7 @@ async fn run_connection(
                     continue;
                 };
                 let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                schedule_secret_expiry(secret_ttl, control_tx.clone());
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
@@ -600,18 +654,33 @@ async fn run_connection(
             } => {
                 let assignment = Assignment {
                     corp_id,
+                    connection_epoch,
                     room_id,
                     mission_id,
                     task_id,
                     run_id,
                     workspace_run_id,
                     agent_id,
+                    assignment_token,
                     adapter,
                     mission_title: prompt,
                     model,
                     reasoning_effort,
                     verification_policy,
                     secrets,
+                };
+                let secret_ttl = match secret_expiry_delay(&assignment.secrets) {
+                    Ok(ttl) => ttl,
+                    Err(error) => {
+                        send_run_event(
+                            &outbound,
+                            &args.runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": error.to_string()}),
+                        );
+                        continue;
+                    }
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate resume command ignored");
@@ -630,6 +699,7 @@ async fn run_connection(
                     continue;
                 };
                 let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                schedule_secret_expiry(secret_ttl, control_tx.clone());
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
@@ -702,15 +772,31 @@ async fn run_connection(
                 approved,
                 note,
             } => {
-                if seen_commands.insert(command_id, ()).is_none()
-                    && let Some(active) = active_runs.get(&run_id)
-                {
-                    let _ = active.control.send(AdapterControl::ApprovalDecision {
-                        approval_id,
-                        approved,
-                        note,
+                let duplicate = seen_commands.insert(command_id, ()).is_some();
+                let applied = duplicate
+                    || active_runs.get(&run_id).is_some_and(|active| {
+                        active
+                            .control
+                            .send(AdapterControl::ApprovalDecision {
+                                approval_id,
+                                approved,
+                                note,
+                            })
+                            .is_ok()
                     });
-                }
+                outbound.send(RunnerToServer::CommandAck {
+                    runner_id: args.runner_id.clone(),
+                    connection_epoch,
+                    command_id,
+                    applied,
+                    detail: if duplicate {
+                        "approval decision was already applied".to_owned()
+                    } else if applied {
+                        "approval decision delivered to the active provider".to_owned()
+                    } else {
+                        "approval decision had no active provider".to_owned()
+                    },
+                });
             }
             ServerToRunner::CircuitBreaker {
                 command_id,
@@ -718,13 +804,27 @@ async fn run_connection(
                 stage,
                 reason,
             } => {
-                if seen_commands.insert(command_id, ()).is_none()
-                    && let Some(active) = active_runs.get(&run_id)
-                {
-                    let _ = active
-                        .control
-                        .send(AdapterControl::CircuitBreaker { stage, reason });
-                }
+                let duplicate = seen_commands.insert(command_id, ()).is_some();
+                let applied = duplicate
+                    || active_runs.get(&run_id).is_some_and(|active| {
+                        active
+                            .control
+                            .send(AdapterControl::CircuitBreaker { stage, reason })
+                            .is_ok()
+                    });
+                outbound.send(RunnerToServer::CommandAck {
+                    runner_id: args.runner_id.clone(),
+                    connection_epoch,
+                    command_id,
+                    applied,
+                    detail: if duplicate {
+                        "circuit-breaker command was already applied".to_owned()
+                    } else if applied {
+                        "circuit-breaker command delivered to the active provider".to_owned()
+                    } else {
+                        "circuit-breaker command had no active provider".to_owned()
+                    },
+                });
             }
             ServerToRunner::Disconnect {
                 reason,
@@ -950,6 +1050,43 @@ impl AdapterEventSink for RunnerEventSink {
             payload,
         );
     }
+}
+
+fn secret_expiry_delay(secrets: &[ResolvedSecret]) -> Result<Option<Duration>> {
+    let now = Utc::now();
+    let mut earliest = None;
+    for secret in secrets {
+        let expires_at = DateTime::parse_from_rfc3339(&secret.expires_at)
+            .with_context(|| format!("secret grant {} has an invalid expiry", secret.grant_id))?
+            .with_timezone(&Utc);
+        if expires_at <= now {
+            return Err(anyhow!(
+                "secret grant {} expired before provider start",
+                secret.grant_id
+            ));
+        }
+        earliest =
+            Some(earliest.map_or(expires_at, |current: DateTime<Utc>| current.min(expires_at)));
+    }
+    earliest
+        .map(|expires_at| {
+            (expires_at - now)
+                .to_std()
+                .context("secret grant expiry interval is invalid")
+        })
+        .transpose()
+}
+
+fn schedule_secret_expiry(ttl: Option<Duration>, control: mpsc::UnboundedSender<AdapterControl>) {
+    let Some(ttl) = ttl else {
+        return;
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(ttl).await;
+        let _ = control.send(AdapterControl::Stop {
+            reason: "task-scoped secret grant expired; provider stopped".to_owned(),
+        });
+    });
 }
 
 async fn execute_assignment(
@@ -1198,8 +1335,10 @@ fn send_run_event(
         event_id: Uuid::new_v4(),
         runner_id: runner_id.to_owned(),
         corp_id: assignment.corp_id,
+        connection_epoch: assignment.connection_epoch,
         run_id: assignment.run_id,
         agent_id: assignment.agent_id,
+        assignment_token: assignment.assignment_token,
         event_type: event_type.to_owned(),
         payload,
     };
@@ -1219,4 +1358,67 @@ fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
         .collect::<Vec<_>>();
     claims.sort_by_key(|claim| claim.run_id);
     claims
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration as ChronoDuration;
+
+    use super::*;
+
+    fn secret(expires_at: DateTime<Utc>) -> ResolvedSecret {
+        ResolvedSecret {
+            grant_id: Uuid::new_v4(),
+            secret_id: Uuid::new_v4(),
+            env_name: "CRONY_TEST_SECRET".to_owned(),
+            value: "redacted-test-value".to_owned(),
+            tool: "test".to_owned(),
+            resource: "test://secret".to_owned(),
+            expires_at: expires_at.to_rfc3339(),
+            assurance: "environment_reduced_assurance".to_owned(),
+        }
+    }
+
+    #[test]
+    fn expired_secrets_fail_before_provider_start() {
+        assert!(secret_expiry_delay(&[secret(Utc::now() - ChronoDuration::seconds(1))]).is_err());
+    }
+
+    #[test]
+    fn active_secrets_schedule_a_bounded_provider_lifetime() {
+        let ttl = secret_expiry_delay(&[secret(Utc::now() + ChronoDuration::seconds(60))])
+            .expect("valid secret")
+            .expect("secret expiry");
+        assert!(ttl <= Duration::from_secs(60));
+        assert!(ttl > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn buffered_run_events_rebind_epoch_without_changing_assignment_fence() {
+        let old_epoch = Uuid::new_v4();
+        let new_epoch = Uuid::new_v4();
+        let assignment_token = Uuid::new_v4();
+        let mut message = RunnerToServer::RunEvent {
+            event_id: Uuid::new_v4(),
+            runner_id: "runner-test".to_owned(),
+            corp_id: Uuid::new_v4(),
+            connection_epoch: old_epoch,
+            run_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            assignment_token,
+            event_type: "run.output".to_owned(),
+            payload: json!({"text": "buffered"}),
+        };
+        bind_connection_epoch(&mut message, new_epoch);
+        let RunnerToServer::RunEvent {
+            connection_epoch,
+            assignment_token: rebound_token,
+            ..
+        } = message
+        else {
+            panic!("expected run event");
+        };
+        assert_eq!(connection_epoch, new_epoch);
+        assert_eq!(rebound_token, assignment_token);
+    }
 }

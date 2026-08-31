@@ -6,7 +6,10 @@ import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
-const managedRoot = path.join(root, 'output', 'runner', 'worktrees')
+const managedRoot = path.resolve(
+  process.env.CRONY_RUNNER_WORKSPACE ?? path.join(root, 'output', 'runner'),
+  'worktrees',
+)
 
 function git(args, cwd = root) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' })

@@ -3,11 +3,7 @@ mod copilot;
 mod external;
 mod fake;
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -285,32 +281,36 @@ pub struct AdapterRegistry {
     adapters: Arc<HashMap<String, Arc<dyn AgentAdapter>>>,
 }
 
+pub struct AdapterRegistryConfig {
+    pub fake_agent_script: PathBuf,
+    pub codex_command: PathBuf,
+    pub codex_prefix_args: Vec<std::ffi::OsString>,
+    pub claude_command: PathBuf,
+    pub claude_prefix_args: Vec<std::ffi::OsString>,
+    pub opencode_command: PathBuf,
+    pub opencode_prefix_args: Vec<std::ffi::OsString>,
+    pub copilot: CopilotSdkConfig,
+}
+
 impl AdapterRegistry {
-    pub fn new(
-        fake_agent_script: impl AsRef<Path>,
-        codex_command: impl AsRef<Path>,
-        claude_command: impl AsRef<Path>,
-        claude_prefix_args: Vec<std::ffi::OsString>,
-        opencode_command: impl AsRef<Path>,
-        opencode_prefix_args: Vec<std::ffi::OsString>,
-        copilot_config: CopilotSdkConfig,
-    ) -> Self {
-        let fake: Arc<dyn AgentAdapter> = Arc::new(FakeProcessAdapter::new(
-            fake_agent_script.as_ref().to_path_buf(),
+    pub fn new(config: AdapterRegistryConfig) -> Self {
+        let fake: Arc<dyn AgentAdapter> =
+            Arc::new(FakeProcessAdapter::new(config.fake_agent_script));
+        let codex: Arc<dyn AgentAdapter> = Arc::new(CodexAdapter::new_with_prefix(
+            config.codex_command,
+            config.codex_prefix_args,
         ));
-        let codex: Arc<dyn AgentAdapter> =
-            Arc::new(CodexAdapter::new(codex_command.as_ref().to_path_buf()));
         let claude: Arc<dyn AgentAdapter> = Arc::new(ExternalCliAdapter::new_with_prefix(
             ExternalFlavor::ClaudeCode,
-            claude_command.as_ref().to_path_buf(),
-            claude_prefix_args,
+            config.claude_command,
+            config.claude_prefix_args,
         ));
         let opencode: Arc<dyn AgentAdapter> = Arc::new(ExternalCliAdapter::new_with_prefix(
             ExternalFlavor::OpenCode,
-            opencode_command.as_ref().to_path_buf(),
-            opencode_prefix_args,
+            config.opencode_command,
+            config.opencode_prefix_args,
         ));
-        let copilot: Arc<dyn AgentAdapter> = Arc::new(CopilotSdkAdapter::new(copilot_config));
+        let copilot: Arc<dyn AgentAdapter> = Arc::new(CopilotSdkAdapter::new(config.copilot));
         let mut adapters = HashMap::new();
         adapters.insert(fake.id().to_owned(), fake);
         adapters.insert(codex.id().to_owned(), codex);

@@ -79,7 +79,31 @@ assert.equal(spend.run.status, 'cancelled')
 const spendStages = spend.state.snapshot.circuit_breaker_incidents
   .filter((incident) => incident.run_id === spend.run.id)
   .map((incident) => incident.stage)
-assert.deepEqual(new Set(spendStages), new Set(['steer', 'constrain', 'suspend', 'stop']))
+for (const required of ['steer', 'constrain', 'suspend']) {
+  assert.ok(spendStages.includes(required))
+}
+assert.match(spend.run.summary, /Circuit breaker suspend checkpoint/)
+assert.ok(
+  spend.state.snapshot.events.some(
+    (event) =>
+      event.type === 'runner.command_acknowledged' &&
+      event.aggregate_id === spend.run.id,
+  ),
+)
+
+await post('/api/demo/reset', {})
+await setPolicy(demo)
+const stopLaunch = await launch(
+  demo,
+  '[budget-loop] immediate hard-stop budget enforcement',
+  5_000,
+)
+const stopped = await waitForRun(demo, stopLaunch.run_id)
+assert.equal(stopped.run.status, 'cancelled')
+const stopStages = stopped.state.snapshot.circuit_breaker_incidents
+  .filter((incident) => incident.run_id === stopped.run.id)
+  .map((incident) => incident.stage)
+assert.deepEqual(new Set(stopStages), new Set(['stop']))
 
 await post('/api/demo/reset', {})
 await setPolicy(demo, { repeated_tool_limit: 10 })
@@ -143,6 +167,7 @@ assert.equal(
 const report = {
   checked_at: new Date().toISOString(),
   spend_stages: spendStages,
+  hard_stop_stages: stopStages,
   repeated_tool_reasons: loopReasons,
   actor_budget_reasons: actorReasons,
   corp_budget_reasons: corpReasons,

@@ -77,8 +77,13 @@ struct ParsedRun {
 }
 
 impl CodexAdapter {
+    #[cfg(test)]
     pub fn new(command: PathBuf) -> Self {
         Self::with_prefix_args(command, Vec::new())
+    }
+
+    pub(crate) fn new_with_prefix(command: PathBuf, prefix_args: Vec<OsString>) -> Self {
+        Self::with_prefix_args(command, prefix_args)
     }
 
     fn with_prefix_args(command: PathBuf, prefix_args: Vec<OsString>) -> Self {
@@ -96,11 +101,6 @@ impl CodexAdapter {
             available,
             usage: Arc::new(DashMap::new()),
         }
-    }
-
-    #[cfg(test)]
-    fn new_with_prefix(command: PathBuf, prefix_args: Vec<OsString>) -> Self {
-        Self::with_prefix_args(command, prefix_args)
     }
 
     fn command(&self) -> Command {
@@ -281,11 +281,13 @@ impl CodexAdapter {
                             pending_steers.push_back((Uuid::nil(), text));
                         }
                         Some(AdapterControl::CircuitBreaker { stage, reason }) => {
-                            if stage == "stop" {
+                            if matches!(stage.as_str(), "suspend" | "stop") {
                                 if termination.is_none() {
                                     termination = Some(TerminationRequest {
                                         kind: TerminationKind::Stop,
-                                        reason,
+                                        reason: format!(
+                                            "Circuit breaker {stage} checkpoint: {reason}"
+                                        ),
                                         sent: false,
                                     });
                                 }

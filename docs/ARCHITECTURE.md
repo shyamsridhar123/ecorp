@@ -69,6 +69,11 @@ is consumed and Corp-authorized before event replay begins, so the OIDC token is
 URL. Development mode retains the fixed Alice, Bob, and Eve actors, but demo routes and claimed
 development identities are not registered in production mode.
 
+The web client presents a production connection form for Corp ID, actor ID, and a short-lived
+token. The token stays in session storage, REST requests use the bearer header, artifact downloads
+use an authenticated fetch, and the operating-as selector is locked to the authenticated actor.
+The CLI accepts the same token through `CRONY_ACCESS_TOKEN`.
+
 ## Runner identity
 
 Runners are bound to one Corp. An owner or admin creates a short-lived, one-time enrollment token.
@@ -85,22 +90,25 @@ then records a metadata-only grant.
 
 Current process adapters receive the short-lived value through their environment and advertise
 `environment_reduced_assurance`. The boundary is explicit: this mode protects shared state and
-logs, but a compromised child process can still inspect its own environment.
+logs, but a compromised child process can still inspect its own environment. The runner rejects a
+grant that is already expired and stops the provider at the earliest grant expiry.
 
 ## Durable action approvals
 
 Agents can request a typed action approval while remaining supervised by the runner. The server
 stores risk, action, rationale, required roles, expiry, and process lineage. Decisions use a
 client-generated idempotency key and transactionally enqueue a durable runner command. Pending
-commands are retried after server or runner reconnect, while runner command IDs suppress duplicate
-process effects.
+commands are retried after server or runner reconnect. They remain pending until the runner
+acknowledges application, while runner command IDs suppress duplicate process effects. Expired
+approvals cancel the run, task, and mission coherently and enqueue a durable rejection.
 
 ## Budgets and circuit breaking
 
 Run, mission, requester, and Corp token/cost limits are evaluated after usage events. Explicit
 tool-activity events feed no-progress and repeated-tool counters; human conversation is exempt.
 Monotonic steer, constrain, suspend, and stop transitions create immutable incidents and durable
-runner directives.
+runner directives. Suspend is a terminal provider checkpoint: the session and worktree are
+preserved for an explicit resume. A hard overrun stops immediately.
 
 ## Current vertical slice
 
@@ -138,8 +146,10 @@ The event envelope contains:
 - structured payload
 - server timestamp and sequence
 
-Runner events have independent UUIDs. Replaying the same runner event is a no-op because
-`(corp_id, idempotency_key)` is unique.
+Runner events have independent UUIDs and carry both the authenticated connection epoch and the
+private assignment token. The server rejects superseded sockets and wrong-assignment events before
+state mutation. Replaying the same valid runner event is a no-op because `(corp_id,
+idempotency_key)` is unique.
 
 ## Real-time delivery
 
@@ -148,6 +158,9 @@ an actor identity and `after_seq` cursor. The server verifies Corp membership be
 connection, subscribes to live events before querying Postgres, replays every visible committed
 event after that cursor in bounded pages, sends a replay watermark, and then switches to the live
 stream while suppressing duplicate sequence numbers.
+
+If the in-memory broadcast subscriber lags, the server refills the missing sequence range from
+Postgres before continuing live delivery.
 
 The current browser refreshes its bounded materialized snapshot after replay or a live event. Later
 clients may apply typed events directly for lower latency.
@@ -186,8 +199,9 @@ ownership. The request is audited and delivered to the runner. Adapters first re
 turn interruption and are force-terminated after a bounded timeout. The mission, task, and run end
 as cancelled.
 
-Messages from the current controller can be delivered to the active process. Other messages are
-durably queued.
+Messages from the current controller can be delivered to adapters that support steering. Other
+messages are durably queued, reserved into the next task prompt, and marked delivered only after
+the run starts.
 
 ## Target module boundaries
 
@@ -221,11 +235,16 @@ Active runners include run IDs and assignment tokens when reconnecting. Matching
 
 A disconnect enters a bounded grace period rather than immediately failing work. Reconnecting with
 a newer epoch cancels the old grace timer. When grace expires, active runs become `lost`, their
-tasks become `blocked`, and their agents become `offline`. A later stale runner claim cannot
-overwrite that terminal lost state.
+tasks become `blocked`, their missions fail, and reusable agent identities return to `idle`. A
+later stale runner claim cannot overwrite that terminal lost state.
 
-The runner keeps active process controls and a bounded outbound event queue outside any individual
-WebSocket connection, so a transport reconnect does not kill the child process or discard events.
+The runner keeps active process controls and its complete outbound event queue outside any
+individual WebSocket connection. Buffered run events are rebound to the new authenticated epoch
+without changing their assignment token, so a transport reconnect does not kill the child process
+or discard events.
+
+Server startup recovery is explicitly single-owner. Secondary replicas and production-auth probes
+disable it so they cannot place another server's healthy runners into grace.
 
 ## Worktree lifecycle
 
@@ -270,6 +289,7 @@ The scheduler:
 - increments attempts transactionally
 - retries failed tasks only while attempts remain
 - launches downstream tasks after committed completion events
+- injects verified dependency artifacts into synthesis prompts
 - marks the mission complete only after every task completes
 
 ## Evidence-gated completion

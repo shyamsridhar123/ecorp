@@ -1,4 +1,8 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+
 const server = process.env.CRONY_SERVER_HTTP ?? "http://127.0.0.1:8791";
+const root = path.resolve(import.meta.dirname, "..");
 
 async function request(path, body) {
   const response = await fetch(`${server}${path}`, {
@@ -142,6 +146,74 @@ const bobQueued = await post(
 if (bobQueued.delivery !== "queued") {
   throw new Error(`expected a valid idle message to queue, got ${bobQueued.delivery}`);
 }
+const queuedMission = await post(
+  `/api/corps/${transferDemo.corp_id}/missions`,
+  {
+    requested_by: transferDemo.bob_actor_id,
+    preferred_adapter: "fake-process",
+    title: "Consume the durable note queued while the agent was off shift.",
+  },
+);
+const queuedLaunch = await post(
+  `/api/corps/${transferDemo.corp_id}/missions/${queuedMission.mission_id}/launch`,
+  { requested_by: transferDemo.bob_actor_id },
+);
+await waitForRun(
+  transferDemo.corp_id,
+  transferDemo.bob_actor_id,
+  queuedLaunch.run_id,
+  false,
+);
+let queuedDeliveryView;
+const queuedDeadline = Date.now() + 10_000;
+while (Date.now() < queuedDeadline) {
+  const current = await snapshot(
+    transferDemo.corp_id,
+    transferDemo.bob_actor_id,
+  );
+  const delivered = current.snapshot.queued_messages.find(
+    (message) => message.id === bobQueued.message_id,
+  );
+  const observed = current.snapshot.events.some(
+    (event) =>
+      event.aggregate_id === queuedLaunch.run_id &&
+      event.type === "run.output" &&
+      String(event.payload.text).includes(
+        "Bob now holds the valid fencing token.",
+      ),
+  );
+  if (delivered?.status === "delivered" && observed) {
+    queuedDeliveryView = current;
+    break;
+  }
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+}
+if (!queuedDeliveryView) {
+  throw new Error("queued note was not durably delivered to the next provider run");
+}
+const deliveredMessage = queuedDeliveryView.snapshot.queued_messages.find(
+  (message) => message.id === bobQueued.message_id,
+);
+if (deliveredMessage?.status !== "delivered") {
+  throw new Error(
+    `queued note was not delivered on the next run: ${deliveredMessage?.status}`,
+  );
+}
+const queuedPromptObserved = queuedDeliveryView.snapshot.events.some(
+  (event) =>
+    event.aggregate_id === queuedLaunch.run_id &&
+    event.type === "run.output" &&
+    String(event.payload.text).includes("Bob now holds the valid fencing token."),
+);
+if (!queuedPromptObserved) {
+  throw new Error("the provider prompt omitted the queued operator note");
+}
+await waitForRun(
+  transferDemo.corp_id,
+  transferDemo.bob_actor_id,
+  queuedLaunch.run_id,
+  true,
+);
 
 const stopDemo = await post("/api/demo/reset", {});
 await post(
@@ -197,21 +269,23 @@ for (const required of ["run.stop_requested", "run.cancelled"]) {
   }
 }
 
-console.log(
-  JSON.stringify(
-    {
-      concurrent_winner: winner.name,
-      concurrent_loser: loser.name,
-      renewal_rotated_token: renewed.token !== winner.result.token,
-      stale_token_status: stale.status,
-      release_then_claim: loserClaim.acquired,
-      transfer_holder: transferred.holder_actor_id,
-      shared_snapshot_hides_token: true,
-      transferred_controller_fenced: aliceAfterTransfer.status === 409,
-      unauthorized_stop_status: forbiddenStop.status,
-      emergency_stop_run_status: stopped.run.status,
-    },
-    null,
-    2,
-  ),
+const report = {
+  checked_at: new Date().toISOString(),
+  concurrent_winner: winner.name,
+  concurrent_loser: loser.name,
+  renewal_rotated_token: renewed.token !== winner.result.token,
+  stale_token_status: stale.status,
+  release_then_claim: loserClaim.acquired,
+  transfer_holder: transferred.holder_actor_id,
+  shared_snapshot_hides_token: true,
+  transferred_controller_fenced: aliceAfterTransfer.status === 409,
+  queued_note_delivered: deliveredMessage.status === "delivered",
+  queued_note_observed_by_provider: queuedPromptObserved,
+  unauthorized_stop_status: forbiddenStop.status,
+  emergency_stop_run_status: stopped.run.status,
+};
+await writeFile(
+  path.join(root, "output", "e2e-leases.json"),
+  `${JSON.stringify(report, null, 2)}\n`,
 );
+console.log(JSON.stringify(report, null, 2));

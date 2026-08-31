@@ -40,8 +40,8 @@ use crony_protocol::{
     VerificationDecisionResponse,
 };
 use crony_store::{
-    LaunchRecord, NewRoomMessageInput, PendingRunnerCommand, PgStore, RunClaim, RunnerConnectInput,
-    RunnerEventInput,
+    LaunchRecord, NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage, RunClaim,
+    RunnerConnectInput, RunnerEventInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -76,6 +76,14 @@ struct Args {
 
     #[arg(long, env = "CRONY_RUNNER_GRACE_SECS", default_value_t = 5)]
     runner_grace_secs: i64,
+
+    #[arg(
+        long,
+        env = "CRONY_RUNNER_STARTUP_RECOVERY",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    runner_startup_recovery: bool,
 
     #[arg(
         long,
@@ -256,6 +264,11 @@ async fn main() -> anyhow::Result<()> {
 
     let store = PgStore::connect(&args.database_url).await?;
     store.migrate().await?;
+    let persisted_runner_recovery = if args.runner_startup_recovery {
+        store.runner_records_requiring_recovery().await?
+    } else {
+        Vec::new()
+    };
     let auth = AuthService::initialize(
         args.mode,
         args.oidc_issuer.clone(),
@@ -289,6 +302,43 @@ async fn main() -> anyhow::Result<()> {
         artifacts,
         artifact_retention_days: args.artifact_retention_days.clamp(1, 3_650),
     };
+    for runner in persisted_runner_recovery {
+        let grace_deadline = if runner.status == "connected" {
+            let events = state
+                .store
+                .runner_disconnected(&runner.id, runner.connection_epoch, state.runner_grace_secs)
+                .await?;
+            for event in events {
+                publish(&state, event);
+            }
+            Utc::now() + ChronoDuration::seconds(state.runner_grace_secs)
+        } else {
+            runner.grace_expires_at.unwrap_or_else(Utc::now)
+        };
+        let delay_millis = (grace_deadline - Utc::now()).num_milliseconds().max(0) as u64;
+        let recovery_state = state.clone();
+        let recovery_runner_id = runner.id.clone();
+        let recovery_epoch = runner.connection_epoch;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_millis)).await;
+            match recovery_state
+                .store
+                .expire_runner_grace(&recovery_runner_id, recovery_epoch)
+                .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        publish(&recovery_state, event);
+                    }
+                }
+                Err(error) => warn!(
+                    %error,
+                    runner_id = %recovery_runner_id,
+                    "startup runner recovery failed"
+                ),
+            }
+        });
+    }
 
     let protected = Router::new()
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
@@ -421,10 +471,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let runners = match state.store.connected_runner_count().await {
+        Ok(count) => usize::try_from(count).unwrap_or_default(),
+        Err(error) => {
+            warn!(%error, "health check could not read authoritative runner count");
+            state.runners.len()
+        }
+    };
     Json(HealthResponse {
         status: "ok",
         service: "crony-server",
-        runners: state.runners.len(),
+        runners,
         mode: match state.auth.mode() {
             ServerMode::Development => "development",
             ServerMode::Production => "production",
@@ -648,8 +705,11 @@ async fn revoke_runner(
     if let Some(event) = outcome.event {
         publish(&state, event);
     }
+    for event in outcome.run_events {
+        publish(&state, event);
+    }
     if outcome.revoked
-        && let Some(connection) = state.runners.get(&runner_id)
+        && let Some((_, connection)) = state.runners.remove(&runner_id)
         && connection.corp_id == corp_id
     {
         let _ = connection.tx.send(ServerToRunner::Disconnect {
@@ -911,10 +971,6 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
         if sender.send(outgoing).is_err() {
             break;
         }
-        state
-            .store
-            .mark_runner_command_dispatched(command.id)
-            .await?;
     }
     Ok(())
 }
@@ -1271,7 +1327,7 @@ async fn schedule_ready_tasks(
             ));
             continue;
         };
-        let (record, event) = match state
+        let (mut record, event) = match state
             .store
             .create_task_run(
                 corp_id,
@@ -1291,6 +1347,30 @@ async fn schedule_ready_tasks(
                 continue;
             }
         };
+        let dependency_context = match resolve_dependency_context(state, &record).await {
+            Ok(context) => context,
+            Err(error) => {
+                if let Ok(event) = state
+                    .store
+                    .fail_run_before_dispatch(
+                        corp_id,
+                        record.run_id,
+                        &format!("dependency context could not be verified: {error}"),
+                    )
+                    .await
+                {
+                    publish(state, event);
+                }
+                outcome.failures.push(format!(
+                    "task {} dependency context failed: {error}",
+                    candidate.task_id
+                ));
+                continue;
+            }
+        };
+        if !dependency_context.is_empty() {
+            record.mission_title.push_str(&dependency_context);
+        }
         let secrets = match resolve_run_secrets(state, &record, &runner_id).await {
             Ok(secrets) => secrets,
             Err(error) => {
@@ -1312,7 +1392,7 @@ async fn schedule_ready_tasks(
                 continue;
             }
         };
-        runner_tx
+        if runner_tx
             .send(ServerToRunner::StartRun {
                 corp_id: record.corp_id,
                 room_id: record.room_id,
@@ -1328,11 +1408,108 @@ async fn schedule_ready_tasks(
                 verification_policy: record.verification_policy.clone(),
                 secrets,
             })
-            .map_err(|_| anyhow::anyhow!("runner disconnected before accepting the run"))?;
+            .is_err()
+        {
+            let reason = "runner disconnected before accepting the run";
+            if let Ok(event) = state
+                .store
+                .fail_run_before_dispatch(corp_id, record.run_id, reason)
+                .await
+            {
+                publish(state, event);
+            }
+            outcome
+                .failures
+                .push(format!("task {} {reason}", candidate.task_id));
+            continue;
+        }
         publish(state, event);
         outcome.records.push((record, runner_id));
     }
     Ok(outcome)
+}
+
+async fn resolve_dependency_context(
+    state: &AppState,
+    record: &LaunchRecord,
+) -> anyhow::Result<String> {
+    const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+    let dependencies = state
+        .store
+        .dependency_artifacts(record.corp_id, record.task_id)
+        .await?;
+    if dependencies.is_empty() {
+        return Ok(String::new());
+    }
+    let mut context = String::from(
+        "\n\nVERIFIED DEPENDENCY OUTPUTS:\n\
+         Use these completed specialist artifacts as source material. Reconcile their tradeoffs \
+         and do not claim synthesis without addressing each one.\n",
+    );
+    for dependency in dependencies {
+        let bytes = state.artifacts.read_verified(&dependency.artifact).await?;
+        let header = format!(
+            "\n--- {} / {} / task {} / run {} / sha256 {} ---\n",
+            dependency.plan_key,
+            dependency.task_title,
+            dependency.task_id,
+            dependency.artifact.run_id,
+            dependency.artifact.sha256,
+        );
+        if context.len().saturating_add(header.len()) >= MAX_CONTEXT_BYTES {
+            break;
+        }
+        context.push_str(&header);
+        if let Some(summary) = dependency.run_summary {
+            context.push_str("Completion summary: ");
+            context.push_str(&summary);
+            context.push('\n');
+        }
+        if dependency.artifact.media_type.starts_with("text/")
+            || dependency.artifact.media_type == "application/json"
+        {
+            let text = String::from_utf8(bytes.to_vec())
+                .context("dependency artifact text is not valid UTF-8")?;
+            let remaining = MAX_CONTEXT_BYTES.saturating_sub(context.len());
+            if remaining == 0 {
+                break;
+            }
+            if text.len() <= remaining {
+                context.push_str(&text);
+            } else {
+                let mut boundary = remaining;
+                while boundary > 0 && !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                context.push_str(&text[..boundary]);
+                context
+                    .push_str("\n[dependency artifact truncated at the bounded context limit]\n");
+                break;
+            }
+        } else {
+            context.push_str(&format!(
+                "Binary artifact: {} bytes, media type {}\n",
+                dependency.artifact.bytes, dependency.artifact.media_type
+            ));
+        }
+    }
+    Ok(context)
+}
+
+fn append_operator_notes(prompt: &mut String, messages: &[QueuedRunMessage]) {
+    if messages.is_empty() {
+        return;
+    }
+    prompt.push_str(
+        "\n\nQUEUED OPERATOR NOTES:\n\
+         These durable notes were queued while the agent was off shift. Address each note in this turn.\n",
+    );
+    for message in messages {
+        prompt.push_str(&format!(
+            "- message {} from actor {}: {}\n",
+            message.id, message.actor_id, message.text
+        ));
+    }
 }
 
 async fn resolve_run_secrets(
@@ -1584,15 +1761,37 @@ async fn resume_run(
         .create_resume_run(corp_id, source_run_id, requested_by)
         .await
         .map_err(ApiError::conflict)?;
-    let runner = state
-        .runners
-        .get(&record.runner_id)
-        .ok_or_else(|| ApiError::conflict("source run's runner is disconnected"))?;
+    let Some(runner) = state.runners.get(&record.runner_id) else {
+        let failure = state
+            .store
+            .fail_run_before_dispatch(
+                corp_id,
+                record.run_id,
+                "source run's runner is disconnected",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        publish(&state, failure);
+        return Err(ApiError::conflict("source run's runner is disconnected"));
+    };
     if runner.corp_id != corp_id {
+        drop(runner);
+        let failure = state
+            .store
+            .fail_run_before_dispatch(
+                corp_id,
+                record.run_id,
+                "source run's runner is enrolled to a different Corp",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        publish(&state, failure);
         return Err(ApiError::forbidden(
             "source run's runner is enrolled to a different Corp",
         ));
     }
+    let runner_tx = runner.tx.clone();
+    drop(runner);
     let launch_record = LaunchRecord {
         corp_id: record.corp_id,
         room_id: record.room_id,
@@ -1608,7 +1807,10 @@ async fn resume_run(
         reasoning_effort: record.reasoning_effort.clone(),
         verification_policy: record.verification_policy.clone(),
         secret_refs: record.secret_refs.clone(),
+        queued_messages: record.queued_messages.clone(),
     };
+    let mut resume_prompt = prompt.to_owned();
+    append_operator_notes(&mut resume_prompt, &record.queued_messages);
     let secrets = match resolve_run_secrets(&state, &launch_record, &record.runner_id).await {
         Ok(secrets) => secrets,
         Err(error) => {
@@ -1627,8 +1829,7 @@ async fn resume_run(
             ));
         }
     };
-    runner
-        .tx
+    if runner_tx
         .send(ServerToRunner::ResumeRun {
             corp_id: record.corp_id,
             room_id: record.room_id,
@@ -1640,13 +1841,28 @@ async fn resume_run(
             assignment_token: record.assignment_token,
             adapter: record.adapter,
             provider_session_id: record.provider_session_id.clone(),
-            prompt: prompt.to_owned(),
+            prompt: resume_prompt,
             model: record.model,
             reasoning_effort: record.reasoning_effort,
             verification_policy: record.verification_policy,
             secrets,
         })
-        .map_err(|_| ApiError::conflict("runner disconnected before accepting resume"))?;
+        .is_err()
+    {
+        let failure = state
+            .store
+            .fail_run_before_dispatch(
+                corp_id,
+                record.run_id,
+                "runner disconnected before accepting resume",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        publish(&state, failure);
+        return Err(ApiError::conflict(
+            "runner disconnected before accepting resume",
+        ));
+    }
     publish(&state, event);
     Ok(Json(ResumeRunResponse {
         run_id: record.run_id,
@@ -1805,26 +2021,48 @@ async fn queue_message(
         )
         .await
         .map_err(ApiError::conflict)?;
+    let message_id = outcome.message.id;
+    let mut delivery = outcome.delivery.clone();
     publish(&state, outcome.event);
 
-    if outcome.delivery == "immediate"
-        && let (Some(run_id), Some(runner_id)) = (outcome.run_id, outcome.runner_id)
-        && let Some(runner) = state.runners.get(&runner_id)
-        && let Some(lease_token) = request.lease_token
-    {
-        let _ = runner.tx.send(ServerToRunner::ControlMessage {
-            corp_id,
-            run_id,
-            agent_id,
-            actor_id,
-            lease_token,
-            text: request.text,
-        });
+    if delivery == "immediate" {
+        let sent = if let (Some(run_id), Some(runner_id), Some(lease_token)) =
+            (outcome.run_id, outcome.runner_id, request.lease_token)
+        {
+            state.runners.get(&runner_id).is_some_and(|runner| {
+                runner
+                    .tx
+                    .send(ServerToRunner::ControlMessage {
+                        corp_id,
+                        run_id,
+                        agent_id,
+                        actor_id,
+                        lease_token,
+                        text: request.text.clone(),
+                    })
+                    .is_ok()
+            })
+        } else {
+            false
+        };
+        if !sent {
+            let event = state
+                .store
+                .requeue_control_message(
+                    corp_id,
+                    message_id,
+                    "runner disconnected before live control delivery",
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            publish(&state, event);
+            delivery = "queued".to_owned();
+        }
     }
 
     Ok(Json(QueueMessageResponse {
-        message_id: outcome.message.id,
-        delivery: outcome.delivery,
+        message_id,
+        delivery,
     }))
 }
 
@@ -2081,6 +2319,45 @@ async fn browser_socket(
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "browser event subscriber lagged");
+                        loop {
+                            let replay = match state
+                                .store
+                                .events_after(corp_id, actor_id, cursor, 500)
+                                .await
+                            {
+                                Ok(replay) => replay,
+                                Err(error) => {
+                                    warn!(
+                                        %error,
+                                        %corp_id,
+                                        cursor,
+                                        "browser lag recovery query failed"
+                                    );
+                                    return;
+                                }
+                            };
+                            if replay.is_empty() {
+                                break;
+                            }
+                            let page_len = replay.len();
+                            for event in replay {
+                                cursor = cursor.max(event.seq);
+                                if send_json(
+                                    &mut sender,
+                                    &BrowserSocketMessage::Event {
+                                        event: Box::new(event),
+                                    },
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if page_len < 500 {
+                                break;
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -2313,34 +2590,108 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             "runner heartbeat persisted"
                         );
                     }
-                    Ok(false) => warn!(%runner_id, "runner heartbeat epoch was rejected"),
+                    Ok(false) => {
+                        warn!(%runner_id, "runner heartbeat epoch was rejected");
+                        let is_current = state
+                            .runners
+                            .get(&runner_id)
+                            .is_some_and(|entry| entry.connection_epoch == connection_epoch);
+                        if is_current
+                            && let Some((_, connection)) = state.runners.remove(&runner_id)
+                        {
+                            let _ = connection.tx.send(ServerToRunner::Disconnect {
+                                reason: "runner heartbeat was rejected by authoritative state"
+                                    .to_owned(),
+                                reconnect_delay_ms: 2_000,
+                            });
+                        }
+                    }
                     Err(error) => warn!(%error, %runner_id, "runner heartbeat persistence failed"),
+                }
+            }
+            RunnerToServer::CommandAck {
+                runner_id,
+                connection_epoch,
+                command_id,
+                applied,
+                detail,
+            } => {
+                let registered_current =
+                    registered
+                        .as_ref()
+                        .is_some_and(|(registered_id, _, epoch)| {
+                            registered_id == &runner_id && *epoch == connection_epoch
+                        })
+                        && state
+                            .runners
+                            .get(&runner_id)
+                            .is_some_and(|entry| entry.connection_epoch == connection_epoch);
+                if !registered_current {
+                    warn!(%runner_id, %command_id, "command ack came from a stale runner socket");
+                    continue;
+                }
+                if !applied {
+                    warn!(%runner_id, %command_id, %detail, "runner could not apply durable command");
+                    continue;
+                }
+                match state
+                    .store
+                    .acknowledge_runner_command(command_id, &runner_id)
+                    .await
+                {
+                    Ok(Some(event)) => {
+                        publish(&state, event);
+                        info!(%runner_id, %command_id, %detail, "durable runner command acknowledged");
+                    }
+                    Ok(None) => {
+                        tracing::debug!(%runner_id, %command_id, "runner command ack was duplicate")
+                    }
+                    Err(error) => {
+                        warn!(%error, %runner_id, %command_id, "runner command ack persistence failed")
+                    }
                 }
             }
             RunnerToServer::RunEvent {
                 event_id,
                 runner_id,
                 corp_id,
+                connection_epoch,
                 run_id,
                 agent_id,
+                assignment_token,
                 event_type,
                 payload,
             } => {
-                if !registered
-                    .as_ref()
-                    .is_some_and(|(registered_id, registered_corp, _)| {
-                        registered_id == &runner_id && *registered_corp == corp_id
-                    })
-                {
-                    warn!(%runner_id, "run event runner id does not match registered socket");
+                let registered_epoch =
+                    registered
+                        .as_ref()
+                        .and_then(|(registered_id, registered_corp, epoch)| {
+                            (registered_id == &runner_id
+                                && *registered_corp == corp_id
+                                && *epoch == connection_epoch)
+                                .then_some(*epoch)
+                        });
+                let current_epoch = state
+                    .runners
+                    .get(&runner_id)
+                    .map(|entry| entry.connection_epoch);
+                if registered_epoch.is_none() || registered_epoch != current_epoch {
+                    warn!(
+                        %runner_id,
+                        ?registered_epoch,
+                        ?current_epoch,
+                        "run event came from an unregistered or superseded runner socket"
+                    );
                     continue;
                 }
                 let input = RunnerEventInput {
                     event_id,
                     runner_id: runner_id.clone(),
                     corp_id,
+                    connection_epoch,
                     run_id,
                     agent_id,
+                    assignment_token,
                     event_type: event_type.clone(),
                     payload,
                 };
@@ -2358,8 +2709,10 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             event_id,
                             runner_id: runner_id.clone(),
                             corp_id,
+                            connection_epoch,
                             run_id,
                             agent_id,
+                            assignment_token,
                             event_type: applied_event_type.clone(),
                             payload: json!({"error": reason}),
                         })
@@ -2367,7 +2720,57 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 }
                 match result {
                     Ok(Some(event)) => {
+                        let approval_expiry = if applied_event_type == "run.approval_requested" {
+                            event
+                                .payload
+                                .get("approval_id")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|value| Uuid::parse_str(value).ok())
+                                .map(|approval_id| {
+                                    let delay = event
+                                        .payload
+                                        .get("expires_in_seconds")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .unwrap_or(300)
+                                        .clamp(1, 3_600);
+                                    (approval_id, delay)
+                                })
+                        } else {
+                            None
+                        };
                         publish(&state, event);
+                        if let Some((approval_id, delay)) = approval_expiry {
+                            let expiry_state = state.clone();
+                            let expiry_runner_id = runner_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                match expiry_state.store.expire_action_approval(approval_id).await {
+                                    Ok(Some(outcome)) => {
+                                        if let Some(event) = outcome.event {
+                                            publish(&expiry_state, event);
+                                        }
+                                        if let Err(error) = dispatch_pending_runner_commands(
+                                            &expiry_state,
+                                            &expiry_runner_id,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                %error,
+                                                %approval_id,
+                                                "expired approval command dispatch failed"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => warn!(
+                                        %error,
+                                        %approval_id,
+                                        "action approval expiry failed"
+                                    ),
+                                }
+                            });
+                        }
                         if matches!(
                             applied_event_type.as_str(),
                             "run.usage" | "run.tool_activity"
@@ -2476,6 +2879,7 @@ async fn process_runner_event(
             input.run_id,
             input.agent_id,
             &input.runner_id,
+            input.assignment_token,
         )
         .await?;
     let retention_until = Utc::now() + ChronoDuration::days(state.artifact_retention_days);

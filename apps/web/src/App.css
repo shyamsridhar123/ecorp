@@ -2504,3 +2504,478 @@ html {
     grid-column: 1;
   }
 }
+
+/* Governed-operation clarity and accessibility */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.button,
+.workspace-nav a,
+.workspace-nav button,
+.mission-examples button,
+.room-message-foot button,
+.reply-context button,
+.transfer-control,
+.emergency-stop,
+.interrupt-run {
+  min-height: 44px;
+}
+
+.button {
+  font-size: 12px;
+}
+
+button:focus-visible,
+.mission-card:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--marigold);
+  outline-offset: 3px;
+}
+
+.office-agent:focus-visible {
+  outline: 3px solid var(--marigold);
+  outline-offset: 3px;
+}
+
+.lease-label,
+.control-note,
+.verification-actions small,
+.mission-field small,
+.mission-run-toggle small,
+.developer-mode-toggle small,
+.mission-submit-note,
+.agent-roster button small {
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.transfer-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.transfer-row label {
+  font: 700 12px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.transfer-row select {
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px;
+  color: var(--ink);
+  border: 1px solid var(--ink);
+  background: var(--paper-light);
+}
+
+.transfer-row .transfer-control {
+  width: auto;
+  margin: 0;
+}
+
+.control-note {
+  grid-column: 1 / -1;
+  color: var(--ink-soft);
+}
+
+.task-graph-item {
+  border-left: 3px solid var(--marigold);
+  background: var(--paper-light);
+}
+
+.task-graph-item .task-graph-row {
+  min-height: 44px;
+  border-left: 0;
+  cursor: pointer;
+}
+
+.task-contract {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: #efe8d3;
+}
+
+.task-contract p,
+.task-contract ul {
+  margin: 0;
+}
+
+.task-contract dl {
+  grid-template-columns: 1fr;
+}
+
+.task-contract dt,
+.task-contract strong {
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.task-contract dd,
+.task-contract li {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.verification-box {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  font-size: 12px;
+}
+
+.evidence-checks {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 7px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  text-transform: none;
+}
+
+.evidence-check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  padding: 8px;
+  color: var(--ink);
+  border-left: 4px solid var(--line);
+  background: var(--paper-light);
+}
+
+.evidence-check-passed {
+  border-left-color: var(--mint);
+}
+
+.evidence-check-failed {
+  border-left-color: var(--signal);
+}
+
+.evidence-check p {
+  grid-column: 1 / -1;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.terminal-summary {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.terminal-summary p,
+.terminal-summary small {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.terminal-failed,
+.terminal-cancelled,
+.terminal-lost {
+  border-left: 5px solid var(--signal);
+}
+
+.terminal-completed {
+  border-left: 5px solid var(--mint);
+}
+
+.verification-actions small {
+  grid-column: 1 / -1;
+  color: #6f1c15;
+}
+
+.developer-mode-toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px dashed var(--line);
+  background: var(--paper-light);
+  cursor: pointer;
+}
+
+.developer-mode-toggle input {
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--signal);
+}
+
+.developer-mode-toggle strong,
+.developer-mode-toggle small {
+  display: block;
+}
+
+.developer-mode-toggle strong {
+  font: 700 12px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.runner-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  padding: 0 18px 18px;
+}
+
+.runner-card {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--signal);
+  background: var(--paper);
+}
+
+.runner-card-connected {
+  border-left-color: var(--mint);
+}
+
+.runner-card-grace {
+  border-left-color: var(--marigold);
+}
+
+.runner-card > div,
+.runner-card li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 10px;
+}
+
+.runner-card > small,
+.runner-card li small {
+  flex-basis: 100%;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.runner-card ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runner-card li {
+  padding-top: 6px;
+  font-size: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.entity-link {
+  min-height: 32px;
+  color: #6b4810;
+  border: 1px solid var(--line);
+  background: #f3ddb0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.artifact-download {
+  min-height: 32px;
+  padding: 3px 6px;
+  color: inherit;
+  font: 700 12px/1.2 var(--mono);
+  border: 1px solid currentColor;
+  background: transparent;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.production-connect {
+  margin-top: 8vh;
+}
+
+.production-connect form {
+  display: grid;
+  gap: 9px;
+  margin-top: 22px;
+}
+
+.production-connect label {
+  font: 700 12px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.production-connect input {
+  min-height: 44px;
+  padding: 9px 10px;
+  color: var(--ink);
+  border: 1px solid var(--ink);
+  background: var(--paper-light);
+}
+
+.approval-queue .verification-card {
+  grid-template-columns: 1fr;
+}
+
+.operations-summary span,
+.event-seq,
+.event-actor,
+.event-row time,
+.event-type,
+.room-message-head span,
+.room-message-head time,
+.mention-chip,
+.entity-link {
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+@media (max-width: 720px) {
+  html,
+  body,
+  #root {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  .topbar {
+    gap: 14px;
+    padding: 14px;
+  }
+
+  .brand-lockup,
+  .brand-row,
+  .operator-console,
+  .journey-heading,
+  .journey-heading > *,
+  .panel-heading,
+  .floor-panel,
+  .mission-panel {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .brand-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+  }
+
+  .brand-mark {
+    flex: 0 0 auto;
+  }
+
+  .brand-row h1 {
+    min-width: 0;
+    font-size: clamp(30px, 12vw, 42px);
+  }
+
+  .alpha-stamp {
+    grid-column: 1 / -1;
+    max-width: 100%;
+    margin-left: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .operator-console {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .operator-console label {
+    grid-column: 1 / -1;
+  }
+
+  .operator-console select {
+    min-width: 0;
+  }
+
+  .workspace-nav {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
+  .workspace-nav a,
+  .workspace-nav button {
+    flex: 1 1 145px;
+    text-align: center;
+  }
+
+  .workspace-nav button {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .journey-heading {
+    padding: 16px;
+    overflow: hidden;
+  }
+
+  .journey-heading h2 {
+    font-size: clamp(26px, 10vw, 38px);
+    overflow-wrap: anywhere;
+  }
+
+  .journey-heading p {
+    overflow-wrap: anywhere;
+  }
+
+  .panel-heading {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .event-row {
+    grid-template-columns: 44px minmax(0, 1fr);
+    align-items: start;
+    padding: 7px 0;
+  }
+
+  .event-seq {
+    grid-row: 1 / span 4;
+  }
+
+  .event-type,
+  .event-detail,
+  .event-actor,
+  .event-row time {
+    grid-column: 2;
+    display: block;
+    width: auto;
+  }
+
+  .event-row > * {
+    padding: 4px 9px;
+    white-space: normal;
+  }
+
+  .floor-legend {
+    justify-content: start;
+  }
+
+  .transfer-row {
+    grid-template-columns: 1fr;
+  }
+
+  .transfer-row .transfer-control {
+    width: 100%;
+  }
+}

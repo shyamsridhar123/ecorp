@@ -169,6 +169,10 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             .into_iter()
             .find(|agent| agent.role == "manager")
             .unwrap_or(first);
+        let (first_model, first_reasoning) = provider_settings(request, &first.adapter);
+        let (second_model, second_reasoning) = provider_settings(request, &second.adapter);
+        let (synthesis_model, synthesis_reasoning) =
+            provider_settings(request, &synthesizer.adapter);
 
         let total_budget = request.budget_tokens.unwrap_or(280_000);
         let total_cost_budget = request.budget_cost_microusd.unwrap_or(3_000_000);
@@ -185,8 +189,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             synthesis_budget,
         );
         synthesis_contract.budget_cost_microusd = synthesis_cost_budget;
-        synthesis_contract.model = request.preferred_model.map(str::to_owned);
-        synthesis_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+        synthesis_contract.model = synthesis_model;
+        synthesis_contract.reasoning_effort = synthesis_reasoning;
         synthesis_contract.references = vec![
             "task:specialist-a".to_owned(),
             "task:specialist-b".to_owned(),
@@ -211,8 +215,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                             specialist_budget,
                         );
                         contract.budget_cost_microusd = specialist_cost_budget;
-                        contract.model = request.preferred_model.map(str::to_owned);
-                        contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+                        contract.model = first_model;
+                        contract.reasoning_effort = first_reasoning;
                         contract
                     },
                     assigned_agent_id: first.id,
@@ -235,8 +239,8 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
                             specialist_budget,
                         );
                         contract.budget_cost_microusd = specialist_cost_budget;
-                        contract.model = request.preferred_model.map(str::to_owned);
-                        contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+                        contract.model = second_model;
+                        contract.reasoning_effort = second_reasoning;
                         contract
                     },
                     assigned_agent_id: second.id,
@@ -427,6 +431,20 @@ fn verification_plan(
             verification_policy,
         }],
     })
+}
+
+fn provider_settings(
+    request: &PlanningRequest<'_>,
+    adapter: &str,
+) -> (Option<String>, Option<String>) {
+    if request.preferred_adapter == Some(adapter) {
+        (
+            request.preferred_model.map(str::to_owned),
+            request.reasoning_effort.map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 fn ordered_candidates(agents: &[Agent]) -> Vec<&Agent> {
@@ -972,6 +990,42 @@ mod tests {
             plan.tasks[0].contract.budget_tokens,
             DEFAULT_SINGLE_TASK_BUDGET_TOKENS
         );
+    }
+
+    #[test]
+    fn parallel_strategy_scopes_model_settings_to_matching_adapters() {
+        let agents = agents();
+        let registry = StrategyRegistry::new();
+        let plan = registry
+            .plan(
+                "parallel-specialists",
+                &PlanningRequest {
+                    mission_title: "compare two bounded approaches",
+                    preferred_adapter: Some("codex"),
+                    preferred_model: Some("gpt-5.6-sol"),
+                    reasoning_effort: Some("high"),
+                    secret_refs: &[],
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
+                },
+                &agents,
+            )
+            .expect("parallel plan");
+        let codex = plan
+            .tasks
+            .iter()
+            .find(|task| task.required_adapter == "codex")
+            .expect("codex specialist");
+        assert_eq!(codex.contract.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(codex.contract.reasoning_effort.as_deref(), Some("high"));
+        for task in plan
+            .tasks
+            .iter()
+            .filter(|task| task.required_adapter != "codex")
+        {
+            assert_eq!(task.contract.model, None);
+            assert_eq!(task.contract.reasoning_effort, None);
+        }
     }
 
     #[test]

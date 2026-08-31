@@ -98,7 +98,8 @@ jobs:
             --source-repository "$PWD" \
             --source-base-ref HEAD \
             --fake-agent-script "$PWD/scripts/fake-agent.mjs" \
-            --codex-command "$PWD/scripts/fake-codex-app-server.mjs" \
+            --codex-command node \
+            --codex-command-arg "$PWD/scripts/fake-codex-app-server.mjs" \
             --claude-command node \
             --claude-command-arg "$PWD/scripts/fake-external-agent.mjs" \
             --opencode-command node \
@@ -154,9 +155,16 @@ jobs:
       - name: Verify scoped secret brokering without plaintext leakage
         run: node tools/e2e_secrets.mjs
       - name: Verify durable risky-action approvals and exactly-once decision effects
+        env:
+          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.pid
+          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
+          CRONY_TEST_SERVER_BIND: 127.0.0.1:8791
+          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
         run: node tools/e2e_approvals.mjs
       - name: Verify budget and loop circuit-breaker stages
         run: node tools/e2e_budgets.mjs
+      - name: Verify terminal provider cleanup and off-shift agent state
+        run: node tools/e2e_idle_cleanup.mjs
       - name: Run the versioned 100-scenario deterministic evaluation lane
         run: node tools/run_evals.mjs
       - name: Consolidate chaos and restart evidence
@@ -181,11 +189,13 @@ jobs:
             output/e2e-secrets.json
             output/e2e-approvals.json
             output/e2e-budgets.json
+            output/e2e-idle-cleanup.json
             output/e2e-chaos.json
             output/eval-report.json
             output/e2e-runner-reconnect.json
             output/e2e-idempotency.json
             output/e2e-replay.json
+            output/e2e-leases.json
             output/server-ci.log
             output/runner-ci.log
             output/runner/**/result.md

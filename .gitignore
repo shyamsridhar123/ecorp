@@ -1,4 +1,5 @@
 **/target/
+/target-audit/
 /node_modules/
 **/node_modules/
 **/dist/

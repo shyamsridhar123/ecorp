@@ -144,6 +144,7 @@ if (-not $controlOutput) {
 }
 
 $adapterCapability = $snapshot.runners |
+    Where-Object connected |
     ForEach-Object capabilities |
     Where-Object name -eq 'fake-process' |
     Select-Object -First 1

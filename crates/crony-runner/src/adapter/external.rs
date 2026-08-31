@@ -187,9 +187,11 @@ impl ExternalCliAdapter {
                         }).to_string());
                     }
                     Some(AdapterControl::CircuitBreaker { stage, reason }) => {
-                        if stage == "stop" {
+                        if matches!(stage.as_str(), "suspend" | "stop") {
                             child.kill().await.context("stop provider at circuit breaker")?;
-                            cancelled = Some(reason);
+                            cancelled = Some(format!(
+                                "Circuit breaker {stage} checkpoint: {reason}"
+                            ));
                             break;
                         }
                         let _ = input_tx.send(json!({

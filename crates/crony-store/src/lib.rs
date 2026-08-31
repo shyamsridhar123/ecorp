@@ -70,6 +70,7 @@ pub struct LaunchRecord {
     pub reasoning_effort: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
+    pub queued_messages: Vec<QueuedRunMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,14 @@ pub struct ResumeLaunchRecord {
     pub reasoning_effort: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
+    pub queued_messages: Vec<QueuedRunMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedRunMessage {
+    pub id: Uuid,
+    pub actor_id: Uuid,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +218,7 @@ pub struct RunnerAuthenticationOutcome {
 pub struct RunnerRevocationOutcome {
     pub revoked: bool,
     pub event: Option<DomainEvent>,
+    pub run_events: Vec<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,12 +285,23 @@ pub struct StoredArtifact {
 }
 
 #[derive(Debug, Clone)]
+pub struct DependencyArtifactContext {
+    pub task_id: Uuid,
+    pub plan_key: String,
+    pub task_title: String,
+    pub run_summary: Option<String>,
+    pub artifact: StoredArtifact,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerEventInput {
     pub event_id: Uuid,
     pub runner_id: String,
     pub corp_id: Uuid,
+    pub connection_epoch: Uuid,
     pub run_id: Uuid,
     pub agent_id: Uuid,
+    pub assignment_token: Uuid,
     pub event_type: String,
     pub payload: Value,
 }
@@ -893,10 +914,14 @@ impl PgStore {
                 "viewer actor does not belong to the requested Corp"
             ));
         }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let corp = map_corp(
             sqlx::query("SELECT id, slug, name, created_at FROM corps WHERE id = $1")
                 .bind(corp_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .context("corp not found")?,
         );
@@ -905,7 +930,7 @@ impl PgStore {
             "SELECT id, corp_id, name, kind, role, created_at FROM actors WHERE corp_id = $1 ORDER BY created_at, name",
         )
         .bind(corp_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_actor)
@@ -922,7 +947,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_room)
@@ -936,7 +961,7 @@ impl PgStore {
             "#,
         )
         .bind(corp_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_agent)
@@ -955,7 +980,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_mission)
@@ -977,7 +1002,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_task)
@@ -996,7 +1021,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let mut dependencies = HashMap::<Uuid, Vec<Uuid>>::new();
         for row in dependency_rows {
@@ -1033,7 +1058,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_run)
@@ -1047,7 +1072,7 @@ impl PgStore {
             "#,
         )
         .bind(corp_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_lease)
@@ -1060,7 +1085,7 @@ impl PgStore {
             "#,
         )
         .bind(corp_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_queued_message)
@@ -1068,19 +1093,25 @@ impl PgStore {
 
         let room_messages = sqlx::query(
             r#"
-            SELECT msg.id, msg.corp_id, msg.room_id, msg.actor_id, msg.thread_root_id,
-                   msg.reply_to_id, msg.body, msg.mentions, msg.link_kind, msg.link_id,
-                   msg.created_at
-            FROM room_messages msg
-            JOIN room_memberships rm ON rm.room_id = msg.room_id
-            WHERE msg.corp_id = $1 AND rm.actor_id = $2
-            ORDER BY msg.created_at ASC
-            LIMIT 500
+            WITH latest AS (
+                SELECT msg.id, msg.corp_id, msg.room_id, msg.actor_id, msg.thread_root_id,
+                       msg.reply_to_id, msg.body, msg.mentions, msg.link_kind, msg.link_id,
+                       msg.created_at
+                FROM room_messages msg
+                JOIN room_memberships rm ON rm.room_id = msg.room_id
+                WHERE msg.corp_id = $1 AND rm.actor_id = $2
+                ORDER BY msg.created_at DESC
+                LIMIT 500
+            )
+            SELECT id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
+                   body, mentions, link_kind, link_id, created_at
+            FROM latest
+            ORDER BY created_at ASC
             "#,
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_room_message)
@@ -1102,7 +1133,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_verification_evidence)
@@ -1124,7 +1155,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_verification_request)
@@ -1146,7 +1177,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_action_approval)
@@ -1168,7 +1199,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_circuit_breaker_incident)
@@ -1194,14 +1225,14 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(map_event)
         .collect::<Vec<_>>();
         events.reverse();
 
-        Ok(CorpSnapshot {
+        let snapshot = CorpSnapshot {
             corp,
             actors,
             rooms,
@@ -1217,7 +1248,9 @@ impl PgStore {
             action_approvals,
             circuit_breaker_incidents,
             events,
-        })
+        };
+        tx.commit().await?;
+        Ok(snapshot)
     }
 
     pub async fn events_after(
@@ -1518,9 +1551,18 @@ impl PgStore {
             return Ok(RunnerRevocationOutcome {
                 revoked: false,
                 event: None,
+                run_events: Vec::new(),
             });
         };
         let credential_id: Uuid = row.get("id");
+        let run_events = mark_runner_runs_lost_tx(
+            &mut tx,
+            runner_id,
+            &[],
+            None,
+            &format!("runner credential revoked: {reason}"),
+        )
+        .await?;
         sqlx::query("UPDATE runner_nodes SET status = 'offline' WHERE id = $1 AND corp_id = $2")
             .bind(runner_id)
             .bind(corp_id)
@@ -1543,6 +1585,7 @@ impl PgStore {
         Ok(RunnerRevocationOutcome {
             revoked: true,
             event,
+            run_events,
         })
     }
 
@@ -1605,6 +1648,31 @@ impl PgStore {
             "#,
         )
         .bind(corp_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_runner)
+        .collect();
+        Ok(records)
+    }
+
+    pub async fn connected_runner_count(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT count(*) FROM runner_nodes WHERE status = 'connected'")
+            .fetch_one(&self.pool)
+            .await
+            .context("count connected runners")
+    }
+
+    pub async fn runner_records_requiring_recovery(&self) -> Result<Vec<RunnerRecord>> {
+        let records = sqlx::query(
+            r#"
+            SELECT id, corp_id, hostname, os, capabilities, connection_epoch, status,
+                   last_seen_at, grace_expires_at
+            FROM runner_nodes
+            WHERE status IN ('connected', 'grace')
+            ORDER BY id
+            "#,
+        )
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -2260,7 +2328,7 @@ impl PgStore {
                 .context("decode verification policy")?;
         let mission_title: String = row.get("mission_title");
         let task_title: String = row.get("task_title");
-        let task_prompt = format_task_prompt(&mission_title, &task_title, &contract, attempt);
+        let mut task_prompt = format_task_prompt(&mission_title, &task_title, &contract, attempt);
         let model = contract.model.clone();
         let reasoning_effort = contract.reasoning_effort.clone();
 
@@ -2287,6 +2355,9 @@ impl PgStore {
         .bind(&reasoning_effort)
         .execute(&mut *tx)
         .await?;
+        let queued_messages =
+            reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
+        append_queued_messages(&mut task_prompt, &queued_messages);
         sqlx::query(
             "UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
         )
@@ -2353,6 +2424,7 @@ impl PgStore {
                 reasoning_effort,
                 verification_policy,
                 secret_refs: contract.secret_refs,
+                queued_messages,
             },
             event,
         ))
@@ -2368,7 +2440,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
-                   r.workspace_run_id,
+                   r.workspace_run_id, r.workspace_disposition,
                    t.mission_id, t.contract, t.verification_policy, m.room_id, a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -2390,6 +2462,12 @@ impl PgStore {
             .try_get::<Option<String>, _>("provider_session_id")?
             .context("source run has no resumable provider session")?;
         let workspace_run_id: Uuid = row.get("workspace_run_id");
+        let workspace_disposition: Option<String> = row.get("workspace_disposition");
+        if workspace_disposition.as_deref() != Some("preserved") {
+            return Err(anyhow!(
+                "source run workspace is not preserved and cannot be resumed safely"
+            ));
+        }
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode verification policy")?;
@@ -2445,6 +2523,8 @@ impl PgStore {
         .bind(&reasoning_effort)
         .execute(&mut *tx)
         .await?;
+        let queued_messages =
+            reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
             .bind(mission_id)
             .execute(&mut *tx)
@@ -2508,6 +2588,7 @@ impl PgStore {
                 reasoning_effort,
                 verification_policy,
                 secret_refs: contract.secret_refs,
+                queued_messages,
             },
             event,
         ))
@@ -2543,6 +2624,12 @@ impl PgStore {
             "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
         )
         .bind(reason)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE queued_messages SET status = 'queued', run_id = NULL WHERE run_id = $1 AND status = 'reserved'",
+        )
         .bind(run_id)
         .execute(&mut *tx)
         .await?;
@@ -2589,6 +2676,7 @@ impl PgStore {
         run_id: Uuid,
         agent_id: Uuid,
         runner_id: &str,
+        assignment_token: Uuid,
     ) -> Result<ArtifactContext> {
         let row = sqlx::query(
             r#"
@@ -2597,6 +2685,7 @@ impl PgStore {
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.assignment_token = $5
               AND r.status IN ('provisioning', 'starting', 'running',
                                'waiting_for_input', 'waiting_for_approval', 'verifying')
             "#,
@@ -2605,6 +2694,7 @@ impl PgStore {
         .bind(corp_id)
         .bind(agent_id)
         .bind(runner_id)
+        .bind(assignment_token)
         .fetch_one(&self.pool)
         .await
         .context("artifact upload does not match an active run")?;
@@ -2624,8 +2714,10 @@ impl PgStore {
             event_id,
             runner_id,
             corp_id,
+            connection_epoch: _,
             run_id,
             agent_id,
+            assignment_token,
             event_type,
             ..
         } = input;
@@ -2647,6 +2739,7 @@ impl PgStore {
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.assignment_token = $5
               AND r.status IN ('provisioning', 'starting', 'running',
                                'waiting_for_input', 'waiting_for_approval', 'verifying')
             FOR UPDATE OF r, t, m
@@ -2656,6 +2749,7 @@ impl PgStore {
         .bind(corp_id)
         .bind(agent_id)
         .bind(&runner_id)
+        .bind(assignment_token)
         .fetch_one(&mut *tx)
         .await
         .context("artifact upload does not match an active run")?;
@@ -2790,13 +2884,84 @@ impl PgStore {
         Ok(row.map(map_stored_artifact))
     }
 
+    pub async fn dependency_artifacts(
+        &self,
+        corp_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<Vec<DependencyArtifactContext>> {
+        let rows = sqlx::query(
+            r#"
+            WITH ranked AS (
+                SELECT parent.id AS dependency_task_id,
+                       parent.plan_key,
+                       parent.title AS task_title,
+                       run.summary AS run_summary,
+                       artifact.id,
+                       artifact.corp_id,
+                       artifact.task_id,
+                       artifact.run_id,
+                       artifact.producer_agent_id,
+                       artifact.producer_runner_id,
+                       artifact.verifier,
+                       artifact.object_key,
+                       artifact.uri,
+                       artifact.sha256,
+                       artifact.media_type,
+                       artifact.bytes,
+                       artifact.provenance_signature,
+                       artifact.retention_until,
+                       row_number() OVER (
+                           PARTITION BY parent.id
+                           ORDER BY run.created_at DESC
+                       ) AS rank
+                FROM task_dependencies dependency
+                JOIN tasks child ON child.id = dependency.task_id
+                JOIN tasks parent ON parent.id = dependency.depends_on_task_id
+                JOIN runs run ON run.task_id = parent.id AND run.status = 'completed'
+                JOIN artifacts artifact ON artifact.run_id = run.id
+                WHERE child.id = $1 AND child.corp_id = $2
+            )
+            SELECT dependency_task_id, plan_key, task_title, run_summary,
+                   id, corp_id, task_id, run_id, producer_agent_id,
+                   producer_runner_id, verifier, object_key, uri, sha256,
+                   media_type, bytes, provenance_signature, retention_until
+            FROM ranked
+            WHERE rank = 1
+            ORDER BY plan_key
+            "#,
+        )
+        .bind(task_id)
+        .bind(corp_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let dependency_task_id = row.get("dependency_task_id");
+                let plan_key = row.get("plan_key");
+                let task_title = row.get("task_title");
+                let run_summary = row.get("run_summary");
+                let artifact = map_stored_artifact(row);
+                DependencyArtifactContext {
+                    task_id: dependency_task_id,
+                    plan_key,
+                    task_title,
+                    run_summary,
+                    artifact,
+                }
+            })
+            .collect())
+    }
+
     pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {
         let RunnerEventInput {
             event_id,
             runner_id,
             corp_id,
+            connection_epoch: _,
             run_id,
             agent_id,
+            assignment_token,
             event_type,
             mut payload,
         } = input;
@@ -2810,11 +2975,12 @@ impl PgStore {
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
+              AND r.assignment_token = $5
               AND (
                 r.status IN ('provisioning', 'starting', 'running',
                              'waiting_for_input', 'waiting_for_approval', 'verifying')
                 OR (
-                  $5::text IN ('run.workspace_preserved', 'run.workspace_removed')
+                  $6::text IN ('run.workspace_preserved', 'run.workspace_removed')
                   AND r.status IN ('completed', 'failed', 'cancelled', 'lost')
                 )
               )
@@ -2825,6 +2991,7 @@ impl PgStore {
         .bind(corp_id)
         .bind(agent_id)
         .bind(&runner_id)
+        .bind(assignment_token)
         .bind(&event_type)
         .fetch_one(&mut *tx)
         .await
@@ -2916,6 +3083,12 @@ impl PgStore {
                     "UPDATE agents SET status = 'working', station = 'terminal' WHERE id = $1",
                 )
                 .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE queued_messages SET status = 'delivered', delivered_at = now() WHERE run_id = $1 AND status = 'reserved'",
+                )
+                .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -3028,7 +3201,7 @@ impl PgStore {
                     .get("expires_in_seconds")
                     .and_then(Value::as_i64)
                     .unwrap_or(300)
-                    .clamp(30, 3_600);
+                    .clamp(1, 3_600);
                 let expires_at = Utc::now() + Duration::seconds(expires_in_seconds);
                 sqlx::query(
                     r#"
@@ -3630,11 +3803,8 @@ impl PgStore {
         }
         let expires_at: chrono::DateTime<Utc> = row.get("expires_at");
         if expires_at <= Utc::now() {
-            sqlx::query("UPDATE action_approvals SET status = 'expired' WHERE id = $1")
-                .bind(approval_id)
-                .execute(&mut *tx)
-                .await?;
             tx.commit().await?;
+            let _ = self.expire_action_approval(approval_id).await?;
             return Err(anyhow!("approval request expired"));
         }
         assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
@@ -3716,6 +3886,130 @@ impl PgStore {
         })
     }
 
+    pub async fn expire_action_approval(
+        &self,
+        approval_id: Uuid,
+    ) -> Result<Option<ActionApprovalDecisionOutcome>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT approval.corp_id, approval.room_id, approval.mission_id,
+                   approval.task_id, approval.run_id, approval.agent_id,
+                   approval.status, approval.expires_at, run.runner_id
+            FROM action_approvals approval
+            JOIN runs run ON run.id = approval.run_id
+            WHERE approval.id = $1
+            FOR UPDATE OF approval, run
+            "#,
+        )
+        .bind(approval_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let status: String = row.get("status");
+        let expires_at: chrono::DateTime<Utc> = row.get("expires_at");
+        if status != "pending" || expires_at > Utc::now() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let corp_id: Uuid = row.get("corp_id");
+        let room_id: Uuid = row.get("room_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let task_id: Uuid = row.get("task_id");
+        let run_id: Uuid = row.get("run_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let runner_id: String = row.get("runner_id");
+        let reason = "Action approval expired before an authorized decision.";
+        sqlx::query(
+            "UPDATE action_approvals SET status = 'expired', decision_note = $1, decided_at = now() WHERE id = $2",
+        )
+        .bind(reason)
+        .bind(approval_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE runs SET status = 'cancelled', summary = $1, updated_at = now() WHERE id = $2 AND status = 'waiting_for_approval'",
+        )
+        .bind(reason)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE tasks SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'awaiting_approval'",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE missions SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'running'",
+        )
+        .bind(mission_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1 AND current_run_id = $2",
+        )
+        .bind(agent_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        let command_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO runner_commands
+                (id, corp_id, runner_id, run_id, command_kind, payload, idempotency_key)
+            VALUES ($1, $2, $3, $4, 'approval_decision', $5, $6)
+            ON CONFLICT (corp_id, idempotency_key) DO NOTHING
+            "#,
+        )
+        .bind(command_id)
+        .bind(corp_id)
+        .bind(&runner_id)
+        .bind(run_id)
+        .bind(json!({
+            "approval_id": approval_id,
+            "approved": false,
+            "note": reason,
+        }))
+        .bind(format!("approval-expired:{approval_id}"))
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "run.approval_expired",
+                    "run",
+                    run_id,
+                    format!("approval-expired-event:{approval_id}"),
+                    json!({
+                        "approval_id": approval_id,
+                        "reason": reason,
+                        "command_id": command_id,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("approval expiry event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(Some(ActionApprovalDecisionOutcome {
+            approval_id,
+            run_id,
+            runner_id,
+            status: "expired".to_owned(),
+            effect_queued: true,
+            event: Some(event),
+        }))
+    }
+
     pub async fn pending_runner_commands(
         &self,
         runner_id: &str,
@@ -3743,14 +4037,65 @@ impl PgStore {
         .collect())
     }
 
-    pub async fn mark_runner_command_dispatched(&self, command_id: Uuid) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE runner_commands SET status = 'dispatched', dispatched_at = now() WHERE id = $1 AND status = 'pending'",
+    pub async fn acknowledge_runner_command(
+        &self,
+        command_id: Uuid,
+        runner_id: &str,
+    ) -> Result<Option<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let command = sqlx::query(
+            r#"
+            UPDATE runner_commands
+            SET status = 'dispatched', dispatched_at = now()
+            WHERE id = $1 AND runner_id = $2 AND status = 'pending'
+            RETURNING corp_id, run_id
+            "#,
         )
         .bind(command_id)
-        .execute(&self.pool)
+        .bind(runner_id)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let Some(command) = command else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let corp_id: Uuid = command.get("corp_id");
+        let run_id: Uuid = command.get("run_id");
+        let context = sqlx::query(
+            r#"
+            SELECT task.mission_id, mission.room_id
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mission_id: Uuid = context.get("mission_id");
+        let room_id: Uuid = context.get("room_id");
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "runner.command_acknowledged",
+                    "run",
+                    run_id,
+                    format!("runner-command-ack:{command_id}"),
+                    json!({"command_id": command_id, "runner_id": runner_id}),
+                )
+            },
+        )
+        .await?
+        .context("runner command acknowledgment event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(Some(event))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4552,11 +4897,13 @@ impl PgStore {
 
         let active_run = sqlx::query(
             r#"
-            SELECT id, runner_id FROM runs
-            WHERE agent_id = $1 AND corp_id = $2
-              AND status IN ('starting', 'running', 'waiting_for_input',
-                             'waiting_for_approval', 'verifying')
-            ORDER BY created_at DESC LIMIT 1
+            SELECT run.id, run.runner_id, agent.adapter
+            FROM runs run
+            JOIN agents agent ON agent.id = run.agent_id
+            WHERE run.agent_id = $1 AND run.corp_id = $2
+              AND run.status IN ('starting', 'running', 'waiting_for_input',
+                                 'waiting_for_approval', 'verifying')
+            ORDER BY run.created_at DESC LIMIT 1
             "#,
         )
         .bind(agent_id)
@@ -4564,7 +4911,13 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let delivery = if holds_lease && active_run.is_some() {
+        let adapter_supports_steer = active_run.as_ref().is_some_and(|row| {
+            matches!(
+                row.get::<String, _>("adapter").as_str(),
+                "codex" | "github-copilot" | "fake-process"
+            )
+        });
+        let delivery = if holds_lease && active_run.is_some() && adapter_supports_steer {
             "immediate"
         } else {
             "queued"
@@ -4621,6 +4974,46 @@ impl PgStore {
             runner_id,
             event,
         })
+    }
+
+    pub async fn requeue_control_message(
+        &self,
+        corp_id: Uuid,
+        message_id: Uuid,
+        reason: &str,
+    ) -> Result<DomainEvent> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE queued_messages
+            SET status = 'queued', run_id = NULL, delivered_at = NULL
+            WHERE id = $1 AND corp_id = $2
+            RETURNING agent_id, actor_id
+            "#,
+        )
+        .bind(message_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("control message not found for requeue")?;
+        let agent_id: Uuid = row.get("agent_id");
+        let actor_id: Uuid = row.get("actor_id");
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "control.message_requeued",
+                "agent",
+                agent_id,
+                format!("control-message-requeued:{message_id}"),
+                json!({"message_id": message_id, "reason": reason}),
+            ),
+        )
+        .await?
+        .context("control message requeue event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(event)
     }
 
     pub async fn create_room_message(
@@ -4982,6 +5375,60 @@ fn format_task_prompt(
     )
 }
 
+async fn reserve_queued_messages_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+) -> Result<Vec<QueuedRunMessage>> {
+    let rows = sqlx::query(
+        r#"
+        WITH queued AS (
+            SELECT id
+            FROM queued_messages
+            WHERE corp_id = $1 AND agent_id = $2 AND status = 'queued'
+            ORDER BY created_at
+            LIMIT 20
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE queued_messages message
+        SET status = 'reserved', run_id = $3, delivered_at = NULL
+        FROM queued
+        WHERE message.id = queued.id
+        RETURNING message.id, message.actor_id, message.text
+        "#,
+    )
+    .bind(corp_id)
+    .bind(agent_id)
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| QueuedRunMessage {
+            id: row.get("id"),
+            actor_id: row.get("actor_id"),
+            text: row.get("text"),
+        })
+        .collect())
+}
+
+fn append_queued_messages(prompt: &mut String, messages: &[QueuedRunMessage]) {
+    if messages.is_empty() {
+        return;
+    }
+    prompt.push_str(
+        "\n\nQUEUED OPERATOR NOTES:\n\
+         These durable notes were queued while the agent was off shift. Address each note in this turn.\n",
+    );
+    for message in messages {
+        prompt.push_str(&format!(
+            "- message {} from actor {}: {}\n",
+            message.id, message.actor_id, message.text
+        ));
+    }
+}
+
 async fn lock_demo_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(DEMO_ADVISORY_LOCK)
@@ -5061,12 +5508,24 @@ async fn mark_runner_runs_lost_tx(
         .bind(run_id)
         .execute(&mut **tx)
         .await?;
+        sqlx::query(
+            "UPDATE queued_messages SET status = 'queued', run_id = NULL WHERE run_id = $1 AND status = 'reserved'",
+        )
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?;
         sqlx::query("UPDATE tasks SET status = 'blocked', updated_at = now() WHERE id = $1")
             .bind(task_id)
             .execute(&mut **tx)
             .await?;
         sqlx::query(
-            "UPDATE agents SET status = 'offline', station = NULL, current_run_id = NULL WHERE id = $1",
+            "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
+        )
+        .bind(mission_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
         )
         .bind(agent_id)
         .execute(&mut **tx)

@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import {
-  appendFileSync,
   existsSync,
   openSync,
   readFileSync,
@@ -52,45 +51,45 @@ async function waitFor(demo, predicate, timeoutMs = 30_000) {
 
 async function restartServer() {
   if (process.env.CRONY_SKIP_SERVER_RESTART === '1') return false
-  const ciPidPath = path.join(root, 'output', 'server-ci.pid')
-  const localPidPath = path.join(root, 'output', 'local-pids.json')
-  let pid
-  let pidWriter
-  if (existsSync(ciPidPath)) {
-    pid = Number(readFileSync(ciPidPath, 'utf8').trim())
-    pidWriter = (nextPid) => writeFileSync(ciPidPath, `${nextPid}\n`)
-  } else if (existsSync(localPidPath)) {
-    const pids = JSON.parse(readFileSync(localPidPath, 'utf8'))
-    pid = Number(pids.server)
-    pidWriter = (nextPid) => {
-      pids.server = nextPid
-      writeFileSync(localPidPath, `${JSON.stringify(pids, null, 2)}\n`)
-    }
-  } else {
-    return false
+  const pidPath = process.env.CRONY_TEST_SERVER_PID_FILE
+  if (!pidPath) return false
+  if (!existsSync(pidPath)) {
+    throw new Error(`test-owned server PID file does not exist: ${pidPath}`)
   }
+  const pid = Number(readFileSync(pidPath, 'utf8').trim())
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error(`test-owned server PID is invalid: ${pid}`)
+  }
+  const databaseUrl = process.env.DATABASE_URL
+  if (!databaseUrl) {
+    throw new Error('DATABASE_URL is required for the approval restart test')
+  }
+  const testServer = new URL(server)
+  const bind =
+    process.env.CRONY_TEST_SERVER_BIND ??
+    `${testServer.hostname}:${testServer.port}`
+  const logDir =
+    process.env.CRONY_TEST_SERVER_LOG_DIR ?? path.dirname(path.resolve(pidPath))
+  process.kill(pid, 0)
   process.kill(pid)
   await new Promise((resolve) => setTimeout(resolve, 500))
-  const binary = path.join(
-    root,
-    'target',
-    'debug',
-    process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-  )
-  const stdout = openSync(path.join(root, 'output', 'server.stdout.log'), 'a')
-  const stderr = openSync(path.join(root, 'output', 'server.stderr.log'), 'a')
-  appendFileSync(
-    path.join(root, 'output', 'server.stdout.log'),
-    '\n--- durable approval restart ---\n',
-  )
+  const binary =
+    process.env.CRONY_TEST_SERVER_BINARY ??
+    path.join(
+      root,
+      'target',
+      'debug',
+      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
+    )
+  const stdout = openSync(path.join(logDir, 'server-restart.stdout.log'), 'a')
+  const stderr = openSync(path.join(logDir, 'server-restart.stderr.log'), 'a')
   const child = spawn(
     binary,
     [
       '--bind',
-      '127.0.0.1:8791',
+      bind,
       '--database-url',
-      process.env.DATABASE_URL ??
-        'postgres://crony:crony@127.0.0.1:54329/crony',
+      databaseUrl,
     ],
     {
       cwd: root,
@@ -99,7 +98,7 @@ async function restartServer() {
       stdio: ['ignore', stdout, stderr],
     },
   )
-  pidWriter(child.pid)
+  writeFileSync(pidPath, `${child.pid}\n`)
   child.unref()
 
   const deadline = Date.now() + 30_000
@@ -138,6 +137,22 @@ assert.equal(
 )
 
 const restarted = await restartServer()
+const restartRecovery = restarted
+  ? await waitFor(demo, (state) => {
+      const events = state.snapshot.events.filter(
+        (event) => event.aggregate_id === launch.run_id,
+      )
+      const recovered =
+        events.some((event) => event.type === 'runner.grace_started') &&
+        events.some((event) => event.type === 'run.reconciled')
+      const run = state.snapshot.runs.find(
+        (candidate) => candidate.id === launch.run_id,
+      )
+      return recovered && run?.status === 'waiting_for_approval'
+        ? run
+        : null
+    })
+  : null
 const decisionKey = crypto.randomUUID()
 const firstDecision = await post(
   `/api/corps/${demo.corp_id}/approvals/${pending.value.id}/decision`,
@@ -162,7 +177,12 @@ assert.equal(duplicateDecision.effect_queued, false)
 
 const completed = await waitFor(demo, (state) => {
   const run = state.snapshot.runs.find((candidate) => candidate.id === launch.run_id)
-  return run?.status === 'completed' ? run : null
+  const acknowledged = state.snapshot.events.some(
+    (event) =>
+      event.type === 'runner.command_acknowledged' &&
+      event.aggregate_id === launch.run_id,
+  )
+  return run?.status === 'completed' && acknowledged ? run : null
 })
 assert.equal(completed.value.status, 'completed')
 
@@ -198,14 +218,69 @@ const rejected = await waitFor(demo, (state) => {
 })
 assert.equal(rejected.value.status, 'cancelled')
 
+const expiryMission = await post(`/api/corps/${demo.corp_id}/missions`, {
+  requested_by: demo.alice_actor_id,
+  preferred_adapter: 'fake-process',
+  title: '[approval-expiry] expire a risky external side effect',
+})
+const expiryLaunch = await post(
+  `/api/corps/${demo.corp_id}/missions/${expiryMission.mission_id}/launch`,
+  { requested_by: demo.alice_actor_id },
+)
+await waitFor(demo, (state) =>
+  state.snapshot.action_approvals.find(
+    (approval) =>
+      approval.run_id === expiryLaunch.run_id && approval.status === 'pending',
+  ),
+)
+const expired = await waitFor(demo, (state) => {
+  const approval = state.snapshot.action_approvals.find(
+    (candidate) => candidate.run_id === expiryLaunch.run_id,
+  )
+  const run = state.snapshot.runs.find(
+    (candidate) => candidate.id === expiryLaunch.run_id,
+  )
+  const task = state.snapshot.tasks.find(
+    (candidate) => candidate.id === run?.task_id,
+  )
+  const agent = state.snapshot.agents.find(
+    (candidate) => candidate.id === run?.agent_id,
+  )
+  const event = state.snapshot.events.find(
+    (candidate) =>
+      candidate.type === 'run.approval_expired' &&
+      candidate.aggregate_id === expiryLaunch.run_id,
+  )
+  const acknowledged = state.snapshot.events.find(
+    (candidate) =>
+      candidate.type === 'runner.command_acknowledged' &&
+      candidate.aggregate_id === expiryLaunch.run_id,
+  )
+  return approval?.status === 'expired' &&
+    run?.status === 'cancelled' &&
+    task?.status === 'cancelled' &&
+    agent?.status === 'idle' &&
+    event &&
+    acknowledged
+    ? { approval, run, task, agent }
+    : null
+})
+
 const report = {
   checked_at: new Date().toISOString(),
   server_restarted_while_suspended: restarted,
+  startup_runner_recovery_verified: Boolean(restartRecovery),
   second_actor_approved: true,
   first_effect_queued: firstDecision.effect_queued,
   duplicate_effect_queued: duplicateDecision.effect_queued,
+  approved_command_acknowledged: true,
   approved_run_status: completed.value.status,
   rejected_run_status: rejected.value.status,
+  expired_approval_status: expired.value.approval.status,
+  expired_run_status: expired.value.run.status,
+  expired_task_status: expired.value.task.status,
+  expired_agent_status: expired.value.agent.status,
+  expired_command_acknowledged: true,
 }
 await writeFile(
   path.join(root, 'output', 'e2e-approvals.json'),

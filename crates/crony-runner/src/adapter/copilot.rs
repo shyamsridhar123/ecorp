@@ -283,7 +283,9 @@ impl CopilotSdkAdapter {
                         }
                     }
                     Some(AdapterControl::CircuitBreaker { stage, reason }) => {
-                        if stage == "stop" {
+                        if matches!(stage.as_str(), "suspend" | "stop") {
+                            let reason =
+                                format!("Circuit breaker {stage} checkpoint: {reason}");
                             reject_pending(&pending, &reason);
                             cancelled = Some(reason);
                             session.abort().await.map_err(sdk_error)?;

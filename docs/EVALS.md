@@ -87,33 +87,44 @@ and linked worktrees are distinct, verifies the configured checkout's HEAD and w
 change, confirms dirty work is preserved, and confirms a clean evidence-only run removes both its
 worktree and branch.
 `tools/e2e_task_graph.mjs` validates a three-node graph with two parallel specialist roots and a
-dependency-gated synthesis task, then proves an always-failing task stops exactly at its retry
-limit.
+dependency-gated synthesis task. The synthesis artifact must contain both verified specialist
+outputs, not merely their task names. The same test proves an always-failing task stops exactly at
+its retry limit.
 `tools/e2e_verification.mjs` proves all six automated verifier types, a missing-file failure that
 blocks completion, an owner approval gate, and an independent-review gate that rejects the
 requester before accepting Bob's member-role decision.
 
 `tools/e2e_identity.mjs` proves production OIDC enforcement, actor-spoof and cross-Corp rejection,
 authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
-rejection, and revocation. See `docs/evidence/2026-08-30-identity-validation.md`.
+rejection, active-run revocation, superseded-socket rejection, and rejection of a current socket
+using the wrong assignment token. See `docs/evidence/2026-08-30-identity-validation.md`.
 
 `tools/e2e_secrets.mjs` proves encrypted storage, scoped dispatch, environment delivery, denial for
 an unauthorized requester, revocation, and absence of plaintext canaries from shared state and
 logs. See `docs/evidence/2026-08-30-secret-broker-validation.md`.
 
 `tools/e2e_approvals.mjs` restarts the server during a suspended risky action, approves from a
-second actor, and proves duplicate decisions do not duplicate effects. `tools/e2e_budgets.mjs`
-proves spend, repeated-tool, rolling requester/Corp budgets, all four breaker stages, and the
-healthy-conversation exemption. See
+second actor, proves duplicate decisions do not duplicate effects, requires runner
+acknowledgment, and verifies that an expired approval cancels coherently. `tools/e2e_budgets.mjs`
+proves spend, repeated-tool, rolling requester/Corp budgets, resumable suspend checkpoints, hard
+stops, and the healthy-conversation exemption. See
 `docs/evidence/2026-08-30-approval-and-budget-validation.md`.
 
 `tests/scenarios/v1.jsonl` is a versioned 100-scenario corpus. `tools/run_evals.mjs` keeps
-deterministic and real-provider lanes separate and reports success, verified completion, rework,
-cost, latency, safety, and intervention metrics with regression thresholds.
+deterministic and real-provider lanes separate. Deterministic rows must reference fresh, hashed
+integration evidence whose category contract passes. Reused category evidence is disclosed, and
+latency, cost, rework, and intervention remain `null` unless they were actually measured; the eval
+runner no longer derives outcomes or invented metrics from `scenario.expected`.
 
 `tools/e2e_chaos_report.mjs` consolidates server-restart, runner-reconnect, duplicate-delivery, and
 browser-replay evidence. The `runner-platforms` CI matrix runs the runner contract on Windows,
 macOS, and Linux. See `docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`.
+
+On August 31, 2026, a fresh isolated Windows matrix passed all 22 integration scripts. Separate
+browser runs exercised plan inspection, real GitHub Copilot and Codex missions, live control,
+Copilot action approvals, independent review across Alice and Bob, failed-verification recovery,
+production OIDC login with a one-time WebSocket ticket, and a 390-pixel responsive layout with no
+horizontal overflow.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and

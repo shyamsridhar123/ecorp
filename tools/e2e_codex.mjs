@@ -80,7 +80,7 @@ async function startSteerResumeScenario() {
   const started = await waitForRun(
     demo,
     launch.run_id,
-    (run) => Boolean(run.provider_session_id),
+    (run) => Boolean(run.provider_session_id) && run.status === 'running',
   )
   const message = await post(
     `/api/corps/${demo.corp_id}/agents/${demo.codex_agent_id}/messages`,
@@ -196,7 +196,7 @@ async function interruptScenario() {
   const started = await waitForRun(
     demo,
     launch.run_id,
-    (run) => Boolean(run.provider_session_id),
+    (run) => Boolean(run.provider_session_id) && run.status === 'running',
   )
   const interrupt = await post(
     `/api/corps/${demo.corp_id}/agents/${demo.codex_agent_id}/interrupt`,

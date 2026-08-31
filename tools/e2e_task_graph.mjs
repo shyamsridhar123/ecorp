@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -156,6 +157,16 @@ async function parallelGraphScenario() {
     synthesisRequested.seq >
       Math.max(...rootCompleted.map((event) => event.seq)),
   )
+  const synthesisArtifact = (
+    await downloadVerifiedArtifact(server, demo, synthesisRun)
+  ).toString('utf8')
+  assert.match(synthesisArtifact, /VERIFIED DEPENDENCY OUTPUTS/)
+  for (const rootRun of rootRuns) {
+    assert.ok(
+      synthesisArtifact.includes(rootRun.id),
+      `synthesis artifact omitted specialist run ${rootRun.id}`,
+    )
+  }
 
   return {
     mission_id: created.mission_id,
@@ -164,6 +175,7 @@ async function parallelGraphScenario() {
     all_run_ids: result.runs.map((run) => run.id),
     max_active_runs: result.maxActiveRuns,
     synthesis_requested_after_roots: true,
+    synthesis_consumed_verified_specialists: true,
     final_status: result.mission.status,
   }
 }

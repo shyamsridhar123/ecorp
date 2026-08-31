@@ -3,6 +3,7 @@ import path from "node:path";
 
 const server = process.env.CRONY_SERVER_HTTP ?? "http://127.0.0.1:8791";
 const root = path.resolve(import.meta.dirname, "..");
+const runnerId = process.env.CRONY_E2E_RUNNER_ID ?? "runner-local";
 
 async function request(path, body) {
   const response = await fetch(`${server}${path}`, {
@@ -57,7 +58,7 @@ async function createSlowRun(demo, title) {
 
 const shortDemo = await request("/api/demo/reset", {});
 const initial = await snapshot(shortDemo.corp_id, shortDemo.alice_actor_id);
-const initialRunner = initial.runners.find((runner) => runner.id === "runner-local");
+const initialRunner = initial.runners.find((runner) => runner.id === runnerId);
 if (!initialRunner || initialRunner.status !== "connected" || !initialRunner.last_seen_at) {
   throw new Error("runner heartbeat record was not persisted");
 }
@@ -66,18 +67,18 @@ const shortRun = await createSlowRun(
   shortDemo,
   "survive a transient runner transport disconnect.",
 );
-await request("/api/demo/runners/runner-local/disconnect", {
+await request(`/api/demo/runners/${runnerId}/disconnect`, {
   reconnect_delay_ms: 1_000,
 });
 const graceObserved = await waitFor("runner grace state", async () => {
   const current = await snapshot(shortDemo.corp_id, shortDemo.alice_actor_id);
-  return current.runners.find((runner) => runner.id === "runner-local")?.status === "grace"
+  return current.runners.find((runner) => runner.id === runnerId)?.status === "grace"
     ? current
     : null;
 });
 const reconnected = await waitFor("runner reconnect", async () => {
   const current = await snapshot(shortDemo.corp_id, shortDemo.alice_actor_id);
-  const runner = current.runners.find((candidate) => candidate.id === "runner-local");
+  const runner = current.runners.find((candidate) => candidate.id === runnerId);
   const reconciled = current.snapshot.events.some(
     (event) => event.type === "run.reconciled" && event.aggregate_id === shortRun.run_id,
   );
@@ -101,12 +102,12 @@ const lostRun = await createSlowRun(
   longDemo,
   "become lost after the runner exceeds its grace period.",
 );
-await request("/api/demo/runners/runner-local/disconnect", {
+await request(`/api/demo/runners/${runnerId}/disconnect`, {
   reconnect_delay_ms: 8_000,
 });
 await waitFor("runner long-disconnect grace state", async () => {
   const current = await snapshot(longDemo.corp_id, longDemo.alice_actor_id);
-  return current.runners.find((runner) => runner.id === "runner-local")?.status === "grace"
+  return current.runners.find((runner) => runner.id === runnerId)?.status === "grace"
     ? current
     : null;
 });
@@ -117,7 +118,7 @@ const lost = await waitFor("run loss after grace expiry", async () => {
 }, 15_000);
 const final = await waitFor("runner reconnect after lost run", async () => {
   const current = await snapshot(longDemo.corp_id, longDemo.alice_actor_id);
-  const runner = current.runners.find((candidate) => candidate.id === "runner-local");
+  const runner = current.runners.find((candidate) => candidate.id === runnerId);
   return runner?.status === "connected" ? current : null;
 }, 15_000);
 const finalRun = final.snapshot.runs.find((candidate) => candidate.id === lostRun.run_id);
@@ -136,7 +137,7 @@ for (const required of ["runner.grace_started", "run.lost"]) {
 
 await new Promise((resolvePromise) => setTimeout(resolvePromise, 10_500));
 const heartbeatView = await snapshot(longDemo.corp_id, longDemo.alice_actor_id);
-const finalRunner = heartbeatView.runners.find((runner) => runner.id === "runner-local");
+const finalRunner = heartbeatView.runners.find((runner) => runner.id === runnerId);
 if (!finalRunner || Date.parse(finalRunner.last_seen_at) <= initialHeartbeat) {
   throw new Error("runner heartbeat timestamp did not advance after reconnect");
 }
@@ -145,7 +146,7 @@ const report = {
       initial_runner_status: initialRunner.status,
       grace_observed: Boolean(graceObserved),
       short_reconnect_status: reconnected.runners.find(
-        (runner) => runner.id === "runner-local",
+        (runner) => runner.id === runnerId,
       )?.status,
       short_run_status: completed.snapshot.runs.find(
         (run) => run.id === shortRun.run_id,

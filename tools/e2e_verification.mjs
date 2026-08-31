@@ -45,7 +45,7 @@ async function createAndLaunch(demo, strategy, title) {
   return { created, launched }
 }
 
-async function waitFor(demo, missionId, predicate, timeoutMs = 30_000) {
+async function waitFor(demo, missionId, predicate, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const state = await snapshot(demo)

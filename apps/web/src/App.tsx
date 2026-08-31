@@ -23,6 +23,7 @@ type Agent = {
 
 type Mission = {
   id: string
+  requested_by: string
   title: string
   strategy: string
   max_nodes: number
@@ -122,6 +123,9 @@ type VerificationRequest = {
   run_id: string
   task_id: string
   gate_type: 'human_approval' | 'independent_review'
+  gate:
+    | { type: 'human_approval'; roles: string[] }
+    | { type: 'independent_review'; roles: string[]; exclude_requester: boolean }
   status: 'pending' | 'approved' | 'rejected'
   decided_by: string | null
   decision_note: string | null
@@ -199,6 +203,18 @@ type RunnerCapability = {
   models: RunnerModel[]
 }
 
+type RunnerNode = {
+  id: string
+  corp_id: string
+  hostname: string
+  os: string
+  connected: boolean
+  status: 'connected' | 'grace' | 'offline'
+  last_seen_at: string
+  grace_expires_at: string | null
+  capabilities: RunnerCapability[]
+}
+
 type SnapshotResponse = {
   snapshot: {
     corp: { id: string; name: string }
@@ -217,17 +233,7 @@ type SnapshotResponse = {
     circuit_breaker_incidents: CircuitBreakerIncident[]
     events: DomainEvent[]
   }
-    runners: {
-      id: string
-      corp_id: string
-      hostname: string
-    os: string
-    connected: boolean
-    status: 'connected' | 'grace' | 'offline'
-    last_seen_at: string
-    grace_expires_at: string | null
-    capabilities: RunnerCapability[]
-  }[]
+  runners: RunnerNode[]
 }
 
 type BootstrapResponse = {
@@ -245,6 +251,20 @@ type CreateMissionResponse = {
   mission_id: string
   task_ids: string[]
   strategy: string
+}
+
+type LaunchMissionResponse = {
+  run_id: string
+  runner_id: string
+  run_ids: string[]
+  runner_ids: string[]
+}
+
+type HealthResponse = {
+  status: 'ok'
+  service: string
+  runners: number
+  mode: 'development' | 'production'
 }
 
 const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
@@ -310,6 +330,27 @@ function agentStatusLabel(agent: Agent): string {
   return agent.status
 }
 
+function statusLabel(value: string): string {
+  return value
+    .replaceAll('_', ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function capabilitySupports(
+  capability: RunnerCapability | undefined,
+  feature: 'steer' | 'interrupt' | 'stop',
+): boolean {
+  return detailValue(capability?.detail, feature) === 'yes'
+}
+
+function canOperate(role: string): boolean {
+  return ['owner', 'admin', 'manager', 'member'].includes(role)
+}
+
+function terminalRun(status: string): boolean {
+  return ['completed', 'failed', 'cancelled', 'lost'].includes(status)
+}
+
 function availableRunnerAdapters(data: SnapshotResponse | null): RunnerCapability[] {
   if (!data) return []
   const connectedRunners = data.runners.filter((runner) => runner.connected)
@@ -349,15 +390,21 @@ function availableRunnerAdapters(data: SnapshotResponse | null): RunnerCapabilit
 
 function detailValue(detail: string | null | undefined, key: string): string | null {
   if (!detail) return null
-  const match = detail.match(new RegExp(`(?:^|;)\\s*${key}=([^;]+)`))
+  const match = detail.match(new RegExp(`(?:^|[;,])\\s*${key}=([^;,]+)`))
   return match?.[1]?.trim() ?? null
 }
 
+function storedAccessToken(): string | null {
+  return window.sessionStorage.getItem('ecorp_access_token')
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = storedAccessToken()
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       'content-type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   })
@@ -374,9 +421,10 @@ function shortId(value: string | null | undefined): string {
 
 function time(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit',
   }).format(new Date(value))
 }
 
@@ -510,10 +558,11 @@ function OfficeFloor({
 
 function AgentDesk({
   agent,
+  capability,
   lease,
   leaseToken,
   actor,
-  otherHuman,
+  humans,
   queuedCount,
   onClaim,
   onRelease,
@@ -523,10 +572,11 @@ function AgentDesk({
   onMessage,
 }: {
   agent: Agent
+  capability: RunnerCapability | undefined
   lease: Lease | undefined
   leaseToken: string | undefined
   actor: Actor
-  otherHuman: Actor | undefined
+  humans: Actor[]
   queuedCount: number
   onClaim: (agent: Agent) => Promise<void>
   onRelease: (agent: Agent, token: string) => Promise<void>
@@ -536,13 +586,32 @@ function AgentDesk({
   onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
 }) {
   const [text, setText] = useState('')
+  const [transferActorId, setTransferActorId] = useState('')
   const ownsLease = lease?.actor_id === actor.id
-  const holderLabel = lease ? (ownsLease ? 'You hold control' : 'Controlled by another operator') : 'Unclaimed'
+  const live = Boolean(agent.current_run_id)
+  const operator = canOperate(actor.role)
+  const supportsSteer = capabilitySupports(capability, 'steer')
+  const supportsInterrupt = capabilitySupports(capability, 'interrupt')
+  const supportsStop = capabilitySupports(capability, 'stop')
+  const canClaim = live && operator && (supportsSteer || supportsInterrupt)
+  const holder = humans.find((human) => human.id === lease?.actor_id)
+  const transferCandidates = humans.filter((human) => human.id !== actor.id && canOperate(human.role))
+  const transferTarget =
+    transferCandidates.find((human) => human.id === transferActorId) ??
+    transferCandidates[0]
+  const holderLabel = lease
+    ? ownsLease
+      ? `You hold control until ${time(lease.expires_at)}`
+      : `${holder?.name ?? 'Another operator'} holds control until ${time(lease.expires_at)}`
+    : live
+      ? 'Live session is unclaimed'
+      : 'No live session'
+  const messageToken = live && supportsSteer && ownsLease ? leaseToken : undefined
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!text.trim()) return
-    await onMessage(agent, text, leaseToken)
+    await onMessage(agent, text, messageToken)
     setText('')
   }
 
@@ -565,13 +634,17 @@ function AgentDesk({
       <p className="agent-inspector-help">
         {agent.current_run_id
           ? `${agent.name} is ${agent.station ?? agent.status}. Claim control to steer the live session.`
+          : agent.status === 'reviewing'
+            ? `${agent.name}'s provider process has ended. The recorded output is awaiting evidence review.`
           : `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`}
       </p>
       <div className="desk-actions">
-        <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
-          {ownsLease && leaseToken ? 'Renew control' : 'Claim control'}
-        </button>
-        {ownsLease && leaseToken ? (
+        {canClaim ? (
+          <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
+            {ownsLease && leaseToken ? 'Renew control' : 'Claim live control'}
+          </button>
+        ) : null}
+        {live && ownsLease && leaseToken ? (
           <button
             type="button"
             className="button button-quiet"
@@ -582,16 +655,30 @@ function AgentDesk({
         ) : null}
         <span className="queue-count">{queuedCount} queued</span>
       </div>
-      {ownsLease && leaseToken && otherHuman ? (
-        <button
-          type="button"
-          className="transfer-control"
-          onClick={() => onTransfer(agent, leaseToken, otherHuman)}
-        >
-          Transfer control to {otherHuman.name}
-        </button>
+      {live && ownsLease && leaseToken && transferTarget ? (
+        <div className="transfer-row">
+          <label htmlFor={`transfer-${agent.id}`}>Transfer control</label>
+          <select
+            id={`transfer-${agent.id}`}
+            value={transferTarget.id}
+            onChange={(event) => setTransferActorId(event.target.value)}
+          >
+            {transferCandidates.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.name} · {candidate.role}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="transfer-control"
+            onClick={() => onTransfer(agent, leaseToken, transferTarget)}
+          >
+            Transfer
+          </button>
+        </div>
       ) : null}
-      {agent.current_run_id && ['owner', 'admin', 'manager'].includes(actor.role) ? (
+      {live && supportsStop && ['owner', 'admin', 'manager'].includes(actor.role) ? (
         <button
           type="button"
           className="emergency-stop"
@@ -600,7 +687,7 @@ function AgentDesk({
           Emergency stop
         </button>
       ) : null}
-      {agent.current_run_id && ownsLease && leaseToken ? (
+      {live && supportsInterrupt && ownsLease && leaseToken ? (
         <button
           type="button"
           className="interrupt-run"
@@ -614,12 +701,17 @@ function AgentDesk({
           aria-label={`Message ${agent.name}`}
           value={text}
           onChange={(event) => setText(event.target.value)}
-          placeholder={ownsLease ? 'Send live direction…' : 'Queue a note…'}
+          placeholder={messageToken ? 'Send live direction…' : 'Queue a note for the next supported turn…'}
         />
         <button className="button button-ink" type="submit">
-          Send
+          {messageToken ? 'Steer' : 'Queue note'}
         </button>
       </form>
+      {live && !supportsSteer ? (
+        <small className="control-note">
+          {adapterLabel(agent.adapter)} does not support live steering. Notes are queued instead.
+        </small>
+      ) : null}
     </article>
   )
 }
@@ -628,6 +720,7 @@ function MissionCard({
   mission,
   tasks,
   runs,
+  agents,
   evidence,
   verificationRequests,
   actionApprovals,
@@ -636,12 +729,14 @@ function MissionCard({
   busy,
   onLaunch,
   onResume,
+  onDownloadArtifact,
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
   mission: Mission
   tasks: Task[]
   runs: Run[]
+  agents: Agent[]
   evidence: VerificationEvidence[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
@@ -650,19 +745,24 @@ function MissionCard({
   busy: boolean
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
+  onDownloadArtifact: (run: Run) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
+  const taskById = new Map(tasks.map((task) => [task.id, task]))
   const latestRun = runs[0]
   const completedTasks = tasks.filter((task) => task.status === 'completed').length
   const activeRuns = runs.filter((run) =>
     ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
   ).length
   const resumableRun = runs.find(
-    (run) => run.provider_session_id && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status),
+    (run) =>
+      run.provider_session_id &&
+      run.workspace_disposition !== 'removed' &&
+      terminalRun(run.status),
   )
   const pendingRun = runs.find((run) => run.status === 'waiting_for_approval')
   const pendingRequest = pendingRun
@@ -675,21 +775,28 @@ function MissionCard({
     (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
   )
   const latestEvidence = latestRun
-    ? evidence.filter((item) => item.run_id === latestRun.id)
+    ? evidence
+        .filter((item) => item.run_id === latestRun.id)
+        .toSorted((left, right) => left.check_index - right.check_index)
     : []
+  const terminalSummary =
+    latestRun && terminalRun(latestRun.status)
+      ? latestRun.summary ?? latestRun.verification_summary
+      : null
   return (
     <article
       className="mission-card"
       data-testid={`mission-${mission.id}`}
       data-mission-id={mission.id}
       data-run-id={latestRun?.id}
+      tabIndex={-1}
     >
       <div className="mission-card-top">
-        <span className={`status-chip status-chip-${mission.status}`}>{mission.status}</span>
+        <span className={`status-chip status-chip-${mission.status}`}>{statusLabel(mission.status)}</span>
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
-      <div className="strategy-chip">{mission.strategy}</div>
+      <div className="strategy-chip">{statusLabel(mission.strategy)}</div>
       <dl>
         <div>
           <dt>Tasks</dt>
@@ -701,34 +808,81 @@ function MissionCard({
         </div>
       </dl>
       <div className="task-graph-list">
-        {orderedTasks.map((task) => (
-          <div className="task-graph-row" key={task.id} data-task-id={task.id}>
-            <span>{task.plan_key}</span>
-            <strong>{task.status}</strong>
-            <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
-          </div>
-        ))}
+        {orderedTasks.map((task) => {
+          const assignedAgent = agents.find((agent) => agent.id === task.assigned_agent_id)
+          const dependencies = task.depends_on
+            .map((dependencyId) => taskById.get(dependencyId)?.plan_key ?? shortId(dependencyId))
+          return (
+            <details className="task-graph-item" key={task.id} data-task-id={task.id}>
+              <summary className="task-graph-row">
+                <span>{task.plan_key}</span>
+                <strong>{statusLabel(task.status)}</strong>
+                <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
+              </summary>
+              <div className="task-contract">
+                <p>{task.objective}</p>
+                <dl>
+                  <div><dt>Agent</dt><dd>{assignedAgent?.name ?? 'Unassigned'} · {adapterLabel(task.required_adapter ?? assignedAgent?.adapter ?? 'unknown')}</dd></div>
+                  <div><dt>Depends on</dt><dd>{dependencies.length ? dependencies.join(', ') : 'Nothing — ready independently'}</dd></div>
+                  <div><dt>Expected output</dt><dd>{task.contract.expected_output}</dd></div>
+                  <div><dt>Budget</dt><dd>{task.contract.budget_tokens.toLocaleString()} tokens</dd></div>
+                  <div><dt>Write scope</dt><dd>{task.contract.write_scope.length ? task.contract.write_scope.join(', ') : 'No repository writes declared'}</dd></div>
+                </dl>
+                <strong>Acceptance checks</strong>
+                <ul>
+                  {task.contract.acceptance_tests.map((test) => <li key={test}>{test}</li>)}
+                </ul>
+              </div>
+            </details>
+          )
+        })}
       </div>
       {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
         <div className="evidence-box">
           <strong>Artifact recorded</strong>
           <span>{shortId(latestRun.artifact_sha256)}…</span>
-          <a
-            href={`${API_URL}${latestRun.artifact_uri}?actor_id=${actorId}`}
-            target="_blank"
-            rel="noreferrer"
+          <button
+            type="button"
+            className="artifact-download"
+            onClick={() => void onDownloadArtifact(latestRun)}
           >
-            Download verified artifact
-          </a>
+            {latestRun.verification_status === 'passed'
+              ? 'Download verified artifact'
+              : 'Download submitted artifact'}
+          </button>
         </div>
       ) : null}
-      {latestRun ? (
+      {latestRun &&
+      (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
         <div className={`verification-box verification-${latestRun.verification_status}`}>
-          <strong>{latestRun.verification_status.replaceAll('_', ' ')}</strong>
+          <strong>{statusLabel(latestRun.verification_status)}</strong>
           <span>
             {latestEvidence.filter((item) => item.status === 'passed').length}/
             {latestEvidence.length} checks passed
           </span>
+          {latestEvidence.length ? (
+            <ol className="evidence-checks">
+              {latestEvidence.map((item) => (
+                <li className={`evidence-check evidence-check-${item.status}`} key={item.id}>
+                  <strong>{statusLabel(item.kind)}</strong>
+                  <span>{statusLabel(item.status)}</span>
+                  <p>{item.summary}</p>
+                </li>
+              ))}
+            </ol>
+          ) : null}
+        </div>
+      ) : null}
+      {latestRun && terminalRun(latestRun.status) ? (
+        <div className={`terminal-summary terminal-${latestRun.status}`}>
+          <strong>{statusLabel(latestRun.status)}</strong>
+          <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+          <small>
+            Worktree: {latestRun.workspace_disposition
+              ? statusLabel(latestRun.workspace_disposition)
+              : 'cleanup pending'}
+            {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+          </small>
         </div>
       ) : null}
       {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
@@ -749,7 +903,7 @@ function MissionCard({
         </div>
       ) : null}
       {mission.status === 'ready' ? (
-        <button className="button button-primary mission-launch" type="button" onClick={() => onLaunch(mission)}>
+        <button className="button button-primary mission-launch" type="button" disabled={busy} onClick={() => onLaunch(mission)}>
           Dispatch mission
         </button>
       ) : null}
@@ -789,16 +943,35 @@ function MissionCard({
         </div>
       ) : null}
       {resumableRun && activeRuns === 0 ? (
-        <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(resumableRun)}>
+        <button className="button button-secondary mission-launch" type="button" disabled={busy} onClick={() => onResume(resumableRun)}>
           Resume agent session
         </button>
       ) : null}
       {pendingRun && pendingRequest ? (
         <div className="verification-actions">
-          <span>{pendingRequest.gate_type.replaceAll('_', ' ')}</span>
+          {(() => {
+            const requiredRoles = pendingRequest.gate.roles
+            const requesterExcluded =
+              pendingRequest.gate.type === 'independent_review' &&
+              pendingRequest.gate.exclude_requester &&
+              mission.requested_by === actorId
+            const canDecide = requiredRoles.includes(actorRole) && !requesterExcluded
+            return (
+              <>
+                <span>
+                  {statusLabel(pendingRequest.gate_type)} · eligible: {requiredRoles.join(', ')}
+                </span>
+                {!canDecide ? (
+                  <small>
+                    {requesterExcluded
+                      ? 'The requester cannot approve an independent review. Switch operator.'
+                      : `Your ${actorRole} role is not eligible for this gate.`}
+                  </small>
+                ) : null}
           <button
             className="button button-primary"
             type="button"
+                  disabled={busy || !canDecide}
             onClick={() => onVerificationDecision(pendingRun, true)}
           >
             Approve evidence
@@ -806,10 +979,14 @@ function MissionCard({
           <button
             className="button button-danger"
             type="button"
+                  disabled={busy || !canDecide}
             onClick={() => onVerificationDecision(pendingRun, false)}
           >
             Reject evidence
           </button>
+              </>
+            )
+          })()}
         </div>
       ) : null}
     </article>
@@ -949,8 +1126,6 @@ function RoomPanel({
             visibleMessages.map((message) => {
               const author = actors.find((actor) => actor.id === message.actor_id)
               const linked = message.link
-                ? `${message.link.kind} · ${shortId(message.link.id)}`
-                : null
               return (
                 <li
                   key={message.id}
@@ -972,7 +1147,21 @@ function RoomPanel({
                           </span>
                         )
                       })}
-                      {linked ? <span className="entity-link">{linked}</span> : null}
+                      {linked ? (
+                        <button
+                          type="button"
+                          className="entity-link"
+                          onClick={() => {
+                            const target = document.querySelector<HTMLElement>(
+                              `[data-${linked.kind}-id="${CSS.escape(linked.id)}"]`,
+                            )
+                            target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                            target?.focus({ preventScroll: true })
+                          }}
+                        >
+                          {statusLabel(linked.kind)} · {shortId(linked.id)}
+                        </button>
+                      ) : null}
                     </div>
                     <button type="button" onClick={() => setReplyToId(message.id)}>
                       Reply
@@ -1030,11 +1219,21 @@ function App() {
   const [missionStrategy, setMissionStrategy] = useState('single')
   const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
+  const [developerMode, setDeveloperMode] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
   const [journeyOpen, setJourneyOpen] = useState(true)
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [announcement, setAnnouncement] = useState('Operations console loading.')
+  const [requiresConnection, setRequiresConnection] = useState(false)
+  const [connectionCorpId, setConnectionCorpId] = useState(
+    () => window.sessionStorage.getItem('ecorp_corp_id') ?? '',
+  )
+  const [connectionActorId, setConnectionActorId] = useState(
+    () => window.sessionStorage.getItem('ecorp_actor_id') ?? '',
+  )
+  const [connectionToken, setConnectionToken] = useState('')
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
 
@@ -1083,23 +1282,56 @@ function App() {
     const newest = snapshot.snapshot.events.at(-1)?.seq ?? 0
     lastEventSeq.current[actorId] = Math.max(lastEventSeq.current[actorId] ?? 0, newest)
     setData(snapshot)
+    return snapshot
   }, [])
 
   useEffect(() => {
     let cancelled = false
-    void api<BootstrapResponse>('/api/demo/bootstrap', { method: 'POST', body: '{}' })
-      .then(async (result) => {
+    void (async () => {
+      const health = await fetch(`${API_URL}/health`).then((response) =>
+        response.json() as Promise<HealthResponse>,
+      )
+      if (health.mode === 'production') {
+        const corpId = window.sessionStorage.getItem('ecorp_corp_id')
+        const actorId = window.sessionStorage.getItem('ecorp_actor_id')
+        if (!corpId || !actorId || !storedAccessToken()) {
+          if (!cancelled) {
+            setRequiresConnection(true)
+            setAnnouncement('Production connection details are required.')
+          }
+          return
+        }
+        const result: BootstrapResponse = {
+          corp_id: corpId,
+          room_id: '',
+          alice_actor_id: actorId,
+          bob_actor_id: actorId,
+          eve_actor_id: actorId,
+          manager_agent_id: '',
+          worker_agent_id: '',
+          codex_agent_id: '',
+        }
         if (cancelled) return
         setBootstrap(result)
-        const actorName = new URLSearchParams(window.location.search).get('actor')
-        const initialActor = actorName?.toLowerCase() === 'bob'
-          ? result.bob_actor_id
-          : actorName?.toLowerCase() === 'eve'
-            ? result.eve_actor_id
-            : result.alice_actor_id
-        setSelectedActorId(initialActor)
-        await refresh(result.corp_id, initialActor)
+        setSelectedActorId(actorId)
+        await refresh(corpId, actorId)
+        return
+      }
+      const result = await api<BootstrapResponse>('/api/demo/bootstrap', {
+        method: 'POST',
+        body: '{}',
       })
+      if (cancelled) return
+      setBootstrap(result)
+      const actorName = new URLSearchParams(window.location.search).get('actor')
+      const initialActor = actorName?.toLowerCase() === 'bob'
+        ? result.bob_actor_id
+        : actorName?.toLowerCase() === 'eve'
+          ? result.eve_actor_id
+          : result.alice_actor_id
+      setSelectedActorId(initialActor)
+      await refresh(result.corp_id, initialActor)
+    })()
       .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)))
     return () => {
       cancelled = true
@@ -1111,14 +1343,37 @@ function App() {
     let disposed = false
     let socket: WebSocket | null = null
 
-    const connect = () => {
+    const connect = async () => {
       if (disposed) return
       let replaying = true
       let replayChanged = false
       setConnection('connecting')
       const wsUrl = API_URL.replace(/^http/, 'ws')
+      let authorization: string
+      try {
+        const token = storedAccessToken()
+        if (token) {
+          const ticket = await api<{ ticket: string }>(
+            `/api/corps/${bootstrap.corp_id}/ws-ticket`,
+            {
+              method: 'POST',
+              body: JSON.stringify({ actor_id: selectedActorId }),
+            },
+          )
+          authorization = `ticket=${encodeURIComponent(ticket.ticket)}`
+        } else {
+          authorization = `actor_id=${encodeURIComponent(selectedActorId)}`
+        }
+      } catch (caught) {
+        if (disposed) return
+        setConnection('offline')
+        setError(caught instanceof Error ? caught.message : String(caught))
+        reconnectTimer.current = window.setTimeout(() => void connect(), 1_500)
+        return
+      }
+      if (disposed) return
       socket = new WebSocket(
-        `${wsUrl}/ws/corps/${bootstrap.corp_id}?actor_id=${selectedActorId}&after_seq=${lastEventSeq.current[selectedActorId] ?? 0}`,
+        `${wsUrl}/ws/corps/${bootstrap.corp_id}?${authorization}&after_seq=${lastEventSeq.current[selectedActorId] ?? 0}`,
       )
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data) as BrowserSocketMessage
@@ -1134,6 +1389,7 @@ function App() {
         }
         if (message.event.seq <= (lastEventSeq.current[selectedActorId] ?? 0)) return
         lastEventSeq.current[selectedActorId] = message.event.seq
+        setAnnouncement(statusLabel(message.event.type))
         if (replaying) {
           replayChanged = true
           return
@@ -1144,11 +1400,11 @@ function App() {
       socket.onclose = () => {
         if (disposed) return
         setConnection('offline')
-        reconnectTimer.current = window.setTimeout(connect, 1_500)
+        reconnectTimer.current = window.setTimeout(() => void connect(), 1_500)
       }
     }
 
-    connect()
+    void connect()
     return () => {
       disposed = true
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
@@ -1163,9 +1419,6 @@ function App() {
   const availableAdapters = useMemo(() => availableRunnerAdapters(data), [data])
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
-  const otherHuman = selectedActor
-    ? humans.find((actor) => actor.id !== selectedActor.id)
-    : undefined
   const preferredAdapter =
     availableAdapters.find((adapter) => adapter.name === 'github-copilot') ??
     availableAdapters.find((adapter) => adapter.name === 'codex') ??
@@ -1179,8 +1432,8 @@ function App() {
       : preferredAdapter?.name ?? ''
 
   const selectActor = (actor: Actor) => {
-    setData(null)
     setSelectedActorId(actor.id)
+    setAnnouncement(`Switching operations view to ${actor.name}.`)
     const url = new URL(window.location.href)
     url.searchParams.set('actor', actor.name.toLowerCase())
     window.history.replaceState({}, '', url)
@@ -1213,18 +1466,35 @@ function App() {
           budget_tokens: deterministicHarness ? null : missionBudgetTokens,
         }),
       })
+      let launched: LaunchMissionResponse | null = null
       if (!pauseAfterPlanning) {
-        await api(`/api/corps/${bootstrap.corp_id}/missions/${created.mission_id}/launch`, {
-          method: 'POST',
-          body: JSON.stringify({ requested_by: selectedActor.id }),
-        })
+        launched = await api<LaunchMissionResponse>(
+          `/api/corps/${bootstrap.corp_id}/missions/${created.mission_id}/launch`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ requested_by: selectedActor.id }),
+          },
+        )
       }
       setMissionTitle('')
-      await refresh(bootstrap.corp_id, selectedActor.id)
+      const refreshed = await refresh(bootstrap.corp_id, selectedActor.id)
+      if (launched) {
+        const launchedRun = refreshed.snapshot.runs.find(
+          (run) => run.id === launched?.run_id,
+        )
+        if (launchedRun) setSelectedAgentId(launchedRun.agent_id)
+      }
+      setAnnouncement(
+        pauseAfterPlanning
+          ? 'Mission plan created. Review the task contracts before dispatch.'
+          : 'Mission dispatched. The active worker is selected on the control floor.',
+      )
       window.setTimeout(() => {
-        document
-          .querySelector(`[data-mission-id="${CSS.escape(created.mission_id)}"]`)
-          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        const card = document.querySelector<HTMLElement>(
+          `[data-mission-id="${CSS.escape(created.mission_id)}"]`,
+        )
+        card?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        card?.focus({ preventScroll: true })
       }, 80)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -1238,11 +1508,19 @@ function App() {
     setBusy(true)
     setError(null)
     try {
-      await api(`/api/corps/${bootstrap.corp_id}/missions/${mission.id}/launch`, {
-        method: 'POST',
-        body: JSON.stringify({ requested_by: selectedActor.id }),
-      })
-      await refresh(bootstrap.corp_id, selectedActor.id)
+      const launched = await api<LaunchMissionResponse>(
+        `/api/corps/${bootstrap.corp_id}/missions/${mission.id}/launch`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ requested_by: selectedActor.id }),
+        },
+      )
+      const refreshed = await refresh(bootstrap.corp_id, selectedActor.id)
+      const launchedRun = refreshed.snapshot.runs.find(
+        (run) => run.id === launched.run_id,
+      )
+      if (launchedRun) setSelectedAgentId(launchedRun.agent_id)
+      setAnnouncement('Mission dispatched. The active worker is selected.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -1398,13 +1676,19 @@ function App() {
 
   const emergencyStop = async (agent: Agent) => {
     if (!bootstrap || !selectedActor) return
+    const defaultReason = `${selectedActor.name} stopped ${agent.name} because the live run required immediate operator intervention.`
+    const reason = window.prompt(
+      `Emergency stop ${agent.name} on run ${shortId(agent.current_run_id)}. Enter the audited reason:`,
+      defaultReason,
+    )
+    if (!reason?.trim()) return
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/emergency-stop`, {
         method: 'POST',
         body: JSON.stringify({
           actor_id: selectedActor.id,
-          reason: `${selectedActor.name} requested an emergency stop from the operations floor.`,
+          reason: reason.trim(),
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
@@ -1475,6 +1759,121 @@ function App() {
     }
   }
 
+  const downloadArtifact = async (run: Run) => {
+    if (!selectedActor || !run.artifact_uri || !run.artifact_id) return
+    setError(null)
+    try {
+      const token = storedAccessToken()
+      const response = await fetch(
+        `${API_URL}${run.artifact_uri}?actor_id=${selectedActor.id}`,
+        {
+          headers: {
+            accept: 'application/octet-stream',
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`Artifact download failed with HTTP ${response.status}.`)
+      }
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const extension = run.artifact_media_type === 'application/json'
+        ? 'json'
+        : run.artifact_media_type === 'text/markdown'
+          ? 'md'
+          : 'bin'
+      link.href = objectUrl
+      link.download = `ecorp-artifact-${run.artifact_id}.${extension}`
+      document.body.append(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+      setAnnouncement('Verified artifact download started.')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const connectProduction = async (event: FormEvent) => {
+    event.preventDefault()
+    const corpId = connectionCorpId.trim()
+    const actorId = connectionActorId.trim()
+    const token = connectionToken.trim()
+    if (!corpId || !actorId || !token) return
+    setBusy(true)
+    setError(null)
+    window.sessionStorage.setItem('ecorp_corp_id', corpId)
+    window.sessionStorage.setItem('ecorp_actor_id', actorId)
+    window.sessionStorage.setItem('ecorp_access_token', token)
+    try {
+      const result: BootstrapResponse = {
+        corp_id: corpId,
+        room_id: '',
+        alice_actor_id: actorId,
+        bob_actor_id: actorId,
+        eve_actor_id: actorId,
+        manager_agent_id: '',
+        worker_agent_id: '',
+        codex_agent_id: '',
+      }
+      await refresh(corpId, actorId)
+      setBootstrap(result)
+      setSelectedActorId(actorId)
+      setConnectionToken('')
+      setRequiresConnection(false)
+      setAnnouncement('Authenticated production connection established.')
+    } catch (caught) {
+      window.sessionStorage.removeItem('ecorp_access_token')
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (requiresConnection) {
+    return (
+      <main className="loading-shell production-connect">
+        <div className="loading-stamp">ECORP SECURE CONNECTION</div>
+        <h1>Connect to your Corp</h1>
+        <p>Enter the Corp, actor, and short-lived OIDC access token issued for this session.</p>
+        {error ? <p className="error-banner" role="alert">{error}</p> : null}
+        <form onSubmit={connectProduction}>
+          <label htmlFor="production-corp">Corp ID</label>
+          <input
+            id="production-corp"
+            value={connectionCorpId}
+            onChange={(event) => setConnectionCorpId(event.target.value)}
+            autoComplete="off"
+          />
+          <label htmlFor="production-actor">Actor ID</label>
+          <input
+            id="production-actor"
+            value={connectionActorId}
+            onChange={(event) => setConnectionActorId(event.target.value)}
+            autoComplete="off"
+          />
+          <label htmlFor="production-token">Access token</label>
+          <input
+            id="production-token"
+            type="password"
+            value={connectionToken}
+            onChange={(event) => setConnectionToken(event.target.value)}
+            autoComplete="off"
+          />
+          <button
+            className="button button-primary"
+            type="submit"
+            disabled={busy || !connectionCorpId.trim() || !connectionActorId.trim() || !connectionToken.trim()}
+          >
+            {busy ? 'Connecting…' : 'Connect securely'}
+          </button>
+        </form>
+      </main>
+    )
+  }
+
   if (!data || !bootstrap || !selectedActor) {
     return (
       <main className="loading-shell">
@@ -1496,13 +1895,19 @@ function App() {
     (model) => model.id === missionModel,
   )
   const runnerLabel = connectedRunners.length
-    ? `${connectedRunners.length} runner online`
+    ? `${connectedRunners.length} runner${connectedRunners.length === 1 ? '' : 's'} online`
     : data.runners.some((runner) => runner.status === 'grace')
       ? 'Runner reconnecting'
       : 'No runner'
   const selectedAgent =
     data.snapshot.agents.find((agent) => agent.id === selectedAgentId) ??
     data.snapshot.agents[0]
+  const selectedAgentCapability = connectedRunners
+    .flatMap((runner) => runner.capabilities)
+    .find(
+      (capability) =>
+        capability.available && capability.name === selectedAgent.adapter,
+    )
   const workspaceCapability = connectedRunners
     .flatMap((runner) => runner.capabilities)
     .find((capability) => capability.name === 'workspace-isolation')
@@ -1519,9 +1924,13 @@ function App() {
   const acceptedArtifacts = data.snapshot.runs.filter(
     (run) => run.verification_status === 'passed' && run.artifact_uri,
   )
+  const productionAuthenticated = Boolean(storedAccessToken())
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" aria-busy={busy}>
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </div>
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-kicker">Distributed intelligence division</span>
@@ -1544,7 +1953,7 @@ function App() {
           </div>
           <label>
             Operating as
-            <select value={selectedActor.id} onChange={(event) => {
+            <select disabled={productionAuthenticated} value={selectedActor.id} onChange={(event) => {
               const actor = humans.find((candidate) => candidate.id === event.target.value)
               if (actor) selectActor(actor)
             }}>
@@ -1653,6 +2062,39 @@ function App() {
                   <small>Then open http://127.0.0.1:5187. Use CRONY_SOURCE_REPOSITORY to target another checkout.</small>
                 </div>
               </div>
+              <div className="runner-list" aria-label="Connected runner readiness">
+                {data.runners.map((runner) => {
+                  const isolation = runner.capabilities.find(
+                    (capability) => capability.name === 'workspace-isolation',
+                  )
+                  return (
+                    <article className={`runner-card runner-card-${runner.status}`} key={runner.id}>
+                      <div>
+                        <strong>{runner.hostname}</strong>
+                        <span>{runner.id} · {runner.os} · {statusLabel(runner.status)}</span>
+                      </div>
+                      <small>
+                        Repository: {detailValue(isolation?.detail, 'repository') ?? 'not reported'}
+                      </small>
+                      <ul>
+                        {runner.capabilities
+                          .filter((capability) => capability.name !== 'workspace-isolation')
+                          .map((capability) => (
+                            <li key={capability.name}>
+                              <span>{adapterLabel(capability.name)}</span>
+                              <strong>{capability.available ? 'Ready' : 'Unavailable'}</strong>
+                              {capability.models.length ? (
+                                <small>
+                                  {capability.models.filter((model) => model.policy_state !== 'disabled').length} selectable models
+                                </small>
+                              ) : null}
+                            </li>
+                          ))}
+                      </ul>
+                    </article>
+                  )
+                })}
+              </div>
             </details>
           </>
         ) : null}
@@ -1674,7 +2116,7 @@ function App() {
             <div>
               <span className="section-code">CONTROL FLOOR / 01</span>
               <h2>{room?.name ?? 'Automation division'}</h2>
-              <p>Only live provider sessions appear on the floor. Finished agents return off shift.</p>
+              <p>Active sessions and work awaiting review appear on the floor. Finished agents return off shift.</p>
             </div>
             <div className="floor-legend">
               <span><StatusMark status="idle" /> off shift</span>
@@ -1700,15 +2142,16 @@ function App() {
                   <StatusMark status={agent.status} />
                   <span>{agent.name}</span>
                   <small>
-                    {adapterLabel(agent.adapter)} · {agent.current_run_id ? agent.status : 'off shift'}
+                    {adapterLabel(agent.adapter)} · {agentStatusLabel(agent)}
                   </small>
                 </button>
               ))}
             </div>
             <AgentDesk
               agent={selectedAgent}
+              capability={selectedAgentCapability}
               actor={selectedActor}
-              otherHuman={otherHuman}
+              humans={humans}
               lease={data.snapshot.leases.find((lease) => lease.agent_id === selectedAgent.id)}
               leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, selectedAgent.id)]}
               queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === selectedAgent.id).length}
@@ -1855,8 +2298,7 @@ function App() {
                   value={missionBudgetTokens}
                   onChange={(event) => setMissionBudgetTokens(Number(event.target.value))}
                 >
-                  <option value={100_000}>Quick task · 100,000 tokens</option>
-                  <option value={500_000}>Focused build · 500,000 tokens</option>
+                  <option value={500_000}>Quick task · 500,000 tokens</option>
                   <option value={1_000_000}>Standard · 1,000,000 tokens</option>
                   <option value={2_000_000}>Large build · 2,000,000 tokens</option>
                 </select>
@@ -1866,8 +2308,25 @@ function App() {
                 </small>
               </div>
             ) : null}
+            <label className="developer-mode-toggle">
+              <input
+                type="checkbox"
+                checked={developerMode}
+                onChange={(event) => {
+                  const enabled = event.target.checked
+                  setDeveloperMode(enabled)
+                  if (!enabled && usesDeterministicHarness(missionStrategy)) {
+                    setMissionStrategy('single')
+                  }
+                }}
+              />
+              <span>
+                <strong>Developer mode</strong>
+                <small>Expose deterministic lifecycle and verification fixtures.</small>
+              </span>
+            </label>
             <div className="mission-field">
-              <label htmlFor="mission-strategy">How should the work be organized?</label>
+              <label htmlFor="mission-strategy">Execution pattern</label>
               <select
                 id="mission-strategy"
                 value={missionStrategy}
@@ -1875,10 +2334,14 @@ function App() {
               >
                 <option value="single">One agent delivers the outcome</option>
                 <option value="parallel-specialists">Two specialists, then synthesis</option>
-                <option value="verification-matrix">Automated verification matrix</option>
-                <option value="human-approval">Pause for human approval</option>
-                <option value="independent-review">Require an independent reviewer</option>
-                <option value="verification-failure">Verification failure demo</option>
+                {developerMode ? (
+                  <optgroup label="Deterministic verification fixtures">
+                    <option value="verification-matrix">Automated verification matrix</option>
+                    <option value="human-approval">Pause for human approval</option>
+                    <option value="independent-review">Require an independent reviewer</option>
+                    <option value="verification-failure">Verification failure demo</option>
+                  </optgroup>
+                ) : null}
               </select>
               <small>
                 {missionStrategy === 'single'
@@ -1926,6 +2389,7 @@ function App() {
                     mission={mission}
                     tasks={tasks}
                     runs={runs}
+                    agents={data.snapshot.agents}
                     evidence={data.snapshot.verification_evidence}
                     verificationRequests={data.snapshot.verification_requests}
                     actionApprovals={data.snapshot.action_approvals}
@@ -1934,6 +2398,7 @@ function App() {
                     busy={busy}
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
+                    onDownloadArtifact={downloadArtifact}
                     onVerificationDecision={decideVerification}
                     onActionApprovalDecision={decideActionApproval}
                   />
@@ -1970,7 +2435,7 @@ function App() {
             <span>{data.snapshot.missions.length} missions</span>
             <span>{data.snapshot.runs.length} runs</span>
             <span>{data.snapshot.circuit_breaker_incidents.length} breaker events</span>
-            <span>{data.snapshot.events.length} events loaded</span>
+            <span>Showing {latestEvents.length} of {data.snapshot.events.length} events</span>
           </div>
         </div>
         {data.snapshot.action_approvals.some((approval) => approval.status === 'pending') ? (
@@ -1981,25 +2446,9 @@ function App() {
                 <article className="verification-card" key={approval.id}>
                   <div>
                     <strong>{approval.action}</strong>
-                    <span>{approval.risk} risk · {approval.rationale}</span>
-                  </div>
-                  <div className="verification-actions">
-                    <button
-                      type="button"
-                      className="button button-primary"
-                      disabled={busy || !approval.required_roles.includes(selectedActor.role)}
-                      onClick={() => void decideActionApproval(approval, true)}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      type="button"
-                      className="button"
-                      disabled={busy || !approval.required_roles.includes(selectedActor.role)}
-                      onClick={() => void decideActionApproval(approval, false)}
-                    >
-                      Reject
-                    </button>
+                    <span>
+                      {approval.risk} risk · decision controls are in the owning mission card
+                    </span>
                   </div>
                 </article>
               ))}

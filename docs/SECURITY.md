@@ -27,9 +27,13 @@ Only credential hashes are stored. Replayed, expired, unknown, and revoked crede
 Secrets are encrypted with ChaCha20-Poly1305 and authenticated associated data. The broker checks
 actor, task, run, runner, tool, resource, and expiry scope before dispatch. Events and snapshots
 contain grant metadata only. Environment injection is labeled reduced assurance.
+Expired grants are rejected before provider start, and the provider is stopped when the earliest
+active grant expires.
 
 Risky action approvals are Corp-scoped, role-gated, expiring, and idempotent. Approval decisions
-transactionally enqueue durable runner commands, and command IDs fence duplicate delivery.
+transactionally enqueue durable runner commands. Commands remain pending until the runner
+acknowledges application, command IDs fence duplicate delivery, and expiry automatically rejects
+the action and repairs run/task/mission/agent state.
 
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state
@@ -64,6 +68,7 @@ length, and media type before returning an attachment with content sniffing disa
 - Emergency stop is role-gated and audited.
 - Runner connections use epochs, and run assignments use independent private fencing tokens.
 - Assignment tokens are omitted from shared snapshots and event payloads.
+- Every runner event must match both the current connection epoch and the stored assignment token.
 - A stale runner cannot turn a `lost` run back into an active or cancelled run.
 
 ## Reporting

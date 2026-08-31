@@ -6,7 +6,10 @@ use crony_protocol::{
     InterruptRunRequest, LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest,
     ResumeRunRequest, TransferLeaseRequest, VerificationDecisionRequest,
 };
-use reqwest::{Client, Method};
+use reqwest::{
+    Client, Method,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -19,6 +22,9 @@ struct Args {
         default_value = "http://127.0.0.1:8791"
     )]
     server: String,
+
+    #[arg(long, env = "CRONY_ACCESS_TOKEN")]
+    access_token: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -118,7 +124,15 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let client = Client::new();
+    let mut headers = HeaderMap::new();
+    if let Some(token) = args.access_token.as_deref() {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("access token cannot be encoded as an HTTP header")?,
+        );
+    }
+    let client = Client::builder().default_headers(headers).build()?;
     let response = match args.command {
         Command::Health => {
             request(
