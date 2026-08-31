@@ -211,7 +211,7 @@ const artifact = [
   "",
   "## Evidence",
   "",
-  "- Executed as a real child process owned by the Crony runner.",
+  "- Executed as a real child process owned by the ECorp runner.",
   "- Wrote this artifact inside the run-specific workspace.",
   "- Runner computes and reports the SHA-256 digest.",
   `- Live control messages observed: ${controls.length}.`,

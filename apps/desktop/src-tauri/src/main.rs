@@ -14,14 +14,14 @@ fn main() {
                 let Some(url) = urls.first() else {
                     return;
                 };
-                if url.scheme() != "crony" {
+                if !matches!(url.scheme(), "ecorp" | "crony") {
                     return;
                 }
                 if let Some(window) = handle.get_webview_window("main")
                     && let Ok(payload) = serde_json::to_string(url.as_str())
                 {
                     let _ = window.eval(format!(
-                        "window.dispatchEvent(new CustomEvent('crony-deep-link', {{ detail: {payload} }}));"
+                        "window.dispatchEvent(new CustomEvent('ecorp-deep-link', {{ detail: {payload} }}));"
                     ));
                     let _ = window.set_focus();
                 }
@@ -29,5 +29,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("run Crony desktop shell");
+        .expect("run ECorp Operations desktop shell");
 }

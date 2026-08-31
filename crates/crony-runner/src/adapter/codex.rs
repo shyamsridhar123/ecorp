@@ -184,8 +184,8 @@ impl CodexAdapter {
                 "id": INITIALIZE_REQUEST_ID,
                 "params": {
                     "clientInfo": {
-                        "name": "crony-corp",
-                        "title": "Crony Corp Runner",
+                        "name": "ecorp-operations",
+                        "title": "ECorp Runner",
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
@@ -381,7 +381,7 @@ impl CodexAdapter {
                                 match &mode {
                                     CodexMode::Start => {
                                         params["ephemeral"] = Value::Bool(false);
-                                        params["threadSource"] = Value::String("crony-corp".to_owned());
+                                        params["threadSource"] = Value::String("ecorp-operations".to_owned());
                                     }
                                     CodexMode::Resume { session_id } => {
                                         params["threadId"] = Value::String(session_id.clone());
@@ -684,7 +684,7 @@ async fn send_turn_start(
     thread_id: &str,
 ) -> Result<(), AdapterError> {
     let prompt = format!(
-        "You are executing a bounded task under Crony Corp supervision.\n\
+        "You are executing a bounded task under ECorp supervision.\n\
          Work only inside the current repository. Do not modify files outside it.\n\
          Complete this mission and verify the resulting files:\n\n{}",
         request.mission_title
@@ -783,7 +783,7 @@ async fn answer_server_request(
             "error": {
                 "code": -32000,
                 "message": format!(
-                    "Crony Corp does not permit interactive app-server request {method}"
+                    "ECorp does not permit interactive app-server request {method}"
                 )
             }
         }),
@@ -829,7 +829,7 @@ fn handle_notification(value: &Value, parsed: &mut ParsedRun, sink: Arc<dyn Adap
         }
         "item/agentMessage/delta" => {
             // App-server emits token-sized deltas. Persisting each one as a domain event creates
-            // avoidable database pressure, so Crony emits the authoritative completed message.
+            // avoidable database pressure, so ECorp emits the authoritative completed message.
         }
         "thread/tokenUsage/updated" => record_usage(params, parsed),
         "warning" => {
@@ -989,14 +989,14 @@ async fn ensure_git_workspace(workspace: &Path) -> Result<(), AdapterError> {
     run_git(workspace, &["init", "-b", "main"]).await?;
     let readme = workspace.join("README.md");
     if !readme.exists() {
-        tokio::fs::write(&readme, "# Crony Codex workspace\n").await?;
+        tokio::fs::write(&readme, "# ECorp Codex workspace\n").await?;
     }
     run_git(workspace, &["add", "README.md"]).await?;
     run_git(
         workspace,
         &[
             "-c",
-            "user.name=Crony Runner",
+            "user.name=ECorp Runner",
             "-c",
             "user.email=crony@example.invalid",
             "commit",

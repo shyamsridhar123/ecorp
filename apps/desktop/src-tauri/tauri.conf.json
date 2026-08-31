@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Crony Corp",
+  "productName": "ECorp Operations",
   "version": "0.1.0",
-  "identifier": "com.cronycorp.desktop",
+  "identifier": "com.ecorp.operations",
   "build": {
     "beforeDevCommand": "pnpm --dir ../web dev --host 127.0.0.1 --port 5187 --strictPort",
     "devUrl": "http://127.0.0.1:5187",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Crony Corp",
+        "title": "ECorp Operations Network",
         "width": 1440,
         "height": 960,
         "minWidth": 960,
@@ -33,7 +33,7 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["crony"]
+        "schemes": ["ecorp", "crony"]
       }
     }
   }

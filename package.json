@@ -1,5 +1,5 @@
 {
-  "name": "crony-corp",
+  "name": "ecorp-operations",
   "private": true,
   "version": "0.1.0",
   "packageManager": "pnpm@11.19.0",
@@ -10,4 +10,3 @@
     "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && pnpm build:web && pnpm lint:web"
   }
 }
-

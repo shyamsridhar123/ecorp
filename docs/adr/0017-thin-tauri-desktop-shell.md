@@ -7,7 +7,8 @@ Accepted — August 30, 2026
 ## Decision
 
 The desktop application is a Tauri 2 shell over the exact React frontend and server APIs used by
-the browser. It owns window lifecycle, native packaging, and `crony://` deep links only.
+the browser. It owns window lifecycle, native packaging, and primary `ecorp://` deep links while
+accepting legacy `crony://` links during migration.
 
 It does not embed the server, runner, database, provider CLI, or process supervisor. Closing the
 desktop therefore cannot terminate an active run.

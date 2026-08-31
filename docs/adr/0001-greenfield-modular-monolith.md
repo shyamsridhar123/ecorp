@@ -5,7 +5,7 @@
 
 ## Decision
 
-Build Crony Corp as a new repository with one server binary and one runner binary. Do not fork
+Build ECorp as a new repository with one server binary and one runner binary. Do not fork
 Munder Difflin or Buzz as the primary implementation base.
 
 ## Rationale

@@ -1,4 +1,4 @@
-# Crony Corp contributor guide
+# ECorp contributor guide
 
 ## Product contract
 

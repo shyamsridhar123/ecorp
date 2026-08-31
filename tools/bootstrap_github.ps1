@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Owner = 'shyamsridhar123',
-    [string]$Repository = 'crony-corp',
-    [string]$ProjectTitle = 'Crony Corp Build'
+    [string]$Repository = 'ecorp',
+    [string]$ProjectTitle = 'ECorp Build'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,7 +69,7 @@ if (-not $project) {
 }
 gh project edit $project.number `
     --owner $Owner `
-    --description 'Execution board for the Crony Corp product, architecture, security, implementation, and real-world validation plan.' `
+    --description 'Execution board for the ECorp product, architecture, security, implementation, and real-world validation plan.' `
     --readme 'Backlog source: `docs/BACKLOG.md`. Product contract: `docs/PRODUCT_AND_TECHNICAL_PLAN.md`.' |
     Out-Null
 
@@ -198,10 +198,10 @@ $issues = @(
         milestone = 'M2 — Real agent work'
         title = 'Implement the first real OpenAI Codex adapter'
         labels = @('type:feature', 'area:runner', 'agent-runtime', 'priority:p0')
-        outcome = 'A real Codex session can execute a bounded repository task under Crony supervision.'
+        outcome = 'A real Codex session can execute a bounded repository task under ECorp supervision.'
         acceptance = @(
             'Start and resume are supported.',
-            'Terminal and structured lifecycle events stream to Crony.',
+            'Terminal and structured lifecycle events stream to ECorp.',
             'Steer, interrupt, and stop have verified behavior.',
             'Usage and completion evidence are recorded.',
             'A real sample repository change passes end-to-end.'
@@ -248,7 +248,7 @@ $issues = @(
         milestone = 'M2 — Real agent work'
         title = 'Add Claude Code and OpenCode adapters'
         labels = @('type:feature', 'area:runner', 'agent-runtime', 'priority:p1')
-        outcome = 'Crony proves the adapter architecture across multiple independent coding-agent runtimes.'
+        outcome = 'ECorp proves the adapter architecture across multiple independent coding-agent runtimes.'
         acceptance = @(
             'Both adapters pass lifecycle conformance tests.',
             'Provider-specific permission and resume behavior is documented.',
@@ -368,9 +368,9 @@ $issues = @(
         milestone = 'M4 — Alpha'
         title = 'Add MCP, ACP, and A2A gateways with conformance tests'
         labels = @('type:feature', 'area:protocol', 'agent-runtime', 'priority:p1')
-        outcome = 'Crony interoperates through open protocols without leaking internal task and policy semantics into their schemas.'
+        outcome = 'ECorp interoperates through open protocols without leaking internal task and policy semantics into their schemas.'
         acceptance = @(
-            'MCP exposes scoped Crony tools and context.',
+            'MCP exposes scoped ECorp tools and context.',
             'ACP adapter covers compatible local agent sessions.',
             'A2A gateway supports discovery, tasks, messages, and streaming.',
             'Protocol conformance tests and version negotiation are documented.'
@@ -380,7 +380,7 @@ $issues = @(
         milestone = 'M4 — Alpha'
         title = 'Complete public name, trademark, domain, art, and licensing review'
         labels = @('type:research', 'area:docs', 'priority:p1')
-        outcome = 'The public brand can launch without knowingly colliding with existing Crony products or copying protected visual identity.'
+        outcome = 'The public brand can launch without knowingly colliding with existing ECorp products or copying protected visual identity.'
         acceptance = @(
             'Trademark and app-store search is recorded.',
             'Domain, package, and social-handle options are recorded.',

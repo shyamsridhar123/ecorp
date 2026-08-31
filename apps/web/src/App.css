@@ -33,16 +33,18 @@
   justify-content: space-between;
   gap: 24px;
   padding: 20px 22px 18px;
-  color: var(--paper-light);
+  color: var(--ink);
   border: 2px solid var(--ink);
-  background: var(--ink);
-  box-shadow: 5px 5px 0 var(--marigold);
+  background:
+    linear-gradient(105deg, transparent 0 73%, rgb(200 32 39 / 9%) 73% 100%),
+    var(--paper-light);
+  box-shadow: 5px 5px 0 var(--signal);
 }
 
 .brand-kicker {
   display: block;
   margin-bottom: 10px;
-  color: #a9b5b6;
+  color: var(--signal);
 }
 
 .brand-row {
@@ -54,27 +56,52 @@
 .brand-row h1 {
   margin: 0;
   font: 700 clamp(29px, 4vw, 50px) / 0.9 var(--sans);
-  letter-spacing: -0.045em;
+  letter-spacing: -0.07em;
   text-transform: uppercase;
 }
 
+.brand-row h1 span {
+  color: var(--signal);
+  font-style: italic;
+}
+
 .brand-mark {
+  position: relative;
+  display: block;
+  width: 52px;
+  height: 52px;
+  overflow: hidden;
+  color: var(--paper-light);
+  border: 2px solid var(--ink);
+  background: var(--signal);
+  transform: skewX(-7deg);
+}
+
+.brand-e {
+  position: absolute;
+  inset: 6px;
   display: grid;
-  width: 48px;
-  height: 48px;
   place-items: center;
-  color: var(--ink);
-  font: 800 19px/1 var(--mono);
-  border: 2px solid var(--paper-light);
-  background: var(--marigold);
-  transform: rotate(-2deg);
+  font: 900 34px/1 var(--sans);
+  transform: skewX(7deg);
+}
+
+.brand-slash {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  width: 5px;
+  height: 70px;
+  background: var(--ink);
+  transform: rotate(24deg);
+  transform-origin: center;
 }
 
 .alpha-stamp {
   padding: 7px 9px;
-  color: var(--marigold);
+  color: var(--signal);
   border: 1px solid currentColor;
-  transform: rotate(1deg);
+  transform: rotate(-1deg);
 }
 
 .operator-console {
@@ -86,7 +113,7 @@
 .operator-console label {
   display: grid;
   gap: 5px;
-  color: #a9b5b6;
+  color: var(--ink-soft);
   font: 700 10px/1 var(--mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -107,9 +134,9 @@
   align-items: center;
   min-height: 37px;
   padding: 0 11px;
-  color: #c5cecf;
+  color: var(--ink-soft);
   font: 700 11px/1 var(--mono);
-  border: 1px solid #506167;
+  border: 1px solid var(--line);
   text-transform: uppercase;
 }
 
@@ -124,8 +151,8 @@
 
 .live-live span,
 .runner-online {
-  color: #dce9e4;
-  background: rgb(78 128 109 / 28%);
+  color: #244b3a;
+  background: rgb(81 119 100 / 18%);
 }
 
 .live-live span {
@@ -1309,8 +1336,8 @@ html {
   padding: 18px 20px 16px;
   color: var(--paper-light);
   background:
-    linear-gradient(110deg, transparent 0 68%, rgb(229 166 64 / 18%) 68% 100%),
-    var(--cobalt-dark);
+    linear-gradient(112deg, transparent 0 67%, rgb(224 29 37 / 42%) 67% 72%, transparent 72% 100%),
+    var(--ink);
 }
 
 .journey-heading h2 {
@@ -1321,7 +1348,7 @@ html {
 }
 
 .journey-heading .section-code {
-  color: var(--marigold);
+  color: #ff4b52;
 }
 
 .journey-heading p {
@@ -1399,7 +1426,7 @@ html {
 }
 
 .journey-steps .journey-current {
-  background: #f5e5bd;
+  background: #f3dadd;
 }
 
 .journey-steps .journey-current::after {
@@ -1407,14 +1434,14 @@ html {
   right: 14px;
   bottom: 10px;
   content: "CURRENT";
-  color: #6b4810;
+  color: var(--cobalt-dark);
   font: 700 8px/1 var(--mono);
   letter-spacing: 0.1em;
 }
 
 .journey-steps .journey-current > span {
-  color: var(--ink);
-  background: var(--marigold);
+  color: var(--paper-light);
+  background: var(--signal);
 }
 
 .setup-drawer summary {
@@ -1554,9 +1581,9 @@ html {
   overflow: hidden;
   border: 2px solid var(--ink);
   background:
-    linear-gradient(90deg, rgb(23 39 45 / 8%) 1px, transparent 1px),
-    linear-gradient(rgb(23 39 45 / 8%) 1px, transparent 1px),
-    #cfbf9f;
+    linear-gradient(90deg, rgb(16 17 18 / 9%) 1px, transparent 1px),
+    linear-gradient(rgb(16 17 18 / 9%) 1px, transparent 1px),
+    #c3c4c2;
   background-size: 36px 36px;
   box-shadow: inset 0 0 0 8px rgb(248 244 232 / 32%);
 }
@@ -1567,8 +1594,8 @@ html {
   height: 98px;
   border-bottom: 4px solid var(--ink);
   background:
-    repeating-linear-gradient(90deg, transparent 0 62px, rgb(23 39 45 / 8%) 62px 64px),
-    #dccfb4;
+    repeating-linear-gradient(90deg, transparent 0 62px, rgb(16 17 18 / 8%) 62px 64px),
+    #e1e1dd;
 }
 
 .office-sign {
@@ -1580,7 +1607,8 @@ html {
   font: 700 9px/1 var(--mono);
   letter-spacing: 0.12em;
   border: 2px solid var(--ink);
-  background: var(--cobalt-dark);
+  background: var(--ink);
+  box-shadow: 4px 0 0 var(--signal);
   transform: translateX(-50%) rotate(-1deg);
 }
 
@@ -1592,8 +1620,8 @@ html {
   border: 3px solid var(--ink);
   background:
     linear-gradient(135deg, transparent 0 45%, rgb(248 244 232 / 45%) 46% 52%, transparent 53%),
-    #8db7b0;
-  box-shadow: inset 0 -12px 0 rgb(35 98 122 / 32%);
+    #8c969a;
+  box-shadow: inset 0 -12px 0 rgb(16 17 18 / 28%);
 }
 
 .office-window-left {
@@ -1638,7 +1666,7 @@ html {
   left: 8%;
   height: 30px;
   border: 2px solid var(--ink);
-  background: repeating-linear-gradient(90deg, var(--cobalt-dark) 0 28px, #315f66 28px 56px);
+  background: repeating-linear-gradient(90deg, var(--ink) 0 28px, var(--signal) 28px 34px, #3e4042 34px 56px);
   opacity: 0.72;
 }
 
@@ -1715,8 +1743,8 @@ html {
   width: 42px;
   height: 31px;
   border: 3px solid var(--ink);
-  background: var(--cobalt-dark);
-  box-shadow: inset 0 -6px 0 #8db7b0;
+  background: var(--ink);
+  box-shadow: inset 0 -6px 0 var(--signal);
 }
 
 .mini-desk {
@@ -1770,7 +1798,8 @@ html {
   place-items: center;
   border: 3px solid var(--ink);
   border-bottom: 0;
-  background: var(--cobalt-dark);
+  background: var(--ink);
+  box-shadow: inset -7px 0 0 var(--signal);
 }
 
 .office-door span {
@@ -1805,7 +1834,7 @@ html {
 .office-agent:focus-visible .sprite-name,
 .office-agent-selected .sprite-name {
   color: var(--paper-light);
-  background: var(--cobalt-dark);
+  background: var(--ink);
 }
 
 .office-agent-selected::after {
@@ -1815,7 +1844,7 @@ html {
   left: 7px;
   height: 10px;
   content: "";
-  border: 2px solid var(--marigold);
+  border: 2px solid var(--signal);
   border-radius: 50%;
 }
 
@@ -1874,15 +1903,15 @@ html {
   width: 31px;
   height: 29px;
   border: 3px solid var(--ink);
-  background: var(--cobalt);
+  background: #3d4448;
 }
 
 .accent-marigold .sprite-body {
-  background: var(--marigold);
+  background: var(--signal);
 }
 
 .accent-cobalt .sprite-body {
-  background: var(--cobalt);
+  background: #3d4448;
 }
 
 .sprite-arm,
@@ -2063,7 +2092,8 @@ html {
 .agent-roster button:hover,
 .agent-roster .agent-roster-selected {
   color: var(--paper-light);
-  background: var(--cobalt-dark);
+  background: var(--ink);
+  box-shadow: inset 0 -3px 0 var(--signal);
 }
 
 .agent-roster button > span:not(.status-mark) {
@@ -2194,12 +2224,12 @@ html {
   color: var(--cobalt-dark);
   font: 700 9px/1 var(--mono);
   border: 1px solid var(--cobalt);
-  background: #dce7e4;
+  background: #f2e3e4;
 }
 
 .mission-examples button:hover {
   color: var(--paper-light);
-  background: var(--cobalt);
+  background: var(--signal);
 }
 
 .mission-field {

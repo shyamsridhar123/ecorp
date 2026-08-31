@@ -415,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("bind server to {}", args.bind))?;
-    info!(address = %args.bind, "Crony server listening");
+    info!(address = %args.bind, "ECorp server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

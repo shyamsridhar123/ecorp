@@ -1,8 +1,8 @@
-# Crony Corp user and developer journey
+# ECorp user and developer journey
 
 Updated: August 30, 2026
 
-Crony turns a repository-level outcome into isolated agent work, human decisions, and verified
+ECorp turns a repository-level outcome into isolated agent work, human decisions, and verified
 artifacts. The office is a live projection of that workflow; it is not a separate game layer or the
 system of record.
 
@@ -30,7 +30,7 @@ $env:CRONY_SOURCE_BASE_REF = 'HEAD'
 ./tools/start_local.ps1
 ```
 
-Every write-capable run receives a linked worktree below `CRONY_RUNNER_WORKSPACE`. Crony does not
+Every write-capable run receives a linked worktree below `CRONY_RUNNER_WORKSPACE`. ECorp does not
 let an agent edit the configured source checkout directly.
 
 ### 2. Choose the crew
@@ -39,7 +39,7 @@ The mission composer lists only adapters reported as available by a connected ru
 
 - **GitHub Copilot** discovers the models enabled for the signed-in Copilot account.
 - **OpenAI Codex**, **Claude Code**, and **OpenCode** use their locally configured runtimes.
-- **Test harness** is deterministic, quota-free, and contains no AI. Use it to test Crony behavior,
+- **Test harness** is deterministic, quota-free, and contains no AI. Use it to test ECorp behavior,
   not to judge agent quality.
 
 For providers with model catalogs, choose a model and supported reasoning effort. Leaving the model
@@ -80,7 +80,7 @@ turn, or issue an emergency stop.
 
 When a run becomes completed, failed, or cancelled, its adapter disconnects or stops the provider,
 the runner removes the run from its active-process map, and the employee identity returns off shift.
-Crony preserves the identity and resumable session metadata so future work can be scheduled without
+ECorp preserves the identity and resumable session metadata so future work can be scheduled without
 leaving an operating-system process alive.
 
 Risky commands create durable approval records. After verification passes, the mission card exposes

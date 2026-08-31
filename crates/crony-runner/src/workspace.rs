@@ -638,7 +638,7 @@ mod tests {
             &repository,
             &[
                 OsStr::new("-c"),
-                OsStr::new("user.name=Crony Test"),
+                OsStr::new("user.name=ECorp Test"),
                 OsStr::new("-c"),
                 OsStr::new("user.email=crony@example.invalid"),
                 OsStr::new("commit"),
@@ -791,7 +791,7 @@ mod tests {
             &committed.path,
             &[
                 OsStr::new("-c"),
-                OsStr::new("user.name=Crony Test"),
+                OsStr::new("user.name=ECorp Test"),
                 OsStr::new("-c"),
                 OsStr::new("user.email=crony@example.invalid"),
                 OsStr::new("commit"),

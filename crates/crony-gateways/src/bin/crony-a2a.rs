@@ -118,7 +118,7 @@ async fn handle_a2a(client: &GatewayClient, request: JsonRpcRequest) -> Value {
                 .await
         }
         "tasks/cancel" => Err(anyhow::anyhow!(
-            "task cancellation requires a Crony agent control lease or emergency-stop policy"
+            "task cancellation requires a ECorp agent control lease or emergency-stop policy"
         )),
         _ => Err(anyhow::anyhow!("method not found")),
     };

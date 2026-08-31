@@ -7,6 +7,6 @@
 - `crony-a2a`: HTTP agent-card, JSON-RPC task/message methods, and SSE streaming.
 
 Unit tests verify version negotiation and ensure private internal field names are absent from public
-descriptions. `node tools/e2e_gateways.mjs` exercises all three binaries against a live Crony server
+descriptions. `node tools/e2e_gateways.mjs` exercises all three binaries against a live ECorp server
 and validates MCP tools, an ACP-created mission/run, A2A discovery, message submission, and
 streaming event frames.

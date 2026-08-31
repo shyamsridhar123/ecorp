@@ -25,4 +25,4 @@ supervised process.
 - A second authorized device can decide the approval.
 - A crash between command send and dispatch acknowledgement may redeliver the command, but the
   runner's command ID fence prevents a duplicate process effect.
-- Provider-specific approval surfaces remain adapters; Crony's approval record is authoritative.
+- Provider-specific approval surfaces remain adapters; ECorp's approval record is authoritative.

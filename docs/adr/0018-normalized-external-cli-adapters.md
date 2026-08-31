@@ -14,4 +14,4 @@ Claude Code is invoked in print mode with streamed JSON and `acceptEdits` permis
 is invoked with `run --format json`. Resume uses each provider's session flag.
 
 Live steering remains explicitly unsupported in batch CLI mode. Stop and interrupt terminate the
-supervised process. Crony's durable approval policy remains authoritative.
+supervised process. ECorp's durable approval policy remains authoritative.

@@ -85,7 +85,7 @@ const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
       secret_id: created.secret_id,
       env_name: 'CRONY_TEST_SECRET',
       tool: 'github',
-      resource: 'repo:shyamsridhar123/crony-corp',
+      resource: 'repo:shyamsridhar123/ecorp',
     },
   ],
 })
@@ -112,7 +112,7 @@ const deniedMission = await post(`/api/corps/${demo.corp_id}/missions`, {
       secret_id: created.secret_id,
       env_name: 'CRONY_TEST_SECRET',
       tool: 'github',
-      resource: 'repo:shyamsridhar123/crony-corp',
+      resource: 'repo:shyamsridhar123/ecorp',
     },
   ],
 })

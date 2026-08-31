@@ -99,7 +99,7 @@ try {
         }
     } while ((Get-Date) -lt $deadline)
     if ($health.status -ne 'ok') {
-        throw 'Crony server did not become ready.'
+        throw 'ECorp server did not become ready.'
     }
 
     $demo = Invoke-RestMethod `
@@ -173,11 +173,11 @@ try {
     } while ((Get-Date) -lt $deadline)
 
     if ($health.status -ne 'ok' -or $health.runners -lt 1 -or $page.StatusCode -ne 200) {
-        throw 'Crony local stack did not become ready.'
+        throw 'ECorp local stack did not become ready.'
     }
 
-    Write-Host "Crony server: http://127.0.0.1:$serverPort"
-    Write-Host "Crony web:    http://127.0.0.1:$webPort"
+    Write-Host "ECorp server: http://127.0.0.1:$serverPort"
+    Write-Host "ECorp web:    http://127.0.0.1:$webPort"
     Write-Host "Runner count: $($health.runners)"
 } finally {
     Pop-Location

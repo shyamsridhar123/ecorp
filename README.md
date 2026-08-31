@@ -1,20 +1,21 @@
-# Crony Corp
+# ECorp
 
-> **Naming status:** Crony Corp is the internal repository codename. The preliminary public-name
-> recommendation is **Guildframe**, pending legal clearance. See
-> `docs/BRAND_NAME_AND_LICENSING_REVIEW.md`.
+**A governed operations network where humans and autonomous agents execute real work together.**
 
-**A multiplayer command center where humans and autonomous agents run a persistent company together.**
-
-Crony Corp combines a real-time shared office, durable missions and approvals, isolated agent
-execution, and evidence-backed completion. The office floor is a projection of actual system
-events: agents move because work is happening, not because an animation timer fired.
+ECorp combines a real-time control floor, durable missions and approvals, isolated agent execution,
+and evidence-backed completion. The visual identity references the cold institutional atmosphere of
+*Mr. Robot* while using an original mark and no official television assets. The floor is a
+projection of actual system events: agents move because work is happening, not because an animation
+timer fired.
 
 > Status: early vertical-slice implementation.
 
+> Compatibility: existing `crony-*` binaries, `CRONY_` environment variables, and `X-Crony-*`
+> headers remain supported while the public product transitions to ECorp.
+
 ## Architecture
 
-Crony Corp has three strict planes:
+ECorp has three strict planes:
 
 1. **Experience:** web and desktop clients.
 2. **Collaboration/control:** rooms, missions, tasks, leases, approvals, events, and audit.
@@ -34,7 +35,8 @@ The UI can close without terminating active work.
 - Run, mission, requester, and Corp budgets with steer-constrain-suspend-stop incidents
 - Versioned 100-scenario evaluation corpus with deterministic regression metrics
 - Consolidated chaos evidence and Windows/macOS/Linux runner CI
-- Thin Tauri 2 desktop shell with `crony://` deep links and Windows build smoke coverage
+- Thin Tauri 2 desktop shell with `ecorp://` deep links, legacy `crony://` compatibility, and
+  Windows build smoke coverage
 - MCP, ACP, and A2A gateways with explicit version negotiation and schema isolation
 - Browser WebSocket updates
 - Resumable, room-filtered event replay

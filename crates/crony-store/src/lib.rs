@@ -681,8 +681,9 @@ impl PgStore {
         sqlx::query(
             r#"
             INSERT INTO corps (id, slug, name)
-            VALUES ($1, 'crony-demo', 'Crony Corp Demonstration Office')
-            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+            VALUES ($1, 'ecorp-demo', 'ECorp Operations Network')
+            ON CONFLICT (id) DO UPDATE
+            SET slug = EXCLUDED.slug, name = EXCLUDED.name
             "#,
         )
         .bind(ids.corp_id)
@@ -720,8 +721,9 @@ impl PgStore {
         sqlx::query(
             r#"
             INSERT INTO rooms (id, corp_id, name, purpose)
-            VALUES ($1, $2, 'Product Lab', 'Shared room for the first multiplayer mission')
-            ON CONFLICT (id) DO UPDATE SET purpose = EXCLUDED.purpose
+            VALUES ($1, $2, 'Automation Division', 'Governed workspace for human and autonomous operations')
+            ON CONFLICT (id) DO UPDATE
+            SET name = EXCLUDED.name, purpose = EXCLUDED.purpose
             "#,
         )
         .bind(ids.room_id)
@@ -833,7 +835,7 @@ impl PgStore {
                 ids.corp_id,
                 "demo-bootstrap-v1",
                 json!({
-                    "name": "Crony Corp Demonstration Office",
+                    "name": "ECorp Operations Network",
                     "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal", "Piper"]
                 }),
             ),

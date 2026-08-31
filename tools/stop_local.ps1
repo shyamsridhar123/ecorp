@@ -6,7 +6,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $pidFile = Join-Path $root 'output\local-pids.json'
 
 if (-not (Test-Path -LiteralPath $pidFile)) {
-    Write-Host 'No Crony local PID file exists.'
+    Write-Host 'No ECorp local PID file exists.'
     exit 0
 }
 
@@ -37,5 +37,5 @@ foreach ($processId in ($targets | Sort-Object -Descending)) {
 }
 
 Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-Write-Host "Stopped $($targets.Count) Crony process(es)."
+Write-Host "Stopped $($targets.Count) ECorp process(es)."
 

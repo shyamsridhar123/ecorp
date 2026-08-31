@@ -44,14 +44,14 @@ impl GatewayClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.context("send Crony API request")?;
+        let response = request.send().await.context("send ECorp API request")?;
         let status = response.status();
         let value = response
             .json::<Value>()
             .await
-            .context("decode Crony API response")?;
+            .context("decode ECorp API response")?;
         if !status.is_success() {
-            return Err(anyhow!("Crony API returned {status}: {value}"));
+            return Err(anyhow!("ECorp API returned {status}: {value}"));
         }
         Ok(value)
     }
@@ -92,7 +92,7 @@ pub fn mcp_tools() -> Value {
             },
             {
                 "name":"crony_create_mission",
-                "description":"Create a bounded Crony mission.",
+                "description":"Create a bounded ECorp mission.",
                 "inputSchema":{
                     "type":"object",
                     "required":["title"],
@@ -199,7 +199,7 @@ async fn handle_mcp_tool(client: &GatewayClient, params: &Value) -> Result<Value
                 )
                 .await?
         }
-        _ => return Err(anyhow!("unknown Crony MCP tool {name}")),
+        _ => return Err(anyhow!("unknown ECorp MCP tool {name}")),
     };
     Ok(json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}))
 }
@@ -217,7 +217,7 @@ pub fn negotiate_version(requested: &str, supported: &[&str]) -> Result<String> 
 
 pub fn a2a_agent_card(base_url: &str) -> Value {
     json!({
-        "name":"Crony Corp gateway",
+        "name":"ECorp gateway",
         "description":"Corp-scoped missions, messages, task status, and streaming events.",
         "url":format!("{}/a2a",base_url.trim_end_matches('/')),
         "protocolVersion":A2A_PROTOCOL_VERSION,
@@ -225,7 +225,7 @@ pub fn a2a_agent_card(base_url: &str) -> Value {
         "defaultInputModes":["text/plain","application/json"],
         "defaultOutputModes":["application/json"],
         "skills":[
-            {"id":"mission","name":"Mission execution","description":"Create and inspect Crony missions"},
+            {"id":"mission","name":"Mission execution","description":"Create and inspect ECorp missions"},
             {"id":"room-message","name":"Room messaging","description":"Post durable Corp room messages"}
         ]
     })

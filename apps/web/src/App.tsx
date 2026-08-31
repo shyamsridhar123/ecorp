@@ -248,7 +248,7 @@ type CreateMissionResponse = {
 }
 
 const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const DEFAULT_MISSION = 'Prepare a verified launch-readiness brief for the Crony Corp alpha.'
+const DEFAULT_MISSION = 'Prepare a verified launch-readiness brief for the ECorp alpha.'
 const MISSION_EXAMPLES = [
   {
     label: 'Build a feature',
@@ -287,7 +287,7 @@ function adapterDescription(adapter: string): string {
   if (adapter === 'codex') return 'Run a real Codex coding session in an isolated worktree.'
   if (adapter === 'claude-code') return 'Run the locally authenticated Claude Code CLI.'
   if (adapter === 'opencode') return 'Run the configured OpenCode provider.'
-  if (adapter === 'fake-process') return 'Deterministic and quota-free. Use this only to test Crony itself.'
+  if (adapter === 'fake-process') return 'Deterministic and quota-free. Use this only to test ECorp itself.'
   return 'Run work through this connected agent adapter.'
 }
 
@@ -413,7 +413,7 @@ function OfficeFloor({
         <span className="office-clock" />
         <span className="office-window office-window-left" />
         <span className="office-window office-window-right" />
-        <span className="office-sign">PRODUCT LAB · LIVE FLOOR</span>
+        <span className="office-sign">ECORP · AUTOMATION CONTROL</span>
       </div>
       <div className="office-zone zone-review">
         <span>Review table</span>
@@ -424,7 +424,7 @@ function OfficeFloor({
         <i />
       </div>
       <div className="office-zone zone-lounge">
-        <span>Stand-up</span>
+        <span>Operator bay</span>
         <i />
       </div>
       {liveAgents.map((agent) => {
@@ -489,7 +489,7 @@ function OfficeFloor({
           </div>
         )
       })}
-      <div className="office-door" aria-hidden="true"><span>Runner</span></div>
+      <div className="office-door" aria-hidden="true"><span>Secure runner</span></div>
       <div className="office-carpet" aria-hidden="true" />
     </div>
   )
@@ -813,7 +813,7 @@ function RoomPanel({
       <section className="room-panel panel" id="room">
         <div className="panel-heading">
           <div>
-            <span className="section-code">ROOM / 03</span>
+            <span className="section-code">SECURE COMMS / 03</span>
             <h2>No room access</h2>
             <p>{selectedActor.name} is not a member of this project room.</p>
           </div>
@@ -877,9 +877,9 @@ function RoomPanel({
     <section className="room-panel panel" id="room" data-room-id={room.id}>
       <div className="panel-heading">
         <div>
-          <span className="section-code">ROOM / 03</span>
-          <h2>{room.name} wire</h2>
-          <p>Humans and agents leave durable, linked messages here.</p>
+          <span className="section-code">SECURE COMMS / 03</span>
+          <h2>{room.name} channel</h2>
+          <p>Every human and agent message is durable, attributable, and linked to the work.</p>
         </div>
         <div className="room-count">{messages.length} messages</div>
       </div>
@@ -1006,8 +1006,12 @@ function App() {
     const listener = (event: Event) => {
       focus((event as CustomEvent<string>).detail)
     }
+    window.addEventListener('ecorp-deep-link', listener)
     window.addEventListener('crony-deep-link', listener)
-    return () => window.removeEventListener('crony-deep-link', listener)
+    return () => {
+      window.removeEventListener('ecorp-deep-link', listener)
+      window.removeEventListener('crony-deep-link', listener)
+    }
   }, [bootstrap])
   const lastEventSeq = useRef<Record<string, number>>({})
 
@@ -1410,8 +1414,8 @@ function App() {
   if (!data || !bootstrap || !selectedActor) {
     return (
       <main className="loading-shell">
-        <div className="loading-stamp">CRONY CORP</div>
-        <h1>Opening the office ledger…</h1>
+        <div className="loading-stamp">ECORP OPERATIONS NETWORK</div>
+        <h1>Authorizing the operations console…</h1>
         {error ? <p className="error-banner">{error}</p> : <p>Waiting for the control plane.</p>}
       </main>
     )
@@ -1456,11 +1460,14 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand-lockup">
-          <span className="brand-kicker">Persistent operations office</span>
+          <span className="brand-kicker">Distributed intelligence division</span>
           <div className="brand-row">
-            <span className="brand-mark">CC</span>
-            <h1>Crony Corp</h1>
-            <span className="alpha-stamp">ALPHA / SHIFT 00A</span>
+            <span className="brand-mark" aria-hidden="true">
+              <span className="brand-e">E</span>
+              <span className="brand-slash" />
+            </span>
+            <h1><span>e</span>corp</h1>
+            <span className="alpha-stamp">OPS NETWORK / NODE 00A</span>
           </div>
         </div>
         <div className="operator-console">
@@ -1487,11 +1494,11 @@ function App() {
         </div>
       </header>
 
-      <nav className="workspace-nav" aria-label="Crony workspace sections">
-        <a href="#floor">Office</a>
+      <nav className="workspace-nav" aria-label="ECorp workspace sections">
+        <a href="#floor">Control floor</a>
         <a href="#missions">Missions</a>
-        <a href="#room">Room</a>
-        <a href="#activity">Activity</a>
+        <a href="#room">Comms</a>
+        <a href="#activity">Audit</a>
         <button type="button" onClick={() => setJourneyOpen((current) => !current)}>
           {journeyOpen ? 'Hide start guide' : 'Show start guide'}
         </button>
@@ -1504,8 +1511,8 @@ function App() {
             <h2>From repository to verified result</h2>
           </div>
           <p>
-            Crony plans the work, runs agents in isolated worktrees, pauses for approvals,
-            and records the evidence.
+            ECorp turns repository work into a governed operating process: isolated execution,
+            accountable decisions, and evidence that survives the session.
           </p>
         </div>
         {journeyOpen ? (
@@ -1542,7 +1549,7 @@ function App() {
                       ? `${activeRuns.length} run active now`
                       : data.snapshot.missions.length
                         ? `${data.snapshot.missions.length} mission records available`
-                        : 'Describe the outcome below; Crony creates the task contract.'}
+                        : 'Describe the outcome below; ECorp creates the task contract.'}
                   </small>
                 </div>
               </li>
@@ -1601,8 +1608,8 @@ function App() {
         <div className="floor-panel panel" id="floor">
           <div className="panel-heading">
             <div>
-              <span className="section-code">FLOOR / 01</span>
-              <h2>{room?.name ?? 'Main floor'}</h2>
+              <span className="section-code">CONTROL FLOOR / 01</span>
+              <h2>{room?.name ?? 'Automation division'}</h2>
               <p>Only live provider sessions appear on the floor. Finished agents return off shift.</p>
             </div>
             <div className="floor-legend">
@@ -1654,9 +1661,9 @@ function App() {
         <aside className="mission-panel panel" id="missions">
           <div className="panel-heading">
             <div>
-              <span className="section-code">MISSIONS / 02</span>
-              <h2>Plan and run</h2>
-              <p>Describe the outcome. Crony isolates the repo, dispatches agents, and verifies the result.</p>
+              <span className="section-code">MISSION CONTROL / 02</span>
+              <h2>Authorize work</h2>
+              <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
             </div>
           </div>
           <form className="mission-form" onSubmit={createMission}>
@@ -1791,10 +1798,10 @@ function App() {
                 {missionStrategy === 'single'
                   ? 'Best for a focused build, fix, or review.'
                   : missionStrategy === 'parallel-specialists'
-                    ? 'Crony runs two independent approaches before a final synthesis task.'
+                    ? 'ECorp runs two independent approaches before a final synthesis task.'
                     : missionStrategy.includes('approval') || missionStrategy.includes('review')
                       ? 'The run pauses until an authorized human records a decision.'
-                      : 'This strategy exercises Crony verification behavior.'}
+                      : 'This strategy exercises ECorp verification behavior.'}
               </small>
             </div>
             <label className="mission-run-toggle">
@@ -1845,7 +1852,7 @@ function App() {
             ) : (
               <div className="empty-state">
                 <strong>No missions yet</strong>
-                <span>Start with a concrete outcome and let Crony create the task contract.</span>
+                <span>Start with a concrete outcome and let ECorp create the task contract.</span>
               </div>
             )}
           </div>
@@ -1866,7 +1873,7 @@ function App() {
       <section className="operations-panel panel" id="activity">
         <div className="panel-heading operations-heading">
           <div>
-            <span className="section-code">JOURNAL / 04</span>
+            <span className="section-code">AUDIT NETWORK / 04</span>
             <h2>Immutable activity</h2>
           </div>
           <div className="operations-summary">

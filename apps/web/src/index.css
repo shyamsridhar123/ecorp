@@ -1,23 +1,23 @@
 :root {
-  --paper: #eee8d8;
-  --paper-light: #f8f4e8;
-  --paper-deep: #d8d0bc;
-  --ink: #17272d;
-  --ink-soft: #4d5b5f;
-  --cobalt: #23627a;
-  --cobalt-dark: #164354;
-  --marigold: #e5a640;
-  --signal: #bc4a3f;
-  --mint: #4e806d;
-  --line: #9c9a8d;
-  --shadow: 5px 5px 0 #17272d;
-  --sans: Bahnschrift, "Arial Narrow", "Segoe UI", sans-serif;
-  --body: Aptos, "Segoe UI", sans-serif;
+  --paper: #e6e5e1;
+  --paper-light: #f7f7f4;
+  --paper-deep: #c8c9c7;
+  --ink: #101112;
+  --ink-soft: #55595d;
+  --cobalt: #c82027;
+  --cobalt-dark: #7f1016;
+  --marigold: #b7b9ba;
+  --signal: #e01d25;
+  --mint: #517764;
+  --line: #96999b;
+  --shadow: 5px 5px 0 #101112;
+  --sans: "Arial Narrow", Bahnschrift, "Franklin Gothic Condensed", "Segoe UI", sans-serif;
+  --body: "Segoe UI", Aptos, sans-serif;
   --mono: "Cascadia Mono", Consolas, monospace;
 
   font: 16px/1.45 var(--body);
   color: var(--ink);
-  background: #c7c1b1;
+  background: #b7b8b6;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -33,10 +33,11 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    linear-gradient(90deg, rgb(23 39 45 / 6%) 1px, transparent 1px),
-    linear-gradient(rgb(23 39 45 / 6%) 1px, transparent 1px),
-    #c7c1b1;
-  background-size: 22px 22px;
+    radial-gradient(circle at 90% 10%, rgb(200 32 39 / 16%), transparent 27%),
+    linear-gradient(90deg, rgb(16 17 18 / 7%) 1px, transparent 1px),
+    linear-gradient(rgb(16 17 18 / 7%) 1px, transparent 1px),
+    #b7b8b6;
+  background-size: auto, 24px 24px, 24px 24px, auto;
 }
 
 button,

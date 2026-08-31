@@ -105,7 +105,7 @@ impl PermissionHandler for CronyPermissionHandler {
         match tokio::time::timeout(Duration::from_secs(600), rx).await {
             Ok(Ok(decision)) if decision.approved => PermissionResult::approve_once(),
             Ok(Ok(decision)) => PermissionResult::reject(Some(decision.note)),
-            _ => PermissionResult::reject(Some("Crony approval expired".to_owned())),
+            _ => PermissionResult::reject(Some("ECorp approval expired".to_owned())),
         }
     }
 }
@@ -291,7 +291,7 @@ impl CopilotSdkAdapter {
                             session
                                 .send(
                                     MessageOptions::new(format!(
-                                        "Crony circuit breaker {stage}: {reason}"
+                                        "ECorp circuit breaker {stage}: {reason}"
                                     ))
                                     .with_mode(DeliveryMode::Immediate),
                                 )
@@ -559,10 +559,10 @@ fn apply_session_config(config: &mut SessionConfig, request: &AdapterRunRequest)
         SystemMessageConfig::new()
             .with_mode("append")
             .with_content(
-                "You are supervised by Crony Corp. Work only inside the assigned worktree. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
+                "You are supervised by ECorp. Work only inside the assigned worktree. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
             ),
     );
-    // Crony owns the worktree lifecycle. Copilot infinite-session workspaces copy
+    // ECorp owns the worktree lifecycle. Copilot infinite-session workspaces copy
     // files under COPILOT_HOME, which would move writes outside the assigned tree.
     config.infinite_sessions = Some(InfiniteSessionConfig::new().with_enabled(false));
     config.enable_config_discovery = Some(false);
@@ -588,7 +588,7 @@ fn apply_resume_config(config: &mut ResumeSessionConfig, request: &AdapterRunReq
         SystemMessageConfig::new()
             .with_mode("append")
             .with_content(
-                "You are supervised by Crony Corp. Continue only inside the assigned worktree. Network access and sandbox bypass require a durable human approval.",
+                "You are supervised by ECorp. Continue only inside the assigned worktree. Network access and sandbox bypass require a durable human approval.",
             ),
     );
     config.infinite_sessions = Some(InfiniteSessionConfig::new().with_enabled(false));
@@ -1207,7 +1207,7 @@ fn permission_rationale(request: &Value) -> String {
     .iter()
     .find_map(|field| request.get(*field).and_then(Value::as_str))
     .unwrap_or(
-        "GitHub Copilot requested a capability outside Crony’s automatically approved worktree boundary.",
+        "GitHub Copilot requested a capability outside ECorp’s automatically approved worktree boundary.",
     )
     .to_owned()
 }

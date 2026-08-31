@@ -105,7 +105,7 @@ async fn prompt(
     let mission_id = mission
         .get("mission_id")
         .and_then(Value::as_str)
-        .context("Crony mission response omitted id")
+        .context("ECorp mission response omitted id")
         .and_then(|value| Uuid::parse_str(value).context("mission id is invalid"))?;
     let launch = client
         .request(
@@ -117,7 +117,7 @@ async fn prompt(
     let run_id = launch
         .get("run_id")
         .and_then(Value::as_str)
-        .context("Crony launch response omitted run id")
+        .context("ECorp launch response omitted run id")
         .and_then(|value| Uuid::parse_str(value).context("run id is invalid"))?;
     sessions.insert(
         session_id,
@@ -163,7 +163,7 @@ fn cancel(sessions: &HashMap<Uuid, Session>, params: &Value) -> Result<Value> {
         "sessionId":session_id,
         "runId":session.run_id,
         "cancelRequested":false,
-        "reason":"Crony cancellation requires an authenticated agent control or emergency-stop command"
+        "reason":"ECorp cancellation requires an authenticated agent control or emergency-stop command"
     }))
 }
 

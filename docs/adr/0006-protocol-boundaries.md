@@ -8,7 +8,7 @@
 - MCP: tools and context
 - ACP: compatible client-to-agent sessions
 - A2A: remote or independently hosted agents
-- Crony protocol: missions, tasks, leases, approvals, budgets, runs, and events
+- ECorp protocol: missions, tasks, leases, approvals, budgets, runs, and events
 
 External protocols are adapters rather than the internal database schema.
 

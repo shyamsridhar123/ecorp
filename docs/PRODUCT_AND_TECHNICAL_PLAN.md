@@ -1,8 +1,8 @@
-# Crony Corp
+# ECorp
 
 ## Product and Technical Plan
 
-**Working title:** Crony Corp  
+**Product name:** ECorp
 **Research snapshot:** August 29, 2026  
 **Recommendation:** Build a new greenfield repository. Do not fork either source project as the primary base.
 
@@ -44,7 +44,7 @@
 
 # 1. Executive recommendation
 
-Crony Corp should be:
+ECorp should be:
 
 > **A multiplayer command center where humans and autonomous agents run a persistent company together.**
 
@@ -60,11 +60,11 @@ The source systems have incompatible architectural centers:
 - Munder Difflin is a local desktop supervisor. Its Electron main process owns PTYs, coordination files, routing, integrations, schedules, and much of the application lifecycle.
 - Buzz is a distributed collaboration relay. Its server, protocol, database, identity model, clients, workflows, media, git hosting, and agent harness form a much broader platform.
 
-Forking either one would force Crony Corp to spend its first year undoing the assumptions of the chosen base. A greenfield design can preserve the best product ideas while creating the missing multiplayer and execution boundaries correctly.
+Forking either one would force ECorp to spend its first year undoing the assumptions of the chosen base. A greenfield design can preserve the best product ideas while creating the missing multiplayer and execution boundaries correctly.
 
 ## The product wedge
 
-The market already contains capable coding-agent dashboards, worktree orchestrators, remote-control interfaces, and multi-provider harnesses. Crony Corp will not win as "another kanban for coding agents."
+The market already contains capable coding-agent dashboards, worktree orchestrators, remote-control interfaces, and multi-provider harnesses. ECorp will not win as "another kanban for coding agents."
 
 Its defensible wedge is the combination of:
 
@@ -121,13 +121,13 @@ Problems to avoid:
 - Files do not naturally provide leases, transactions, authorization, tenant isolation, or efficient multi-user queries.
 - One co-edited blackboard requires a privileged single scribe.
 
-**Crony decision:** use transactional state plus an immutable event journal. Git remains for source artifacts, not for the message bus.
+**ECorp decision:** use transactional state plus an immutable event journal. Git remains for source artifacts, not for the message bus.
 
 ### UI-owned process lifecycle
 
 Munder's desktop main process owns too much. Closing, freezing, updating, or blocking the desktop application can affect active agents.
 
-**Crony decision:** a separate runner daemon owns PTYs and agent processes. Desktop and web clients are replaceable views.
+**ECorp decision:** a separate runner daemon owns PTYs and agent processes. Desktop and web clients are replaceable views.
 
 ### Single GOD agent
 
@@ -139,13 +139,13 @@ A fixed god agent is easy to understand, but it becomes:
 - a single failure domain
 - an implicit policy engine hidden inside a prompt
 
-**Crony decision:** orchestration is a replaceable role and strategy. A workspace can use one manager, a hierarchy, a deterministic workflow, a peer swarm, or a review quorum.
+**ECorp decision:** orchestration is a replaceable role and strategy. A workspace can use one manager, a hierarchy, a deterministic workflow, a peer swarm, or a review quorum.
 
 ### Human approval
 
 Tool prompts inside one agent terminal are not a sufficient multiplayer approval system.
 
-**Crony decision:** approvals are durable, typed records with:
+**ECorp decision:** approvals are durable, typed records with:
 
 - requested action
 - risk classification
@@ -194,7 +194,7 @@ Nostr supplies signed events and portable identity, but it also introduces:
 
 Buzz's own product documents acknowledge key-management and onboarding costs.
 
-**Crony decision:**
+**ECorp decision:**
 
 - Human identity uses OIDC and passkeys.
 - Agents and runners receive independent cryptographic identities.
@@ -205,19 +205,19 @@ Buzz's own product documents acknowledge key-management and onboarding costs.
 
 Buzz includes collaboration, workflows, mobile clients, media, voice, git hosting, search, moderation, federation concepts, and shared compute.
 
-**Crony decision:** do not build a full Slack, GitHub, Discord, CI system, and model network in the MVP. Integrate with existing repositories and providers first.
+**ECorp decision:** do not build a full Slack, GitHub, Discord, CI system, and model network in the MVP. Integrate with existing repositories and providers first.
 
 ### Agent secret injection
 
 Open Buzz issues and the reviewed code show that long-lived agent credentials can enter child-process environments and, through adapters, command-line arguments.
 
-**Crony decision:** the agent model should not receive long-lived workspace credentials. Use a broker that exchanges short-lived capability tokens over a local authenticated channel.
+**ECorp decision:** the agent model should not receive long-lived workspace credentials. Use a broker that exchanges short-lived capability tokens over a local authenticated channel.
 
 ### Workflow reliability
 
 Open issue patterns include re-trigger cycles, duplicate replies, wake-up failures, and incomplete approval suspension.
 
-**Crony decision:** idempotency, causal-depth limits, durable suspension, leases, and at-most-once effects are part of the first execution design, not later patches.
+**ECorp decision:** idempotency, causal-depth limits, durable suspension, leases, and at-most-once effects are part of the first execution design, not later patches.
 
 ---
 
@@ -408,7 +408,7 @@ Replay is a core trust feature, not a post-launch analytics feature.
 
 ## 6.1 Three-plane design
 
-Crony Corp should extend Munder's two-plane idea into three strict planes.
+ECorp should extend Munder's two-plane idea into three strict planes.
 
 ```mermaid
 flowchart TB
@@ -419,7 +419,7 @@ flowchart TB
   end
 
   subgraph Control["Collaboration and control plane"]
-    API["Crony server<br/>auth, rooms, tasks, policies"]
+    API["ECorp server<br/>auth, rooms, tasks, policies"]
     Realtime["Realtime gateway<br/>WebSocket + resume cursor"]
     Orchestrator["Orchestration engine"]
     Audit["Event journal and audit"]
@@ -676,21 +676,21 @@ Higher-assurance mode:
 
 # 9. Protocol strategy
 
-Crony should use protocols at clear boundaries rather than forcing one protocol to model everything.
+ECorp should use protocols at clear boundaries rather than forcing one protocol to model everything.
 
 | Boundary | Protocol |
 |---|---|
 | Agent to tools and context | MCP |
 | Compatible client/editor to local agent | ACP |
-| Remote or independently hosted agent to Crony | A2A |
-| Browser and desktop real-time state | Crony WebSocket protocol |
+| Remote or independently hosted agent to ECorp | A2A |
+| Browser and desktop real-time state | ECorp WebSocket protocol |
 | Human and service APIs | REST/JSON initially |
 | Runner control | Authenticated bidirectional stream |
 | Optional Buzz interoperability | Nostr bridge later |
 
 ## Rule
 
-Crony's internal mission, task, approval, budget, and control-lease semantics remain Crony domain concepts. External protocols are adapters, not the core database schema.
+ECorp's internal mission, task, approval, budget, and control-lease semantics remain ECorp domain concepts. External protocols are adapters, not the core database schema.
 
 ---
 
@@ -977,7 +977,7 @@ Automerge or Yjs can support collaborative documents. Do not use CRDTs for appro
 # 15. Repository structure
 
 ```text
-crony-corp/
+ecorp/
   README.md
   LICENSE
   NOTICE
@@ -998,7 +998,7 @@ crony-corp/
     crony-server/       # HTTP, WebSocket, auth, orchestration host
     crony-runner/       # PTY, sandbox, worktree, process supervision
     crony-cli/          # human and agent CLI
-    crony-mcp/          # MCP server for Crony tools/context
+    crony-mcp/          # MCP server for ECorp tools/context
     crony-acp/          # ACP adapter
     crony-a2a/          # A2A gateway
 
@@ -1309,7 +1309,7 @@ Use the OWASP Agentic AI threat taxonomy as a review checklist, not as a substit
 
 ## Recommendation
 
-- License Crony Corp under Apache-2.0.
+- License ECorp under Apache-2.0.
 - Maintain a `NOTICE` and third-party provenance ledger.
 - Prefer a clean-room implementation of the architecture.
 - Port individual code only after:
@@ -1317,21 +1317,27 @@ Use the OWASP Agentic AI threat taxonomy as a review checklist, not as a substit
   - source attribution
   - security review
   - tests proving it fits the new boundary
-- Commission or generate original Crony Corp art.
+- Commission or generate original ECorp art.
 
 ## Name warning
 
-"Crony" and "Crony Corp" are already in use by existing software and game-related entities. Treat Crony Corp as a working title until:
+`E Corp` is strongly associated with the fictional conglomerate in *Mr. Robot*. The engineering
+rebrand intentionally uses an original mark and does not bundle official show assets, but a public
+commercial launch still requires counsel to review the name, wordmark, and potential false
+affiliation risk.
+
+Keep the current ECorp name gated until:
 
 - trademark search
 - domain review
 - app-store search
 - package-name search
 - social-handle search
+- entertainment and merchandise affiliation review
 
 Possible fallback names:
 
-- Crony HQ
+- ECorp Operations
 - Orgcraft
 - OfficeSwarm
 - Boardroom OS
@@ -1394,9 +1400,9 @@ This scenario proves implementation, multiplayer delivery, agent coordination, h
 
 # 23. Immediate next actions
 
-1. Confirm Crony Corp is a working title.
+1. Complete legal review of the ECorp name and original governance-slash mark.
 2. Approve the greenfield/modular-monolith direction.
-3. Create `C:\Users\shyamsridhar\code\crony-corp`.
+3. Create the `ecorp` repository.
 4. Initialize the repository with the structure in section 15.
 5. Add the eight ADRs before implementation.
 6. Build the fake-agent vertical slice before any provider-specific adapter.

@@ -1,4 +1,4 @@
-# Crony Corp architecture
+# ECorp architecture
 
 ## Product invariant
 
@@ -163,7 +163,7 @@ Room membership is a server-side visibility boundary:
 - mentions are actor IDs validated against room membership
 - links to missions, tasks, runs, and artifacts are validated against the same room
 
-The demo includes Eve as a Corp guest without Product Lab membership so isolation can be exercised
+The demo includes Eve as a Corp guest without Automation Division membership so isolation can be exercised
 end to end.
 
 ## Control lease
@@ -201,9 +201,9 @@ durably queued.
 
 ## External protocol gateways
 
-MCP, ACP, and A2A remain adapters over authenticated Crony APIs. They negotiate explicit versions
+MCP, ACP, and A2A remain adapters over authenticated ECorp APIs. They negotiate explicit versions
 and expose bounded context, mission, message, task, and streaming operations. Assignment fencing,
-control leases, approval tables, budgets, and secret records remain private Crony concepts.
+control leases, approval tables, budgets, and secret records remain private ECorp concepts.
 
 ## Runner liveness and reconciliation
 
@@ -319,7 +319,7 @@ The Codex adapter:
 - starts one app-server process per active turn
 - uses `thread/start`, `turn/start`, `turn/steer`, and `turn/interrupt`
 - resumes durable provider state with `thread/resume`
-- converts structured item and turn notifications into Crony events
+- converts structured item and turn notifications into ECorp events
 - records token usage without double-counting cumulative notifications
 - denies unexpected interactive provider requests
 - applies a workspace-write, network-disabled sandbox policy
@@ -337,7 +337,7 @@ levels, and billing multiplier metadata. The selected model and reasoning effort
 the task contract and run, survive resume, and participate in runner matching. Copilot may write
 inside the assigned worktree and read its per-worktree isolated SDK state automatically. Network,
 sandbox bypass, external paths, and shell commands that cannot be proven scoped suspend through
-Crony's durable approval flow.
+ECorp's durable approval flow.
 
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.

@@ -5,7 +5,7 @@
 
 ## Decision
 
-License Crony Corp under Apache-2.0. Maintain `NOTICE` and preserve attribution for any future
+License ECorp under Apache-2.0. Maintain `NOTICE` and preserve attribution for any future
 third-party code.
 
 Do not copy Munder Difflin's separately licensed artwork, The Office character likenesses, or the

@@ -1,12 +1,13 @@
-Crony Corp
-Copyright 2026 Shyam Sridhar and Crony Corp contributors.
+ECorp
+Copyright 2026 Shyam Sridhar and ECorp contributors.
 
-"Crony Corp" is an internal working title. The preliminary August 30, 2026 brand review recommends
-"Guildframe" as a public-name candidate subject to legal clearance.
+ECorp is the user-facing product name. Internal compatibility identifiers may continue to use the
+legacy `crony-*`, `CRONY_`, and `X-Crony-*` forms until a versioned migration is released.
 
 This repository is an original greenfield implementation informed by public research into
 multi-agent systems and multiplayer collaboration products, including Munder Difflin and Buzz.
-No Munder Difflin artwork, The Office character likenesses, or Buzz product branding is included.
+The ECorp icon and wordmark are original to this repository. No Mr. Robot production artwork,
+official E Corp logo, television-character likenesses, Munder Difflin artwork, or Buzz product
+branding is included.
 
 Third-party dependencies retain their respective licenses.
-
