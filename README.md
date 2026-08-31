@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/ecorp-relay-mascot.png" width="176" alt="Relay, the ECorp pixel-art operations mascot">
+
 <h1>ECORP</h1>
 
 <h3>Run an AI company on top of your codebase.</h3>
@@ -24,6 +26,10 @@ evidence-backed results.
 </div>
 
 ![ECorp operations control room](docs/assets/ecorp-control-room.png)
+
+<p align="center"><sub><strong>LIVE CONTROL FLOOR:</strong> concurrent Claude Code and OpenCode adapter sessions plus a deterministic worker, projected from actual runner state.</sub></p>
+
+<p align="center"><strong>Meet Relay.</strong> Part dispatcher, part safety officer, always asking for evidence.</p>
 
 ## Not another agent chat. An operating system for agent work.
 

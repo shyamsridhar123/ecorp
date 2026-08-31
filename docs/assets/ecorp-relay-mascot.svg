@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Relay, the ECorp operations mascot</title>
+  <desc id="desc">An original pixel-art command robot with a red visor, operations jacket, headset antenna, and mission clipboard.</desc>
+
+  <!-- antenna and headset -->
+  <rect x="160" y="0" width="16" height="8" fill="#75c09f"/>
+  <rect x="168" y="8" width="8" height="16" fill="#111111"/>
+  <rect x="176" y="16" width="8" height="16" fill="#9aa2a6"/>
+  <rect x="48" y="48" width="16" height="32" fill="#d71920"/>
+  <rect x="192" y="48" width="16" height="32" fill="#d71920"/>
+  <rect x="40" y="56" width="8" height="16" fill="#111111"/>
+  <rect x="208" y="56" width="8" height="16" fill="#111111"/>
+
+  <!-- monitor head -->
+  <rect x="64" y="24" width="128" height="80" fill="#111111"/>
+  <rect x="72" y="32" width="112" height="64" fill="#333a3e"/>
+  <rect x="80" y="40" width="96" height="48" fill="#f7f1df"/>
+  <rect x="80" y="40" width="96" height="8" fill="#ffffff" opacity="0.72"/>
+
+  <!-- diagonal signal visor, built on an 8px grid -->
+  <rect x="88" y="48" width="56" height="8" fill="#d71920"/>
+  <rect x="96" y="56" width="56" height="8" fill="#d71920"/>
+  <rect x="104" y="64" width="56" height="8" fill="#d71920"/>
+  <rect x="112" y="72" width="48" height="8" fill="#d71920"/>
+  <rect x="160" y="48" width="8" height="8" fill="#75c09f"/>
+  <rect x="112" y="80" width="32" height="8" fill="#111111"/>
+
+  <!-- neck -->
+  <rect x="104" y="104" width="48" height="16" fill="#111111"/>
+  <rect x="112" y="104" width="32" height="16" fill="#9aa2a6"/>
+
+  <!-- left arm on hip -->
+  <rect x="48" y="128" width="24" height="56" fill="#111111"/>
+  <rect x="40" y="152" width="16" height="32" fill="#333a3e"/>
+  <rect x="48" y="176" width="24" height="16" fill="#f7f1df"/>
+  <rect x="56" y="184" width="24" height="8" fill="#111111"/>
+
+  <!-- body and jacket -->
+  <rect x="72" y="120" width="112" height="80" fill="#111111"/>
+  <rect x="80" y="128" width="96" height="64" fill="#333a3e"/>
+  <rect x="96" y="128" width="64" height="48" fill="#f7f1df"/>
+  <rect x="80" y="128" width="24" height="48" fill="#202528"/>
+  <rect x="152" y="128" width="24" height="48" fill="#202528"/>
+  <rect x="104" y="128" width="16" height="8" fill="#9aa2a6"/>
+  <rect x="136" y="128" width="16" height="8" fill="#9aa2a6"/>
+
+  <!-- red command sash -->
+  <rect x="112" y="136" width="16" height="8" fill="#d71920"/>
+  <rect x="120" y="144" width="16" height="8" fill="#d71920"/>
+  <rect x="128" y="152" width="16" height="8" fill="#d71920"/>
+  <rect x="136" y="160" width="16" height="8" fill="#d71920"/>
+  <rect x="88" y="176" width="80" height="16" fill="#202528"/>
+  <rect x="112" y="176" width="32" height="8" fill="#9aa2a6"/>
+  <rect x="160" y="136" width="8" height="8" fill="#75c09f"/>
+
+  <!-- right arm and clipboard -->
+  <rect x="184" y="128" width="16" height="64" fill="#111111"/>
+  <rect x="192" y="136" width="16" height="48" fill="#333a3e"/>
+  <rect x="184" y="184" width="24" height="16" fill="#f7f1df"/>
+  <rect x="200" y="128" width="40" height="64" fill="#111111"/>
+  <rect x="208" y="136" width="24" height="48" fill="#f7f1df"/>
+  <rect x="208" y="128" width="24" height="16" fill="#d71920"/>
+  <rect x="216" y="152" width="16" height="8" fill="#9aa2a6"/>
+  <rect x="216" y="168" width="16" height="8" fill="#9aa2a6"/>
+
+  <!-- legs and boots -->
+  <rect x="88" y="200" width="32" height="32" fill="#333a3e"/>
+  <rect x="136" y="200" width="32" height="32" fill="#333a3e"/>
+  <rect x="88" y="200" width="32" height="8" fill="#9aa2a6"/>
+  <rect x="136" y="200" width="32" height="8" fill="#9aa2a6"/>
+  <rect x="80" y="224" width="48" height="24" fill="#111111"/>
+  <rect x="128" y="224" width="48" height="24" fill="#111111"/>
+  <rect x="80" y="224" width="40" height="8" fill="#d71920"/>
+  <rect x="136" y="224" width="40" height="8" fill="#d71920"/>
+  <rect x="72" y="248" width="56" height="8" fill="#333a3e"/>
+  <rect x="128" y="248" width="56" height="8" fill="#333a3e"/>
+</svg>
