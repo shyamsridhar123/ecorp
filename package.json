@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "packageManager": "pnpm@11.19.0",
   "scripts": {
+    "check:migrations": "node tools/check_migrations.mjs",
     "dev:web": "pnpm --dir apps/web dev",
     "build:web": "pnpm --dir apps/web build",
     "lint:web": "pnpm --dir apps/web lint",
-    "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && pnpm build:web && pnpm lint:web"
+    "check": "pnpm check:migrations && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && pnpm build:web && pnpm lint:web"
   }
 }

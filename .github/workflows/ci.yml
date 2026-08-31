@@ -25,6 +25,7 @@ jobs:
           cache: pnpm
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
+      - run: node tools/check_migrations.mjs
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
