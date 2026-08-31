@@ -206,6 +206,15 @@ pub struct TaskContract {
     pub reasoning_effort: Option<String>,
 }
 
+impl TaskContract {
+    pub fn normalize_for_adapter(&mut self, adapter: &str) {
+        if adapter == "fake-process" {
+            self.model = None;
+            self.reasoning_effort = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSecretReference {
     pub secret_id: Uuid,

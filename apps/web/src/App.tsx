@@ -264,6 +264,19 @@ const MISSION_EXAMPLES = [
   },
 ] as const
 
+const DETERMINISTIC_HARNESS_STRATEGIES = [
+  'verification-matrix',
+  'verification-failure',
+  'human-approval',
+  'independent-review',
+] as const
+
+function usesDeterministicHarness(strategy: string): boolean {
+  return DETERMINISTIC_HARNESS_STRATEGIES.includes(
+    strategy as (typeof DETERMINISTIC_HARNESS_STRATEGIES)[number],
+  )
+}
+
 const OFFICE_POSITIONS = [
   { x: 14, y: 31 },
   { x: 39, y: 31 },
@@ -1110,11 +1123,12 @@ function App() {
     availableAdapters.find((adapter) => adapter.name === 'codex') ??
     availableAdapters.find((adapter) => adapter.name === 'claude-code') ??
     availableAdapters[0]
-  const effectiveMissionAdapter = availableAdapters.some(
-    (adapter) => adapter.name === missionAdapter,
-  )
-    ? missionAdapter
-    : preferredAdapter?.name ?? ''
+  const deterministicHarness = usesDeterministicHarness(missionStrategy)
+  const effectiveMissionAdapter = deterministicHarness
+    ? availableAdapters.find((adapter) => adapter.name === 'fake-process')?.name ?? ''
+    : availableAdapters.some((adapter) => adapter.name === missionAdapter)
+      ? missionAdapter
+      : preferredAdapter?.name ?? ''
 
   const selectActor = (actor: Actor) => {
     setData(null)
@@ -1141,8 +1155,9 @@ function App() {
           title: missionTitle,
           requested_by: selectedActor.id,
           preferred_adapter: effectiveMissionAdapter,
-          preferred_model: selectedModel ? missionModel : null,
+          preferred_model: !deterministicHarness && selectedModel ? missionModel : null,
           reasoning_effort:
+            !deterministicHarness &&
             selectedModel?.supported_reasoning_efforts.includes(missionReasoningEffort)
               ? missionReasoningEffort
               : null,
@@ -1699,6 +1714,7 @@ function App() {
               <select
                 id="mission-adapter"
                 value={effectiveMissionAdapter}
+                disabled={deterministicHarness}
                 onChange={(event) => {
                   setMissionAdapter(event.target.value)
                   setMissionModel('')
@@ -1716,13 +1732,15 @@ function App() {
                   </option>
                 ))}
               </select>
-              <small className={effectiveMissionAdapter === 'fake-process' ? 'field-warning' : ''}>
-                {selectedAdapter
+              <small className={deterministicHarness || effectiveMissionAdapter === 'fake-process' ? 'field-warning' : ''}>
+                {deterministicHarness
+                  ? 'This lifecycle fixture always uses the deterministic test harness. AI models and reasoning settings do not apply.'
+                  : selectedAdapter
                   ? adapterDescription(selectedAdapter.name)
                   : 'Connect a runner to make an agent runtime available.'}
               </small>
             </div>
-            {selectedAdapter?.models.length ? (
+            {!deterministicHarness && selectedAdapter?.models.length ? (
               <div className="mission-field">
                 <label htmlFor="mission-model">Model</label>
                 <select
@@ -1757,7 +1775,7 @@ function App() {
                 </small>
               </div>
             ) : null}
-            {selectedModel?.supports_reasoning_effort ? (
+            {!deterministicHarness && selectedModel?.supports_reasoning_effort ? (
               <div className="mission-field">
                 <label htmlFor="mission-reasoning">Reasoning effort</label>
                 <select

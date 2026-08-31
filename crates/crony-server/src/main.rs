@@ -58,7 +58,7 @@ use uuid::Uuid;
 
 use artifacts::{ArtifactIdentity, ArtifactStore};
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
-use planning::{PlanningRequest, StrategyRegistry};
+use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness};
 use secrets::SecretCipher;
 
 #[derive(Debug, Parser)]
@@ -1092,12 +1092,22 @@ async fn create_mission(
             "secret references currently require the single-task strategy",
         ));
     }
+    let (preferred_adapter, preferred_model, reasoning_effort) =
+        if uses_deterministic_harness(strategy) {
+            (Some("fake-process"), None, None)
+        } else {
+            (
+                request.preferred_adapter.as_deref(),
+                request.preferred_model.as_deref(),
+                request.reasoning_effort.as_deref(),
+            )
+        };
     validate_requested_model(
         &state,
         corp_id,
-        request.preferred_adapter.as_deref(),
-        request.preferred_model.as_deref(),
-        request.reasoning_effort.as_deref(),
+        preferred_adapter,
+        preferred_model,
+        reasoning_effort,
     )?;
     let agents = state
         .store
@@ -1110,9 +1120,9 @@ async fn create_mission(
             strategy,
             &PlanningRequest {
                 mission_title: &request.title,
-                preferred_adapter: request.preferred_adapter.as_deref(),
-                preferred_model: request.preferred_model.as_deref(),
-                reasoning_effort: request.reasoning_effort.as_deref(),
+                preferred_adapter,
+                preferred_model,
+                reasoning_effort,
                 secret_refs: &request.secret_refs,
                 budget_tokens: request.budget_tokens,
                 budget_cost_microusd: request.budget_cost_microusd,
@@ -1183,23 +1193,51 @@ async fn launch_mission(
         Permission::Operate,
     )
     .await?;
-    let records = schedule_ready_tasks(&state, corp_id, mission_id, Some(requested_by))
+    let outcome = schedule_ready_tasks(&state, corp_id, mission_id, Some(requested_by))
         .await
         .map_err(ApiError::conflict)?;
-    let first = records
+    let first = outcome
+        .records
         .first()
-        .context("mission has no ready tasks with a compatible runner")
-        .map_err(ApiError::conflict)?;
+        .ok_or_else(|| ApiError::conflict(outcome.failure_message()))?;
 
     Ok(Json(LaunchMissionResponse {
         run_id: first.0.run_id,
         runner_id: first.1.clone(),
-        run_ids: records.iter().map(|(record, _)| record.run_id).collect(),
-        runner_ids: records
+        run_ids: outcome
+            .records
+            .iter()
+            .map(|(record, _)| record.run_id)
+            .collect(),
+        runner_ids: outcome
+            .records
             .iter()
             .map(|(_, runner_id)| runner_id.clone())
             .collect(),
     }))
+}
+
+#[derive(Default)]
+struct ScheduleOutcome {
+    records: Vec<(LaunchRecord, String)>,
+    candidate_count: usize,
+    failures: Vec<String>,
+}
+
+impl ScheduleOutcome {
+    fn failure_message(&self) -> String {
+        if self.candidate_count == 0 {
+            return "mission has no schedulable tasks; tasks may be waiting on dependencies, assigned to a busy agent, already active, or finished"
+                .to_owned();
+        }
+        if self.failures.is_empty() {
+            return "mission had ready tasks, but none could be dispatched".to_owned();
+        }
+        format!(
+            "mission had ready tasks, but none could be dispatched: {}",
+            self.failures.join("; ")
+        )
+    }
 }
 
 async fn schedule_ready_tasks(
@@ -1207,9 +1245,12 @@ async fn schedule_ready_tasks(
     corp_id: Uuid,
     mission_id: Uuid,
     requested_by: Option<Uuid>,
-) -> anyhow::Result<Vec<(LaunchRecord, String)>> {
+) -> anyhow::Result<ScheduleOutcome> {
     let candidates = state.store.schedulable_tasks(corp_id, mission_id).await?;
-    let mut scheduled = Vec::new();
+    let mut outcome = ScheduleOutcome {
+        candidate_count: candidates.len(),
+        ..ScheduleOutcome::default()
+    };
     for candidate in candidates {
         let Some((runner_id, runner_tx)) = select_runner(
             state,
@@ -1218,9 +1259,19 @@ async fn schedule_ready_tasks(
             candidate.required_model.as_deref(),
             candidate.required_reasoning_effort.as_deref(),
         ) else {
+            outcome.failures.push(format!(
+                "task {} {}",
+                candidate.task_id,
+                runner_requirement_mismatch(
+                    &runner_capabilities(state, corp_id),
+                    &candidate.required_adapter,
+                    candidate.required_model.as_deref(),
+                    candidate.required_reasoning_effort.as_deref(),
+                )
+            ));
             continue;
         };
-        let Ok((record, event)) = state
+        let (record, event) = match state
             .store
             .create_task_run(
                 corp_id,
@@ -1230,8 +1281,15 @@ async fn schedule_ready_tasks(
                 &runner_id,
             )
             .await
-        else {
-            continue;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                outcome.failures.push(format!(
+                    "task {} could not create a run: {error}",
+                    candidate.task_id
+                ));
+                continue;
+            }
         };
         let secrets = match resolve_run_secrets(state, &record, &runner_id).await {
             Ok(secrets) => secrets,
@@ -1247,6 +1305,10 @@ async fn schedule_ready_tasks(
                 {
                     publish(state, event);
                 }
+                outcome.failures.push(format!(
+                    "task {} secret assignment failed: {error}",
+                    candidate.task_id
+                ));
                 continue;
             }
         };
@@ -1268,9 +1330,9 @@ async fn schedule_ready_tasks(
             })
             .map_err(|_| anyhow::anyhow!("runner disconnected before accepting the run"))?;
         publish(state, event);
-        scheduled.push((record, runner_id));
+        outcome.records.push((record, runner_id));
     }
-    Ok(scheduled)
+    Ok(outcome)
 }
 
 async fn resolve_run_secrets(
@@ -1317,9 +1379,106 @@ async fn resolve_run_secrets(
 
 async fn schedule_ready_corp(state: &AppState, corp_id: Uuid) -> anyhow::Result<()> {
     for mission_id in state.store.schedulable_mission_ids(corp_id).await? {
-        schedule_ready_tasks(state, corp_id, mission_id, None).await?;
+        let _ = schedule_ready_tasks(state, corp_id, mission_id, None).await?;
     }
     Ok(())
+}
+
+fn runner_capabilities(state: &AppState, corp_id: Uuid) -> Vec<RunnerCapability> {
+    state
+        .runners
+        .iter()
+        .filter(|entry| entry.corp_id == corp_id)
+        .flat_map(|entry| entry.capabilities.clone())
+        .collect()
+}
+
+fn capability_satisfies_requirement(
+    capability: &RunnerCapability,
+    required_adapter: &str,
+    required_model: Option<&str>,
+    required_reasoning_effort: Option<&str>,
+) -> bool {
+    capability.name == required_adapter
+        && capability.available
+        && required_model.is_none_or(|required_model| {
+            capability.models.iter().any(|model| {
+                model.id == required_model
+                    && model.policy_state.as_deref() != Some("disabled")
+                    && required_reasoning_effort.is_none_or(|effort| {
+                        model.supports_reasoning_effort
+                            && model
+                                .supported_reasoning_efforts
+                                .iter()
+                                .any(|supported| supported == effort)
+                    })
+            })
+        })
+}
+
+fn runner_requirement_mismatch(
+    capabilities: &[RunnerCapability],
+    required_adapter: &str,
+    required_model: Option<&str>,
+    required_reasoning_effort: Option<&str>,
+) -> String {
+    let adapter_capabilities = capabilities
+        .iter()
+        .filter(|capability| capability.name == required_adapter)
+        .collect::<Vec<_>>();
+    if adapter_capabilities.is_empty() {
+        return format!(
+            "requires adapter {required_adapter}, which no connected runner advertises"
+        );
+    }
+    let available = adapter_capabilities
+        .into_iter()
+        .filter(|capability| capability.available)
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return format!("requires adapter {required_adapter}, but that adapter is unavailable");
+    }
+    let Some(model_id) = required_model else {
+        return format!(
+            "requires adapter {required_adapter}, but no matching runner was selectable"
+        );
+    };
+    let matching_models = available
+        .iter()
+        .flat_map(|capability| capability.models.iter())
+        .filter(|model| model.id == model_id && model.policy_state.as_deref() != Some("disabled"))
+        .collect::<Vec<_>>();
+    if matching_models.is_empty() {
+        let advertised_models = available
+            .iter()
+            .flat_map(|capability| capability.models.iter())
+            .filter(|model| model.policy_state.as_deref() != Some("disabled"))
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        if advertised_models.is_empty() {
+            return format!(
+                "requires model {model_id} on {required_adapter}, but connected runners expose no selectable models for that adapter"
+            );
+        }
+        return format!(
+            "requires model {model_id} on {required_adapter}; available models are {}",
+            advertised_models.join(", ")
+        );
+    }
+    if let Some(effort) = required_reasoning_effort
+        && !matching_models.iter().any(|model| {
+            model.supports_reasoning_effort
+                && model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|supported| supported == effort)
+        })
+    {
+        return format!(
+            "requires reasoning effort {effort} for model {model_id} on {required_adapter}, but connected runners do not support it"
+        );
+    }
+    format!("requires {required_adapter}/{model_id}, but no matching runner was selectable")
 }
 
 fn select_runner(
@@ -1335,21 +1494,12 @@ fn select_runner(
         .filter(|entry| {
             entry.corp_id == corp_id
                 && entry.capabilities.iter().any(|capability| {
-                    capability.name == required_adapter
-                        && capability.available
-                        && required_model.is_none_or(|required_model| {
-                            capability.models.iter().any(|model| {
-                                model.id == required_model
-                                    && model.policy_state.as_deref() != Some("disabled")
-                                    && required_reasoning_effort.is_none_or(|effort| {
-                                        model.supports_reasoning_effort
-                                            && model
-                                                .supported_reasoning_efforts
-                                                .iter()
-                                                .any(|supported| supported == effort)
-                                    })
-                            })
-                        })
+                    capability_satisfies_requirement(
+                        capability,
+                        required_adapter,
+                        required_model,
+                        required_reasoning_effort,
+                    )
                 })
         })
         .map(|entry| (entry.key().clone(), entry.tx.clone()))
@@ -2366,4 +2516,71 @@ where
         .map_err(|error| {
             warn!(%error, "websocket send failed");
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use crony_protocol::{RunnerCapability, RunnerModel};
+
+    use super::{capability_satisfies_requirement, runner_requirement_mismatch};
+
+    fn model(id: &str, efforts: &[&str]) -> RunnerModel {
+        RunnerModel {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            policy_state: Some("enabled".to_owned()),
+            policy_terms: None,
+            supports_vision: false,
+            supports_reasoning_effort: !efforts.is_empty(),
+            max_prompt_tokens: None,
+            max_context_window_tokens: None,
+            supported_reasoning_efforts: efforts
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect(),
+            default_reasoning_effort: None,
+            billing_multiplier: None,
+        }
+    }
+
+    #[test]
+    fn model_less_adapter_reports_the_invalid_model_requirement() {
+        let capabilities = vec![RunnerCapability {
+            name: "fake-process".to_owned(),
+            available: true,
+            detail: None,
+            models: Vec::new(),
+        }];
+        assert_eq!(
+            runner_requirement_mismatch(
+                &capabilities,
+                "fake-process",
+                Some("gpt-5.6-sol"),
+                Some("max"),
+            ),
+            "requires model gpt-5.6-sol on fake-process, but connected runners expose no selectable models for that adapter"
+        );
+    }
+
+    #[test]
+    fn runner_matching_enforces_model_and_reasoning_support() {
+        let capability = RunnerCapability {
+            name: "github-copilot".to_owned(),
+            available: true,
+            detail: None,
+            models: vec![model("gpt-5.6-sol", &["high", "max"])],
+        };
+        assert!(capability_satisfies_requirement(
+            &capability,
+            "github-copilot",
+            Some("gpt-5.6-sol"),
+            Some("max"),
+        ));
+        assert!(!capability_satisfies_requirement(
+            &capability,
+            "github-copilot",
+            Some("gpt-5.6-sol"),
+            Some("minimal"),
+        ));
+    }
 }

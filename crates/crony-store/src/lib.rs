@@ -1928,6 +1928,8 @@ impl PgStore {
             } else {
                 "pending"
             };
+            let mut contract = task.contract.clone();
+            contract.normalize_for_adapter(&task.required_adapter);
             sqlx::query(
                 r#"
                 INSERT INTO tasks
@@ -1943,7 +1945,7 @@ impl PgStore {
             .bind(&task.title)
             .bind(&task.contract.objective)
             .bind(&task.key)
-            .bind(serde_json::to_value(&task.contract)?)
+            .bind(serde_json::to_value(&contract)?)
             .bind(task.depth)
             .bind(task.max_attempts)
             .bind(&task.required_adapter)

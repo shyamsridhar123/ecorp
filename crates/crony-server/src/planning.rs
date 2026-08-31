@@ -16,6 +16,13 @@ pub const MAX_TASK_ATTEMPTS: i32 = 3;
 pub const MAX_TASK_BUDGET_TOKENS: i64 = 200_000;
 pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 500_000;
 
+pub fn uses_deterministic_harness(strategy: &str) -> bool {
+    matches!(
+        strategy,
+        "verification-matrix" | "verification-failure" | "human-approval" | "independent-review"
+    )
+}
+
 pub struct PlanningRequest<'a> {
     pub mission_title: &'a str,
     pub preferred_adapter: Option<&'a str>,
@@ -398,8 +405,7 @@ fn verification_plan(
         budget_tokens,
     );
     task_contract.budget_cost_microusd = budget_cost_microusd;
-    task_contract.model = request.preferred_model.map(str::to_owned);
-    task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+    task_contract.normalize_for_adapter(&agent.adapter);
     Ok(TaskGraphPlan {
         strategy: strategy.to_owned(),
         max_nodes: 1,
@@ -516,6 +522,14 @@ pub fn validate_plan(plan: &TaskGraphPlan, agents: &[Agent]) -> Result<()> {
                 task.key,
                 task.required_adapter,
                 agent.adapter
+            ));
+        }
+        if task.required_adapter == "fake-process"
+            && (task.contract.model.is_some() || task.contract.reasoning_effort.is_some())
+        {
+            return Err(anyhow!(
+                "task {} uses fake-process and cannot require a model or reasoning effort",
+                task.key
             ));
         }
         if !(1..=MAX_TASK_ATTEMPTS).contains(&task.max_attempts) {
@@ -951,6 +965,31 @@ mod tests {
             )
             .expect("single plan");
         assert_eq!(plan.tasks[0].required_adapter, "codex");
+    }
+
+    #[test]
+    fn deterministic_verification_strategy_drops_provider_model_settings() {
+        let agents = agents();
+        let registry = StrategyRegistry::new();
+        let plan = registry
+            .plan(
+                "verification-matrix",
+                &PlanningRequest {
+                    mission_title: "verify without a provider",
+                    preferred_adapter: Some("github-copilot"),
+                    preferred_model: Some("gpt-5.6-sol"),
+                    reasoning_effort: Some("max"),
+                    secret_refs: &[],
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
+                },
+                &agents,
+            )
+            .expect("verification plan");
+        let task = &plan.tasks[0];
+        assert_eq!(task.required_adapter, "fake-process");
+        assert_eq!(task.contract.model, None);
+        assert_eq!(task.contract.reasoning_effort, None);
     }
 
     #[test]
