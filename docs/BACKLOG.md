@@ -54,13 +54,4 @@ This file is the local source for the initial GitHub milestones and issues.
 | P1 | Complete public-name and licensing review | Brand, domain, package, art, and attribution decisions recorded |
 | P1 | Dogfood with three real teams | Measured setup, completion, recovery, and rework results |
 
-## M5 — Dynamic workforce
-
-| Priority | Issue | Definition of done |
-|---|---|---|
-| P0 | Replace the static demo crew with mission-scoped dynamic staffing | Mission planning derives required roles from the use case, creates only the required agent identities, and capability-matches each role to an available adapter and model |
-| P0 | Add safe crew clearing and agent retirement | Authorized operators can clear or retire agents only when they have no active run; historical missions, runs, messages, approvals, and attribution remain intact |
-| P0 | Terminate and retire mission-scoped agents automatically | Provider processes stop at terminal run state, unpinned mission-scoped identities retire after their mission completes, and explicitly pinned reusable agents remain available |
-| P1 | Add dynamic workforce controls to the UI | The UI supports Clear crew, pin/unpin, and lifecycle labels for live, off-shift, and retired identities, with clear warnings when active work prevents removal |
-| P0 | Prove dynamic staffing end to end | Tests cover single-worker, specialist/synthesis, tester/reviewer, unavailable-provider fallback, active-run deletion rejection, history preservation, and automatic post-mission retirement |
 
