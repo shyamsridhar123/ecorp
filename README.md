@@ -1,141 +1,199 @@
-# ECorp
+<div align="center">
 
-**A governed operations network where humans and autonomous agents execute real work together.**
+<h1>ECORP</h1>
 
-ECorp combines a real-time control floor, durable missions and approvals, isolated agent execution,
-and evidence-backed completion. The visual identity references the cold institutional atmosphere of
-*Mr. Robot* while using an original mark and no official television assets. The floor is a
-projection of actual system events: agents move because work is happening, not because an animation
-timer fired.
+<h3>Run an AI company on top of your codebase.</h3>
 
-> Status: early vertical-slice implementation.
+<p><strong>Give ECorp a Git repository. It gives your agents a mission control room.</strong></p>
 
-> Compatibility: existing `crony-*` binaries, `CRONY_` environment variables, and `X-Crony-*`
-> headers remain supported while the public product transitions to ECorp.
+<p>
+Dispatch GitHub Copilot, OpenAI Codex, Claude Code, OpenCode, and deterministic workers into
+isolated worktrees. Watch the work live. Steer active sessions. Approve risky actions. Accept only
+evidence-backed results.
+</p>
 
-## Architecture
+<p><strong>One repository. Multiple agents. Human authority. Receipts for every mission.</strong></p>
 
-ECorp has three strict planes:
+<p>
+<img alt="Rust control plane" src="https://img.shields.io/badge/control_plane-Rust-111111?style=flat-square&logo=rust">
+<img alt="React operations console" src="https://img.shields.io/badge/operations_console-React-111111?style=flat-square&logo=react">
+<img alt="PostgreSQL durable state" src="https://img.shields.io/badge/durable_state-PostgreSQL-111111?style=flat-square&logo=postgresql">
+<img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-d71920?style=flat-square">
+</p>
 
-1. **Experience:** web and desktop clients.
-2. **Collaboration/control:** rooms, missions, tasks, leases, approvals, events, and audit.
-3. **Execution:** runner daemons that own PTYs, worktrees, sandboxes, and agent processes.
+</div>
 
-The UI can close without terminating active work.
+![ECorp operations control room](docs/assets/ecorp-control-room.png)
 
-## Current vertical slice
+## Not another agent chat. An operating system for agent work.
 
-- Shared demo Corp with three human actors and two agent identities
-- Durable room membership, human-agent messages, replies, mentions, and work-item links
-- Durable Postgres state and event journal
-- Production OIDC authentication with Corp-scoped, deny-by-default RBAC
-- One-time runner enrollment, rotating workload credentials, replay rejection, and revocation
-- Encrypted, actor/task/tool/resource-scoped secret delivery with metadata-only audit events
-- Durable risky-action suspension with role-gated, idempotent decisions
-- Run, mission, requester, and Corp budgets with steer-constrain-suspend-stop incidents
-- Versioned 100-scenario evaluation corpus with deterministic regression metrics
-- Consolidated chaos evidence and Windows/macOS/Linux runner CI
-- Thin Tauri 2 desktop shell with `ecorp://` deep links, legacy `crony://` compatibility, and
-  Windows build smoke coverage
-- MCP, ACP, and A2A gateways with explicit version negotiation and schema isolation
-- Browser WebSocket updates
-- Resumable, room-filtered event replay
-- Outbound-connected runner daemon
-- Persisted runner heartbeats, disconnect grace, and active-run reconciliation
-- Pluggable `AgentAdapter` lifecycle contract with explicit feature capabilities
-- Real child-process execution through a deterministic fake-agent adapter
-- Native OpenAI Codex app-server adapter with structured lifecycle streaming
-- Normalized Claude Code and OpenCode CLI adapters with common evidence
-- Official GitHub Copilot SDK adapter with live account model discovery, explicit model and
-  reasoning selection, durable permission handoff, and resumable sessions
-- Durable Codex provider sessions with start, live steer, interrupt, stop, and resume
-- Per-run token usage plus SHA-256 evidence for tracked and untracked file changes
-- Dedicated Git branch and linked worktree for every write-capable task lineage
-- Fail-safe worktree cleanup that preserves dirty, committed, or uncertain work
-- Replaceable manager strategies that produce bounded, dependency-aware task graphs
-- Deterministic capability matching, parallel root dispatch, dependency release, and bounded retries
-- Runner-side evidence policies for artifacts, files, commands, tests, JSON schemas, and screenshots
-- Human approval and independent-review gates with role and requester separation
-- Mission creation and launch
-- Agent control leasing with private rotating fencing tokens
-- Explicit release and transfer, queued messages, and role-gated emergency stop
-- Server-mediated content-addressed artifact storage with digest/media verification, HMAC-signed
-  provenance, retention metadata, and Corp-authorized downloads
-- Live office, operations panel, and activity replay
+Most agent tools disappear behind a terminal or a conversation. ECorp turns repository work into a
+durable operating process that humans can see, control, and audit.
 
-## Run locally
+| You get | What it means |
+| --- | --- |
+| **A live control floor** | Agent movement, status, review, and approval states are projections of real provider sessions—not decorative animation. |
+| **Your choice of intelligence** | Select a connected runtime, an account-enabled GitHub Copilot model, and supported reasoning effort for each mission. |
+| **Safe parallel execution** | Every write-capable run receives its own Git branch and linked worktree. Agents never edit the configured source checkout directly. |
+| **Human authority at the point of risk** | Steer live work, interrupt a turn, transfer control, approve scoped actions, or issue an audited emergency stop. |
+| **Proof before completion** | Artifacts, files, commands, tests, schemas, screenshots, human approval, and independent review can gate success. |
+| **Durable operations** | Missions, rooms, messages, approvals, budgets, events, provider sessions, and signed artifact metadata survive the browser session. |
 
-Prerequisites:
+## From repository to verified result
 
-- Rust
-- Node.js and pnpm
-- Docker
-- An authenticated `codex` CLI for real Codex missions (optional; the fake adapter works offline)
-- A GitHub Copilot subscription/login for real Copilot missions (optional; CI uses a deterministic
-  Copilot fixture and does not consume account quota)
-
-```powershell
-Copy-Item .env.example .env
-docker compose -f deploy/compose/docker-compose.yml up -d
-pnpm install
-cargo build --workspace
+```text
+1. Point ECorp at a Git repository
+                  ↓
+2. Define the outcome, runtime, model, strategy, and safety budget
+                  ↓
+3. ECorp creates bounded tasks and isolated worktrees
+                  ↓
+4. Agents execute while humans watch, steer, and approve
+                  ↓
+5. Verification runs before the mission can complete
+                  ↓
+6. ECorp records the result, evidence, provenance, and audit trail
 ```
 
-The supported development path performs demo bootstrap and runner enrollment automatically:
+Choose one focused agent or run two independent specialists followed by a dependency-gated
+synthesis task. The scheduler releases only ready work, matches it to a compatible connected
+runner, and keeps retries, depth, fan-out, tokens, and cost inside explicit bounds.
+
+## Bring the agents you already trust
+
+| Runtime | ECorp integration |
+| --- | --- |
+| **GitHub Copilot** | Official SDK integration, live account model discovery, model and reasoning selection, streaming, steering, interruption, approvals, usage, evidence, and resumable sessions. |
+| **OpenAI Codex** | Native app-server lifecycle with structured output, live steering, interrupt, stop, resume, usage, and repository-change evidence. |
+| **Claude Code** | Normalized CLI execution with streaming, interruption, stop, resume, and common evidence. |
+| **OpenCode** | Normalized CLI execution through the same governed runner and evidence contract. |
+| **Deterministic harness** | Quota-free, no-AI lifecycle fixture for testing orchestration, verification, approvals, budgets, and failure paths. |
+
+The provider is not the control plane. Runners advertise exactly what they support, and ECorp
+dispatches only when the requested adapter, model, and reasoning capability are available.
+
+## Control without surrendering the repository
+
+```text
+Web console · Tauri desktop · CLI · MCP / ACP / A2A
+                         │
+                    REST + WebSocket
+                         ▼
+              ┌─────────────────────┐
+              │ ECorp control plane │
+              │ missions · policy   │
+              │ rooms · approvals   │
+              │ events · artifacts  │
+              └──────────┬──────────┘
+                         │ fenced, outbound assignments
+                         ▼
+              ┌─────────────────────┐
+              │ trusted runner node │
+              │ provider supervisor │
+              │ isolated worktrees  │
+              └──────────┬──────────┘
+                         ▼
+                verification + signed evidence
+```
+
+The server never executes an agent shell command. Outbound-connected runner daemons own provider
+processes, worktree isolation, artifact collection, and verification. Postgres remains the
+authoritative state and event journal, so closing the UI does not terminate active work.
+
+## Safety is part of the workflow
+
+- **Deny-by-default access:** production OIDC identity, Corp-scoped RBAC, room membership, and
+  one-time WebSocket tickets.
+- **Revocable runner identity:** short-lived enrollment, rotating workload credentials, replay
+  rejection, reconnect grace, and fenced assignments.
+- **Scoped secrets:** encrypted at rest and released only for an authorized actor, task, run,
+  runner, tool, resource, and expiry window.
+- **Durable approvals:** ambiguous, external, networked, or policy-controlled actions pause until
+  an authorized human decides.
+- **Circuit breakers:** run, mission, requester, and Corp budgets can steer, constrain, suspend, or
+  stop runaway work.
+- **Artifact provenance:** content-addressed storage, SHA-256 integrity, media validation,
+  retention metadata, HMAC-signed provenance, and authorized downloads.
+
+Read the exact boundaries in [`docs/SECURITY.md`](docs/SECURITY.md) and
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
+
+## Start locally
+
+### Fastest path: Windows PowerShell
+
+Prerequisites: Rust, Node.js, pnpm, Docker, and at least one optional authenticated provider CLI or
+GitHub Copilot account. The deterministic harness works without provider credentials.
 
 ```powershell
+git clone https://github.com/shyamsridhar123/ecorp.git
+cd ecorp
 ./tools/start_local.ps1
 ```
 
-Open `http://127.0.0.1:5187`.
+Open **http://127.0.0.1:5187**.
 
-The UI now includes a four-step start guide that explains runner setup, provider selection, mission
-planning and dispatch, live operation, approvals, and evidence review. See
-[`docs/USER_AND_DEVELOPER_JOURNEY.md`](docs/USER_AND_DEVELOPER_JOURNEY.md) for the complete user and
-developer journey.
+The startup script launches Postgres, the Rust control plane, an enrolled outbound runner, and the
+React operations console.
 
-The runner uses the current Git repository and `HEAD` as its source by default. Set
-`CRONY_SOURCE_REPOSITORY` and `CRONY_SOURCE_BASE_REF` to choose another local checkout and base.
-Agents receive linked worktrees below `CRONY_RUNNER_WORKSPACE`; they never execute in the source
-checkout itself.
+### Point ECorp at another repository
 
-The `fake-process` adapter is a deterministic test harness, not an AI provider. It launches
-`scripts/fake-agent.mjs` as a real child process and emits predictable lifecycle, steering, and
-artifact events so orchestration can be tested offline. It remains registered beside real
-providers; selecting `github-copilot`, `codex`, `claude-code`, or `opencode` does not route through
-the fake harness. `CRONY_COPILOT_FIXTURE=true` is a separate CI-only Copilot simulator.
+```powershell
+$env:CRONY_SOURCE_REPOSITORY = 'C:\path\to\your\repository'
+$env:CRONY_SOURCE_BASE_REF = 'HEAD'
+./tools/start_local.ps1
+```
 
-In production, set `CRONY_MODE=production`, configure an HTTPS `CRONY_OIDC_ISSUER`, provision
-`human_identities`, and explicitly enroll each runner. Demo endpoints and claimed demo identities
-are unavailable in production. `CRONY_SECRET_MASTER_KEY_HEX` must contain a deployment-managed
-32-byte key encoded as 64 hexadecimal characters. Production also requires
-`CRONY_ARTIFACT_SIGNING_KEY_HEX` and a private S3-compatible bucket. Shared snapshots contain only
-the authorized artifact API URI and signed metadata, never runner-local paths or direct bucket URLs.
+The runner validates the repository and base ref at startup. Each mission then receives a dedicated
+worktree beneath `CRONY_RUNNER_WORKSPACE`.
 
-## Documents
+### Run the engineering checks
 
-- [`docs/PRODUCT_AND_TECHNICAL_PLAN.md`](docs/PRODUCT_AND_TECHNICAL_PLAN.md)
-- [`docs/USER_AND_DEVELOPER_JOURNEY.md`](docs/USER_AND_DEVELOPER_JOURNEY.md)
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- [`docs/SECURITY.md`](docs/SECURITY.md)
-- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
-- [`docs/EVALS.md`](docs/EVALS.md)
-- [`docs/BACKLOG.md`](docs/BACKLOG.md)
-- [`docs/BRAND_NAME_AND_LICENSING_REVIEW.md`](docs/BRAND_NAME_AND_LICENSING_REVIEW.md)
-- [`docs/evidence/2026-08-29-codex-adapter-validation.md`](docs/evidence/2026-08-29-codex-adapter-validation.md)
-- [`docs/evidence/2026-08-29-worktree-isolation-validation.md`](docs/evidence/2026-08-29-worktree-isolation-validation.md)
-- [`docs/evidence/2026-08-29-task-graph-validation.md`](docs/evidence/2026-08-29-task-graph-validation.md)
-- [`docs/evidence/2026-08-29-evidence-verification-validation.md`](docs/evidence/2026-08-29-evidence-verification-validation.md)
-- [`docs/evidence/2026-08-30-identity-validation.md`](docs/evidence/2026-08-30-identity-validation.md)
-- [`docs/evidence/2026-08-30-secret-broker-validation.md`](docs/evidence/2026-08-30-secret-broker-validation.md)
-- [`docs/evidence/2026-08-30-approval-and-budget-validation.md`](docs/evidence/2026-08-30-approval-and-budget-validation.md)
-- [`docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md`](docs/evidence/2026-08-30-alpha-eval-chaos-platform-validation.md)
-- [`docs/evidence/2026-08-30-artifact-storage-validation.md`](docs/evidence/2026-08-30-artifact-storage-validation.md)
-- [`docs/evidence/2026-08-30-external-adapter-validation.md`](docs/evidence/2026-08-30-external-adapter-validation.md)
-- [`docs/evidence/2026-08-30-github-copilot-adapter-validation.md`](docs/evidence/2026-08-30-github-copilot-adapter-validation.md)
-- [`docs/evidence/2026-08-30-protocol-gateway-validation.md`](docs/evidence/2026-08-30-protocol-gateway-validation.md)
-- [`docs/evidence/2026-08-30-tauri-desktop-validation.md`](docs/evidence/2026-08-30-tauri-desktop-validation.md)
+```powershell
+pnpm install --frozen-lockfile
+pnpm check
+```
+
+## What to try first
+
+1. Choose **GitHub Copilot**, **Codex**, **Claude Code**, or **OpenCode**.
+2. Select a model, reasoning effort, and mission budget when the provider exposes them.
+3. Describe an outcome and the proof you expect.
+4. Use **One agent** for a focused build or **Two specialists, then synthesis** for competing
+   approaches.
+5. Keep **Pause after planning** enabled when you want to inspect the task graph before dispatch.
+6. Approve scoped actions directly inside the mission card.
+7. Download the verified artifact when the mission completes.
+
+Example mission:
+
+> Build a browser-playable multiplayer game with power-ups and boss battles. Test the complete
+> gameplay loop, attach browser evidence, and do not modify files outside the assigned worktree.
+
+## Current state
+
+ECorp is an active alpha with a working web console, Rust control plane, Postgres event journal,
+outbound runner, provider adapters, thin Tauri desktop shell, protocol gateways, approval system,
+budget circuit breakers, worktree isolation, and evidence-gated completion.
+
+It is not yet a safe sandbox for fully untrusted child processes. Development mode intentionally
+includes fixed demo identities, permissive local CORS, and a deterministic process that runs with
+the local user's permissions. Production deployments require OIDC, deployment-managed keys,
+explicit runner enrollment, and private S3-compatible artifact storage.
+
+The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environment variables, and
+`X-Crony-*` headers remain supported for compatibility during the transition.
+
+## Go deeper
+
+- [User and developer journey](docs/USER_AND_DEVELOPER_JOURNEY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security](docs/SECURITY.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Evaluation strategy](docs/EVALS.md)
+- [Product and technical plan](docs/PRODUCT_AND_TECHNICAL_PLAN.md)
+- [Backlog](docs/BACKLOG.md)
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
