@@ -630,20 +630,28 @@ function MissionCard({
   runs,
   evidence,
   verificationRequests,
+  actionApprovals,
   actorId,
+  actorRole,
+  busy,
   onLaunch,
   onResume,
   onVerificationDecision,
+  onActionApprovalDecision,
 }: {
   mission: Mission
   tasks: Task[]
   runs: Run[]
   evidence: VerificationEvidence[]
   verificationRequests: VerificationRequest[]
+  actionApprovals: ActionApproval[]
   actorId: string
+  actorRole: string
+  busy: boolean
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
+  onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
@@ -662,6 +670,10 @@ function MissionCard({
         (request) => request.run_id === pendingRun.id && request.status === 'pending',
       )
     : undefined
+  const runIds = new Set(runs.map((run) => run.id))
+  const pendingActionApprovals = actionApprovals.filter(
+    (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
+  )
   const latestEvidence = latestRun
     ? evidence.filter((item) => item.run_id === latestRun.id)
     : []
@@ -740,6 +752,41 @@ function MissionCard({
         <button className="button button-primary mission-launch" type="button" onClick={() => onLaunch(mission)}>
           Dispatch mission
         </button>
+      ) : null}
+      {pendingActionApprovals.length ? (
+        <div className="mission-approval-list">
+          <strong>
+            {pendingActionApprovals.length} action
+            {pendingActionApprovals.length === 1 ? '' : 's'} need your approval
+          </strong>
+          {pendingActionApprovals.map((approval) => {
+            const canDecide = approval.required_roles.includes(actorRole)
+            return (
+              <div className="mission-approval-item" key={approval.id}>
+                <span>{approval.action}</span>
+                <small>{approval.risk} risk · {approval.rationale}</small>
+                <div>
+                  <button
+                    className="button button-primary"
+                    type="button"
+                    disabled={busy || !canDecide}
+                    onClick={() => void onActionApprovalDecision(approval, true)}
+                  >
+                    Approve action
+                  </button>
+                  <button
+                    className="button"
+                    type="button"
+                    disabled={busy || !canDecide}
+                    onClick={() => void onActionApprovalDecision(approval, false)}
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
       ) : null}
       {resumableRun && activeRuns === 0 ? (
         <button className="button button-secondary mission-launch" type="button" onClick={() => onResume(resumableRun)}>
@@ -981,6 +1028,7 @@ function App() {
   const [missionModel, setMissionModel] = useState('')
   const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
   const [missionStrategy, setMissionStrategy] = useState('single')
+  const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
   const [journeyOpen, setJourneyOpen] = useState(true)
@@ -1162,6 +1210,7 @@ function App() {
               ? missionReasoningEffort
               : null,
           strategy: missionStrategy,
+          budget_tokens: deterministicHarness ? null : missionBudgetTokens,
         }),
       })
       if (!pauseAfterPlanning) {
@@ -1798,6 +1847,25 @@ function App() {
                 </select>
               </div>
             ) : null}
+            {!deterministicHarness ? (
+              <div className="mission-field">
+                <label htmlFor="mission-budget">Mission token budget</label>
+                <select
+                  id="mission-budget"
+                  value={missionBudgetTokens}
+                  onChange={(event) => setMissionBudgetTokens(Number(event.target.value))}
+                >
+                  <option value={100_000}>Quick task · 100,000 tokens</option>
+                  <option value={500_000}>Focused build · 500,000 tokens</option>
+                  <option value={1_000_000}>Standard · 1,000,000 tokens</option>
+                  <option value={2_000_000}>Large build · 2,000,000 tokens</option>
+                </select>
+                <small>
+                  This is a hard safety ceiling across the run. Use Large build for games or
+                  other multi-file work with high reasoning effort.
+                </small>
+              </div>
+            ) : null}
             <div className="mission-field">
               <label htmlFor="mission-strategy">How should the work be organized?</label>
               <select
@@ -1860,10 +1928,14 @@ function App() {
                     runs={runs}
                     evidence={data.snapshot.verification_evidence}
                     verificationRequests={data.snapshot.verification_requests}
+                    actionApprovals={data.snapshot.action_approvals}
                     actorId={selectedActor.id}
+                    actorRole={selectedActor.role}
+                    busy={busy}
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
                     onVerificationDecision={decideVerification}
+                    onActionApprovalDecision={decideActionApproval}
                   />
                 )
               })

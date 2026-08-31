@@ -248,7 +248,7 @@ impl CopilotSdkAdapter {
             .await
             .map_err(sdk_error)?;
         let mut streamed_messages = HashSet::<String>::new();
-        let mut tool_names = HashMap::<String, String>::new();
+        let mut tool_signatures = HashMap::<String, String>::new();
         let mut assistant_messages = 0_u64;
         let mut tool_calls = 0_u64;
         let mut cancelled = None;
@@ -360,22 +360,20 @@ impl CopilotSdkAdapter {
                             tool_calls += 1;
                             let tool_call_id = event.data.get("toolCallId").and_then(Value::as_str).unwrap_or("unknown");
                             let tool_name = event.data.get("toolName").and_then(Value::as_str).unwrap_or("copilot-tool");
-                            tool_names.insert(tool_call_id.to_owned(), tool_name.to_owned());
+                            tool_signatures.insert(
+                                tool_call_id.to_owned(),
+                                tool_activity_signature(tool_name, event.data.get("arguments")),
+                            );
                             sink.emit(AdapterEvent::Status {
                                 status: "working".to_owned(),
                                 station: "tool".to_owned(),
                                 message: format!("GitHub Copilot is running {tool_name}"),
                             });
-                            sink.emit(AdapterEvent::ToolActivity {
-                                signature: tool_name.to_owned(),
-                                progressed: false,
-                                human_conversation: false,
-                            });
                         }
                         "tool.execution_complete" => {
                             let tool_call_id = event.data.get("toolCallId").and_then(Value::as_str).unwrap_or("unknown");
                             sink.emit(AdapterEvent::ToolActivity {
-                                signature: tool_names.get(tool_call_id).cloned().unwrap_or_else(|| "copilot-tool".to_owned()),
+                                signature: tool_signatures.remove(tool_call_id).unwrap_or_else(|| "copilot-tool:unknown".to_owned()),
                                 progressed: event.data.get("success").and_then(Value::as_bool).unwrap_or(false),
                                 human_conversation: false,
                             });
@@ -634,6 +632,33 @@ fn model_from_sdk(model: github_copilot_sdk::Model) -> AdapterModel {
     }
 }
 
+fn tool_activity_signature(tool_name: &str, arguments: Option<&Value>) -> String {
+    let mut canonical_arguments = arguments.cloned().unwrap_or(Value::Null);
+    canonicalize_json(&mut canonical_arguments);
+    let encoded = serde_json::to_vec(&canonical_arguments).unwrap_or_default();
+    let digest = hex::encode(Sha256::digest(encoded));
+    format!("{tool_name}:{}", &digest[..16])
+}
+
+fn canonicalize_json(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        Value::Object(values) => {
+            let mut entries = std::mem::take(values).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, mut value) in entries {
+                canonicalize_json(&mut value);
+                values.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn fixture_models() -> Vec<AdapterModel> {
     vec![
         AdapterModel {
@@ -749,12 +774,13 @@ fn permission_is_automatically_safe(
             .get("path")
             .and_then(Value::as_str)
             .is_some_and(|candidate| {
-                path_is_inside(workspace, candidate) || path_is_inside(state_directory, candidate)
+                path_is_inside_workspace(workspace, candidate)
+                    || path_is_inside(state_directory, candidate)
             }),
         Some("write") => request
             .get("fileName")
             .and_then(Value::as_str)
-            .is_some_and(|candidate| path_is_inside(workspace, candidate)),
+            .is_some_and(|candidate| path_is_inside_workspace(workspace, candidate)),
         Some("shell") => {
             let commands_read_only = request
                 .get("commands")
@@ -778,12 +804,12 @@ fn permission_is_automatically_safe(
                 && possible_paths.iter().all(|candidate| {
                     candidate
                         .as_str()
-                        .is_some_and(|candidate| path_is_inside(workspace, candidate))
+                        .is_some_and(|candidate| path_is_inside_workspace(workspace, candidate))
                 });
             let paths_are_read_scoped = !possible_paths.is_empty()
                 && possible_paths.iter().all(|candidate| {
                     candidate.as_str().is_some_and(|candidate| {
-                        path_is_inside(workspace, candidate)
+                        path_is_inside_workspace(workspace, candidate)
                             || path_is_inside(state_directory, candidate)
                     })
                 });
@@ -976,7 +1002,8 @@ fn shell_command_is_scoped_read_only(
     let path_literals = quoted_path_literals(command);
     !path_literals.is_empty()
         && path_literals.iter().all(|candidate| {
-            path_is_inside(workspace, candidate) || path_is_inside(state_directory, candidate)
+            path_is_inside_workspace(workspace, candidate)
+                || path_is_inside(state_directory, candidate)
         })
 }
 
@@ -1061,7 +1088,16 @@ fn simple_property_list(value: &str) -> bool {
 }
 
 fn path_is_inside(workspace: &Path, candidate: &str) -> bool {
-    let candidate = Path::new(candidate);
+    path_is_inside_path(workspace, Path::new(candidate))
+}
+
+fn path_is_inside_workspace(workspace: &Path, candidate: &str) -> bool {
+    let candidate = map_copilot_workspace_path(workspace, candidate)
+        .unwrap_or_else(|| PathBuf::from(candidate));
+    path_is_inside_path(workspace, &candidate)
+}
+
+fn path_is_inside_path(workspace: &Path, candidate: &Path) -> bool {
     let candidate = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
@@ -1081,6 +1117,39 @@ fn path_is_inside(workspace: &Path, candidate: &str) -> bool {
     };
     std::fs::canonicalize(existing_ancestor)
         .is_ok_and(|ancestor| path_starts_with(&ancestor, &canonical_workspace))
+}
+
+fn map_copilot_workspace_path(workspace: &Path, candidate: &str) -> Option<PathBuf> {
+    let windows = candidate.replace('/', "\\");
+    if windows.eq_ignore_ascii_case(r"C:\workspace") {
+        return Some(workspace.to_path_buf());
+    }
+    const WINDOWS_PREFIX: &str = "C:\\workspace\\";
+    if windows
+        .get(..WINDOWS_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(WINDOWS_PREFIX))
+    {
+        return Some(join_workspace_alias(
+            workspace,
+            &windows[WINDOWS_PREFIX.len()..],
+        ));
+    }
+
+    let unix = candidate.replace('\\', "/");
+    if unix == "/workspace" {
+        return Some(workspace.to_path_buf());
+    }
+    unix.strip_prefix("/workspace/")
+        .map(|relative| join_workspace_alias(workspace, relative))
+}
+
+fn join_workspace_alias(workspace: &Path, relative: &str) -> PathBuf {
+    relative
+        .split(['\\', '/'])
+        .filter(|component| !component.is_empty())
+        .fold(workspace.to_path_buf(), |path, component| {
+            path.join(component)
+        })
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
@@ -1289,6 +1358,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_activity_signature_tracks_arguments_without_exposing_them() {
+        let first = tool_activity_signature(
+            "view",
+            Some(&json!({
+                "path": "src/alpha.ts",
+                "options": {"line": 10, "context": 3}
+            })),
+        );
+        let reordered = tool_activity_signature(
+            "view",
+            Some(&json!({
+                "options": {"context": 3, "line": 10},
+                "path": "src/alpha.ts"
+            })),
+        );
+        let second = tool_activity_signature(
+            "view",
+            Some(&json!({
+                "path": "src/beta.ts",
+                "options": {"line": 10, "context": 3}
+            })),
+        );
+        assert_eq!(first, reordered);
+        assert_ne!(first, second);
+        assert!(first.starts_with("view:"));
+        assert!(!first.contains("alpha"));
+        assert!(!first.contains("src/"));
+    }
+
+    #[test]
     fn permission_policy_is_scoped_to_the_worktree() {
         let root = std::env::temp_dir()
             .join("crony-copilot-permission-tests")
@@ -1303,6 +1402,21 @@ mod tests {
         let state_file = state_directory.join("session-state/session/file.txt");
         assert!(permission_is_automatically_safe(
             &json!({"kind":"write","fileName":workspace_file}),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(permission_is_automatically_safe(
+            &json!({"kind":"read","path":r"C:\workspace\src\lib.rs"}),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(permission_is_automatically_safe(
+            &json!({"kind":"write","fileName":"/workspace/src/generated.rs"}),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(!permission_is_automatically_safe(
+            &json!({"kind":"read","path":r"C:\workspace\..\other\secret.txt"}),
             &workspace,
             &state_directory,
         ));

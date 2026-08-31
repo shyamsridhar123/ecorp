@@ -3855,9 +3855,9 @@ impl PgStore {
                    task.mission_id, mission.room_id, mission.requested_by,
                    mission.budget_tokens AS mission_token_limit,
                    mission.budget_cost_microusd AS mission_cost_limit,
-                   COALESCE(policy.actor_tokens_per_24h, 500000) AS actor_token_limit,
+                   COALESCE(policy.actor_tokens_per_24h, 4000000) AS actor_token_limit,
                    COALESCE(policy.actor_cost_microusd_per_24h, 10000000) AS actor_cost_limit,
-                   COALESCE(policy.corp_tokens_per_24h, 5000000) AS corp_token_limit,
+                   COALESCE(policy.corp_tokens_per_24h, 20000000) AS corp_token_limit,
                    COALESCE(policy.corp_cost_microusd_per_24h, 100000000) AS corp_cost_limit,
                    COALESCE(policy.no_progress_event_limit, 8) AS no_progress_limit,
                    COALESCE(policy.repeated_tool_limit, 5) AS repeated_tool_limit

@@ -13,8 +13,9 @@ use crony_domain::{
 pub const MAX_GRAPH_NODES: usize = 8;
 pub const MAX_GRAPH_DEPTH: i32 = 4;
 pub const MAX_TASK_ATTEMPTS: i32 = 3;
-pub const MAX_TASK_BUDGET_TOKENS: i64 = 200_000;
-pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 500_000;
+pub const MAX_TASK_BUDGET_TOKENS: i64 = 2_000_000;
+pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 2_000_000;
+const DEFAULT_SINGLE_TASK_BUDGET_TOKENS: i64 = 1_000_000;
 
 pub fn uses_deterministic_harness(strategy: &str) -> bool {
     matches!(
@@ -103,7 +104,9 @@ impl ManagerStrategy for SingleTaskStrategy {
                         .is_none_or(|adapter| agent.adapter == adapter)
             })
             .context("no worker agent satisfies the requested adapter")?;
-        let budget_tokens = request.budget_tokens.unwrap_or(100_000);
+        let budget_tokens = request
+            .budget_tokens
+            .unwrap_or(DEFAULT_SINGLE_TASK_BUDGET_TOKENS);
         let budget_cost_microusd = request.budget_cost_microusd.unwrap_or(1_000_000);
         let mut task_contract = contract(
             format!("Complete the mission outcome: {}", request.mission_title),
@@ -965,6 +968,10 @@ mod tests {
             )
             .expect("single plan");
         assert_eq!(plan.tasks[0].required_adapter, "codex");
+        assert_eq!(
+            plan.tasks[0].contract.budget_tokens,
+            DEFAULT_SINGLE_TASK_BUDGET_TOKENS
+        );
     }
 
     #[test]

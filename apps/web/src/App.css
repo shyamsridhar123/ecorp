@@ -875,6 +875,47 @@ select:focus-visible {
   text-transform: uppercase;
 }
 
+.mission-approval-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 9px;
+  border: 1px solid var(--marigold);
+  background: #f6e4b7;
+}
+
+.mission-approval-list > strong {
+  font: 700 10px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.mission-approval-item {
+  display: grid;
+  gap: 5px;
+  padding-top: 8px;
+  border-top: 1px solid rgb(107 72 16 / 25%);
+}
+
+.mission-approval-item span,
+.mission-approval-item small {
+  overflow-wrap: anywhere;
+}
+
+.mission-approval-item span {
+  font: 10px/1.35 var(--mono);
+}
+
+.mission-approval-item small {
+  color: #6b4810;
+  font-size: 9px;
+}
+
+.mission-approval-item > div {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
 .approval-queue {
   display: grid;
   gap: 8px;
