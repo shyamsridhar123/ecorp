@@ -90,6 +90,16 @@
       "version": 18,
       "file": "0018_queued_message_delivery.sql",
       "sha384": "6a04fc508322cb2290933868e7643e5ffa478a28733f4def8931b891a21c767a7a56815efa965b32abab501393e7f748"
+    },
+    {
+      "version": 19,
+      "file": "0019_factory_work_items.sql",
+      "sha384": "0a522f998a1067b44019bba1bf71d0c4480d4c568c5026776dd34e343d5c2d21012edce2f1f6f135089e1aef801ff2b9"
+    },
+    {
+      "version": 20,
+      "file": "0020_factory_state_transitions.sql",
+      "sha384": "02c6dcdd62885880ade91aeb47b7d1fdaebaed592ed97a3714c53de281214268b3bd4c055b86ddcc738ad7ee05c77745"
     }
   ]
 }

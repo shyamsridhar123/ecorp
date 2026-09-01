@@ -1,0 +1,944 @@
+import assert from 'node:assert/strict'
+import { execFile as execFileCallback } from 'node:child_process'
+import { promisify } from 'node:util'
+import { readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const execFile = promisify(execFileCallback)
+const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
+const root = path.resolve(import.meta.dirname, '..')
+const binary =
+  process.env.CRONY_CLI_BINARY ??
+  path.join(
+    root,
+    'target',
+    'debug',
+    process.platform === 'win32' ? 'crony-cli.exe' : 'crony-cli',
+  )
+const statePath = path.join(root, 'output', 'fake-github-factory-state.json')
+const fakeGithub = path.join(root, 'tools', 'fake_github_cli.mjs')
+
+async function request(url, init) {
+  const response = await fetch(`${server}${url}`, init)
+  const body = await response.json()
+  if (!response.ok) {
+    throw new Error(`${response.status}: ${JSON.stringify(body)}`)
+  }
+  return body
+}
+
+function post(url, body) {
+  return request(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+async function snapshot(demo) {
+  return request(
+    `/api/corps/${demo.corp_id}/snapshot?actor_id=${demo.alice_actor_id}`,
+  )
+}
+
+async function runController(
+  demo,
+  issueNumber,
+  dryRun = false,
+  {
+    actorId = demo.alice_actor_id,
+    leaseSeconds = 300,
+    repository = 'ShyamSridhar123/ECorp',
+    strategy = 'single',
+    githubTimeoutMs,
+  } = {},
+) {
+  const args = [
+    'factory',
+    demo.corp_id,
+    actorId,
+    '--owner',
+    'acme',
+    '--project-number',
+    '7',
+    '--repository',
+    repository,
+    '--adapter',
+    'fake-process',
+    '--strategy',
+    strategy,
+    '--budget-tokens',
+    '20000',
+    '--budget-cost-microusd',
+    '1000000',
+    '--lease-seconds',
+    String(leaseSeconds),
+    '--github-cli',
+    process.execPath,
+  ]
+  if (issueNumber !== null) args.push('--issue', String(issueNumber))
+  if (dryRun) args.push('--dry-run')
+  const { stdout } = await execFile(binary, args, {
+    cwd: root,
+    env: {
+      ...process.env,
+      ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
+      ECORP_FAKE_GITHUB_STATE: statePath,
+      ...(githubTimeoutMs
+        ? { ECORP_GITHUB_COMMAND_TIMEOUT_MS: String(githubTimeoutMs) }
+        : {}),
+    },
+    maxBuffer: 4 * 1024 * 1024,
+    windowsHide: true,
+  })
+  return JSON.parse(stdout)
+}
+
+async function waitForMission(demo, missionId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const mission = state.snapshot.missions.find((item) => item.id === missionId)
+    if (mission && ['completed', 'failed', 'cancelled'].includes(mission.status)) {
+      return { state, mission }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for factory controller mission ${missionId}`)
+}
+
+async function waitForApproval(demo, missionId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const taskIds = new Set(
+      state.snapshot.tasks
+        .filter((task) => task.mission_id === missionId)
+        .map((task) => task.id),
+    )
+    const run = state.snapshot.runs.find((item) => taskIds.has(item.task_id))
+    const request = run
+      ? state.snapshot.verification_requests.find(
+          (item) => item.run_id === run.id && item.status === 'pending',
+        )
+      : undefined
+    if (run?.status === 'waiting_for_approval' && request) {
+      return { state, run, request }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for factory approval ${missionId}`)
+}
+
+const demo = await post('/api/demo/reset', {})
+const issue = {
+  id: 'I_FAKE_FACTORY_9001',
+  number: 9001,
+  title: 'Build a deterministic factory controller canary',
+  body: `## Outcome
+
+Run one governed issue through ECorp and produce verified evidence.
+
+## Acceptance criteria
+
+- [ ] one durable factory work item exists
+- [ ] one mission and one run complete
+- [ ] replay creates no duplicate
+
+## Dependencies
+
+No blockers.
+`,
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9001',
+  state: 'OPEN',
+  createdAt: '2026-09-01T14:00:00Z',
+  updatedAt: '2026-09-01T14:00:00Z',
+  labels: [{ name: 'factory:ready' }],
+}
+await writeFile(
+  statePath,
+  `${JSON.stringify(
+    {
+      repository: 'shyamsridhar123/ecorp',
+      project: {
+        id: 'PVT_FAKE_FACTORY',
+        number: 7,
+        owner: 'acme',
+        title: 'Factory Test Project',
+        status_field_id: 'PVTSSF_FAKE_STATUS',
+        status_options: [
+          { id: 'todo', name: 'Todo' },
+          { id: 'in-progress', name: 'In Progress' },
+          { id: 'done', name: 'Done' },
+        ],
+      },
+      items: [
+        {
+          id: 'PVTI_FAKE_FACTORY_9001',
+          status: 'Todo',
+          content: {
+            body: issue.body,
+            number: issue.number,
+            repository: 'shyamsridhar123/ecorp',
+            title: issue.title,
+            type: 'Issue',
+            url: issue.url,
+          },
+        },
+      ],
+      issues: { '9001': issue },
+      item_edits: 0,
+    },
+    null,
+    2,
+  )}\n`,
+)
+
+const dryRun = await runController(demo, 9001, true)
+assert.equal(dryRun.mode, 'dry_run')
+assert.equal(dryRun.selected.issue_number, 9001)
+assert.equal(dryRun.selected.eligible, true)
+assert.deepEqual(dryRun.mutations, [])
+assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
+
+const first = await runController(demo, 9001)
+assert.equal(first.mode, 'executed')
+assert.equal(first.issue_number, 9001)
+assert.equal(first.project_status, 'In Progress')
+assert.equal(first.materialized_now, true)
+assert.equal(first.factory_state, 'running')
+assert.equal(first.auto_merge, false)
+const fencedState = await snapshot(demo)
+const fencedItem = fencedState.snapshot.factory_work_items.find(
+  (item) => item.id === first.factory_work_item_id,
+)
+assert.ok(Date.parse(fencedItem.lease_expires_at) > Date.now() + 240_000)
+const fencedEvents = fencedState.snapshot.events.filter(
+  (event) => event.aggregate_id === first.factory_work_item_id,
+)
+assert.ok(
+  fencedEvents.filter((event) => event.type === 'factory.claim_renewed').length >= 2,
+)
+const fencedTask = fencedState.snapshot.tasks.find(
+  (task) => task.mission_id === first.mission_id,
+)
+assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
+
+const completed = await waitForMission(demo, first.mission_id)
+assert.equal(completed.mission.status, 'completed')
+const replay = await runController(demo, 9001)
+assert.equal(replay.factory_work_item_id, first.factory_work_item_id)
+assert.equal(replay.mission_id, first.mission_id)
+assert.equal(replay.materialized_now, false)
+assert.equal(replay.launch.recovered, true)
+assert.equal(replay.factory_state, 'verified')
+
+const finalState = await snapshot(demo)
+const factoryItems = finalState.snapshot.factory_work_items.filter(
+  (item) => item.source_project_item_id === 'PVTI_FAKE_FACTORY_9001',
+)
+assert.equal(factoryItems.length, 1)
+assert.equal(factoryItems[0].state, 'verified')
+assert.equal(Object.hasOwn(factoryItems[0], 'claim_token'), false)
+const missions = finalState.snapshot.missions.filter(
+  (item) => item.id === first.mission_id,
+)
+assert.equal(missions.length, 1)
+const taskIds = new Set(
+  finalState.snapshot.tasks
+    .filter((task) => task.mission_id === first.mission_id)
+    .map((task) => task.id),
+)
+const runs = finalState.snapshot.runs.filter((run) => taskIds.has(run.task_id))
+assert.equal(runs.length, 1)
+assert.equal(runs[0].status, 'completed')
+const fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.items[0].status, 'In Progress')
+assert.ok(fakeState.item_edits >= 1)
+const successfulProjectStatus = fakeState.items[0].status
+
+const queuedIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9003',
+  number: 9003,
+  title: 'Advance to the next eligible issue after verification',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9003',
+  createdAt: '2026-09-01T14:02:00Z',
+  updatedAt: '2026-09-01T14:02:00Z',
+}
+fakeState.items.push({
+  id: 'PVTI_FAKE_FACTORY_9003',
+  status: 'Todo',
+  content: {
+    body: queuedIssue.body,
+    number: queuedIssue.number,
+    repository: 'shyamsridhar123/ecorp',
+    title: queuedIssue.title,
+    type: 'Issue',
+    url: queuedIssue.url,
+  },
+})
+fakeState.issues['9003'] = queuedIssue
+await writeFile(statePath, `${JSON.stringify(fakeState, null, 2)}\n`)
+const nextIssue = await runController(demo, null)
+assert.equal(nextIssue.issue_number, 9003)
+assert.equal(nextIssue.factory_state, 'running')
+await waitForMission(demo, nextIssue.mission_id)
+const nextIssueVerified = await runController(demo, 9003)
+assert.equal(nextIssueVerified.factory_state, 'verified')
+
+const recoveryDemo = await post('/api/demo/reset', {})
+const recoveryIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9002',
+  number: 9002,
+  title: 'Recover a factory mission after Project status synchronization fails',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9002',
+  createdAt: '2026-09-01T14:01:00Z',
+  updatedAt: '2026-09-01T14:01:00Z',
+}
+fakeState.items = [
+  {
+    id: 'PVTI_FAKE_FACTORY_9002',
+    status: 'Todo',
+    content: {
+      body: recoveryIssue.body,
+      number: recoveryIssue.number,
+      repository: 'shyamsridhar123/ecorp',
+      title: recoveryIssue.title,
+      type: 'Issue',
+      url: recoveryIssue.url,
+    },
+  },
+]
+fakeState.issues = { '9002': recoveryIssue }
+fakeState.item_edits = 0
+fakeState.fail_next_item_edit = true
+fakeState.fail_next_item_edit_message =
+  'injected GitHub Project status update failure\nrequest details withheld'
+await writeFile(statePath, `${JSON.stringify(fakeState, null, 2)}\n`)
+
+let injectedFailure
+try {
+  await runController(recoveryDemo, 9002)
+} catch (error) {
+  injectedFailure = error
+}
+assert.ok(injectedFailure, 'injected Project status failure was not surfaced')
+const blockedState = await snapshot(recoveryDemo)
+const blockedItems = blockedState.snapshot.factory_work_items.filter(
+  (item) => item.source_issue_number === 9002,
+)
+assert.equal(blockedItems.length, 1)
+assert.equal(blockedItems[0].state, 'blocked')
+assert.match(blockedItems[0].failure_detail, /status synchronization failed/)
+assert.equal(/[\u0000-\u001f\u007f]/u.test(blockedItems[0].failure_detail), false)
+assert.ok(blockedItems[0].mission_id)
+const blockedMissionRuns = blockedState.snapshot.runs.filter((run) =>
+  blockedState.snapshot.tasks.some(
+    (task) =>
+      task.id === run.task_id && task.mission_id === blockedItems[0].mission_id,
+  ),
+)
+assert.equal(blockedMissionRuns.length, 0)
+
+const recovered = await runController(recoveryDemo, 9002)
+assert.equal(recovered.factory_work_item_id, blockedItems[0].id)
+assert.equal(recovered.mission_id, blockedItems[0].mission_id)
+assert.equal(recovered.factory_state, 'running')
+const recoveryCompleted = await waitForMission(recoveryDemo, recovered.mission_id)
+assert.equal(recoveryCompleted.mission.status, 'completed')
+const verifiedRecovery = await runController(recoveryDemo, 9002)
+assert.equal(verifiedRecovery.factory_work_item_id, blockedItems[0].id)
+assert.equal(verifiedRecovery.factory_state, 'verified')
+const recoveredState = await snapshot(recoveryDemo)
+const recoveredItem = recoveredState.snapshot.factory_work_items.find(
+  (item) => item.id === blockedItems[0].id,
+)
+assert.equal(recoveredItem.state, 'verified')
+const recoveredTaskIds = new Set(
+  recoveredState.snapshot.tasks
+    .filter((task) => task.mission_id === recovered.mission_id)
+    .map((task) => task.id),
+)
+const recoveredRuns = recoveredState.snapshot.runs.filter((run) =>
+  recoveredTaskIds.has(run.task_id),
+)
+assert.equal(recoveredRuns.length, 1)
+const recoveredFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(recoveredFakeState.items[0].status, 'In Progress')
+assert.equal(recoveredFakeState.item_edit_failures, 1)
+const recoveredProjectStatus = recoveredFakeState.items[0].status
+
+const timeoutDemo = await post('/api/demo/reset', {})
+const timeoutIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9011',
+  number: 9011,
+  title: 'Bound a stalled GitHub Project mutation',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9011',
+  createdAt: '2026-09-01T14:11:00Z',
+  updatedAt: '2026-09-01T14:11:00Z',
+}
+const timeoutState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9011',
+      status: 'Todo',
+      content: {
+        body: timeoutIssue.body,
+        number: timeoutIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: timeoutIssue.title,
+        type: 'Issue',
+        url: timeoutIssue.url,
+      },
+    },
+  ],
+  issues: { '9011': timeoutIssue },
+  item_edits: 0,
+  item_edit_delay_ms: 3_000,
+}
+await writeFile(statePath, `${JSON.stringify(timeoutState, null, 2)}\n`)
+let timeoutFailure
+try {
+  await runController(timeoutDemo, 9011, false, { githubTimeoutMs: 1_500 })
+} catch (error) {
+  timeoutFailure = error
+}
+assert.ok(timeoutFailure, 'stalled Project mutation did not time out')
+const timeoutSnapshot = await snapshot(timeoutDemo)
+const timeoutItem = timeoutSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9011,
+)
+assert.equal(timeoutItem.state, 'blocked')
+assert.match(timeoutItem.failure_detail, /timed out after 1500 ms/i)
+const timeoutTaskIds = new Set(
+  timeoutSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === timeoutItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  timeoutSnapshot.snapshot.runs.filter((run) => timeoutTaskIds.has(run.task_id)).length,
+  0,
+)
+const timeoutFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(timeoutFakeState.items[0].status, 'Todo')
+assert.equal(timeoutFakeState.item_edits, 0)
+
+const failureDemo = await post('/api/demo/reset', {})
+const failureIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9004',
+  number: 9004,
+  title: '[always-fail] Persist a terminal factory failure',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9004',
+  createdAt: '2026-09-01T14:03:00Z',
+  updatedAt: '2026-09-01T14:03:00Z',
+}
+recoveredFakeState.items = [
+  {
+    id: 'PVTI_FAKE_FACTORY_9004',
+    status: 'Todo',
+    content: {
+      body: failureIssue.body,
+      number: failureIssue.number,
+      repository: 'shyamsridhar123/ecorp',
+      title: failureIssue.title,
+      type: 'Issue',
+      url: failureIssue.url,
+    },
+  },
+]
+recoveredFakeState.issues = { '9004': failureIssue }
+recoveredFakeState.item_edits = 0
+recoveredFakeState.fail_next_item_edit = false
+await writeFile(statePath, `${JSON.stringify(recoveredFakeState, null, 2)}\n`)
+const failing = await runController(failureDemo, 9004)
+const failedMission = await waitForMission(failureDemo, failing.mission_id)
+assert.equal(failedMission.mission.status, 'failed')
+let terminalFailure
+try {
+  await runController(failureDemo, 9004)
+} catch (error) {
+  terminalFailure = error
+}
+assert.ok(terminalFailure, 'terminal mission failure did not fail the controller command')
+const failureState = await snapshot(failureDemo)
+const failedItem = failureState.snapshot.factory_work_items.find(
+  (item) => item.id === failing.factory_work_item_id,
+)
+assert.equal(failedItem.state, 'failed')
+assert.match(failedItem.failure_detail, /fail/i)
+
+const verificationFailureDemo = await post('/api/demo/reset', {})
+const verificationFailureIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9005',
+  number: 9005,
+  title: 'Persist a factory verification failure',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9005',
+  createdAt: '2026-09-01T14:04:00Z',
+  updatedAt: '2026-09-01T14:04:00Z',
+}
+recoveredFakeState.items = [
+  {
+    id: 'PVTI_FAKE_FACTORY_9005',
+    status: 'Todo',
+    content: {
+      body: verificationFailureIssue.body,
+      number: verificationFailureIssue.number,
+      repository: 'shyamsridhar123/ecorp',
+      title: verificationFailureIssue.title,
+      type: 'Issue',
+      url: verificationFailureIssue.url,
+    },
+  },
+]
+recoveredFakeState.issues = { '9005': verificationFailureIssue }
+recoveredFakeState.item_edits = 0
+await writeFile(statePath, `${JSON.stringify(recoveredFakeState, null, 2)}\n`)
+const verificationStarted = await runController(
+  verificationFailureDemo,
+  9005,
+  false,
+  { strategy: 'verification-failure' },
+)
+const verificationMission = await waitForMission(
+  verificationFailureDemo,
+  verificationStarted.mission_id,
+)
+assert.equal(verificationMission.mission.status, 'failed')
+let verificationFailure
+try {
+  await runController(verificationFailureDemo, 9005, false, {
+    strategy: 'verification-failure',
+  })
+} catch (error) {
+  verificationFailure = error
+}
+assert.ok(verificationFailure, 'verification failure did not fail the controller command')
+const verificationFailureState = await snapshot(verificationFailureDemo)
+const verificationFailureItem =
+  verificationFailureState.snapshot.factory_work_items.find(
+    (item) => item.id === verificationStarted.factory_work_item_id,
+  )
+assert.equal(verificationFailureItem.state, 'verification_failed')
+assert.match(
+  verificationFailureItem.failure_detail,
+  /verifier|verification|evidence|artifact/i,
+)
+const verificationFailureTasks = verificationFailureState.snapshot.tasks.filter(
+  (task) => task.mission_id === verificationStarted.mission_id,
+)
+assert.ok(verificationFailureTasks.length > 0)
+assert.ok(
+  verificationFailureTasks.every(
+    (task) =>
+      task.status === 'verification_failed' && task.verification_status === 'failed',
+  ),
+)
+const verificationFailureTaskIds = new Set(
+  verificationFailureTasks.map((task) => task.id),
+)
+const verificationFailureRuns = verificationFailureState.snapshot.runs.filter((run) =>
+  verificationFailureTaskIds.has(run.task_id),
+)
+assert.equal(verificationFailureRuns.length, 1)
+assert.equal(verificationFailureRuns[0].verification_status, 'failed')
+
+const approvalDemo = await post('/api/demo/reset', {})
+const approvalIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9012',
+  number: 9012,
+  title: 'Require substantive independent factory verification',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9012',
+  createdAt: '2026-09-01T14:12:00Z',
+  updatedAt: '2026-09-01T14:12:00Z',
+}
+const approvalState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9012',
+      status: 'Todo',
+      content: {
+        body: approvalIssue.body,
+        number: approvalIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: approvalIssue.title,
+        type: 'Issue',
+        url: approvalIssue.url,
+      },
+    },
+  ],
+  issues: { '9012': approvalIssue },
+  item_edits: 0,
+}
+await writeFile(statePath, `${JSON.stringify(approvalState, null, 2)}\n`)
+const approvalStarted = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+const waitingApproval = await waitForApproval(approvalDemo, approvalStarted.mission_id)
+const awaitingFactory = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+assert.equal(awaitingFactory.factory_state, 'awaiting_approval')
+const requesterDecision = await fetch(
+  `${server}/api/corps/${approvalDemo.corp_id}/runs/` +
+    `${waitingApproval.run.id}/verification-decision`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: approvalDemo.alice_actor_id,
+      approved: true,
+      note: 'Requester must not self-review factory evidence.',
+    }),
+  },
+)
+assert.equal(requesterDecision.status, 403)
+await post(
+  `/api/corps/${approvalDemo.corp_id}/runs/` +
+    `${waitingApproval.run.id}/verification-decision`,
+  {
+    actor_id: approvalDemo.bob_actor_id,
+    approved: true,
+    note: 'Independent reviewer approved the factory evidence.',
+  },
+)
+await waitForMission(approvalDemo, approvalStarted.mission_id)
+const approvedFactory = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+assert.equal(approvedFactory.factory_state, 'verified')
+
+const mismatchDemo = await post('/api/demo/reset', {})
+const mismatchIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9006',
+  number: 9006,
+  title: 'Reject a runner checked out to the wrong repository',
+  url: 'https://github.com/acme/widget/issues/9006',
+  createdAt: '2026-09-01T14:05:00Z',
+  updatedAt: '2026-09-01T14:05:00Z',
+}
+recoveredFakeState.repository = 'acme/widget'
+recoveredFakeState.items = [
+  {
+    id: 'PVTI_FAKE_FACTORY_9006',
+    status: 'Todo',
+    content: {
+      body: mismatchIssue.body,
+      number: mismatchIssue.number,
+      repository: 'acme/widget',
+      title: mismatchIssue.title,
+      type: 'Issue',
+      url: mismatchIssue.url,
+    },
+  },
+]
+recoveredFakeState.issues = { '9006': mismatchIssue }
+recoveredFakeState.item_edits = 0
+await writeFile(statePath, `${JSON.stringify(recoveredFakeState, null, 2)}\n`)
+let repositoryMismatch
+try {
+  await runController(mismatchDemo, 9006, false, {
+    repository: 'acme/widget',
+  })
+} catch (error) {
+  repositoryMismatch = error
+}
+assert.ok(repositoryMismatch, 'repository mismatch did not fail the controller')
+const mismatchState = await snapshot(mismatchDemo)
+const mismatchItem = mismatchState.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9006,
+)
+assert.equal(mismatchItem.state, 'blocked')
+assert.match(mismatchItem.failure_detail, /repository|runner|dispatch/i)
+const mismatchTasks = mismatchState.snapshot.tasks.filter(
+  (task) => task.mission_id === mismatchItem.mission_id,
+)
+assert.ok(mismatchTasks.length > 0)
+assert.ok(
+  mismatchTasks.every(
+    (task) =>
+      task.contract.source_repository === 'acme/widget' &&
+      task.contract.source_base_ref === 'HEAD',
+  ),
+)
+const mismatchTaskIds = new Set(mismatchTasks.map((task) => task.id))
+assert.equal(
+  mismatchState.snapshot.runs.filter((run) => mismatchTaskIds.has(run.task_id)).length,
+  0,
+)
+
+const sourceChangeDemo = await post('/api/demo/reset', {})
+const sourceChangedIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9007',
+  number: 9007,
+  title: 'Block dispatch when the claimed issue changes',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9007',
+  createdAt: '2026-09-01T14:06:00Z',
+  updatedAt: '2026-09-01T14:06:00Z',
+}
+const sourceChangeState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9007',
+      status: 'Todo',
+      content: {
+        body: sourceChangedIssue.body,
+        number: sourceChangedIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: sourceChangedIssue.title,
+        type: 'Issue',
+        url: sourceChangedIssue.url,
+      },
+    },
+  ],
+  issues: { '9007': sourceChangedIssue },
+  item_edits: 0,
+  item_list_calls: 0,
+  item_list_mutation: {
+    call: 3,
+    issue_number: 9007,
+    patch: { updatedAt: '2026-09-01T14:06:30Z' },
+    remove_label: 'factory:ready',
+  },
+}
+await writeFile(statePath, `${JSON.stringify(sourceChangeState, null, 2)}\n`)
+let sourceChangeFailure
+try {
+  await runController(sourceChangeDemo, 9007)
+} catch (error) {
+  sourceChangeFailure = error
+}
+assert.ok(sourceChangeFailure, 'source revision change did not stop the controller')
+const sourceChangeSnapshot = await snapshot(sourceChangeDemo)
+const sourceChangeItem = sourceChangeSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9007,
+)
+assert.equal(sourceChangeItem.state, 'blocked')
+assert.match(sourceChangeItem.failure_detail, /source revalidation failed before Project status/i)
+const sourceChangeTaskIds = new Set(
+  sourceChangeSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === sourceChangeItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  sourceChangeSnapshot.snapshot.runs.filter((run) =>
+    sourceChangeTaskIds.has(run.task_id),
+  ).length,
+  0,
+)
+const sourceChangeFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(sourceChangeFakeState.items[0].status, 'Todo')
+assert.equal(sourceChangeFakeState.item_edits, 0)
+assert.equal(sourceChangeFakeState.item_list_mutations_applied, 1)
+
+const dependencyChangeDemo = await post('/api/demo/reset', {})
+const dependencyChangedIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9008',
+  number: 9008,
+  title: 'Block launch when a dependency reopens',
+  body: `${issue.body}
+
+## Dependencies
+
+Blocked by #9009.
+`,
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9008',
+  createdAt: '2026-09-01T14:07:00Z',
+  updatedAt: '2026-09-01T14:07:00Z',
+}
+const reopenedDependency = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9009',
+  number: 9009,
+  title: 'Dependency that reopens before launch',
+  body: 'Dependency fixture.',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9009',
+  state: 'CLOSED',
+  createdAt: '2026-09-01T14:08:00Z',
+  updatedAt: '2026-09-01T14:08:00Z',
+  labels: [],
+}
+const dependencyChangeState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9008',
+      status: 'Todo',
+      content: {
+        body: dependencyChangedIssue.body,
+        number: dependencyChangedIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: dependencyChangedIssue.title,
+        type: 'Issue',
+        url: dependencyChangedIssue.url,
+      },
+    },
+  ],
+  issues: {
+    '9008': dependencyChangedIssue,
+    '9009': reopenedDependency,
+  },
+  item_edits: 0,
+  item_list_calls: 0,
+  item_list_mutation: {
+    call: 5,
+    issue_number: 9009,
+    patch: {
+      state: 'OPEN',
+      updatedAt: '2026-09-01T14:08:30Z',
+    },
+  },
+}
+await writeFile(statePath, `${JSON.stringify(dependencyChangeState, null, 2)}\n`)
+let dependencyChangeFailure
+try {
+  await runController(dependencyChangeDemo, 9008)
+} catch (error) {
+  dependencyChangeFailure = error
+}
+assert.ok(dependencyChangeFailure, 'reopened dependency did not stop mission launch')
+const dependencyChangeSnapshot = await snapshot(dependencyChangeDemo)
+const dependencyChangeItem = dependencyChangeSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9008,
+)
+assert.equal(dependencyChangeItem.state, 'blocked')
+assert.match(dependencyChangeItem.failure_detail, /source revalidation failed before mission launch/i)
+assert.match(dependencyChangeItem.failure_detail, /blocked by open issue #9009/i)
+const dependencyChangeTaskIds = new Set(
+  dependencyChangeSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === dependencyChangeItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  dependencyChangeSnapshot.snapshot.runs.filter((run) =>
+    dependencyChangeTaskIds.has(run.task_id),
+  ).length,
+  0,
+)
+const dependencyChangeFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(dependencyChangeFakeState.items[0].status, 'In Progress')
+assert.equal(dependencyChangeFakeState.item_edits, 1)
+assert.equal(dependencyChangeFakeState.item_list_mutations_applied, 1)
+
+const report = {
+  checked_at: new Date().toISOString(),
+  issue_number: 9001,
+  project_item_id: 'PVTI_FAKE_FACTORY_9001',
+  project_status: successfulProjectStatus,
+  factory_work_item_id: first.factory_work_item_id,
+  mission_id: first.mission_id,
+  run_ids: runs.map((run) => run.id),
+  dry_run_mutated_nothing: true,
+  exactly_one_work_item: true,
+  exactly_one_mission: true,
+  exactly_one_run: true,
+  replay_recovered_existing_mission: true,
+  external_effect_lease_revalidated: true,
+  claimed_repository_persisted_to_task: true,
+  factory_state: factoryItems[0].state,
+  claim_token_absent_from_snapshot: true,
+  mission_status: missions[0].status,
+  run_status: runs[0].status,
+  auto_merge: false,
+  queue_progression: {
+    next_issue_number: nextIssue.issue_number,
+    verified_items_do_not_starve_todo_work: true,
+  },
+  project_status_failure: {
+    issue_number: 9002,
+    factory_work_item_id: recoveredItem.id,
+    mission_id: recovered.mission_id,
+    run_ids: recoveredRuns.map((run) => run.id),
+    durable_blocked_state_recorded: true,
+    retry_reused_existing_mission: true,
+    recovered_factory_state: recoveredItem.state,
+    project_status: recoveredProjectStatus,
+  },
+  project_status_timeout: {
+    issue_number: 9011,
+    factory_work_item_id: timeoutItem.id,
+    mission_id: timeoutItem.mission_id,
+    factory_state: timeoutItem.state,
+    project_status: timeoutFakeState.items[0].status,
+    project_mutations: timeoutFakeState.item_edits,
+    run_count: 0,
+  },
+  terminal_mission_failure: {
+    issue_number: 9004,
+    factory_work_item_id: failedItem.id,
+    mission_id: failing.mission_id,
+    mission_status: failedMission.mission.status,
+    factory_state: failedItem.state,
+    controller_returned_error: true,
+  },
+  verification_failure: {
+    issue_number: 9005,
+    factory_work_item_id: verificationFailureItem.id,
+    mission_id: verificationStarted.mission_id,
+    run_ids: verificationFailureRuns.map((run) => run.id),
+    mission_status: verificationMission.mission.status,
+    factory_state: verificationFailureItem.state,
+    task_statuses: verificationFailureTasks.map((task) => task.status),
+    controller_returned_error: true,
+  },
+  independent_verification: {
+    issue_number: 9012,
+    factory_work_item_id: approvalStarted.factory_work_item_id,
+    mission_id: approvalStarted.mission_id,
+    run_id: waitingApproval.run.id,
+    requester_decision_status: requesterDecision.status,
+    reviewer_actor_id: approvalDemo.bob_actor_id,
+    waiting_factory_state: awaitingFactory.factory_state,
+    final_factory_state: approvedFactory.factory_state,
+  },
+  repository_routing: {
+    issue_number: 9006,
+    factory_work_item_id: mismatchItem.id,
+    mission_id: mismatchItem.mission_id,
+    required_repository: 'acme/widget',
+    required_base_ref: 'HEAD',
+    mismatched_runner_rejected: true,
+    run_count: 0,
+    factory_state: mismatchItem.state,
+  },
+  source_revalidation: {
+    source_change_before_project_status: {
+      issue_number: 9007,
+      factory_work_item_id: sourceChangeItem.id,
+      factory_state: sourceChangeItem.state,
+      project_status: sourceChangeFakeState.items[0].status,
+      project_mutations: sourceChangeFakeState.item_edits,
+      run_count: 0,
+    },
+    dependency_reopened_before_launch: {
+      issue_number: 9008,
+      dependency_issue_number: 9009,
+      factory_work_item_id: dependencyChangeItem.id,
+      factory_state: dependencyChangeItem.state,
+      project_status: dependencyChangeFakeState.items[0].status,
+      project_mutations: dependencyChangeFakeState.item_edits,
+      run_count: 0,
+    },
+  },
+}
+await writeFile(
+  path.join(root, 'output', 'e2e-factory-controller.json'),
+  `${JSON.stringify(report, null, 2)}\n`,
+)
+console.log(JSON.stringify(report, null, 2))

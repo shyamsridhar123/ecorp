@@ -44,6 +44,41 @@ transactionally enqueue durable runner commands. Commands remain pending until t
 acknowledges application, command IDs fence duplicate delivery, and expiry automatically rejects
 the action and repairs run/task/mission/agent state.
 
+Dark-factory claims use a separate opaque fencing token plus a monotonic work-item version.
+Claim tokens are returned only to the authorized operator and are omitted from shared snapshots,
+events, prompts, logs, and artifacts. A GitHub label or Project status is never treated as an
+execution lock. Mission materialization requires an active lease and atomically persists the
+issue-to-mission link. The trusted CLI invokes GitHub CLI without putting its credential in an
+argument, log, mission contract, or agent environment.
+Expired reclaims must exactly match the original source and policy snapshots and cannot widen
+permissions or replace the claimed revision before materialization.
+GitHub owner and repository names are canonicalized before advisory locking and database lookup so
+case variants cannot bypass the one-work-item-per-Project-item boundary.
+
+The persisted factory policy is enforced again during mission materialization. A later request
+cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
+prohibitions, write scope, token budget, or cost budget. Factory `verified` state requires
+authoritative completed mission and passing task-verification records.
+Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
+rejected rather than interpreted as permission to use a provider default.
+Provider-backed factory tasks require a manual verification gate; an artifact-only result cannot
+become accepted completion without an authorized evidence decision.
+Verifier rejection is persisted as `verification_failed`, not collapsed into an execution failure.
+Publication states cannot be asserted through the generic factory transition endpoint.
+
+Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
+events omit GitHub source metadata; once a mission exists, factory events inherit its room
+visibility.
+
+Controllers renew their fenced lease immediately before a GitHub mutation and again before launch.
+After each renewal they re-fetch and compare the Project item, issue revision, state, required
+label, and dependency eligibility. A changed or newly blocked source is durably blocked before the
+next effect. A final renewal follows each revalidation, and GitHub CLI subprocesses are killed on a
+bounded timeout below the effect lease. Factory tasks carry the claimed repository and base ref,
+and the scheduler accepts only a runner advertising the same normalized checkout.
+External CLI failure details are collapsed to bounded single-line text before persistence so
+multi-line stderr cannot bypass the durable blocked transition.
+
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state
 directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.
@@ -70,6 +105,8 @@ length, and media type before returning an attachment with content sniffing disa
 - Runners connect outbound and receive scoped assignments.
 - Long-lived secrets never enter prompts, logs, command arguments, or agent-readable files.
 - Irreversible effects require authorization and idempotency.
+- GitHub Project status, pull-request publication, merge, and deployment remain separate effects;
+  no factory claim implicitly authorizes a later effect.
 - Artifacts are content-hashed.
 - Agent control uses rotating fencing tokens; stale tokens are rejected.
 - Lease tokens are returned only when the current controller explicitly claims or renews control;

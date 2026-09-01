@@ -25,23 +25,27 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
-use crony_domain::DomainEvent;
+use crony_domain::{DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference};
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
-    ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest, CreateMissionResponse,
-    CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
-    CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
-    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest,
-    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
-    QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResolvedSecret,
+    ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
+    CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
+    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, CreateSecretRequest,
+    CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
+    FactoryMissionContract, FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse,
+    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse, QueueMessageRequest,
+    QueueMessageResponse, ReleaseLeaseRequest, RenewFactoryWorkItemRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
-    VerificationDecisionResponse,
+    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest,
+    TransitionFactoryWorkItemRequest, VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    LaunchRecord, NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage, RunClaim,
-    RunnerConnectInput, RunnerEventInput,
+    ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
+    NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage,
+    RenewFactoryWorkItemInput, RunClaim, RunnerConnectInput, RunnerEventInput,
+    TransitionFactoryWorkItemInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -58,7 +62,7 @@ use uuid::Uuid;
 
 use artifacts::{ArtifactIdentity, ArtifactStore};
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
-use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness};
+use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness, validate_plan};
 use secrets::SecretCipher;
 
 #[derive(Debug, Parser)]
@@ -238,6 +242,8 @@ impl IntoResponse for ApiError {
 fn map_store_error(error: anyhow::Error) -> ApiError {
     if error.to_string().starts_with("forbidden:") {
         ApiError::forbidden(error)
+    } else if error.to_string().starts_with("conflict:") {
+        ApiError::conflict(error)
     } else {
         ApiError::bad_request(error)
     }
@@ -347,6 +353,22 @@ async fn main() -> anyhow::Result<()> {
             get(download_artifact),
         )
         .route("/api/corps/{corp_id}/missions", post(create_mission))
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/claim",
+            post(claim_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/renew",
+            post(renew_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
+            post(transition_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
+            post(materialize_factory_mission),
+        )
         .route(
             "/api/corps/{corp_id}/rooms/{room_id}/messages",
             post(create_room_message),
@@ -1128,6 +1150,148 @@ struct ArtifactDownloadQuery {
     actor_id: Uuid,
 }
 
+struct MissionPlanInput<'a> {
+    title: &'a str,
+    preferred_adapter: Option<&'a str>,
+    preferred_model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    strategy: Option<&'a str>,
+    secret_refs: &'a [TaskSecretReference],
+    budget_tokens: Option<i64>,
+    budget_cost_microusd: Option<i64>,
+    factory_contract: Option<&'a FactoryMissionContract>,
+}
+
+async fn plan_mission(
+    state: &AppState,
+    corp_id: Uuid,
+    input: MissionPlanInput<'_>,
+) -> Result<TaskGraphPlan, ApiError> {
+    let strategy = input.strategy.unwrap_or("single");
+    if !input.secret_refs.is_empty() && strategy != "single" {
+        return Err(ApiError::bad_request(
+            "secret references currently require the single-task strategy",
+        ));
+    }
+    let (preferred_adapter, preferred_model, reasoning_effort) =
+        if uses_deterministic_harness(strategy) {
+            (Some("fake-process"), None, None)
+        } else {
+            (
+                input.preferred_adapter,
+                input.preferred_model,
+                input.reasoning_effort,
+            )
+        };
+    validate_requested_model(
+        state,
+        corp_id,
+        preferred_adapter,
+        preferred_model,
+        reasoning_effort,
+    )?;
+    let agents = state
+        .store
+        .agents_for_planning(corp_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut plan = state
+        .strategies
+        .plan(
+            strategy,
+            &PlanningRequest {
+                mission_title: input.title,
+                preferred_adapter,
+                preferred_model,
+                reasoning_effort,
+                secret_refs: input.secret_refs,
+                budget_tokens: input.budget_tokens,
+                budget_cost_microusd: input.budget_cost_microusd,
+            },
+            &agents,
+        )
+        .map_err(ApiError::bad_request)?;
+    if let Some(contract) = input.factory_contract {
+        apply_factory_contract(&mut plan, contract)?;
+        validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
+    }
+    Ok(plan)
+}
+
+fn apply_factory_contract(
+    plan: &mut TaskGraphPlan,
+    contract: &FactoryMissionContract,
+) -> Result<(), ApiError> {
+    if contract.objective.len() > 100_000 || contract.expected_output.len() > 10_000 {
+        return Err(ApiError::bad_request(
+            "factory mission objective or expected output is too large",
+        ));
+    }
+    for (name, values) in [
+        ("acceptance tests", &contract.acceptance_tests),
+        ("allowed tools", &contract.allowed_tools),
+        ("prohibited actions", &contract.prohibited_actions),
+        ("references", &contract.references),
+        ("write scope", &contract.write_scope),
+    ] {
+        if values.len() > 64 {
+            return Err(ApiError::bad_request(format!(
+                "factory mission {name} cannot contain more than 64 entries"
+            )));
+        }
+    }
+
+    let multi_task = plan.tasks.len() > 1;
+    for task in &mut plan.tasks {
+        if !contract.objective.trim().is_empty() {
+            task.contract.objective = if multi_task {
+                format!(
+                    "{}\n\nROLE-SPECIFIC OBJECTIVE:\n{}",
+                    contract.objective.trim(),
+                    task.contract.objective
+                )
+            } else {
+                contract.objective.trim().to_owned()
+            };
+        }
+        if !contract.expected_output.trim().is_empty() {
+            task.contract.expected_output = contract.expected_output.trim().to_owned();
+        }
+        append_unique(
+            &mut task.contract.acceptance_tests,
+            &contract.acceptance_tests,
+        );
+        if !contract.allowed_tools.is_empty() {
+            task.contract.allowed_tools = contract.allowed_tools.clone();
+        }
+        append_unique(
+            &mut task.contract.prohibited_actions,
+            &contract.prohibited_actions,
+        );
+        append_unique(&mut task.contract.references, &contract.references);
+        if !contract.write_scope.is_empty() {
+            task.contract.write_scope = contract.write_scope.clone();
+        }
+        if task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
+        {
+            task.verification_policy.manual_gate =
+                Some(ManualVerificationGate::IndependentReview {
+                    roles: vec!["member".to_owned(), "owner".to_owned(), "admin".to_owned()],
+                    exclude_requester: true,
+                });
+        }
+    }
+    Ok(())
+}
+
+fn append_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.contains(value) {
+            target.push(value.clone());
+        }
+    }
+}
+
 async fn create_mission(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1142,50 +1306,22 @@ async fn create_mission(
         Permission::Operate,
     )
     .await?;
-    let strategy = request.strategy.as_deref().unwrap_or("single");
-    if !request.secret_refs.is_empty() && strategy != "single" {
-        return Err(ApiError::bad_request(
-            "secret references currently require the single-task strategy",
-        ));
-    }
-    let (preferred_adapter, preferred_model, reasoning_effort) =
-        if uses_deterministic_harness(strategy) {
-            (Some("fake-process"), None, None)
-        } else {
-            (
-                request.preferred_adapter.as_deref(),
-                request.preferred_model.as_deref(),
-                request.reasoning_effort.as_deref(),
-            )
-        };
-    validate_requested_model(
+    let plan = plan_mission(
         &state,
         corp_id,
-        preferred_adapter,
-        preferred_model,
-        reasoning_effort,
-    )?;
-    let agents = state
-        .store
-        .agents_for_planning(corp_id)
-        .await
-        .map_err(ApiError::internal)?;
-    let plan = state
-        .strategies
-        .plan(
-            strategy,
-            &PlanningRequest {
-                mission_title: &request.title,
-                preferred_adapter,
-                preferred_model,
-                reasoning_effort,
-                secret_refs: &request.secret_refs,
-                budget_tokens: request.budget_tokens,
-                budget_cost_microusd: request.budget_cost_microusd,
-            },
-            &agents,
-        )
-        .map_err(ApiError::bad_request)?;
+        MissionPlanInput {
+            title: &request.title,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            factory_contract: None,
+        },
+    )
+    .await?;
     let (ids, events) = state
         .store
         .create_mission(corp_id, requested_by, &request.title, &plan)
@@ -1199,6 +1335,212 @@ async fn create_mission(
         task_id: ids.task_ids[0],
         task_ids: ids.task_ids,
         strategy: plan.strategy,
+    }))
+}
+
+async fn claim_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<ClaimFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .claim_factory_work_item(ClaimFactoryWorkItemInput {
+            corp_id,
+            actor_id,
+            source: FactorySourceInput {
+                project_owner: request.source_project_owner,
+                project_number: request.source_project_number,
+                project_item_id: request.source_project_item_id,
+                repository_owner: request.source_repository_owner,
+                repository_name: request.source_repository_name,
+                issue_number: request.source_issue_number,
+                issue_node_id: request.source_issue_node_id,
+                issue_url: request.source_issue_url,
+                title: request.source_title,
+                revision: request.source_revision,
+            },
+            idempotency_key: request.idempotency_key,
+            lease_seconds: request.lease_seconds,
+            policy: request.policy,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn renew_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RenewFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .renew_factory_work_item(RenewFactoryWorkItemInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            lease_seconds: request.lease_seconds,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn transition_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<TransitionFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .transition_factory_work_item(TransitionFactoryWorkItemInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            state: request.state,
+            failure_detail: request.failure_detail,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn materialize_factory_mission(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MaterializeFactoryMissionRequest>,
+) -> Result<Json<MaterializeFactoryMissionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let operation_request = json!({
+        "title": &request.title,
+        "preferred_adapter": &request.preferred_adapter,
+        "preferred_model": &request.preferred_model,
+        "reasoning_effort": &request.reasoning_effort,
+        "strategy": &request.strategy,
+        "secret_refs": &request.secret_refs,
+        "budget_tokens": request.budget_tokens,
+        "budget_cost_microusd": request.budget_cost_microusd,
+        "contract": &request.contract
+    });
+    let materialize_input = MaterializeFactoryMissionInput {
+        corp_id,
+        work_item_id,
+        actor_id,
+        claim_token: request.claim_token,
+        expected_version: request.expected_version,
+        idempotency_key: request.idempotency_key.clone(),
+        title: request.title.clone(),
+        request: operation_request,
+    };
+    if let Some(outcome) = state
+        .store
+        .replay_factory_materialization(&materialize_input)
+        .await
+        .map_err(map_store_error)?
+    {
+        return Ok(Json(MaterializeFactoryMissionResponse {
+            mission_id: outcome.ids.mission_id,
+            task_id: outcome.ids.task_ids[0],
+            task_ids: outcome.ids.task_ids,
+            strategy: outcome.strategy,
+            work_item: outcome.work_item,
+            replayed: true,
+        }));
+    }
+    let plan = plan_mission(
+        &state,
+        corp_id,
+        MissionPlanInput {
+            title: &request.title,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            factory_contract: Some(&request.contract),
+        },
+    )
+    .await?;
+    let outcome = state
+        .store
+        .materialize_factory_mission(materialize_input, &plan)
+        .await
+        .map_err(map_store_error)?;
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    Ok(Json(MaterializeFactoryMissionResponse {
+        mission_id: outcome.ids.mission_id,
+        task_id: outcome.ids.task_ids[0],
+        task_ids: outcome.ids.task_ids,
+        strategy: outcome.strategy,
+        work_item: outcome.work_item,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -1314,6 +1656,8 @@ async fn schedule_ready_tasks(
             &candidate.required_adapter,
             candidate.required_model.as_deref(),
             candidate.required_reasoning_effort.as_deref(),
+            candidate.required_source_repository.as_deref(),
+            candidate.required_source_base_ref.as_deref(),
         ) else {
             outcome.failures.push(format!(
                 "task {} {}",
@@ -1323,6 +1667,8 @@ async fn schedule_ready_tasks(
                     &candidate.required_adapter,
                     candidate.required_model.as_deref(),
                     candidate.required_reasoning_effort.as_deref(),
+                    candidate.required_source_repository.as_deref(),
+                    candidate.required_source_base_ref.as_deref(),
                 )
             ));
             continue;
@@ -1598,7 +1944,22 @@ fn runner_requirement_mismatch(
     required_adapter: &str,
     required_model: Option<&str>,
     required_reasoning_effort: Option<&str>,
+    required_source_repository: Option<&str>,
+    required_source_base_ref: Option<&str>,
 ) -> String {
+    if required_source_repository.is_some()
+        && !runner_workspace_satisfies_requirement(
+            capabilities,
+            required_source_repository,
+            required_source_base_ref,
+        )
+    {
+        return format!(
+            "requires source repository {} at {}, but no connected runner advertises that checkout",
+            required_source_repository.unwrap_or("unknown"),
+            required_source_base_ref.unwrap_or("unknown")
+        );
+    }
     let adapter_capabilities = capabilities
         .iter()
         .filter(|capability| capability.name == required_adapter)
@@ -1664,12 +2025,19 @@ fn select_runner(
     required_adapter: &str,
     required_model: Option<&str>,
     required_reasoning_effort: Option<&str>,
+    required_source_repository: Option<&str>,
+    required_source_base_ref: Option<&str>,
 ) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
     let mut runners = state
         .runners
         .iter()
         .filter(|entry| {
             entry.corp_id == corp_id
+                && runner_workspace_satisfies_requirement(
+                    &entry.capabilities,
+                    required_source_repository,
+                    required_source_base_ref,
+                )
                 && entry.capabilities.iter().any(|capability| {
                     capability_satisfies_requirement(
                         capability,
@@ -1683,6 +2051,35 @@ fn select_runner(
         .collect::<Vec<_>>();
     runners.sort_by(|left, right| left.0.cmp(&right.0));
     runners.into_iter().next()
+}
+
+fn runner_workspace_satisfies_requirement(
+    capabilities: &[RunnerCapability],
+    required_repository: Option<&str>,
+    required_base_ref: Option<&str>,
+) -> bool {
+    let Some(required_repository) = required_repository else {
+        return required_base_ref.is_none();
+    };
+    let Some(required_base_ref) = required_base_ref else {
+        return false;
+    };
+    capabilities.iter().any(|capability| {
+        capability.name == "workspace-isolation"
+            && capability.available
+            && capability_detail_value(capability.detail.as_deref(), "remote")
+                .is_some_and(|repository| repository.eq_ignore_ascii_case(required_repository))
+            && capability_detail_value(capability.detail.as_deref(), "base")
+                == Some(required_base_ref)
+    })
+}
+
+fn capability_detail_value<'a>(detail: Option<&'a str>, key: &str) -> Option<&'a str> {
+    detail?
+        .split([';', ','])
+        .map(str::trim)
+        .find_map(|entry| entry.strip_prefix(&format!("{key}=")))
+        .map(str::trim)
 }
 
 fn validate_requested_model(
@@ -1790,6 +2187,26 @@ async fn resume_run(
             "source run's runner is enrolled to a different Corp",
         ));
     }
+    if !runner_workspace_satisfies_requirement(
+        &runner.capabilities,
+        record.source_repository.as_deref(),
+        record.source_base_ref.as_deref(),
+    ) {
+        drop(runner);
+        let failure = state
+            .store
+            .fail_run_before_dispatch(
+                corp_id,
+                record.run_id,
+                "source run's runner no longer advertises the required repository checkout",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        publish(&state, failure);
+        return Err(ApiError::conflict(
+            "source run's runner no longer advertises the required repository checkout",
+        ));
+    }
     let runner_tx = runner.tx.clone();
     drop(runner);
     let launch_record = LaunchRecord {
@@ -1805,6 +2222,8 @@ async fn resume_run(
         mission_title: prompt.to_owned(),
         model: record.model.clone(),
         reasoning_effort: record.reasoning_effort.clone(),
+        source_repository: record.source_repository.clone(),
+        source_base_ref: record.source_base_ref.clone(),
         verification_policy: record.verification_policy.clone(),
         secret_refs: record.secret_refs.clone(),
         queued_messages: record.queued_messages.clone(),
@@ -2924,9 +3343,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crony_protocol::{RunnerCapability, RunnerModel};
+    use crony_domain::{ManualVerificationGate, TaskGraphPlan};
+    use crony_protocol::{FactoryMissionContract, RunnerCapability, RunnerModel};
+    use serde_json::json;
+    use uuid::Uuid;
 
-    use super::{capability_satisfies_requirement, runner_requirement_mismatch};
+    use super::{
+        apply_factory_contract, capability_satisfies_requirement, runner_requirement_mismatch,
+    };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
         RunnerModel {
@@ -2961,6 +3385,8 @@ mod tests {
                 "fake-process",
                 Some("gpt-5.6-sol"),
                 Some("max"),
+                None,
+                None,
             ),
             "requires model gpt-5.6-sol on fake-process, but connected runners expose no selectable models for that adapter"
         );
@@ -2985,6 +3411,97 @@ mod tests {
             "github-copilot",
             Some("gpt-5.6-sol"),
             Some("minimal"),
+        ));
+    }
+
+    #[test]
+    fn runner_matching_enforces_repository_and_base_ref() {
+        let capabilities = vec![RunnerCapability {
+            name: "workspace-isolation".to_owned(),
+            available: true,
+            detail: Some(
+                "root=/tmp/runner; repository=/src/ecorp; remote=shyamsridhar123/ecorp; base=HEAD"
+                    .to_owned(),
+            ),
+            models: Vec::new(),
+        }];
+        assert!(super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("shyamsridhar123/ecorp"),
+            Some("HEAD"),
+        ));
+        assert!(!super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("acme/widget"),
+            Some("HEAD"),
+        ));
+        assert!(!super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("shyamsridhar123/ecorp"),
+            Some("main"),
+        ));
+    }
+
+    #[test]
+    fn provider_backed_factory_tasks_require_independent_verification() {
+        let mut plan: TaskGraphPlan = serde_json::from_value(json!({
+            "strategy": "single",
+            "max_nodes": 1,
+            "max_depth": 0,
+            "budget_tokens": 1_000,
+            "budget_cost_microusd": 1_000_000,
+            "tasks": [{
+                "key": "deliver",
+                "title": "Deliver",
+                "contract": {
+                    "objective": "Implement the issue",
+                    "expected_output": "A verified change",
+                    "source_repository": null,
+                    "source_base_ref": null,
+                    "acceptance_tests": ["tests pass"],
+                    "allowed_tools": ["filesystem", "shell"],
+                    "prohibited_actions": ["do not merge"],
+                    "references": [],
+                    "write_scope": ["**"],
+                    "budget_tokens": 1_000,
+                    "budget_cost_microusd": 1_000_000,
+                    "deadline_at": null,
+                    "escalation": "ask the operator",
+                    "secret_refs": [],
+                    "model": null,
+                    "reasoning_effort": null
+                },
+                "assigned_agent_id": Uuid::new_v4(),
+                "required_adapter": "codex",
+                "depends_on": [],
+                "depth": 0,
+                "max_attempts": 1,
+                "verification_policy": {
+                    "checks": [{"type": "artifact", "min_bytes": 1}],
+                    "manual_gate": null
+                }
+            }]
+        }))
+        .expect("valid plan");
+        apply_factory_contract(
+            &mut plan,
+            &FactoryMissionContract {
+                objective: String::new(),
+                expected_output: String::new(),
+                acceptance_tests: Vec::new(),
+                allowed_tools: Vec::new(),
+                prohibited_actions: Vec::new(),
+                references: Vec::new(),
+                write_scope: Vec::new(),
+            },
+        )
+        .expect("factory contract");
+        assert!(matches!(
+            plan.tasks[0].verification_policy.manual_gate,
+            Some(ManualVerificationGate::IndependentReview {
+                exclude_requester: true,
+                ..
+            })
         ));
     }
 }

@@ -362,8 +362,62 @@ ECorp's durable approval flow.
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.
 
+## Governed dark-factory intake
+
+GitHub Project issues enter the execution plane through a durable factory work item rather than
+directly launching a provider. Each item records the exact Project item, repository issue, source
+revision, policy snapshot, current state, claim owner, lease expiry, monotonic version, and linked
+mission.
+
+Claim, renewal, and mission materialization are Corp-scoped and idempotent. Competing controllers
+are serialized in Postgres, while fencing tokens and expected versions reject stale automation.
+The claim token is a capability: it is returned only in the direct authorized response and is
+omitted from shared snapshots and immutable events.
+Every reclaim preserves and revalidates the original source and policy snapshots; only ownership,
+fencing, lease, and recoverable lifecycle fields can change.
+GitHub owner and repository identities are normalized to lowercase before locking and uniqueness
+checks, preventing case variants from creating duplicate work items.
+
+Mission and task creation is atomic with the `claimed -> mission_created` transition. A controller
+that loses its response or restarts can replay the same operation and recover the existing mission;
+it cannot create a duplicate graph.
+
+The same fenced controller advances explicit `running`, `blocked`, and `verified` states. External
+status failure is persisted before the controller returns an error, and retry reclaims an expired
+non-terminal lease without changing the original source revision or policy snapshot.
+Execution failures and evidence-verification failures remain distinct factory states.
+Materialization may only narrow the persisted repository, adapter, write-scope, token, and cost
+policy. The server derives `verified` authority from a completed mission whose tasks all passed
+verification; a controller cannot assert it directly.
+When policy pins a model or reasoning effort, every materialized task must retain that exact value;
+omission cannot fall back to a provider default.
+Provider-backed factory tasks also receive a manual verification gate before accepted completion.
+The deterministic `fake-process` harness remains gate-free so offline systems tests can terminate
+without pretending to be production evidence.
+The generic transition endpoint cannot assert `publishing` or `published`; those states are
+reserved for the verifier-gated publication operation in #61.
+
+Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
+source issue metadata, and events become room-scoped as soon as a mission exists.
+
+GitHub remains the planning and status source of truth, but external status changes must follow
+durable ECorp transitions. Pull-request publication, merge, and deployment are separate effects
+with separate authorization and idempotency boundaries. See ADR 0020.
+
+Before changing GitHub Project state, the controller renews its lease to an external-effect window,
+then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
+It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded
+deadline below the minimum effect lease. After the mutation it renews, repeats the
+source-eligibility check, and renews once more immediately before launch.
+Any changed or newly blocked source durably moves the factory item to `blocked` without launching a
+run. Factory tasks persist the claimed GitHub repository and source base ref. Runners advertise a
+normalized `remote` and `base`, and scheduling rejects a runner whose configured checkout does not
+match before creating a run.
+
 ## Near-term architecture work
 
-1. Add stronger OS/container isolation for untrusted child processes.
-2. Add artifact retention sweeping and signing-key rotation.
-3. Add multi-region control-plane and object-store recovery drills.
+1. Connect eligible GitHub Project items to the durable factory claim API.
+2. Add verifier-gated, idempotent pull-request publication without implicit merge.
+3. Add stronger OS/container isolation for untrusted child processes.
+4. Add artifact retention sweeping and signing-key rotation.
+5. Add multi-region control-plane and object-store recovery drills.

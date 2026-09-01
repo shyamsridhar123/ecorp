@@ -163,6 +163,34 @@ finish with verified worktree evidence. See
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
 methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.
 
+`tools/e2e_factory_claims.mjs` races duplicate factory claims, renewals, and mission
+materialization, restarts the server between claim and renewal, rejects guest, cross-Corp, stale
+version, stale token, and duplicate-active operations, proves the fencing token is absent from
+snapshots and events, proves non-operators cannot read source metadata through factory snapshots or
+events, rejects source or policy replacement during an expired pre-materialization reclaim, and
+proves mixed-case GitHub identities collapse onto the same work item before launching the one
+linked mission through the real runner.
+
+`tools/e2e_factory_controller.mjs` gives the CLI a deterministic GitHub API boundary and proves
+Project eligibility, dependency parsing, a mutation-free dry run, durable claim-before-dispatch,
+Todo-to-In-Progress synchronization only after mission linkage, one real child-process run, and
+duplicate controller recovery without a second work item, mission, or run. It also injects a
+GitHub Project status failure, verifies durable `blocked` state before launch, and proves retry
+reuses the existing mission. The failure fixture emits multi-line stderr to prove error text cannot
+prevent the durable transition, and a stalled Project mutation is killed before the lease window
+can expire. Additional regressions prove verified items leave the intake queue
+and terminal mission failure becomes terminal factory failure while verifier rejection remains
+`verification_failed`. It also proves lease renewal around external effects, source revision and
+label revalidation before the Project mutation,
+reopened-dependency revalidation before launch, persistence of the claimed repository/base
+requirement, and rejection of a runner checked out to another repository before run creation.
+`crony-store` unit coverage separately proves exact retention of policy-pinned model and reasoning
+settings on every materialized task and rejects provider-backed tasks without a manual gate. The
+controller E2E proves an independent reviewer, not the requester, advances
+`awaiting_approval -> verified`. CLI unit coverage verifies Markdown section boundaries for
+dependency and acceptance parsing. See
+`docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before

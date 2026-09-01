@@ -125,6 +125,40 @@ impl RunStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryWorkItemState {
+    Claimed,
+    MissionCreated,
+    Running,
+    Blocked,
+    AwaitingApproval,
+    VerificationFailed,
+    Verified,
+    Publishing,
+    Published,
+    Failed,
+    Cancelled,
+}
+
+impl FactoryWorkItemState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::MissionCreated => "mission_created",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::VerificationFailed => "verification_failed",
+            Self::Verified => "verified",
+            Self::Publishing => "publishing",
+            Self::Published => "published",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Corp {
     pub id: Uuid,
@@ -185,9 +219,39 @@ pub struct Mission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryWorkItem {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub source_kind: String,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_project_item_id: String,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub source_issue_number: i64,
+    pub source_issue_node_id: String,
+    pub source_issue_url: String,
+    pub source_title: String,
+    pub source_revision: String,
+    pub state: FactoryWorkItemState,
+    pub version: i64,
+    pub claim_owner_id: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
+    pub policy: Value,
+    pub mission_id: Option<Uuid>,
+    pub failure_detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContract {
     pub objective: String,
     pub expected_output: String,
+    #[serde(default)]
+    pub source_repository: Option<String>,
+    #[serde(default)]
+    pub source_base_ref: Option<String>,
     pub acceptance_tests: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub prohibited_actions: Vec<String>,
@@ -571,6 +635,8 @@ pub struct CorpSnapshot {
     pub verification_requests: Vec<VerificationRequest>,
     pub action_approvals: Vec<ActionApproval>,
     pub circuit_breaker_incidents: Vec<CircuitBreakerIncident>,
+    #[serde(default)]
+    pub factory_work_items: Vec<FactoryWorkItem>,
     pub events: Vec<DomainEvent>,
 }
 
@@ -585,5 +651,10 @@ mod tests {
             "\"awaiting_approval\""
         );
         assert_eq!(RunStatus::WaitingForInput.as_str(), "waiting_for_input");
+        assert_eq!(
+            serde_json::to_string(&FactoryWorkItemState::MissionCreated)
+                .expect("serialize factory state"),
+            "\"mission_created\""
+        );
     }
 }

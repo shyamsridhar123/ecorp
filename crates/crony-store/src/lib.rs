@@ -4,9 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
-    Corp, CorpSnapshot, DomainEvent, EntityLink, ManualVerificationGate, Mission, MissionStatus,
-    NewEvent, QueuedMessage, Room, RoomMessage, Run, RunStatus, Task, TaskContract, TaskGraphPlan,
-    TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy, VerificationRequest,
+    Corp, CorpSnapshot, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
+    ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage, Room, RoomMessage,
+    Run, RunStatus, Task, TaskContract, TaskGraphPlan, TaskSecretReference, TaskStatus,
+    VerificationEvidence, VerificationPolicy, VerificationRequest,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -55,6 +56,103 @@ pub struct MissionPlanIds {
 }
 
 #[derive(Debug, Clone)]
+pub struct FactorySourceInput {
+    pub project_owner: String,
+    pub project_number: i64,
+    pub project_item_id: String,
+    pub repository_owner: String,
+    pub repository_name: String,
+    pub issue_number: i64,
+    pub issue_node_id: String,
+    pub issue_url: String,
+    pub title: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimFactoryWorkItemInput {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub source: FactorySourceInput,
+    pub idempotency_key: String,
+    pub lease_seconds: i64,
+    pub policy: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenewFactoryWorkItemInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransitionFactoryWorkItemInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub state: FactoryWorkItemState,
+    pub failure_detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializeFactoryMissionInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub title: String,
+    pub request: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryWorkItemOutcome {
+    pub work_item: FactoryWorkItem,
+    pub claim_token: Option<Uuid>,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryMissionOutcome {
+    pub work_item: FactoryWorkItem,
+    pub ids: MissionPlanIds,
+    pub strategy: String,
+    pub events: Vec<DomainEvent>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FactoryOperation {
+    work_item_id: Uuid,
+    actor_id: Uuid,
+    operation: String,
+    resulting_version: i64,
+    claim_token: Option<Uuid>,
+    request: Value,
+}
+
+struct NewFactoryOperation<'a> {
+    corp_id: Uuid,
+    idempotency_key: &'a str,
+    work_item_id: Uuid,
+    actor_id: Uuid,
+    operation: &'a str,
+    resulting_version: i64,
+    claim_token: Option<Uuid>,
+    request: &'a Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct LaunchRecord {
     pub corp_id: Uuid,
     pub room_id: Uuid,
@@ -68,6 +166,8 @@ pub struct LaunchRecord {
     pub mission_title: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -79,6 +179,8 @@ pub struct SchedulableTask {
     pub required_adapter: String,
     pub required_model: Option<String>,
     pub required_reasoning_effort: Option<String>,
+    pub required_source_repository: Option<String>,
+    pub required_source_base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +199,8 @@ pub struct ResumeLaunchRecord {
     pub provider_session_id: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -882,6 +986,10 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM factory_work_items WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM runs WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1205,6 +1313,35 @@ impl PgStore {
         .map(map_circuit_breaker_incident)
         .collect();
 
+        let factory_work_items = sqlx::query(
+            r#"
+            SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+                   source_project_item_id, source_repository_owner, source_repository_name,
+                   source_issue_number, source_issue_node_id, source_issue_url, source_title,
+                   source_revision, state, version, claim_owner_id, lease_expires_at, policy,
+                   mission_id, failure_detail, created_at, updated_at
+            FROM factory_work_items
+            WHERE corp_id = $1
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = factory_work_items.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_factory_work_item)
+        .collect::<Result<Vec<_>>>()?;
+
         let mut events = sqlx::query(
             r#"
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
@@ -1247,6 +1384,7 @@ impl PgStore {
             verification_requests,
             action_approvals,
             circuit_breaker_incidents,
+            factory_work_items,
             events,
         };
         tx.commit().await?;
@@ -1889,6 +2027,844 @@ impl PgStore {
         Ok(events)
     }
 
+    pub async fn claim_factory_work_item(
+        &self,
+        input: ClaimFactoryWorkItemInput,
+    ) -> Result<FactoryWorkItemOutcome> {
+        let source = normalize_factory_source(input.source)?;
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let lease_seconds = validate_factory_lease_seconds(input.lease_seconds)?;
+        let policy = normalize_factory_policy(input.policy)?;
+        let operation_request = json!({
+            "source_project_owner": &source.project_owner,
+            "source_project_number": source.project_number,
+            "source_project_item_id": &source.project_item_id,
+            "source_repository_owner": &source.repository_owner,
+            "source_repository_name": &source.repository_name,
+            "source_issue_number": source.issue_number,
+            "source_issue_node_id": &source.issue_node_id,
+            "source_issue_url": &source.issue_url,
+            "source_title": &source.title,
+            "source_revision": &source.revision,
+            "lease_seconds": lease_seconds,
+            "policy": &policy
+        });
+        let now = Utc::now();
+        let lease_expires_at = now + Duration::seconds(lease_seconds);
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!(
+                    "factory:source:{}:{}:{}:{}",
+                    input.corp_id,
+                    source.project_owner,
+                    source.project_number,
+                    source.project_item_id
+                ),
+            ],
+        )
+        .await?;
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "claim",
+                input.actor_id,
+                None,
+                None,
+                &operation_request,
+            )?;
+            let (work_item, current_token) =
+                factory_work_item_tx(&mut tx, input.corp_id, operation.work_item_id, false)
+                    .await?
+                    .context("idempotent factory claim references a missing work item")?;
+            ensure_factory_source_matches(&work_item, &source)?;
+            if work_item.policy != policy {
+                return Err(anyhow!(
+                    "factory idempotency key was reused with a different policy snapshot"
+                ));
+            }
+            let claim_token =
+                replayable_factory_claim_token(&work_item, current_token, &operation, now);
+            tx.commit().await?;
+            return Ok(FactoryWorkItemOutcome {
+                work_item,
+                claim_token,
+                event: None,
+                replayed: true,
+            });
+        }
+
+        let existing = sqlx::query(
+            r#"
+            SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+                   source_project_item_id, source_repository_owner, source_repository_name,
+                   source_issue_number, source_issue_node_id, source_issue_url, source_title,
+                   source_revision, state, version, claim_owner_id, claim_token,
+                   lease_expires_at, policy, mission_id, failure_detail, created_at, updated_at
+            FROM factory_work_items
+            WHERE corp_id = $1
+              AND source_kind = 'github_project_issue'
+              AND source_project_owner = $2
+              AND source_project_number = $3
+              AND source_project_item_id = $4
+            FOR UPDATE
+            "#,
+        )
+        .bind(input.corp_id)
+        .bind(&source.project_owner)
+        .bind(source.project_number)
+        .bind(&source.project_item_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let claim_token = Uuid::new_v4();
+        let (work_item, event_type) = if let Some(row) = existing {
+            let current_token: Uuid = row.get("claim_token");
+            let current = map_factory_work_item(row)?;
+            if factory_state_is_terminal(current.state) {
+                return Err(anyhow!(
+                    "conflict: factory work item {} is terminal in state {}",
+                    current.id,
+                    current.state.as_str()
+                ));
+            }
+            if current.lease_expires_at > now {
+                if current.claim_owner_id == input.actor_id {
+                    ensure_factory_source_matches(&current, &source)?;
+                    if current.policy != policy {
+                        return Err(anyhow!(
+                            "factory recovery policy does not match the persisted policy snapshot"
+                        ));
+                    }
+                    record_factory_operation_tx(
+                        &mut tx,
+                        NewFactoryOperation {
+                            corp_id: input.corp_id,
+                            idempotency_key: &idempotency_key,
+                            work_item_id: current.id,
+                            actor_id: input.actor_id,
+                            operation: "claim",
+                            resulting_version: current.version,
+                            claim_token: Some(current_token),
+                            request: &operation_request,
+                        },
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(FactoryWorkItemOutcome {
+                        work_item: current,
+                        claim_token: Some(current_token),
+                        event: None,
+                        replayed: true,
+                    });
+                }
+                return Err(anyhow!(
+                    "conflict: factory work item {} is claimed until {}",
+                    current.id,
+                    current.lease_expires_at
+                ));
+            }
+            if current_token == claim_token {
+                return Err(anyhow!("factory claim token collision"));
+            }
+            ensure_factory_source_matches(&current, &source)?;
+            if current.policy != policy {
+                return Err(anyhow!(
+                    "factory recovery policy does not match the persisted policy snapshot"
+                ));
+            }
+            let preserves_materialized_state = current.mission_id.is_some();
+            let row = if preserves_materialized_state {
+                sqlx::query(
+                    r#"
+                    UPDATE factory_work_items
+                    SET version = version + 1,
+                        claim_owner_id = $1,
+                        claim_token = $2,
+                        lease_expires_at = $3,
+                        updated_at = now()
+                    WHERE id = $4 AND corp_id = $5
+                    RETURNING id, corp_id, source_kind, source_project_owner,
+                              source_project_number, source_project_item_id,
+                              source_repository_owner, source_repository_name,
+                              source_issue_number, source_issue_node_id, source_issue_url,
+                              source_title, source_revision, state, version, claim_owner_id,
+                              lease_expires_at, policy, mission_id, failure_detail,
+                              created_at, updated_at
+                    "#,
+                )
+                .bind(input.actor_id)
+                .bind(claim_token)
+                .bind(lease_expires_at)
+                .bind(current.id)
+                .bind(input.corp_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE factory_work_items
+                    SET state = 'claimed',
+                        version = version + 1,
+                        claim_owner_id = $1,
+                        claim_token = $2,
+                        lease_expires_at = $3,
+                        failure_detail = NULL,
+                        updated_at = now()
+                    WHERE id = $4 AND corp_id = $5
+                    RETURNING id, corp_id, source_kind, source_project_owner,
+                              source_project_number, source_project_item_id,
+                              source_repository_owner, source_repository_name,
+                              source_issue_number, source_issue_node_id, source_issue_url,
+                              source_title, source_revision, state, version, claim_owner_id,
+                              lease_expires_at, policy, mission_id, failure_detail,
+                              created_at, updated_at
+                    "#,
+                )
+                .bind(input.actor_id)
+                .bind(claim_token)
+                .bind(lease_expires_at)
+                .bind(current.id)
+                .bind(input.corp_id)
+                .fetch_one(&mut *tx)
+                .await?
+            };
+            (map_factory_work_item(row)?, "factory.work_item_reclaimed")
+        } else {
+            let work_item_id = Uuid::new_v4();
+            let row = sqlx::query(
+                r#"
+                INSERT INTO factory_work_items
+                    (id, corp_id, source_kind, source_project_owner,
+                     source_project_number, source_project_item_id,
+                     source_repository_owner, source_repository_name,
+                     source_issue_number, source_issue_node_id, source_issue_url,
+                     source_title, source_revision, state, version, claim_owner_id,
+                     claim_token, lease_expires_at, policy)
+                VALUES
+                    ($1, $2, 'github_project_issue', $3, $4, $5, $6, $7, $8,
+                     $9, $10, $11, $12, 'claimed', 1, $13, $14, $15, $16)
+                RETURNING id, corp_id, source_kind, source_project_owner,
+                          source_project_number, source_project_item_id,
+                          source_repository_owner, source_repository_name,
+                          source_issue_number, source_issue_node_id, source_issue_url,
+                          source_title, source_revision, state, version, claim_owner_id,
+                          lease_expires_at, policy, mission_id, failure_detail,
+                          created_at, updated_at
+                "#,
+            )
+            .bind(work_item_id)
+            .bind(input.corp_id)
+            .bind(&source.project_owner)
+            .bind(source.project_number)
+            .bind(&source.project_item_id)
+            .bind(&source.repository_owner)
+            .bind(&source.repository_name)
+            .bind(source.issue_number)
+            .bind(&source.issue_node_id)
+            .bind(&source.issue_url)
+            .bind(&source.title)
+            .bind(&source.revision)
+            .bind(input.actor_id)
+            .bind(claim_token)
+            .bind(lease_expires_at)
+            .bind(&policy)
+            .fetch_one(&mut *tx)
+            .await?;
+            (map_factory_work_item(row)?, "factory.work_item_claimed")
+        };
+
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "claim",
+                resulting_version: work_item.version,
+                claim_token: Some(claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let event_room_id =
+            factory_event_room_id_tx(&mut tx, input.corp_id, work_item.mission_id).await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: event_room_id,
+                aggregate_version: work_item.version,
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    event_type,
+                    "factory_work_item",
+                    work_item.id,
+                    format!("factory:{}:claim:{}", work_item.id, work_item.version),
+                    json!({
+                        "claim_owner_id": work_item.claim_owner_id,
+                        "lease_expires_at": work_item.lease_expires_at,
+                        "state": work_item.state.as_str()
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory claim event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(FactoryWorkItemOutcome {
+            work_item,
+            claim_token: Some(claim_token),
+            event: Some(event),
+            replayed: false,
+        })
+    }
+
+    pub async fn renew_factory_work_item(
+        &self,
+        input: RenewFactoryWorkItemInput,
+    ) -> Result<FactoryWorkItemOutcome> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let lease_seconds = validate_factory_lease_seconds(input.lease_seconds)?;
+        let operation_request = json!({
+            "work_item_id": input.work_item_id,
+            "expected_version": input.expected_version,
+            "lease_seconds": lease_seconds
+        });
+        let now = Utc::now();
+        let lease_expires_at = now + Duration::seconds(lease_seconds);
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "renew",
+                input.actor_id,
+                Some(input.work_item_id),
+                Some(input.claim_token),
+                &operation_request,
+            )?;
+            let (work_item, current_token) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                    .await?
+                    .context("idempotent factory renewal references a missing work item")?;
+            let claim_token =
+                replayable_factory_claim_token(&work_item, current_token, &operation, now);
+            tx.commit().await?;
+            return Ok(FactoryWorkItemOutcome {
+                work_item,
+                claim_token,
+                event: None,
+                replayed: true,
+            });
+        }
+
+        let (current, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_active_factory_control(
+            &current,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_version,
+            now,
+        )?;
+
+        let row = sqlx::query(
+            r#"
+            UPDATE factory_work_items
+            SET version = version + 1, lease_expires_at = $1, updated_at = now()
+            WHERE id = $2 AND corp_id = $3
+            RETURNING id, corp_id, source_kind, source_project_owner,
+                      source_project_number, source_project_item_id,
+                      source_repository_owner, source_repository_name,
+                      source_issue_number, source_issue_node_id, source_issue_url,
+                      source_title, source_revision, state, version, claim_owner_id,
+                      lease_expires_at, policy, mission_id, failure_detail,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(lease_expires_at)
+        .bind(input.work_item_id)
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let work_item = map_factory_work_item(row)?;
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "renew",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let event_room_id =
+            factory_event_room_id_tx(&mut tx, input.corp_id, work_item.mission_id).await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: event_room_id,
+                aggregate_version: work_item.version,
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.claim_renewed",
+                    "factory_work_item",
+                    work_item.id,
+                    format!("factory:{}:renew:{}", work_item.id, work_item.version),
+                    json!({
+                        "claim_owner_id": work_item.claim_owner_id,
+                        "lease_expires_at": work_item.lease_expires_at,
+                        "state": work_item.state.as_str()
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory renewal event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(FactoryWorkItemOutcome {
+            work_item,
+            claim_token: Some(input.claim_token),
+            event: Some(event),
+            replayed: false,
+        })
+    }
+
+    pub async fn transition_factory_work_item(
+        &self,
+        input: TransitionFactoryWorkItemInput,
+    ) -> Result<FactoryWorkItemOutcome> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        if matches!(
+            input.state,
+            FactoryWorkItemState::Claimed
+                | FactoryWorkItemState::MissionCreated
+                | FactoryWorkItemState::Publishing
+                | FactoryWorkItemState::Published
+        ) {
+            return Err(anyhow!(
+                "claim, materialization, and publication states require their dedicated operations"
+            ));
+        }
+        let failure_detail = input
+            .failure_detail
+            .as_deref()
+            .map(|detail| normalize_factory_text(detail, "factory failure detail", 2_000))
+            .transpose()?;
+        if matches!(
+            input.state,
+            FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Failed
+        ) && failure_detail.is_none()
+        {
+            return Err(anyhow!(
+                "blocked and failed factory states require a failure detail"
+            ));
+        }
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let operation_request = json!({
+            "work_item_id": input.work_item_id,
+            "expected_version": input.expected_version,
+            "state": input.state.as_str(),
+            "failure_detail": &failure_detail
+        });
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "transition",
+                input.actor_id,
+                Some(input.work_item_id),
+                Some(input.claim_token),
+                &operation_request,
+            )?;
+            let (work_item, current_token) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                    .await?
+                    .context("idempotent factory transition references a missing work item")?;
+            let claim_token =
+                replayable_factory_claim_token(&work_item, current_token, &operation, now);
+            tx.commit().await?;
+            return Ok(FactoryWorkItemOutcome {
+                work_item,
+                claim_token,
+                event: None,
+                replayed: true,
+            });
+        }
+
+        let (current, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_active_factory_control(
+            &current,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_version,
+            now,
+        )?;
+        if !factory_transition_allowed(current.state, input.state) {
+            return Err(anyhow!(
+                "conflict: factory transition {} -> {} is not allowed",
+                current.state.as_str(),
+                input.state.as_str()
+            ));
+        }
+        if current.mission_id.is_none()
+            && !matches!(
+                input.state,
+                FactoryWorkItemState::Blocked
+                    | FactoryWorkItemState::Failed
+                    | FactoryWorkItemState::Cancelled
+            )
+        {
+            return Err(anyhow!(
+                "conflict: factory work item must link a mission before entering {}",
+                input.state.as_str()
+            ));
+        }
+        if input.state == FactoryWorkItemState::Verified {
+            let mission_id = current
+                .mission_id
+                .context("factory work item has no linked mission")?;
+            ensure_factory_mission_verified_tx(&mut tx, input.corp_id, mission_id).await?;
+        }
+        let row = sqlx::query(
+            r#"
+            UPDATE factory_work_items
+            SET state = $1,
+                version = version + 1,
+                failure_detail = $2,
+                updated_at = now()
+            WHERE id = $3 AND corp_id = $4
+            RETURNING id, corp_id, source_kind, source_project_owner,
+                      source_project_number, source_project_item_id,
+                      source_repository_owner, source_repository_name,
+                      source_issue_number, source_issue_node_id, source_issue_url,
+                      source_title, source_revision, state, version, claim_owner_id,
+                      lease_expires_at, policy, mission_id, failure_detail,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(input.state.as_str())
+        .bind(&failure_detail)
+        .bind(input.work_item_id)
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let work_item = map_factory_work_item(row)?;
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "transition",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let event_room_id =
+            factory_event_room_id_tx(&mut tx, input.corp_id, work_item.mission_id).await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: event_room_id,
+                aggregate_version: work_item.version,
+                correlation_id: work_item.mission_id,
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.state_changed",
+                    "factory_work_item",
+                    work_item.id,
+                    format!(
+                        "factory:{}:state:{}:{}",
+                        work_item.id,
+                        work_item.state.as_str(),
+                        work_item.version
+                    ),
+                    json!({
+                        "previous_state": current.state.as_str(),
+                        "state": work_item.state.as_str(),
+                        "mission_id": work_item.mission_id,
+                        "failure_detail": &work_item.failure_detail
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory state-change event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(FactoryWorkItemOutcome {
+            work_item,
+            claim_token: Some(input.claim_token),
+            event: Some(event),
+            replayed: false,
+        })
+    }
+
+    pub async fn replay_factory_materialization(
+        &self,
+        input: &MaterializeFactoryMissionInput,
+    ) -> Result<Option<FactoryMissionOutcome>> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let operation_request = normalize_factory_operation_request(input.request.clone())?;
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+        let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        ensure_factory_operation_matches(
+            &operation,
+            "materialize",
+            input.actor_id,
+            Some(input.work_item_id),
+            Some(input.claim_token),
+            &operation_request,
+        )?;
+        let (work_item, _) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                .await?
+                .context("idempotent factory materialization references a missing work item")?;
+        let mission_id = work_item
+            .mission_id
+            .context("idempotent factory materialization has no mission linkage")?;
+        let (ids, strategy) =
+            factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+        tx.commit().await?;
+        Ok(Some(FactoryMissionOutcome {
+            work_item,
+            ids,
+            strategy,
+            events: Vec::new(),
+            replayed: true,
+        }))
+    }
+
+    pub async fn materialize_factory_mission(
+        &self,
+        input: MaterializeFactoryMissionInput,
+        plan: &TaskGraphPlan,
+    ) -> Result<FactoryMissionOutcome> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let title = normalize_mission_title(&input.title)?;
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let operation_request = normalize_factory_operation_request(input.request)?;
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "materialize",
+                input.actor_id,
+                Some(input.work_item_id),
+                Some(input.claim_token),
+                &operation_request,
+            )?;
+            let (work_item, _) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                    .await?
+                    .context("idempotent factory materialization references a missing work item")?;
+            let mission_id = work_item
+                .mission_id
+                .context("idempotent factory materialization has no mission linkage")?;
+            let (ids, strategy) =
+                factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+            tx.commit().await?;
+            return Ok(FactoryMissionOutcome {
+                work_item,
+                ids,
+                strategy,
+                events: Vec::new(),
+                replayed: true,
+            });
+        }
+
+        let (current, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_materializable_factory_claim(
+            &current,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_version,
+            now,
+        )?;
+        let mut constrained_plan = plan.clone();
+        apply_factory_source_constraints(&current, &mut constrained_plan)?;
+        validate_factory_plan_against_policy(&current, &constrained_plan)?;
+
+        let (ids, mut events) = create_mission_tx(
+            &mut tx,
+            input.corp_id,
+            input.actor_id,
+            &title,
+            &constrained_plan,
+        )
+        .await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE factory_work_items
+            SET state = 'mission_created',
+                version = version + 1,
+                mission_id = $1,
+                failure_detail = NULL,
+                updated_at = now()
+            WHERE id = $2 AND corp_id = $3
+            RETURNING id, corp_id, source_kind, source_project_owner,
+                      source_project_number, source_project_item_id,
+                      source_repository_owner, source_repository_name,
+                      source_issue_number, source_issue_node_id, source_issue_url,
+                      source_title, source_revision, state, version, claim_owner_id,
+                      lease_expires_at, policy, mission_id, failure_detail,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(ids.mission_id)
+        .bind(input.work_item_id)
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let work_item = map_factory_work_item(row)?;
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "materialize",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let factory_event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: events.first().and_then(|event| event.room_id),
+                aggregate_version: work_item.version,
+                correlation_id: Some(ids.mission_id),
+                causation_id: events.last().map(|event| event.id),
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.mission_linked",
+                    "factory_work_item",
+                    work_item.id,
+                    format!("factory:{}:mission:{}", work_item.id, ids.mission_id),
+                    json!({
+                        "mission_id": ids.mission_id,
+                        "task_ids": &ids.task_ids,
+                        "state": work_item.state.as_str()
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory mission-link event unexpectedly existed")?;
+        events.push(factory_event);
+        tx.commit().await?;
+        Ok(FactoryMissionOutcome {
+            work_item,
+            ids,
+            strategy: constrained_plan.strategy,
+            events,
+            replayed: false,
+        })
+    }
+
     pub async fn create_mission(
         &self,
         corp_id: Uuid,
@@ -1896,225 +2872,10 @@ impl PgStore {
         title: &str,
         plan: &TaskGraphPlan,
     ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
-        let title = title.trim();
-        if title.is_empty() {
-            return Err(anyhow!("mission title cannot be empty"));
-        }
-        if title.len() > 240 {
-            return Err(anyhow!("mission title cannot exceed 240 characters"));
-        }
-
         let mut tx = self.pool.begin().await?;
-        let room_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM rooms WHERE corp_id = $1 ORDER BY created_at LIMIT 1",
-        )
-        .bind(corp_id)
-        .fetch_one(&mut *tx)
-        .await
-        .context("corp has no room")?;
-        assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
-
-        let mission_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO missions
-                (id, corp_id, room_id, requested_by, title, strategy,
-                 max_nodes, max_depth, budget_tokens, budget_cost_microusd, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ready')
-            "#,
-        )
-        .bind(mission_id)
-        .bind(corp_id)
-        .bind(room_id)
-        .bind(requested_by)
-        .bind(title)
-        .bind(&plan.strategy)
-        .bind(plan.max_nodes)
-        .bind(plan.max_depth)
-        .bind(plan.budget_tokens)
-        .bind(plan.budget_cost_microusd)
-        .execute(&mut *tx)
-        .await?;
-
-        let mission_event = append_event_tx(
-            &mut tx,
-            NewEvent {
-                room_id: Some(room_id),
-                correlation_id: Some(mission_id),
-                ..NewEvent::new(
-                    corp_id,
-                    Some(requested_by),
-                    "mission.created",
-                    "mission",
-                    mission_id,
-                    format!("mission:{mission_id}:created"),
-                    json!({
-                        "title": title,
-                        "strategy": plan.strategy,
-                        "max_nodes": plan.max_nodes,
-                        "max_depth": plan.max_depth,
-                        "budget_tokens": plan.budget_tokens,
-                        "budget_cost_microusd": plan.budget_cost_microusd,
-                        "status": "ready"
-                    }),
-                )
-            },
-        )
-        .await?
-        .context("mission created event unexpectedly existed")?;
-
-        let mut task_ids = HashMap::new();
-        for task in &plan.tasks {
-            task_ids.insert(task.key.clone(), Uuid::new_v4());
-        }
-        let mut events = vec![mission_event.clone()];
-        for task in &plan.tasks {
-            let task_id = *task_ids
-                .get(&task.key)
-                .context("planned task id unexpectedly missing")?;
-            let adapter: String =
-                sqlx::query_scalar("SELECT adapter FROM agents WHERE id = $1 AND corp_id = $2")
-                    .bind(task.assigned_agent_id)
-                    .bind(corp_id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "planned task {} references an agent outside the Corp",
-                            task.key
-                        )
-                    })?;
-            if adapter != task.required_adapter {
-                return Err(anyhow!(
-                    "planned task {} requires adapter {} but assigned agent uses {adapter}",
-                    task.key,
-                    task.required_adapter
-                ));
-            }
-            let status = if task.depends_on.is_empty() {
-                "ready"
-            } else {
-                "pending"
-            };
-            let mut contract = task.contract.clone();
-            contract.normalize_for_adapter(&task.required_adapter);
-            sqlx::query(
-                r#"
-                INSERT INTO tasks
-                    (id, mission_id, corp_id, title, objective, plan_key, contract,
-                     depth, max_attempts, attempt_count, required_adapter, status,
-                     assigned_agent_id, verification_policy, verification_status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, 'pending')
-                "#,
-            )
-            .bind(task_id)
-            .bind(mission_id)
-            .bind(corp_id)
-            .bind(&task.title)
-            .bind(&task.contract.objective)
-            .bind(&task.key)
-            .bind(serde_json::to_value(&contract)?)
-            .bind(task.depth)
-            .bind(task.max_attempts)
-            .bind(&task.required_adapter)
-            .bind(status)
-            .bind(task.assigned_agent_id)
-            .bind(serde_json::to_value(&task.verification_policy)?)
-            .execute(&mut *tx)
-            .await?;
-
-            let event = append_event_tx(
-                &mut tx,
-                NewEvent {
-                    room_id: Some(room_id),
-                    correlation_id: Some(mission_id),
-                    causation_id: Some(mission_event.id),
-                    ..NewEvent::new(
-                        corp_id,
-                        Some(requested_by),
-                        "task.created",
-                        "task",
-                        task_id,
-                        format!("task:{task_id}:created"),
-                        json!({
-                            "plan_key": task.key,
-                            "title": task.title,
-                            "assigned_agent_id": task.assigned_agent_id,
-                            "required_adapter": task.required_adapter,
-                            "depends_on": task.depends_on,
-                            "depth": task.depth,
-                            "max_attempts": task.max_attempts,
-                            "budget_tokens": task.contract.budget_tokens,
-                            "status": status
-                        }),
-                    )
-                },
-            )
-            .await?
-            .context("task created event unexpectedly existed")?;
-            events.push(event);
-        }
-
-        for task in &plan.tasks {
-            let task_id = *task_ids
-                .get(&task.key)
-                .context("planned task id unexpectedly missing")?;
-            for dependency in &task.depends_on {
-                let dependency_id = *task_ids
-                    .get(dependency)
-                    .with_context(|| format!("unknown planned dependency {dependency}"))?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO task_dependencies (task_id, depends_on_task_id)
-                    VALUES ($1, $2)
-                    "#,
-                )
-                .bind(task_id)
-                .bind(dependency_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-
-        let planned_event = append_event_tx(
-            &mut tx,
-            NewEvent {
-                room_id: Some(room_id),
-                correlation_id: Some(mission_id),
-                causation_id: Some(mission_event.id),
-                ..NewEvent::new(
-                    corp_id,
-                    Some(requested_by),
-                    "mission.planned",
-                    "mission",
-                    mission_id,
-                    format!("mission:{mission_id}:planned"),
-                    json!({
-                        "strategy": plan.strategy,
-                        "task_count": plan.tasks.len(),
-                        "task_ids": plan.tasks.iter().filter_map(|task| {
-                            task_ids.get(&task.key).copied()
-                        }).collect::<Vec<_>>()
-                    }),
-                )
-            },
-        )
-        .await?
-        .context("mission planned event unexpectedly existed")?;
-        events.push(planned_event);
+        let outcome = create_mission_tx(&mut tx, corp_id, requested_by, title, plan).await?;
         tx.commit().await?;
-
-        Ok((
-            MissionPlanIds {
-                mission_id,
-                task_ids: plan
-                    .tasks
-                    .iter()
-                    .filter_map(|task| task_ids.get(&task.key).copied())
-                    .collect(),
-            },
-            events,
-        ))
+        Ok(outcome)
     }
 
     pub async fn schedulable_mission_ids(&self, corp_id: Uuid) -> Result<Vec<Uuid>> {
@@ -2166,7 +2927,9 @@ impl PgStore {
             SELECT t.id AS task_id,
                    COALESCE(t.required_adapter, a.adapter) AS required_adapter,
                    t.contract->>'model' AS required_model,
-                   t.contract->>'reasoning_effort' AS required_reasoning_effort
+                   t.contract->>'reasoning_effort' AS required_reasoning_effort,
+                   t.contract->>'source_repository' AS required_source_repository,
+                   t.contract->>'source_base_ref' AS required_source_base_ref
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -2207,6 +2970,8 @@ impl PgStore {
                 required_adapter: row.get("required_adapter"),
                 required_model: row.get("required_model"),
                 required_reasoning_effort: row.get("required_reasoning_effort"),
+                required_source_repository: row.get("required_source_repository"),
+                required_source_base_ref: row.get("required_source_base_ref"),
             })
         })
         .collect()
@@ -2422,6 +3187,8 @@ impl PgStore {
                 mission_title: task_prompt,
                 model,
                 reasoning_effort,
+                source_repository: contract.source_repository.clone(),
+                source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -2586,6 +3353,8 @@ impl PgStore {
                 provider_session_id,
                 model,
                 reasoning_effort,
+                source_repository: contract.source_repository.clone(),
+                source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -5368,6 +6137,8 @@ fn format_task_prompt(
         "MISSION: {mission_title}\n\
          TASK: {task_title}\n\
          ATTEMPT: {attempt}\n\
+         SOURCE REPOSITORY: {}\n\
+         SOURCE BASE REF: {}\n\
          OBJECTIVE: {}\n\
          EXPECTED OUTPUT: {}\n\
          ACCEPTANCE TESTS:\n{}\n\
@@ -5382,6 +6153,14 @@ fn format_task_prompt(
          SECRET CAPABILITIES:\n{}\n\
          DEADLINE: {}\n\
          ESCALATION: {}",
+        contract
+            .source_repository
+            .as_deref()
+            .unwrap_or("runner default"),
+        contract
+            .source_base_ref
+            .as_deref()
+            .unwrap_or("runner default"),
         contract.objective,
         contract.expected_output,
         list(&contract.acceptance_tests),
@@ -5587,6 +6366,1037 @@ async fn mark_runner_runs_lost_tx(
         }
     }
     Ok(events)
+}
+
+async fn create_mission_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    requested_by: Uuid,
+    title: &str,
+    plan: &TaskGraphPlan,
+) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
+    let title = normalize_mission_title(title)?;
+
+    let room_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM rooms WHERE corp_id = $1 ORDER BY created_at LIMIT 1")
+            .bind(corp_id)
+            .fetch_one(&mut **tx)
+            .await
+            .context("corp has no room")?;
+    assert_room_membership_tx(tx, corp_id, room_id, requested_by).await?;
+
+    let mission_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO missions
+            (id, corp_id, room_id, requested_by, title, strategy,
+             max_nodes, max_depth, budget_tokens, budget_cost_microusd, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ready')
+        "#,
+    )
+    .bind(mission_id)
+    .bind(corp_id)
+    .bind(room_id)
+    .bind(requested_by)
+    .bind(&title)
+    .bind(&plan.strategy)
+    .bind(plan.max_nodes)
+    .bind(plan.max_depth)
+    .bind(plan.budget_tokens)
+    .bind(plan.budget_cost_microusd)
+    .execute(&mut **tx)
+    .await?;
+
+    let mission_event = append_event_tx(
+        tx,
+        NewEvent {
+            room_id: Some(room_id),
+            correlation_id: Some(mission_id),
+            ..NewEvent::new(
+                corp_id,
+                Some(requested_by),
+                "mission.created",
+                "mission",
+                mission_id,
+                format!("mission:{mission_id}:created"),
+                json!({
+                    "title": title,
+                    "strategy": plan.strategy,
+                    "max_nodes": plan.max_nodes,
+                    "max_depth": plan.max_depth,
+                    "budget_tokens": plan.budget_tokens,
+                    "budget_cost_microusd": plan.budget_cost_microusd,
+                    "status": "ready"
+                }),
+            )
+        },
+    )
+    .await?
+    .context("mission created event unexpectedly existed")?;
+
+    let mut task_ids = HashMap::new();
+    for task in &plan.tasks {
+        task_ids.insert(task.key.clone(), Uuid::new_v4());
+    }
+    let mut events = vec![mission_event.clone()];
+    for task in &plan.tasks {
+        let task_id = *task_ids
+            .get(&task.key)
+            .context("planned task id unexpectedly missing")?;
+        let adapter: String =
+            sqlx::query_scalar("SELECT adapter FROM agents WHERE id = $1 AND corp_id = $2")
+                .bind(task.assigned_agent_id)
+                .bind(corp_id)
+                .fetch_one(&mut **tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "planned task {} references an agent outside the Corp",
+                        task.key
+                    )
+                })?;
+        if adapter != task.required_adapter {
+            return Err(anyhow!(
+                "planned task {} requires adapter {} but assigned agent uses {adapter}",
+                task.key,
+                task.required_adapter
+            ));
+        }
+        let status = if task.depends_on.is_empty() {
+            "ready"
+        } else {
+            "pending"
+        };
+        let mut contract = task.contract.clone();
+        contract.normalize_for_adapter(&task.required_adapter);
+        sqlx::query(
+            r#"
+            INSERT INTO tasks
+                (id, mission_id, corp_id, title, objective, plan_key, contract,
+                 depth, max_attempts, attempt_count, required_adapter, status,
+                 assigned_agent_id, verification_policy, verification_status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, 'pending')
+            "#,
+        )
+        .bind(task_id)
+        .bind(mission_id)
+        .bind(corp_id)
+        .bind(&task.title)
+        .bind(&task.contract.objective)
+        .bind(&task.key)
+        .bind(serde_json::to_value(&contract)?)
+        .bind(task.depth)
+        .bind(task.max_attempts)
+        .bind(&task.required_adapter)
+        .bind(status)
+        .bind(task.assigned_agent_id)
+        .bind(serde_json::to_value(&task.verification_policy)?)
+        .execute(&mut **tx)
+        .await?;
+
+        let event = append_event_tx(
+            tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                causation_id: Some(mission_event.id),
+                ..NewEvent::new(
+                    corp_id,
+                    Some(requested_by),
+                    "task.created",
+                    "task",
+                    task_id,
+                    format!("task:{task_id}:created"),
+                    json!({
+                        "plan_key": task.key,
+                        "title": task.title,
+                        "assigned_agent_id": task.assigned_agent_id,
+                        "required_adapter": task.required_adapter,
+                        "depends_on": task.depends_on,
+                        "depth": task.depth,
+                        "max_attempts": task.max_attempts,
+                        "budget_tokens": task.contract.budget_tokens,
+                        "status": status
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("task created event unexpectedly existed")?;
+        events.push(event);
+    }
+
+    for task in &plan.tasks {
+        let task_id = *task_ids
+            .get(&task.key)
+            .context("planned task id unexpectedly missing")?;
+        for dependency in &task.depends_on {
+            let dependency_id = *task_ids
+                .get(dependency)
+                .with_context(|| format!("unknown planned dependency {dependency}"))?;
+            sqlx::query(
+                r#"
+                INSERT INTO task_dependencies (task_id, depends_on_task_id)
+                VALUES ($1, $2)
+                "#,
+            )
+            .bind(task_id)
+            .bind(dependency_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    let planned_event = append_event_tx(
+        tx,
+        NewEvent {
+            room_id: Some(room_id),
+            correlation_id: Some(mission_id),
+            causation_id: Some(mission_event.id),
+            ..NewEvent::new(
+                corp_id,
+                Some(requested_by),
+                "mission.planned",
+                "mission",
+                mission_id,
+                format!("mission:{mission_id}:planned"),
+                json!({
+                    "strategy": plan.strategy,
+                    "task_count": plan.tasks.len(),
+                    "task_ids": plan.tasks.iter().filter_map(|task| {
+                        task_ids.get(&task.key).copied()
+                    }).collect::<Vec<_>>()
+                }),
+            )
+        },
+    )
+    .await?
+    .context("mission planned event unexpectedly existed")?;
+    events.push(planned_event);
+    Ok((
+        MissionPlanIds {
+            mission_id,
+            task_ids: plan
+                .tasks
+                .iter()
+                .filter_map(|task| task_ids.get(&task.key).copied())
+                .collect(),
+        },
+        events,
+    ))
+}
+
+fn normalize_mission_title(value: &str) -> Result<String> {
+    normalize_factory_text(value, "mission title", 240)
+}
+
+fn apply_factory_source_constraints(
+    work_item: &FactoryWorkItem,
+    plan: &mut TaskGraphPlan,
+) -> Result<()> {
+    let policy = work_item
+        .policy
+        .as_object()
+        .context("factory policy snapshot must be a JSON object")?;
+    let source_repository = format!(
+        "{}/{}",
+        work_item.source_repository_owner, work_item.source_repository_name
+    );
+    let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    validate_factory_base_ref(&source_base_ref)?;
+    for task in &mut plan.tasks {
+        task.contract.source_repository = Some(source_repository.clone());
+        task.contract.source_base_ref = Some(source_base_ref.clone());
+    }
+    Ok(())
+}
+
+fn validate_factory_plan_against_policy(
+    work_item: &FactoryWorkItem,
+    plan: &TaskGraphPlan,
+) -> Result<()> {
+    let policy = work_item
+        .policy
+        .as_object()
+        .context("factory policy snapshot must be a JSON object")?;
+    if policy.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return Err(anyhow!("factory policy schema_version must be 1"));
+    }
+    if policy.get("source_of_truth").and_then(Value::as_str) != Some("github_project") {
+        return Err(anyhow!(
+            "factory policy source_of_truth must be github_project"
+        ));
+    }
+    if policy.get("auto_merge").and_then(Value::as_bool) != Some(false) {
+        return Err(anyhow!("factory policy must explicitly disable auto_merge"));
+    }
+    let repositories = factory_policy_string_array(policy, "repository_allowlist")?;
+    let source_repository = format!(
+        "{}/{}",
+        work_item.source_repository_owner, work_item.source_repository_name
+    );
+    if !repositories.contains(&source_repository) {
+        return Err(anyhow!(
+            "factory policy does not allow source repository {source_repository}"
+        ));
+    }
+    let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    if let Some(task) = plan.tasks.iter().find(|task| {
+        task.contract.source_repository.as_deref() != Some(source_repository.as_str())
+            || task.contract.source_base_ref.as_deref() != Some(source_base_ref.as_str())
+    }) {
+        return Err(anyhow!(
+            "factory task {} does not preserve the claimed repository and base ref",
+            task.key
+        ));
+    }
+    let adapters = factory_policy_string_array(policy, "adapter_allowlist")?;
+    if let Some(task) = plan
+        .tasks
+        .iter()
+        .find(|task| !adapters.contains(&task.required_adapter))
+    {
+        return Err(anyhow!(
+            "factory policy does not allow adapter {} for task {}",
+            task.required_adapter,
+            task.key
+        ));
+    }
+    let strategies = factory_policy_string_array(policy, "strategy_allowlist")?;
+    if !strategies.contains(&plan.strategy) {
+        return Err(anyhow!(
+            "factory policy does not allow strategy {}",
+            plan.strategy
+        ));
+    }
+    let allowed_model = factory_policy_optional_string(policy, "model")?;
+    match allowed_model.as_deref() {
+        Some(allowed_model) => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.model.as_deref() != Some(allowed_model))
+            {
+                return Err(anyhow!(
+                    "factory task {} must preserve policy model {allowed_model}; got {}",
+                    task.key,
+                    task.contract.model.as_deref().unwrap_or("provider default")
+                ));
+            }
+        }
+        None => {
+            if let Some(task) = plan.tasks.iter().find(|task| task.contract.model.is_some()) {
+                return Err(anyhow!(
+                    "factory policy does not allow a model override for task {}",
+                    task.key
+                ));
+            }
+        }
+    }
+    let allowed_reasoning = factory_policy_optional_string(policy, "reasoning_effort")?;
+    match allowed_reasoning.as_deref() {
+        Some(allowed_reasoning) => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.reasoning_effort.as_deref() != Some(allowed_reasoning))
+            {
+                return Err(anyhow!(
+                    "factory task {} must preserve policy reasoning effort {allowed_reasoning}; got {}",
+                    task.key,
+                    task.contract
+                        .reasoning_effort
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ));
+            }
+        }
+        None => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.reasoning_effort.is_some())
+            {
+                return Err(anyhow!(
+                    "factory policy does not allow a reasoning override for task {}",
+                    task.key
+                ));
+            }
+        }
+    }
+    let write_scope = factory_policy_string_array(policy, "write_scope")?;
+    if let Some((task, scope)) = plan.tasks.iter().find_map(|task| {
+        task.contract
+            .write_scope
+            .iter()
+            .find(|scope| !write_scope.contains(*scope))
+            .map(|scope| (task, scope))
+    }) {
+        return Err(anyhow!(
+            "factory policy does not allow write scope {scope} for task {}",
+            task.key
+        ));
+    }
+    let allowed_tools = factory_policy_string_array(policy, "allowed_tools")?;
+    if let Some((task, tool)) = plan.tasks.iter().find_map(|task| {
+        task.contract
+            .allowed_tools
+            .iter()
+            .find(|tool| !allowed_tools.contains(*tool))
+            .map(|tool| (task, tool))
+    }) {
+        return Err(anyhow!(
+            "factory policy does not allow tool {tool} for task {}",
+            task.key
+        ));
+    }
+    let required_prohibitions = factory_policy_string_array(policy, "prohibited_actions")?;
+    if let Some((task, prohibition)) = plan.tasks.iter().find_map(|task| {
+        required_prohibitions
+            .iter()
+            .find(|prohibition| !task.contract.prohibited_actions.contains(*prohibition))
+            .map(|prohibition| (task, prohibition))
+    }) {
+        return Err(anyhow!(
+            "factory task {} omits policy prohibition {prohibition}",
+            task.key
+        ));
+    }
+    let allowed_secret_ids = factory_policy_string_list(policy, "secret_ids", true)?;
+    if let Some((task, secret_id)) = plan.tasks.iter().find_map(|task| {
+        task.contract
+            .secret_refs
+            .iter()
+            .map(|secret| secret.secret_id.to_string())
+            .find(|secret_id| !allowed_secret_ids.contains(secret_id))
+            .map(|secret_id| (task, secret_id))
+    }) {
+        return Err(anyhow!(
+            "factory policy does not allow secret {secret_id} for task {}",
+            task.key
+        ));
+    }
+    if policy.get("verification_required").and_then(Value::as_bool) != Some(true)
+        || plan
+            .tasks
+            .iter()
+            .any(|task| task.verification_policy.checks.is_empty())
+    {
+        return Err(anyhow!(
+            "factory policy requires a non-empty verification policy for every task"
+        ));
+    }
+    if let Some(task) = plan.tasks.iter().find(|task| {
+        task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
+    }) {
+        return Err(anyhow!(
+            "factory task {} requires a manual verification gate for provider-backed execution",
+            task.key
+        ));
+    }
+    let budget_tokens = factory_policy_positive_i64(policy, "budget_tokens")?;
+    if plan.budget_tokens > budget_tokens {
+        return Err(anyhow!(
+            "factory plan token budget {} exceeds policy {}",
+            plan.budget_tokens,
+            budget_tokens
+        ));
+    }
+    let budget_cost_microusd = factory_policy_positive_i64(policy, "budget_cost_microusd")?;
+    if plan.budget_cost_microusd > budget_cost_microusd {
+        return Err(anyhow!(
+            "factory plan cost budget {} exceeds policy {}",
+            plan.budget_cost_microusd,
+            budget_cost_microusd
+        ));
+    }
+    Ok(())
+}
+
+fn factory_policy_string_array(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>> {
+    factory_policy_string_list(policy, key, false)
+}
+
+fn factory_policy_string_list(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+    allow_empty: bool,
+) -> Result<Vec<String>> {
+    let values = policy
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("factory policy {key} must be an array"))?;
+    if (!allow_empty && values.is_empty()) || values.len() > 64 {
+        return Err(anyhow!(
+            "factory policy {key} must contain between 1 and 64 entries"
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && value.len() <= 500)
+                .map(str::to_owned)
+                .with_context(|| format!("factory policy {key} contains an invalid entry"))
+        })
+        .collect()
+}
+
+fn factory_policy_optional_string(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>> {
+    match policy.get(key) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() && value.len() <= 128 => {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(anyhow!(
+            "factory policy {key} must be null or a non-empty string"
+        )),
+    }
+}
+
+fn factory_policy_required_string(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+    max_len: usize,
+) -> Result<String> {
+    policy
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= max_len)
+        .map(str::to_owned)
+        .with_context(|| format!("factory policy {key} must be a non-empty string"))
+}
+
+fn validate_factory_base_ref(value: &str) -> Result<()> {
+    if value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
+    {
+        return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
+    }
+    Ok(())
+}
+
+fn factory_policy_positive_i64(policy: &serde_json::Map<String, Value>, key: &str) -> Result<i64> {
+    policy
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .with_context(|| format!("factory policy {key} must be a positive integer"))
+}
+
+fn normalize_factory_source(input: FactorySourceInput) -> Result<FactorySourceInput> {
+    if input.project_number <= 0 {
+        return Err(anyhow!("factory source project number must be positive"));
+    }
+    if input.issue_number <= 0 {
+        return Err(anyhow!("factory source issue number must be positive"));
+    }
+    let project_owner =
+        normalize_github_component(&input.project_owner, "source project owner", 100)?;
+    let project_item_id =
+        normalize_factory_identifier(&input.project_item_id, "source project item id", 160)?;
+    let repository_owner =
+        normalize_github_component(&input.repository_owner, "source repository owner", 100)?;
+    let repository_name =
+        normalize_github_component(&input.repository_name, "source repository name", 100)?;
+    let issue_node_id =
+        normalize_factory_identifier(&input.issue_node_id, "source issue node id", 160)?;
+    let title = normalize_factory_text(&input.title, "source issue title", 240)?;
+    let revision = normalize_factory_text(&input.revision, "source issue revision", 160)?;
+    let issue_url = normalize_factory_text(&input.issue_url, "source issue URL", 500)?;
+    let expected_url = format!(
+        "https://github.com/{repository_owner}/{repository_name}/issues/{}",
+        input.issue_number
+    );
+    if !issue_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(&expected_url)
+    {
+        return Err(anyhow!(
+            "source issue URL must identify the declared GitHub repository and issue"
+        ));
+    }
+    Ok(FactorySourceInput {
+        project_owner,
+        project_number: input.project_number,
+        project_item_id,
+        repository_owner,
+        repository_name,
+        issue_number: input.issue_number,
+        issue_node_id,
+        issue_url: expected_url,
+        title,
+        revision,
+    })
+}
+
+fn normalize_github_component(value: &str, field: &str, max_len: usize) -> Result<String> {
+    let value = normalize_factory_text(value, field, max_len)?;
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "{field} may contain only ASCII letters, numbers, hyphen, underscore, or period"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn normalize_factory_identifier(value: &str, field: &str, max_len: usize) -> Result<String> {
+    let value = normalize_factory_text(value, field, max_len)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(anyhow!("{field} cannot contain whitespace"));
+    }
+    Ok(value)
+}
+
+fn normalize_factory_text(value: &str, field: &str, max_len: usize) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{field} cannot be empty"));
+    }
+    if value.len() > max_len {
+        return Err(anyhow!("{field} cannot exceed {max_len} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(anyhow!("{field} cannot contain control characters"));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_factory_idempotency_key(value: &str) -> Result<String> {
+    normalize_factory_identifier(value, "factory idempotency key", 240)
+}
+
+fn validate_factory_lease_seconds(value: i64) -> Result<i64> {
+    if !(30..=3_600).contains(&value) {
+        return Err(anyhow!(
+            "factory claim lease must be between 30 and 3600 seconds"
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_factory_policy(policy: Value) -> Result<Value> {
+    let policy = match policy {
+        Value::Null => json!({}),
+        Value::Object(_) => policy,
+        _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
+    };
+    if serde_json::to_vec(&policy)?.len() > 65_536 {
+        return Err(anyhow!("factory policy snapshot cannot exceed 65536 bytes"));
+    }
+    Ok(policy)
+}
+
+fn normalize_factory_operation_request(request: Value) -> Result<Value> {
+    if !request.is_object() {
+        return Err(anyhow!(
+            "factory operation request snapshot must be a JSON object"
+        ));
+    }
+    if serde_json::to_vec(&request)?.len() > 65_536 {
+        return Err(anyhow!(
+            "factory operation request snapshot cannot exceed 65536 bytes"
+        ));
+    }
+    Ok(request)
+}
+
+async fn lock_factory_keys_tx(tx: &mut Transaction<'_, Postgres>, keys: &[String]) -> Result<()> {
+    let mut keys = keys.to_vec();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn factory_operation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<FactoryOperation>> {
+    Ok(sqlx::query(
+        r#"
+        SELECT work_item_id, actor_id, operation, resulting_version, claim_token, request
+        FROM factory_operations
+        WHERE corp_id = $1 AND idempotency_key = $2
+        "#,
+    )
+    .bind(corp_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|row| FactoryOperation {
+        work_item_id: row.get("work_item_id"),
+        actor_id: row.get("actor_id"),
+        operation: row.get("operation"),
+        resulting_version: row.get("resulting_version"),
+        claim_token: row.get("claim_token"),
+        request: row.get("request"),
+    }))
+}
+
+fn ensure_factory_operation_matches(
+    operation: &FactoryOperation,
+    expected_operation: &str,
+    actor_id: Uuid,
+    work_item_id: Option<Uuid>,
+    claim_token: Option<Uuid>,
+    request: &Value,
+) -> Result<()> {
+    if operation.operation != expected_operation
+        || operation.actor_id != actor_id
+        || work_item_id.is_some_and(|expected| expected != operation.work_item_id)
+        || claim_token.is_some_and(|expected| Some(expected) != operation.claim_token)
+        || &operation.request != request
+    {
+        return Err(anyhow!(
+            "factory idempotency key was already used for a different operation"
+        ));
+    }
+    Ok(())
+}
+
+async fn record_factory_operation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: NewFactoryOperation<'_>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO factory_operations
+            (corp_id, idempotency_key, work_item_id, actor_id, operation,
+             resulting_version, claim_token, request)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(input.corp_id)
+    .bind(input.idempotency_key)
+    .bind(input.work_item_id)
+    .bind(input.actor_id)
+    .bind(input.operation)
+    .bind(input.resulting_version)
+    .bind(input.claim_token)
+    .bind(input.request)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn factory_work_item_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    for_update: bool,
+) -> Result<Option<(FactoryWorkItem, Uuid)>> {
+    let suffix = if for_update { " FOR UPDATE" } else { "" };
+    let query = format!(
+        r#"
+        SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+               source_project_item_id, source_repository_owner, source_repository_name,
+               source_issue_number, source_issue_node_id, source_issue_url, source_title,
+               source_revision, state, version, claim_owner_id, claim_token,
+               lease_expires_at, policy, mission_id, failure_detail, created_at, updated_at
+        FROM factory_work_items
+        WHERE id = $1 AND corp_id = $2{suffix}
+        "#
+    );
+    let row = sqlx::query(&query)
+        .bind(work_item_id)
+        .bind(corp_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(|row| {
+        let claim_token = row.get("claim_token");
+        Ok((map_factory_work_item(row)?, claim_token))
+    })
+    .transpose()
+}
+
+fn replayable_factory_claim_token(
+    work_item: &FactoryWorkItem,
+    current_token: Uuid,
+    operation: &FactoryOperation,
+    now: chrono::DateTime<Utc>,
+) -> Option<Uuid> {
+    let operation_token = operation.claim_token?;
+    (!factory_state_is_terminal(work_item.state)
+        && work_item.claim_owner_id == operation.actor_id
+        && work_item.version >= operation.resulting_version
+        && work_item.lease_expires_at > now
+        && current_token == operation_token)
+        .then_some(operation_token)
+}
+
+fn factory_state_is_terminal(state: FactoryWorkItemState) -> bool {
+    matches!(
+        state,
+        FactoryWorkItemState::Published
+            | FactoryWorkItemState::Failed
+            | FactoryWorkItemState::Cancelled
+    )
+}
+
+fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemState) -> bool {
+    match from {
+        FactoryWorkItemState::Claimed => matches!(
+            to,
+            FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::MissionCreated => matches!(
+            to,
+            FactoryWorkItemState::Running
+                | FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::AwaitingApproval
+                | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::Running => matches!(
+            to,
+            FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::AwaitingApproval
+                | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Verified
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::Blocked => matches!(
+            to,
+            FactoryWorkItemState::Running
+                | FactoryWorkItemState::AwaitingApproval
+                | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::AwaitingApproval => matches!(
+            to,
+            FactoryWorkItemState::Running
+                | FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Verified
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::VerificationFailed => matches!(
+            to,
+            FactoryWorkItemState::Running
+                | FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::Verified => matches!(
+            to,
+            FactoryWorkItemState::Publishing
+                | FactoryWorkItemState::Published
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::Publishing => matches!(
+            to,
+            FactoryWorkItemState::Verified
+                | FactoryWorkItemState::Published
+                | FactoryWorkItemState::Failed
+                | FactoryWorkItemState::Cancelled
+        ),
+        FactoryWorkItemState::Published
+        | FactoryWorkItemState::Failed
+        | FactoryWorkItemState::Cancelled => false,
+    }
+}
+
+fn ensure_active_factory_control(
+    work_item: &FactoryWorkItem,
+    current_token: Uuid,
+    actor_id: Uuid,
+    presented_token: Uuid,
+    expected_version: i64,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    if factory_state_is_terminal(work_item.state) {
+        return Err(anyhow!(
+            "conflict: factory work item {} is terminal in state {}",
+            work_item.id,
+            work_item.state.as_str()
+        ));
+    }
+    if work_item.claim_owner_id != actor_id || current_token != presented_token {
+        return Err(anyhow!(
+            "conflict: stale or unauthorized factory claim token"
+        ));
+    }
+    if work_item.version != expected_version {
+        return Err(anyhow!(
+            "conflict: factory work item version is {}, not {}",
+            work_item.version,
+            expected_version
+        ));
+    }
+    if work_item.lease_expires_at <= now {
+        return Err(anyhow!("conflict: factory claim lease has expired"));
+    }
+    Ok(())
+}
+
+fn ensure_materializable_factory_claim(
+    work_item: &FactoryWorkItem,
+    current_token: Uuid,
+    actor_id: Uuid,
+    presented_token: Uuid,
+    expected_version: i64,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    ensure_active_factory_control(
+        work_item,
+        current_token,
+        actor_id,
+        presented_token,
+        expected_version,
+        now,
+    )?;
+    if work_item.state != FactoryWorkItemState::Claimed || work_item.mission_id.is_some() {
+        return Err(anyhow!(
+            "conflict: factory work item {} cannot materialize from state {}",
+            work_item.id,
+            work_item.state.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_factory_source_matches(
+    work_item: &FactoryWorkItem,
+    source: &FactorySourceInput,
+) -> Result<()> {
+    if work_item.source_kind != "github_project_issue"
+        || work_item.source_project_owner != source.project_owner
+        || work_item.source_project_number != source.project_number
+        || work_item.source_project_item_id != source.project_item_id
+        || work_item.source_repository_owner != source.repository_owner
+        || work_item.source_repository_name != source.repository_name
+        || work_item.source_issue_number != source.issue_number
+        || work_item.source_issue_node_id != source.issue_node_id
+        || work_item.source_issue_url != source.issue_url
+        || work_item.source_title != source.title
+        || work_item.source_revision != source.revision
+    {
+        return Err(anyhow!(
+            "factory idempotency key was reused for a different source revision"
+        ));
+    }
+    Ok(())
+}
+
+async fn factory_mission_details_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+) -> Result<(MissionPlanIds, String)> {
+    let strategy: Option<String> =
+        sqlx::query_scalar("SELECT strategy FROM missions WHERE id = $1 AND corp_id = $2")
+            .bind(mission_id)
+            .bind(corp_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let strategy = strategy.context("factory mission linkage references a missing mission")?;
+    let task_ids = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE mission_id = $1 AND corp_id = $2 ORDER BY created_at, id",
+    )
+    .bind(mission_id)
+    .bind(corp_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if task_ids.is_empty() {
+        return Err(anyhow!("factory mission linkage has no tasks"));
+    }
+    Ok((
+        MissionPlanIds {
+            mission_id,
+            task_ids,
+        },
+        strategy,
+    ))
+}
+
+async fn factory_event_room_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    let Some(mission_id) = mission_id else {
+        return Ok(None);
+    };
+    sqlx::query_scalar("SELECT room_id FROM missions WHERE id = $1 AND corp_id = $2")
+        .bind(mission_id)
+        .bind(corp_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .with_context(|| format!("factory mission {mission_id} has no scoped room"))
+        .map(Some)
+}
+
+async fn ensure_factory_mission_verified_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+) -> Result<()> {
+    let verified: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM missions mission
+            WHERE mission.id = $1
+              AND mission.corp_id = $2
+              AND mission.status = 'completed'
+              AND EXISTS (
+                  SELECT 1 FROM tasks task
+                  WHERE task.mission_id = mission.id
+                    AND task.corp_id = mission.corp_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM tasks task
+                  WHERE task.mission_id = mission.id
+                    AND task.corp_id = mission.corp_id
+                    AND (
+                        task.status <> 'completed'
+                        OR task.verification_status <> 'passed'
+                    )
+              )
+        )
+        "#,
+    )
+    .bind(mission_id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !verified {
+        return Err(anyhow!(
+            "conflict: factory work item cannot enter verified before its mission and task verification pass"
+        ));
+    }
+    Ok(())
 }
 
 async fn assert_actor_agent_scope_tx(
@@ -5985,6 +7795,33 @@ fn map_mission(row: sqlx::postgres::PgRow) -> Result<Mission> {
     })
 }
 
+fn map_factory_work_item(row: sqlx::postgres::PgRow) -> Result<FactoryWorkItem> {
+    Ok(FactoryWorkItem {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        source_kind: row.get("source_kind"),
+        source_project_owner: row.get("source_project_owner"),
+        source_project_number: row.get("source_project_number"),
+        source_project_item_id: row.get("source_project_item_id"),
+        source_repository_owner: row.get("source_repository_owner"),
+        source_repository_name: row.get("source_repository_name"),
+        source_issue_number: row.get("source_issue_number"),
+        source_issue_node_id: row.get("source_issue_node_id"),
+        source_issue_url: row.get("source_issue_url"),
+        source_title: row.get("source_title"),
+        source_revision: row.get("source_revision"),
+        state: parse_factory_work_item_state(row.get::<String, _>("state").as_str())?,
+        version: row.get("version"),
+        claim_owner_id: row.get("claim_owner_id"),
+        lease_expires_at: row.get("lease_expires_at"),
+        policy: row.get("policy"),
+        mission_id: row.get("mission_id"),
+        failure_detail: row.get("failure_detail"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn map_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     Ok(Task {
         id: row.get("id"),
@@ -6294,6 +8131,23 @@ fn parse_run_status(value: &str) -> Result<RunStatus> {
     }
 }
 
+fn parse_factory_work_item_state(value: &str) -> Result<FactoryWorkItemState> {
+    match value {
+        "claimed" => Ok(FactoryWorkItemState::Claimed),
+        "mission_created" => Ok(FactoryWorkItemState::MissionCreated),
+        "running" => Ok(FactoryWorkItemState::Running),
+        "blocked" => Ok(FactoryWorkItemState::Blocked),
+        "awaiting_approval" => Ok(FactoryWorkItemState::AwaitingApproval),
+        "verification_failed" => Ok(FactoryWorkItemState::VerificationFailed),
+        "verified" => Ok(FactoryWorkItemState::Verified),
+        "publishing" => Ok(FactoryWorkItemState::Publishing),
+        "published" => Ok(FactoryWorkItemState::Published),
+        "failed" => Ok(FactoryWorkItemState::Failed),
+        "cancelled" => Ok(FactoryWorkItemState::Cancelled),
+        other => Err(anyhow!("unknown factory work-item state {other}")),
+    }
+}
+
 fn breaker_rank(stage: &str) -> u8 {
     match stage {
         "steer" => 1,
@@ -6462,9 +8316,19 @@ fn strongest_breaker_stage<'a>(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+    use crony_domain::{
+        FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, PlannedTask, TaskContract,
+        TaskGraphPlan, VerificationPolicy, VerifierCheck,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
     use super::{
-        breaker_blocks_runner_progress, ensure_breaker_allows_human_progress,
-        should_retry_runner_failure,
+        FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
+        ensure_breaker_allows_human_progress, factory_transition_allowed, normalize_factory_source,
+        should_retry_runner_failure, validate_factory_lease_seconds,
+        validate_factory_plan_against_policy,
     };
 
     #[test]
@@ -6516,5 +8380,243 @@ mod tests {
         assert!(should_retry_runner_failure("healthy", 1, 3));
         assert!(!should_retry_runner_failure("healthy", 3, 3));
         assert!(ensure_breaker_allows_human_progress("constrain", "decision").is_ok());
+    }
+
+    fn factory_work_item(lease_expires_at: chrono::DateTime<Utc>) -> (FactoryWorkItem, Uuid) {
+        let corp_id = Uuid::new_v4();
+        let actor_id = Uuid::new_v4();
+        let token = Uuid::new_v4();
+        (
+            FactoryWorkItem {
+                id: Uuid::new_v4(),
+                corp_id,
+                source_kind: "github_project_issue".to_owned(),
+                source_project_owner: "owner".to_owned(),
+                source_project_number: 3,
+                source_project_item_id: "PVTI_test".to_owned(),
+                source_repository_owner: "owner".to_owned(),
+                source_repository_name: "repo".to_owned(),
+                source_issue_number: 59,
+                source_issue_node_id: "I_test".to_owned(),
+                source_issue_url: "https://github.com/owner/repo/issues/59".to_owned(),
+                source_title: "Factory claim".to_owned(),
+                source_revision: "2026-09-01T00:00:00Z".to_owned(),
+                state: FactoryWorkItemState::Claimed,
+                version: 2,
+                claim_owner_id: actor_id,
+                lease_expires_at,
+                policy: json!({}),
+                mission_id: None,
+                failure_detail: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            token,
+        )
+    }
+
+    fn factory_policy_plan(
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> (FactoryWorkItem, TaskGraphPlan) {
+        let (mut work_item, _) = factory_work_item(Utc::now() + Duration::minutes(5));
+        work_item.policy = json!({
+            "schema_version": 1,
+            "source_of_truth": "github_project",
+            "auto_merge": false,
+            "repository_allowlist": ["owner/repo"],
+            "source_base_ref": "HEAD",
+            "adapter_allowlist": ["codex"],
+            "strategy_allowlist": ["single"],
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "write_scope": ["src/**"],
+            "allowed_tools": ["filesystem"],
+            "prohibited_actions": ["merge requires separate authorization"],
+            "secret_ids": [],
+            "verification_required": true,
+            "budget_tokens": 1_000,
+            "budget_cost_microusd": 1_000_000
+        });
+        let plan = TaskGraphPlan {
+            strategy: "single".to_owned(),
+            max_nodes: 1,
+            max_depth: 0,
+            budget_tokens: 1_000,
+            budget_cost_microusd: 1_000_000,
+            tasks: vec![PlannedTask {
+                key: "deliver".to_owned(),
+                title: "Deliver".to_owned(),
+                contract: TaskContract {
+                    objective: "Deliver the issue".to_owned(),
+                    expected_output: "A verified change".to_owned(),
+                    source_repository: Some("owner/repo".to_owned()),
+                    source_base_ref: Some("HEAD".to_owned()),
+                    acceptance_tests: vec!["tests pass".to_owned()],
+                    allowed_tools: vec!["filesystem".to_owned()],
+                    prohibited_actions: vec!["merge requires separate authorization".to_owned()],
+                    references: Vec::new(),
+                    write_scope: vec!["src/**".to_owned()],
+                    budget_tokens: 1_000,
+                    budget_cost_microusd: 1_000_000,
+                    deadline_at: None,
+                    escalation: "ask the operator".to_owned(),
+                    secret_refs: Vec::new(),
+                    model: model.map(str::to_owned),
+                    reasoning_effort: reasoning_effort.map(str::to_owned),
+                },
+                assigned_agent_id: Uuid::new_v4(),
+                required_adapter: "codex".to_owned(),
+                depends_on: Vec::new(),
+                depth: 0,
+                max_attempts: 1,
+                verification_policy: VerificationPolicy {
+                    checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+                    manual_gate: Some(ManualVerificationGate::IndependentReview {
+                        roles: vec!["member".to_owned()],
+                        exclude_requester: true,
+                    }),
+                },
+            }],
+        };
+        (work_item, plan)
+    }
+
+    #[test]
+    fn factory_claims_reject_expired_tokens_and_stale_versions() {
+        let now = Utc::now();
+        let (expired, token) = factory_work_item(now - Duration::seconds(1));
+        assert!(
+            ensure_active_factory_control(
+                &expired,
+                token,
+                expired.claim_owner_id,
+                token,
+                expired.version,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expired")
+        );
+
+        let (active, token) = factory_work_item(now + Duration::minutes(5));
+        assert!(
+            ensure_active_factory_control(
+                &active,
+                token,
+                active.claim_owner_id,
+                token,
+                active.version - 1,
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("version")
+        );
+    }
+
+    #[test]
+    fn factory_source_and_lease_validation_are_bounded() {
+        let source = normalize_factory_source(FactorySourceInput {
+            project_owner: " OwNeR ".to_owned(),
+            project_number: 3,
+            project_item_id: "PVTI_test".to_owned(),
+            repository_owner: "OWNER".to_owned(),
+            repository_name: "RePo".to_owned(),
+            issue_number: 59,
+            issue_node_id: "I_test".to_owned(),
+            issue_url: "https://github.com/OWNER/RePo/issues/59/".to_owned(),
+            title: " Factory claim ".to_owned(),
+            revision: "2026-09-01T00:00:00Z".to_owned(),
+        })
+        .expect("valid source");
+        assert_eq!(source.project_owner, "owner");
+        assert_eq!(source.repository_owner, "owner");
+        assert_eq!(source.repository_name, "repo");
+        assert_eq!(source.issue_url, "https://github.com/owner/repo/issues/59");
+        assert_eq!(source.title, "Factory claim");
+        assert!(validate_factory_lease_seconds(29).is_err());
+        assert!(validate_factory_lease_seconds(30).is_ok());
+        assert!(validate_factory_lease_seconds(3_600).is_ok());
+        assert!(validate_factory_lease_seconds(3_601).is_err());
+    }
+
+    #[test]
+    fn factory_policy_requires_every_task_to_retain_pinned_provider_settings() {
+        let (work_item, plan) = factory_policy_plan(Some("gpt-5.6-sol"), Some("high"));
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("matching provider settings should pass");
+
+        let mut missing_model = plan.clone();
+        missing_model.tasks[0].contract.model = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_model)
+                .unwrap_err()
+                .to_string()
+                .contains("must preserve policy model")
+        );
+
+        let mut missing_reasoning = plan;
+        missing_reasoning.tasks[0].contract.reasoning_effort = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_reasoning)
+                .unwrap_err()
+                .to_string()
+                .contains("must preserve policy reasoning effort")
+        );
+
+        let (_, mut missing_gate) = factory_policy_plan(Some("gpt-5.6-sol"), Some("high"));
+        missing_gate.tasks[0].verification_policy.manual_gate = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_gate)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a manual verification gate")
+        );
+    }
+
+    #[test]
+    fn factory_state_transitions_do_not_skip_governance_stages() {
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::Running,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Running,
+            FactoryWorkItemState::Verified,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::AwaitingApproval,
+            FactoryWorkItemState::Blocked,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::VerificationFailed,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::AwaitingApproval,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Blocked,
+            FactoryWorkItemState::VerificationFailed,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Blocked,
+            FactoryWorkItemState::AwaitingApproval,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Verified,
+            FactoryWorkItemState::Publishing,
+        ));
+        assert!(!factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::Published,
+        ));
+        assert!(!factory_transition_allowed(
+            FactoryWorkItemState::Published,
+            FactoryWorkItemState::Running,
+        ));
     }
 }

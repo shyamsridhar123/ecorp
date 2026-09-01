@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use tokio::{process::Command, sync::Mutex};
+use url::Url;
 use uuid::Uuid;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,6 +18,7 @@ pub struct WorkspaceManager {
     root: PathBuf,
     worktrees_root: PathBuf,
     repository: PathBuf,
+    repository_identity: Option<String>,
     base_ref: String,
     git_lock: Arc<Mutex<()>>,
 }
@@ -65,10 +67,11 @@ impl WorkspaceManager {
         let repository = canonicalize_path(&repository)
             .await
             .with_context(|| format!("resolve source repository {}", repository.display()))?;
-        let manager = Self {
+        let mut manager = Self {
             root,
             worktrees_root,
             repository,
+            repository_identity: None,
             base_ref,
             git_lock: Arc::new(Mutex::new(())),
         };
@@ -77,6 +80,14 @@ impl WorkspaceManager {
             .await
             .context("configured source path is not a Git repository")?;
         manager.resolve_base_commit().await?;
+        manager.repository_identity = manager
+            .git_text(
+                &manager.repository,
+                &["config", "--get", "remote.origin.url"],
+            )
+            .await
+            .ok()
+            .and_then(|remote| parse_github_repository_identity(&remote));
         Ok(manager)
     }
 
@@ -86,6 +97,10 @@ impl WorkspaceManager {
 
     pub fn repository(&self) -> &Path {
         &self.repository
+    }
+
+    pub fn repository_identity(&self) -> Option<&str> {
+        self.repository_identity.as_deref()
     }
 
     pub fn base_ref(&self) -> &str {
@@ -500,6 +515,36 @@ impl WorkspaceManager {
     }
 }
 
+fn parse_github_repository_identity(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path.to_owned()
+    } else {
+        let url = Url::parse(remote).ok()?;
+        if !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        {
+            return None;
+        }
+        url.path().trim_start_matches('/').to_owned()
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some()
+        || owner.is_empty()
+        || repository.is_empty()
+        || !owner.chars().chain(repository.chars()).all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
+}
+
 fn branch_name(task_id: Uuid, workspace_run_id: Uuid) -> String {
     format!(
         "crony/task-{}/run-{}",
@@ -866,6 +911,24 @@ mod tests {
         );
         assert!(!repository.join("not-a-worktree.txt").exists());
         cleanup_fixture(&root, &repository);
+    }
+
+    #[test]
+    fn github_remote_urls_normalize_to_repository_identity() {
+        for remote in [
+            "https://github.com/shyamsridhar123/ecorp.git",
+            "ssh://git@github.com/shyamsridhar123/ecorp.git",
+            "git@github.com:shyamsridhar123/ecorp.git",
+        ] {
+            assert_eq!(
+                parse_github_repository_identity(remote).as_deref(),
+                Some("shyamsridhar123/ecorp")
+            );
+        }
+        assert_eq!(
+            parse_github_repository_identity("https://example.com/acme/repo.git"),
+            None
+        );
     }
 
     #[test]
