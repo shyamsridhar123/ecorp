@@ -7195,6 +7195,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
         FactoryWorkItemState::AwaitingApproval => matches!(
             to,
             FactoryWorkItemState::Running
+                | FactoryWorkItemState::Blocked
                 | FactoryWorkItemState::VerificationFailed
                 | FactoryWorkItemState::Verified
                 | FactoryWorkItemState::Failed
@@ -8570,6 +8571,10 @@ mod tests {
         assert!(factory_transition_allowed(
             FactoryWorkItemState::Running,
             FactoryWorkItemState::Verified,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::AwaitingApproval,
+            FactoryWorkItemState::Blocked,
         ));
         assert!(factory_transition_allowed(
             FactoryWorkItemState::Verified,
