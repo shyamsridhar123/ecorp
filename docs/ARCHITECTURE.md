@@ -375,6 +375,8 @@ The claim token is a capability: it is returned only in the direct authorized re
 omitted from shared snapshots and immutable events.
 Every reclaim preserves and revalidates the original source and policy snapshots; only ownership,
 fencing, lease, and recoverable lifecycle fields can change.
+GitHub owner and repository identities are normalized to lowercase before locking and uniqueness
+checks, preventing case variants from creating duplicate work items.
 
 Mission and task creation is atomic with the `claimed -> mission_created` transition. A controller
 that loses its response or restarts can replay the same operation and recover the existing mission;
@@ -383,6 +385,7 @@ it cannot create a duplicate graph.
 The same fenced controller advances explicit `running`, `blocked`, and `verified` states. External
 status failure is persisted before the controller returns an error, and retry reclaims an expired
 non-terminal lease without changing the original source revision or policy snapshot.
+Execution failures and evidence-verification failures remain distinct factory states.
 Materialization may only narrow the persisted repository, adapter, write-scope, token, and cost
 policy. The server derives `verified` authority from a completed mission whose tasks all passed
 verification; a controller cannot assert it directly.

@@ -52,6 +52,8 @@ issue-to-mission link. The trusted CLI invokes GitHub CLI without putting its cr
 argument, log, mission contract, or agent environment.
 Expired reclaims must exactly match the original source and policy snapshots and cannot widen
 permissions or replace the claimed revision before materialization.
+GitHub owner and repository names are canonicalized before advisory locking and database lookup so
+case variants cannot bypass the one-work-item-per-Project-item boundary.
 
 The persisted factory policy is enforced again during mission materialization. A later request
 cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
@@ -59,6 +61,7 @@ prohibitions, write scope, token budget, or cost budget. Factory `verified` stat
 authoritative completed mission and passing task-verification records.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
+Verifier rejection is persisted as `verification_failed`, not collapsed into an execution failure.
 Publication states cannot be asserted through the generic factory transition endpoint.
 
 Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
@@ -70,6 +73,8 @@ After each renewal they re-fetch and compare the Project item, issue revision, s
 label, and dependency eligibility. A changed or newly blocked source is durably blocked before the
 next effect. Factory tasks carry the claimed repository and base ref, and the scheduler accepts only
 a runner advertising the same normalized checkout.
+External CLI failure details are collapsed to bounded single-line text before persistence so
+multi-line stderr cannot bypass the durable blocked transition.
 
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state

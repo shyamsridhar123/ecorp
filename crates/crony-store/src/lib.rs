@@ -6914,7 +6914,10 @@ fn normalize_factory_source(input: FactorySourceInput) -> Result<FactorySourceIn
         "https://github.com/{repository_owner}/{repository_name}/issues/{}",
         input.issue_number
     );
-    if issue_url.trim_end_matches('/') != expected_url {
+    if !issue_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(&expected_url)
+    {
         return Err(anyhow!(
             "source issue URL must identify the declared GitHub repository and issue"
         ));
@@ -6943,7 +6946,7 @@ fn normalize_github_component(value: &str, field: &str, max_len: usize) -> Resul
             "{field} may contain only ASCII letters, numbers, hyphen, underscore, or period"
         ));
     }
-    Ok(value)
+    Ok(value.to_ascii_lowercase())
 }
 
 fn normalize_factory_identifier(value: &str, field: &str, max_len: usize) -> Result<String> {
@@ -7158,6 +7161,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
             to,
             FactoryWorkItemState::Running
                 | FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::VerificationFailed
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
         ),
@@ -7173,6 +7177,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
         FactoryWorkItemState::Blocked => matches!(
             to,
             FactoryWorkItemState::Running
+                | FactoryWorkItemState::VerificationFailed
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
         ),
@@ -8501,19 +8506,22 @@ mod tests {
     #[test]
     fn factory_source_and_lease_validation_are_bounded() {
         let source = normalize_factory_source(FactorySourceInput {
-            project_owner: " owner ".to_owned(),
+            project_owner: " OwNeR ".to_owned(),
             project_number: 3,
             project_item_id: "PVTI_test".to_owned(),
-            repository_owner: "owner".to_owned(),
-            repository_name: "repo".to_owned(),
+            repository_owner: "OWNER".to_owned(),
+            repository_name: "RePo".to_owned(),
             issue_number: 59,
             issue_node_id: "I_test".to_owned(),
-            issue_url: "https://github.com/owner/repo/issues/59/".to_owned(),
+            issue_url: "https://github.com/OWNER/RePo/issues/59/".to_owned(),
             title: " Factory claim ".to_owned(),
             revision: "2026-09-01T00:00:00Z".to_owned(),
         })
         .expect("valid source");
         assert_eq!(source.project_owner, "owner");
+        assert_eq!(source.repository_owner, "owner");
+        assert_eq!(source.repository_name, "repo");
+        assert_eq!(source.issue_url, "https://github.com/owner/repo/issues/59");
         assert_eq!(source.title, "Factory claim");
         assert!(validate_factory_lease_seconds(29).is_err());
         assert!(validate_factory_lease_seconds(30).is_ok());
@@ -8559,6 +8567,14 @@ mod tests {
         assert!(factory_transition_allowed(
             FactoryWorkItemState::AwaitingApproval,
             FactoryWorkItemState::Blocked,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::VerificationFailed,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Blocked,
+            FactoryWorkItemState::VerificationFailed,
         ));
         assert!(factory_transition_allowed(
             FactoryWorkItemState::Verified,

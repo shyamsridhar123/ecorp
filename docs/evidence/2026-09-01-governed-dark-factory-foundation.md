@@ -29,11 +29,12 @@ real child-process stack.
 
 Latest result:
 
-- work item `3ee7fa4e-a1cc-48af-b978-fde73da4874a`
-- mission `fea261e9-26ad-46af-8a35-2a41587ee00b`
-- task `0095a564-6b72-4df9-89c1-5da1e52038b0`
-- run `30f94cc8-2272-453b-b92d-317885aa7559`
+- work item `ac54a2fb-59ae-4d3f-96f1-7ee02752a71a`
+- mission `ecc2b006-26d4-4cf5-817b-8007578f712f`
+- task `2a51b8fd-cbaf-4aa1-bbcb-93edbfc90931`
+- run `d8ca9560-48c2-485e-b0c6-1c13e8bb6acd`
 - concurrent claim, renewal, and materialization requests collapsed to one effect
+- mixed-case GitHub owner and repository identities resolved to the same canonical work item
 - the server restarted between claim and renewal
 - guest and cross-Corp claims were rejected
 - stale versions, stale tokens, and an invalid verified-to-running regression were rejected
@@ -70,14 +71,15 @@ journal.
 Successful issue:
 
 - Project item `PVTI_FAKE_FACTORY_9001`
-- work item `d7e8cf79-595d-4c32-9623-a84850c83ba6`
-- mission `0c7ed378-e0c6-4fa0-ad5b-51b9f7925b55`
-- run `f977b064-ed00-4334-b8b4-aafd7057817c`
+- work item `d9da200e-51cd-4e4b-be58-340ea240b6a7`
+- mission `15ea9a0a-d6c3-46bf-96c1-754b19bb04cf`
+- run `72bf5849-d61d-4481-aa04-eb6f3b11da41`
 - dry run changed neither ECorp nor GitHub state
 - Project status changed from `Todo` to `In Progress` only after mission linkage
 - replay recovered the same work item, mission, and run
 - controller lease was renewed before the GitHub status effect and revalidated again before launch
 - the task persisted `shyamsridhar123/ecorp @ HEAD`, matching the runner's advertised checkout
+- mixed-case repository input was canonicalized through claim, materialization, and runner routing
 - final factory state was `verified`
 - the next unqualified controller pass selected Todo issue `9003` instead of repeatedly selecting
   the already-verified item
@@ -85,33 +87,42 @@ Successful issue:
 Injected GitHub Project failure:
 
 - Project item `PVTI_FAKE_FACTORY_9002`
-- work item `1f5e33c7-279a-436b-b268-1fc0120b3957`
-- mission `c01730b7-3c56-4c97-b3dc-b6766ab5e8c8`
-- run `7af916cb-4181-4589-8729-b69df6a024fb`
+- work item `08fef744-f6d2-463b-96b0-e3b4f76f01ab`
+- mission `e59f9604-56c4-4e53-acd7-6a7576467768`
+- run `2ed35a16-c8c2-4244-9cf0-2200d8a060ee`
 - the failed status update persisted a `blocked` factory state and failure detail
+- multi-line GitHub CLI stderr was normalized to bounded single-line failure text
 - no run launched before the external status effect succeeded
 - retry reused the existing mission, moved the Project item to `In Progress`, launched one run,
   and reached `verified`
 
 Terminal mission failure:
 
-- work item `f3c3c4c9-4333-4a53-b783-36ac3c31ecde`
-- mission `160efe81-3839-4350-a509-a888f038d04c`
+- work item `2ee7963c-76bc-47bb-b620-e6bf95394b86`
+- mission `57e2dfe0-fed2-4a72-bb19-8f29ad64ffe6`
 - the mission exhausted its bounded retries and ended `failed`
 - the next controller pass persisted factory state `failed` and returned an error rather than
-  reporting a healthy running factory item
+reporting a healthy running factory item
+
+Verification failure:
+
+- work item `0dceb43f-9bf9-4782-a299-a2aea6918ac4`
+- mission `ad162241-aa4a-411c-b49f-b2405b598809`
+- run `4b62ac1d-6749-4c3f-8be9-0f5d9eeab10b`
+- the mission ended `failed` because its verifier rejected evidence
+- the task and factory work item remained explicitly `verification_failed`
 
 Repository routing rejection:
 
-- work item `ef22d2d8-9ee8-43c0-afb4-9ac90723e48e`
-- mission `c82fcc3b-adf4-41ec-bb7c-4bb379344771`
+- work item `03dc2057-7ae5-40d3-8460-ae7e69558f53`
+- mission `0b504f3d-21f2-43d7-9f2a-96b92a753ef1`
 - required checkout `acme/widget @ HEAD`
 - the connected ECorp runner was rejected before a run was created
 - the factory work item durably entered `blocked`
 
 Source changed before Project mutation:
 
-- work item `41b53d57-d602-4110-88a3-b375b9622e40`
+- work item `c7de21da-5798-4175-b137-3a82d61f002a`
 - the issue revision changed and `factory:ready` was removed after mission materialization
 - the controller durably entered `blocked`
 - the Project item remained `Todo`
@@ -119,7 +130,7 @@ Source changed before Project mutation:
 
 Dependency reopened before launch:
 
-- work item `ca66e3bc-62fe-4d5a-8e90-a657860eba83`
+- work item `620c4c1c-c0c5-446b-9097-e2b449a24727`
 - dependency issue `#9009` reopened after the Project item reached `In Progress`
 - the controller re-evaluated dependency eligibility, durably entered `blocked`, and created no run
 
@@ -159,6 +170,11 @@ mission launch; a change is persisted as `blocked` before any later effect.
 A third review found that an expired pre-materialization reclaim could replace the original source
 and policy snapshots. Reclaims now require exact snapshot equality and update only ownership,
 fencing, lease, state, and failure detail.
+
+A fourth review found that case variants could bypass source uniqueness and that verifier failures
+were collapsed into execution failures. GitHub identities are now canonicalized before locking and
+lookup, and the controller derives `verification_failed` from authoritative task verification
+state.
 
 ## Browser evidence
 

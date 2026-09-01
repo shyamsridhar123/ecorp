@@ -194,7 +194,8 @@ impl EvaluatedItem {
     }
 }
 
-pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Value> {
+pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
+    normalize_args(&mut args)?;
     validate_args(&args)?;
     let snapshot = server_json(
         client,
@@ -522,29 +523,42 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
     };
     let mission_status = launch.get("mission_status").and_then(Value::as_str);
     if matches!(mission_status, Some("failed" | "cancelled")) {
-        let terminal_state = mission_status.expect("matched terminal mission state");
-        let failure_detail = (terminal_state == "failed").then(|| {
-            launch
-                .get("run_summary")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("Factory mission {mission_id} failed"))
-        });
-        let transitioned = transition_factory_state(
-            client,
-            server,
-            &args,
-            work_item_id,
-            control_token,
-            work_item_version,
-            terminal_state,
-            failure_detail,
-            &stable_prefix,
-        )
-        .await?;
-        work_item_state = transitioned.0;
+        let mission_terminal_state = mission_status.expect("matched terminal mission state");
+        let terminal_state = if mission_terminal_state == "failed"
+            && launch
+                .get("verification_failed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            "verification_failed"
+        } else {
+            mission_terminal_state
+        };
+        let failure_detail =
+            matches!(terminal_state, "failed" | "verification_failed").then(|| {
+                launch
+                    .get("run_summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Factory mission {mission_id} failed"))
+            });
+        if work_item_state != terminal_state {
+            let transitioned = transition_factory_state(
+                client,
+                server,
+                &args,
+                work_item_id,
+                control_token,
+                work_item_version,
+                terminal_state,
+                failure_detail,
+                &stable_prefix,
+            )
+            .await?;
+            work_item_state = transitioned.0;
+        }
         bail!(
-            "factory mission {mission_id} ended as {terminal_state}; factory work item is {}",
+            "factory mission {mission_id} ended as {mission_terminal_state}; factory work item is {}",
             work_item_state
         );
     }
@@ -630,6 +644,44 @@ fn validate_args(args: &FactoryArgs) -> Result<()> {
         bail!("factory write scope is invalid");
     }
     Ok(())
+}
+
+fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
+    args.owner = normalize_github_component(&args.owner, "GitHub Project owner")?;
+    let repository = args.repository.trim();
+    let (repository_owner, repository_name) = repository_parts(repository)?;
+    args.repository = format!(
+        "{}/{}",
+        normalize_github_component(repository_owner, "repository owner")?,
+        normalize_github_component(repository_name, "repository name")?
+    );
+    args.source_base_ref = args.source_base_ref.trim().to_owned();
+    args.adapter = args.adapter.trim().to_owned();
+    args.strategy = args.strategy.trim().to_owned();
+    args.allowed_adapters = args
+        .allowed_adapters
+        .iter()
+        .map(|adapter| adapter.trim().to_owned())
+        .collect();
+    args.write_scope = args
+        .write_scope
+        .iter()
+        .map(|scope| scope.trim().to_owned())
+        .collect();
+    Ok(())
+}
+
+fn normalize_github_component(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 100
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        bail!("{field} is invalid");
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn validate_source_base_ref(value: &str) -> Result<()> {
@@ -739,7 +791,10 @@ fn evaluate_items(
     let now = Utc::now();
     for item in items {
         if item.content.kind != "Issue"
-            || item.content.repository != args.repository
+            || !item
+                .content
+                .repository
+                .eq_ignore_ascii_case(&args.repository)
             || (args.issue.is_none() && !matches!(item.status.as_str(), "Todo" | "In Progress"))
             || args
                 .issue
@@ -866,6 +921,13 @@ fn refresh_selected(
     selected: &EvaluatedItem,
 ) -> Result<EvaluatedItem> {
     let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
+    if project.items.len() < project.total_count {
+        bail!(
+            "GitHub Project returned {} of {} items while refreshing the selected issue",
+            project.items.len(),
+            project.total_count
+        );
+    }
     let item = project
         .items
         .into_iter()
@@ -911,7 +973,11 @@ fn revalidate_selected_for_effect(
             item.content.kind
         ));
     }
-    if item.content.repository != args.repository {
+    if !item
+        .content
+        .repository
+        .eq_ignore_ascii_case(&args.repository)
+    {
         reasons.push(format!(
             "Project item repository is {}, not {}",
             item.content.repository, args.repository
@@ -1158,7 +1224,7 @@ async fn transition_factory_state(
     failure_detail: Option<String>,
     stable_prefix: &str,
 ) -> Result<(String, i64)> {
-    let failure_detail = failure_detail.map(|detail| truncate_utf8(&detail, 2_000));
+    let failure_detail = failure_detail.map(|detail| sanitize_failure_detail(&detail));
     let response = server_json(
         client,
         Method::POST,
@@ -1200,27 +1266,8 @@ async fn launch_or_recover(
         None,
     )
     .await?;
-    let mission_status = snapshot
-        .pointer("/snapshot/missions")
-        .and_then(Value::as_array)
-        .and_then(|missions| {
-            missions.iter().find(|mission| {
-                mission.get("id").and_then(Value::as_str) == Some(&mission_id.to_string())
-            })
-        })
-        .and_then(|mission| mission.get("status"))
-        .and_then(Value::as_str)
-        .context("factory mission is absent from the authorized snapshot")?;
-    let task_ids = snapshot
-        .pointer("/snapshot/tasks")
-        .and_then(Value::as_array)
-        .context("ECorp snapshot omitted tasks")?
-        .iter()
-        .filter(|task| {
-            task.get("mission_id").and_then(Value::as_str) == Some(&mission_id.to_string())
-        })
-        .filter_map(|task| task.get("id").and_then(Value::as_str))
-        .collect::<HashSet<_>>();
+    let (mission_status, task_ids, verification_failed) =
+        factory_mission_snapshot(&snapshot, mission_id)?;
     let existing_runs = snapshot
         .pointer("/snapshot/runs")
         .and_then(Value::as_array)
@@ -1236,6 +1283,7 @@ async fn launch_or_recover(
         return Ok(json!({
             "recovered": true,
             "mission_status": mission_status,
+            "verification_failed": verification_failed,
             "run_summary": existing_runs
                 .first()
                 .and_then(|run| run.get("summary"))
@@ -1278,7 +1326,9 @@ async fn launch_or_recover(
             None,
         )
         .await?;
-        let run_ids = refreshed
+        let (mission_status, task_ids, verification_failed) =
+            factory_mission_snapshot(&refreshed, mission_id)?;
+        let existing_runs = refreshed
             .pointer("/snapshot/runs")
             .and_then(Value::as_array)
             .context("ECorp snapshot omitted runs after launch conflict")?
@@ -1288,13 +1338,61 @@ async fn launch_or_recover(
                     .and_then(Value::as_str)
                     .is_some_and(|task_id| task_ids.contains(task_id))
             })
-            .filter_map(|run| run.get("id").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        if !run_ids.is_empty() {
-            return Ok(json!({"recovered": true, "run_ids": run_ids}));
+        if !existing_runs.is_empty() {
+            return Ok(json!({
+                "recovered": true,
+                "mission_status": mission_status,
+                "verification_failed": verification_failed,
+                "run_summary": existing_runs
+                    .first()
+                    .and_then(|run| run.get("summary"))
+                    .and_then(Value::as_str),
+                "run_ids": existing_runs
+                    .iter()
+                    .filter_map(|run| run.get("id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+            }));
         }
     }
     bail!("factory mission launch failed with {status}: {body}")
+}
+
+fn factory_mission_snapshot(
+    snapshot: &Value,
+    mission_id: Uuid,
+) -> Result<(String, HashSet<String>, bool)> {
+    let mission_id = mission_id.to_string();
+    let mission_status = snapshot
+        .pointer("/snapshot/missions")
+        .and_then(Value::as_array)
+        .and_then(|missions| {
+            missions.iter().find(|mission| {
+                mission.get("id").and_then(Value::as_str) == Some(mission_id.as_str())
+            })
+        })
+        .and_then(|mission| mission.get("status"))
+        .and_then(Value::as_str)
+        .context("factory mission is absent from the authorized snapshot")?
+        .to_owned();
+    let tasks = snapshot
+        .pointer("/snapshot/tasks")
+        .and_then(Value::as_array)
+        .context("ECorp snapshot omitted tasks")?;
+    let mission_tasks = tasks
+        .iter()
+        .filter(|task| task.get("mission_id").and_then(Value::as_str) == Some(mission_id.as_str()))
+        .collect::<Vec<_>>();
+    let task_ids = mission_tasks
+        .iter()
+        .filter_map(|task| task.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let verification_failed = mission_tasks.iter().any(|task| {
+        task.get("verification_status").and_then(Value::as_str) == Some("failed")
+            || task.get("status").and_then(Value::as_str) == Some("verification_failed")
+    });
+    Ok((mission_status, task_ids, verification_failed))
 }
 
 fn blocked_dependency_numbers(body: &str) -> Vec<i64> {
@@ -1302,8 +1400,8 @@ fn blocked_dependency_numbers(body: &str) -> Vec<i64> {
     let mut dependencies = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            in_dependencies = heading.trim().eq_ignore_ascii_case("Dependencies");
+        if let Some((level, heading)) = markdown_heading(trimmed) {
+            in_dependencies = level == 2 && heading.trim().eq_ignore_ascii_case("Dependencies");
             continue;
         }
         if !in_dependencies {
@@ -1325,7 +1423,10 @@ fn blocked_dependency_numbers(body: &str) -> Vec<i64> {
             .min()
             .unwrap_or(clause.len());
             dependencies.extend(issue_numbers(&clause[..end]));
-        } else if trimmed.starts_with("- [ ]") && trimmed.contains('#') {
+        } else if trimmed.starts_with("- [ ]")
+            && trimmed.contains('#')
+            && (lower.contains("blocked") || lower.contains("must"))
+        {
             dependencies.extend(issue_numbers(trimmed));
         }
     }
@@ -1339,8 +1440,9 @@ fn acceptance_tests(body: &str) -> Vec<String> {
     let mut tests = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            in_acceptance = heading.trim().eq_ignore_ascii_case("Acceptance criteria");
+        if let Some((level, heading)) = markdown_heading(trimmed) {
+            in_acceptance =
+                level == 2 && heading.trim().eq_ignore_ascii_case("Acceptance criteria");
             continue;
         }
         if !in_acceptance {
@@ -1383,6 +1485,14 @@ fn issue_numbers(line: &str) -> Vec<i64> {
     numbers
 }
 
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.bytes().take_while(|byte| *byte == b'#').count();
+    if level == 0 || line.as_bytes().get(level) != Some(&b' ') {
+        return None;
+    }
+    Some((level, &line[level + 1..]))
+}
+
 fn bounded_title(number: i64, title: &str) -> String {
     truncate_utf8(&format!("GitHub #{number}: {}", title.trim()), 240)
 }
@@ -1413,6 +1523,26 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+fn sanitize_failure_detail(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = if collapsed.is_empty() {
+        "factory operation failed"
+    } else {
+        collapsed.as_str()
+    };
+    truncate_utf8(collapsed, 2_000)
 }
 
 fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
@@ -1447,11 +1577,12 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .output()
         .with_context(|| format!("run {} {}", github_cli.display(), args.join(" ")))?;
     if !output.status.success() {
+        let detail = sanitize_failure_detail(&String::from_utf8_lossy(&output.stderr));
         bail!(
             "{} {} failed: {}",
             github_cli.display(),
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            detail
         );
     }
     Ok(output.stdout)
@@ -1539,7 +1670,8 @@ mod tests {
 
     use super::{
         ExistingFactoryItem, acceptance_tests, blocked_dependency_numbers,
-        factory_item_recoverable_by, issue_numbers, truncate_utf8,
+        factory_item_recoverable_by, issue_numbers, normalize_github_component,
+        sanitize_failure_detail, truncate_utf8,
     };
 
     #[test]
@@ -1550,6 +1682,11 @@ mod tests {
 Blocked by #59 and #53.
 Aligned with #48 and #52.
 - [ ] #61 must land.
+- [ ] Aligned with #62.
+
+### Notes
+
+Blocked by #77.
 
 ## Notes
 
@@ -1567,6 +1704,10 @@ Blocked by #999 outside the section.
 - [ ] first outcome
 - [x] already proven
 
+### Notes
+
+- [ ] not an acceptance item
+
 ## Boundaries
 
 - [ ] not an acceptance item
@@ -1581,6 +1722,18 @@ Blocked by #999 outside the section.
     fn utf8_truncation_never_splits_a_character() {
         assert_eq!(truncate_utf8("ab🙂cd", 5), "ab");
         assert_eq!(truncate_utf8("ab🙂cd", 6), "ab🙂");
+    }
+
+    #[test]
+    fn github_identity_and_failure_details_are_canonical_and_single_line() {
+        assert_eq!(
+            normalize_github_component(" ShYaM.Repo ", "repository").unwrap(),
+            "shyam.repo"
+        );
+        assert_eq!(
+            sanitize_failure_detail("GitHub failed:\r\nAuthorization: redacted\trequest"),
+            "GitHub failed: Authorization: redacted request"
+        );
     }
 
     #[test]

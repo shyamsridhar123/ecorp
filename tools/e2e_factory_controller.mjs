@@ -48,7 +48,8 @@ async function runController(
   {
     actorId = demo.alice_actor_id,
     leaseSeconds = 300,
-    repository = 'shyamsridhar123/ecorp',
+    repository = 'ShyamSridhar123/ECorp',
+    strategy = 'single',
   } = {},
 ) {
   const args = [
@@ -63,6 +64,8 @@ async function runController(
     repository,
     '--adapter',
     'fake-process',
+    '--strategy',
+    strategy,
     '--budget-tokens',
     '20000',
     '--budget-cost-microusd',
@@ -285,6 +288,8 @@ fakeState.items = [
 fakeState.issues = { '9002': recoveryIssue }
 fakeState.item_edits = 0
 fakeState.fail_next_item_edit = true
+fakeState.fail_next_item_edit_message =
+  'injected GitHub Project status update failure\nrequest details withheld'
 await writeFile(statePath, `${JSON.stringify(fakeState, null, 2)}\n`)
 
 let injectedFailure
@@ -301,6 +306,7 @@ const blockedItems = blockedState.snapshot.factory_work_items.filter(
 assert.equal(blockedItems.length, 1)
 assert.equal(blockedItems[0].state, 'blocked')
 assert.match(blockedItems[0].failure_detail, /status synchronization failed/)
+assert.equal(/[\u0000-\u001f\u007f]/u.test(blockedItems[0].failure_detail), false)
 assert.ok(blockedItems[0].mission_id)
 const blockedMissionRuns = blockedState.snapshot.runs.filter((run) =>
   blockedState.snapshot.tasks.some(
@@ -382,6 +388,82 @@ const failedItem = failureState.snapshot.factory_work_items.find(
 )
 assert.equal(failedItem.state, 'failed')
 assert.match(failedItem.failure_detail, /fail/i)
+
+const verificationFailureDemo = await post('/api/demo/reset', {})
+const verificationFailureIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9005',
+  number: 9005,
+  title: 'Persist a factory verification failure',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9005',
+  createdAt: '2026-09-01T14:04:00Z',
+  updatedAt: '2026-09-01T14:04:00Z',
+}
+recoveredFakeState.items = [
+  {
+    id: 'PVTI_FAKE_FACTORY_9005',
+    status: 'Todo',
+    content: {
+      body: verificationFailureIssue.body,
+      number: verificationFailureIssue.number,
+      repository: 'shyamsridhar123/ecorp',
+      title: verificationFailureIssue.title,
+      type: 'Issue',
+      url: verificationFailureIssue.url,
+    },
+  },
+]
+recoveredFakeState.issues = { '9005': verificationFailureIssue }
+recoveredFakeState.item_edits = 0
+await writeFile(statePath, `${JSON.stringify(recoveredFakeState, null, 2)}\n`)
+const verificationStarted = await runController(
+  verificationFailureDemo,
+  9005,
+  false,
+  { strategy: 'verification-failure' },
+)
+const verificationMission = await waitForMission(
+  verificationFailureDemo,
+  verificationStarted.mission_id,
+)
+assert.equal(verificationMission.mission.status, 'failed')
+let verificationFailure
+try {
+  await runController(verificationFailureDemo, 9005, false, {
+    strategy: 'verification-failure',
+  })
+} catch (error) {
+  verificationFailure = error
+}
+assert.ok(verificationFailure, 'verification failure did not fail the controller command')
+const verificationFailureState = await snapshot(verificationFailureDemo)
+const verificationFailureItem =
+  verificationFailureState.snapshot.factory_work_items.find(
+    (item) => item.id === verificationStarted.factory_work_item_id,
+  )
+assert.equal(verificationFailureItem.state, 'verification_failed')
+assert.match(
+  verificationFailureItem.failure_detail,
+  /verifier|verification|evidence|artifact/i,
+)
+const verificationFailureTasks = verificationFailureState.snapshot.tasks.filter(
+  (task) => task.mission_id === verificationStarted.mission_id,
+)
+assert.ok(verificationFailureTasks.length > 0)
+assert.ok(
+  verificationFailureTasks.every(
+    (task) =>
+      task.status === 'verification_failed' && task.verification_status === 'failed',
+  ),
+)
+const verificationFailureTaskIds = new Set(
+  verificationFailureTasks.map((task) => task.id),
+)
+const verificationFailureRuns = verificationFailureState.snapshot.runs.filter((run) =>
+  verificationFailureTaskIds.has(run.task_id),
+)
+assert.equal(verificationFailureRuns.length, 1)
+assert.equal(verificationFailureRuns[0].verification_status, 'failed')
 
 const mismatchDemo = await post('/api/demo/reset', {})
 const mismatchIssue = {
@@ -641,6 +723,16 @@ const report = {
     mission_id: failing.mission_id,
     mission_status: failedMission.mission.status,
     factory_state: failedItem.state,
+    controller_returned_error: true,
+  },
+  verification_failure: {
+    issue_number: 9005,
+    factory_work_item_id: verificationFailureItem.id,
+    mission_id: verificationStarted.mission_id,
+    run_ids: verificationFailureRuns.map((run) => run.id),
+    mission_status: verificationMission.mission.status,
+    factory_state: verificationFailureItem.state,
+    task_statuses: verificationFailureTasks.map((task) => task.status),
     controller_returned_error: true,
   },
   repository_routing: {

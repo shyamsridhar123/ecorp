@@ -90,7 +90,10 @@ if (args[0] === 'project' && args[1] === 'item-list') {
     state.fail_next_item_edit = false
     state.item_edit_failures = (state.item_edit_failures ?? 0) + 1
     await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
-    fail('injected GitHub Project status update failure')
+    fail(
+      state.fail_next_item_edit_message ??
+        'injected GitHub Project status update failure',
+    )
   }
   item.status = status.name
   state.item_edits = (state.item_edits ?? 0) + 1

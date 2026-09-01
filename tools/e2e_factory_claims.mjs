@@ -186,6 +186,19 @@ const claim = concurrentClaims[0]
 assert.equal(claim.work_item.state, 'claimed')
 assert.equal(claim.work_item.version, 1)
 assert.ok(claim.claim_token)
+const mixedCaseReplay = await postOk(claimPath, {
+  ...claimRequest,
+  source_project_owner: 'ShYaMsRiDhAr123',
+  source_repository_owner: 'SHYAMSRIDHAR123',
+  source_repository_name: 'ECorp',
+  source_issue_url: 'https://github.com/SHYAMSRIDHAR123/ECorp/issues/59',
+  idempotency_key: `factory-e2e-mixed-case-${nonce}`,
+})
+assert.equal(mixedCaseReplay.work_item.id, claim.work_item.id)
+assert.equal(mixedCaseReplay.claim_token, claim.claim_token)
+assert.equal(mixedCaseReplay.work_item.source_project_owner, 'shyamsridhar123')
+assert.equal(mixedCaseReplay.work_item.source_repository_owner, 'shyamsridhar123')
+assert.equal(mixedCaseReplay.work_item.source_repository_name, 'ecorp')
 
 const unauthorized = await post(claimPath, {
   ...claimRequest,
@@ -610,6 +623,7 @@ const report = {
   cross_corp_claim_rejected: true,
   active_duplicate_rejected: true,
   same_owner_recovered_active_token: true,
+  github_identity_case_normalized: true,
   stale_version_rejected: true,
   stale_token_rejected: true,
   policy_widening_rejected: true,
