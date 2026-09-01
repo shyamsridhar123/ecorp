@@ -40,12 +40,12 @@ durable operating process that humans can see, control, and audit.
 | --- | --- |
 | **A live control floor** | Agent movement, status, review, and approval states are projections of real provider sessions—not decorative animation. |
 | **Your choice of intelligence** | Select a connected runtime, an account-enabled GitHub Copilot model, and supported reasoning effort for each mission. |
-| **Safe parallel execution** | Every write-capable run receives its own Git branch and linked worktree. Agents never edit the configured source checkout directly. |
+| **Safe parallel execution** | ECorp assigns every write-capable run its own Git branch and linked worktree. Provider-global hooks and process trees are not fully contained yet, so fully untrusted child processes remain unsupported and tracked in #51. |
 | **Human authority at the point of risk** | Steer live work, interrupt a turn, transfer control, approve scoped actions, or issue an audited emergency stop. |
 | **Proof before completion** | Artifacts, files, commands, tests, schemas, screenshots, human approval, and independent review can gate success. |
 | **Durable operations** | Missions, rooms, messages, approvals, budgets, events, provider sessions, and signed artifact metadata survive the browser session. |
 
-## From repository to verified result
+## From repository to evidence-gated run
 
 ```text
 1. Point ECorp at a Git repository
@@ -58,12 +58,16 @@ durable operating process that humans can see, control, and audit.
                   ↓
 5. Verification runs before the mission can complete
                   ↓
-6. ECorp records the result, evidence, provenance, and audit trail
+6. ECorp records provider output, accepted evidence, provenance, and audit trail
 ```
 
 Choose one focused agent or run two independent specialists followed by a dependency-gated
 synthesis task. The scheduler releases only ready work, matches it to a compatible connected
 runner, and keeps retries, depth, fan-out, tokens, and cost inside explicit bounds.
+
+The currently accepted artifact may be a provider evidence envelope rather than the application
+source itself. Exporting an exact source archive, patch, commit, or merge-ready branch is tracked in
+#53.
 
 ## Bring the agents you already trust
 
@@ -77,6 +81,11 @@ runner, and keeps retries, depth, fan-out, tokens, and cost inside explicit boun
 
 The provider is not the control plane. Runners advertise exactly what they support, and ECorp
 dispatches only when the requested adapter, model, and reasoning capability are available.
+
+Claude Code now launches without user plugins, MCP servers, browser integration, hooks, or
+auto-memory. Its shell-permission requests and descendant-process cleanup are not yet bridged
+through the durable ECorp approval lifecycle; that remaining boundary is tracked in GitHub issue
+#51. Do not treat normalized external-CLI execution as equivalent to the Copilot SDK approval path.
 
 ## Control without surrendering the repository
 
@@ -164,12 +173,14 @@ pnpm check
 
 1. Choose **GitHub Copilot**, **Codex**, **Claude Code**, or **OpenCode**.
 2. Select a model, reasoning effort, and mission budget when the provider exposes them.
-3. Describe an outcome and the proof you expect.
+3. Enter a concise mission title. Durable specifications and operator-authored verifier policies
+   are tracked in #52.
 4. Use **One agent** for a focused build or **Two specialists, then synthesis** for competing
    approaches.
 5. Keep **Pause after planning** enabled when you want to inspect the task graph before dispatch.
 6. Approve scoped actions directly inside the mission card.
-7. Download the verified artifact when the mission completes.
+7. Download the accepted evidence artifact when the mission completes. Portable source
+   deliverables are tracked in #53.
 
 Example mission:
 
@@ -186,6 +197,11 @@ It is not yet a safe sandbox for fully untrusted child processes. Development mo
 includes fixed demo identities, permissive local CORS, and a deterministic process that runs with
 the local user's permissions. Production deployments require OIDC, deployment-managed keys,
 explicit runner enrollment, and private S3-compatible artifact storage.
+
+The September 1, 2026 enterprise-application dogfood pass is recorded in
+[`docs/evidence/2026-09-01-enterprise-application-dogfood.md`](docs/evidence/2026-09-01-enterprise-application-dogfood.md).
+It validated two generated applications and exposed open gaps in budget recovery, provider
+isolation and permissions, rich mission contracts, and portable merge-ready deliverables.
 
 The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environment variables, and
 `X-Crony-*` headers remain supported for compatibility during the transition.
