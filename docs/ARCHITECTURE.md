@@ -47,9 +47,23 @@ The server never executes an agent shell command.
 ## Artifact storage and provenance
 
 The runner reads the adapter artifact from its isolated worktree and sends a bounded base64 upload
-over the authenticated runner channel. The server revalidates the declared byte count, SHA-256, and
-media type before writing a Corp-namespaced content-addressed object. Production uses an
-S3-compatible private bucket; development can use the same object-store interface on local disk.
+over the authenticated runner channel. The server validates the declared byte count, SHA-256, and
+media type in memory. While holding the authoritative run lock, Postgres then rechecks assignment,
+task, budget, and breaker state and persists the `staged` metadata reservation. Only the owner of
+that reservation writes bytes to the top-level `staging/corps/<corp>/<event>` key, publishes the
+Corp-namespaced content-addressed object, and atomically marks metadata `ready` with the immutable
+artifact event. Production uses an S3-compatible private bucket; development uses the same
+object-store interface on local disk.
+
+Final publication and metadata finalization are idempotent. A retry can adopt the existing staged
+row for the same run and digest and writes the same bytes to its authoritative key. Startup and
+periodic recovery wait through a reservation grace window, finalize valid staged metadata, accept an
+already-published final object when the staging copy was already cleaned, reject old metadata whose
+bytes fail integrity checks, release old reservations whose staged and final objects are both
+missing so the runner can retry, retry cleanup for `ready` or `rejected` rows, and remove staging
+objects only after rechecking that no metadata reservation owns them. Transient object-store or
+database failures are left recoverable rather than made terminal. Cleanup never deletes a
+content-addressed final object, so accepted and rejected uploads may safely share a digest.
 
 The server records artifact ID, Corp, task, run, producing agent, producing runner, verifier,
 digest, normalized media type, byte count, retention deadline, and an HMAC-SHA256 provenance

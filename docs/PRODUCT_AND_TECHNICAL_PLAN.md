@@ -36,9 +36,11 @@
 - The versioned 100-scenario deterministic evaluation lane, consolidated chaos evidence, and
   hosted Windows/macOS/Linux runner matrix are implemented. Real-provider and real-team evidence
   remain explicitly separate.
-- Server-mediated artifact upload now verifies bytes, SHA-256, and media type before writing
-  Corp-namespaced content-addressed objects. Signed provenance and authorized download replace
-  runner-local artifact paths in shared state.
+- Server-mediated artifact upload now validates bytes, SHA-256, and media type in memory, commits
+  an authoritative reservation under the run lock, and only then writes a disposable staging key
+  before final publication. Staged, finalized, rejected, and orphaned states recover after restart
+  or a periodic reconciliation pass. Signed provenance and authorized download replace runner-local
+  artifact paths in shared state.
 
 ---
 

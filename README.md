@@ -128,7 +128,8 @@ authoritative state and event journal, so closing the UI does not terminate acti
 - **Circuit breakers:** run, mission, requester, and Corp budgets can steer, constrain, suspend, or
   stop runaway work.
 - **Artifact provenance:** content-addressed storage, SHA-256 integrity, media validation,
-  retention metadata, HMAC-signed provenance, and authorized downloads.
+  atomic staging, crash-safe metadata finalization, retention metadata, HMAC-signed provenance,
+  and authorized downloads.
 
 Read the exact boundaries in [`docs/SECURITY.md`](docs/SECURITY.md) and
 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
