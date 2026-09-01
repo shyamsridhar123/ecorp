@@ -553,13 +553,6 @@ impl CodexAdapter {
                 .and_modify(|usage| add_usage(usage, &parsed.usage))
                 .or_insert_with(|| parsed.usage.clone());
         }
-        if parsed.usage.input_tokens > 0
-            || parsed.usage.output_tokens > 0
-            || parsed.usage.cost_microusd > 0
-        {
-            sink.emit(AdapterEvent::Usage(parsed.usage.clone()));
-        }
-
         let (status, summary) = match &outcome {
             TerminalOutcome::Completed => (
                 "completed",
@@ -833,7 +826,11 @@ fn handle_notification(value: &Value, parsed: &mut ParsedRun, sink: Arc<dyn Adap
             // App-server emits token-sized deltas. Persisting each one as a domain event creates
             // avoidable database pressure, so ECorp emits the authoritative completed message.
         }
-        "thread/tokenUsage/updated" => record_usage(params, parsed),
+        "thread/tokenUsage/updated" => {
+            if let Some(usage) = record_usage(params, parsed) {
+                sink.emit(AdapterEvent::Usage(usage));
+            }
+        }
         "warning" => {
             if let Some(message) = params.get("message").and_then(Value::as_str) {
                 sink.emit(AdapterEvent::Output {
@@ -932,30 +929,30 @@ fn handle_completed_item(item: &Value, parsed: &mut ParsedRun, sink: Arc<dyn Ada
     }
 }
 
-fn record_usage(params: &Value, parsed: &mut ParsedRun) {
+fn record_usage(params: &Value, parsed: &mut ParsedRun) -> Option<UsageSnapshot> {
     if params.get("turnId").and_then(Value::as_str) != parsed.turn_id.as_deref() {
-        return;
+        return None;
     }
-    let Some(total_tokens) = params
+    let total_tokens = params
         .pointer("/tokenUsage/total/totalTokens")
-        .and_then(Value::as_u64)
-    else {
-        return;
-    };
+        .and_then(Value::as_u64)?;
     if parsed.last_usage_total == Some(total_tokens) {
-        return;
+        return None;
     }
+    // App-server reports `last` for the latest model API call and `total` cumulatively for the
+    // thread. Use the monotonic total as the duplicate cursor, but account and emit `last` once.
     let last = params.pointer("/tokenUsage/last").unwrap_or(&Value::Null);
-    parsed.usage.input_tokens = parsed
-        .usage
-        .input_tokens
-        .saturating_add(last.get("inputTokens").and_then(Value::as_u64).unwrap_or(0));
-    parsed.usage.output_tokens = parsed.usage.output_tokens.saturating_add(
-        last.get("outputTokens")
+    let usage = UsageSnapshot {
+        input_tokens: last.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: last
+            .get("outputTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-    );
+        cost_microusd: 0,
+    };
+    add_usage(&mut parsed.usage, &usage);
     parsed.last_usage_total = Some(total_tokens);
+    (usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cost_microusd > 0).then_some(usage)
 }
 
 fn rpc_error(value: &Value) -> Option<String> {
@@ -1515,19 +1512,37 @@ mod tests {
                 "last": {"inputTokens": 10, "outputTokens": 2}
             }
         });
-        record_usage(&notification, &mut parsed);
-        record_usage(&notification, &mut parsed);
-        record_usage(
+        let first = record_usage(&notification, &mut parsed).expect("first usage");
+        assert_eq!(first.input_tokens, 10);
+        assert_eq!(first.output_tokens, 2);
+        assert!(record_usage(&notification, &mut parsed).is_none());
+        let second = record_usage(
             &json!({
-                "turnId": "other",
+                "turnId": "turn-1",
                 "tokenUsage": {
                     "total": {"totalTokens": 20},
-                    "last": {"inputTokens": 5, "outputTokens": 3}
+                    "last": {"inputTokens": 6, "outputTokens": 2}
                 }
             }),
             &mut parsed,
+        )
+        .expect("second usage");
+        assert_eq!(second.input_tokens, 6);
+        assert_eq!(second.output_tokens, 2);
+        assert!(
+            record_usage(
+                &json!({
+                    "turnId": "other",
+                    "tokenUsage": {
+                        "total": {"totalTokens": 20},
+                        "last": {"inputTokens": 5, "outputTokens": 3}
+                    }
+                }),
+                &mut parsed,
+            )
+            .is_none()
         );
-        assert_eq!(parsed.usage.input_tokens, 10);
-        assert_eq!(parsed.usage.output_tokens, 2);
+        assert_eq!(parsed.usage.input_tokens, 16);
+        assert_eq!(parsed.usage.output_tokens, 4);
     }
 }

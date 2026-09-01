@@ -2688,6 +2688,7 @@ impl PgStore {
               AND r.assignment_token = $5
               AND r.status IN ('provisioning', 'starting', 'running',
                                'waiting_for_input', 'waiting_for_approval', 'verifying')
+              AND r.breaker_stage NOT IN ('suspend', 'stop')
             "#,
         )
         .bind(run_id)
@@ -2734,7 +2735,7 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT r.task_id, t.mission_id, m.room_id
+            SELECT r.task_id, r.breaker_stage, t.mission_id, m.room_id
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -2742,6 +2743,7 @@ impl PgStore {
               AND r.assignment_token = $5
               AND r.status IN ('provisioning', 'starting', 'running',
                                'waiting_for_input', 'waiting_for_approval', 'verifying')
+              AND r.breaker_stage NOT IN ('suspend', 'stop')
             FOR UPDATE OF r, t, m
             "#,
         )
@@ -2756,6 +2758,9 @@ impl PgStore {
         let task_id: Uuid = row.get("task_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
+        let breaker_stage: String = row.get("breaker_stage");
+        ensure_run_not_hard_blocked_tx(&mut tx, corp_id, run_id, &breaker_stage, "artifact upload")
+            .await?;
         if artifact.task_id != task_id {
             return Err(anyhow!("artifact task does not match the active run"));
         }
@@ -2969,6 +2974,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.verification_status AS run_verification_status,
+                   r.breaker_stage,
                    t.mission_id, t.verification_policy, m.room_id,
                    t.attempt_count, t.max_attempts
             FROM runs r
@@ -3002,9 +3008,25 @@ impl PgStore {
         let attempt_count: i32 = row.get("attempt_count");
         let max_attempts: i32 = row.get("max_attempts");
         let run_verification_status: String = row.get("run_verification_status");
+        let breaker_stage: String = row.get("breaker_stage");
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode task verification policy")?;
+        if breaker_blocks_runner_progress(&breaker_stage, &event_type) {
+            return Err(anyhow!(
+                "run event {event_type} is blocked by breaker stage {breaker_stage}"
+            ));
+        }
+        if runner_event_advances_run(&event_type) {
+            ensure_run_not_hard_blocked_tx(
+                &mut tx,
+                corp_id,
+                run_id,
+                &breaker_stage,
+                &format!("run event {event_type}"),
+            )
+            .await?;
+        }
         if event_type == "run.verification_evidence" {
             payload = sanitize_verification_evidence_tx(&mut tx, run_id, payload).await?;
         }
@@ -3690,7 +3712,8 @@ impl PgStore {
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
-                let retry = attempt_count < max_attempts;
+                let retry =
+                    should_retry_runner_failure(&breaker_stage, attempt_count, max_attempts);
                 sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
                     .bind(if retry { "ready" } else { "failed" })
                     .bind(task_id)
@@ -3768,12 +3791,12 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT approval.run_id, approval.room_id, approval.status, approval.expires_at,
-                   approval.required_roles, approval.decision_key,
-                   run.runner_id
+                    approval.required_roles, approval.decision_key,
+                    run.runner_id, run.breaker_stage
             FROM action_approvals approval
             JOIN runs run ON run.id = approval.run_id
             WHERE approval.id = $1 AND approval.corp_id = $2
-            FOR UPDATE OF approval
+            FOR UPDATE OF approval, run
             "#,
         )
         .bind(approval_id)
@@ -3801,6 +3824,9 @@ impl PgStore {
             }
             return Err(anyhow!("approval was already decided as {status}"));
         }
+        let breaker_stage: String = row.get("breaker_stage");
+        ensure_run_not_hard_blocked_tx(&mut tx, corp_id, run_id, &breaker_stage, "action approval")
+            .await?;
         let expires_at: chrono::DateTime<Utc> = row.get("expires_at");
         if expires_at <= Utc::now() {
             tx.commit().await?;
@@ -4452,7 +4478,7 @@ impl PgStore {
                    request.status AS request_status,
                    task.mission_id, task.status AS task_status,
                    mission.room_id, mission.requested_by, mission.status AS mission_status,
-                   run.status AS run_status, run.agent_id,
+                    run.status AS run_status, run.breaker_stage, run.agent_id,
                    producer.actor_id AS producer_actor_id
             FROM verification_requests request
             JOIN runs run ON run.id = request.run_id
@@ -4517,6 +4543,15 @@ impl PgStore {
         {
             return Err(anyhow!("verification request is no longer pending"));
         }
+        let breaker_stage: String = row.get("breaker_stage");
+        ensure_run_not_hard_blocked_tx(
+            &mut tx,
+            corp_id,
+            run_id,
+            &breaker_stage,
+            "verification decision",
+        )
+        .await?;
         let mission_status: String = row.get("mission_status");
         if matches!(
             mission_status.as_str(),
@@ -6269,6 +6304,131 @@ fn breaker_rank(stage: &str) -> u8 {
     }
 }
 
+fn breaker_is_hard(stage: &str) -> bool {
+    matches!(stage, "suspend" | "stop")
+}
+
+fn should_retry_runner_failure(stage: &str, attempt_count: i32, max_attempts: i32) -> bool {
+    attempt_count < max_attempts && !breaker_is_hard(stage)
+}
+
+fn ensure_breaker_allows_human_progress(stage: &str, action: &str) -> Result<()> {
+    if breaker_is_hard(stage) {
+        return Err(anyhow!(
+            "{action} is blocked by circuit breaker stage {stage}"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_run_not_hard_blocked_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+    stage: &str,
+    action: &str,
+) -> Result<()> {
+    ensure_breaker_allows_human_progress(stage, action)?;
+    if hard_breaker_reached_tx(tx, corp_id, run_id).await? {
+        return Err(anyhow!(
+            "{action} is blocked because current budget or loop metrics require a hard breaker"
+        ));
+    }
+    Ok(())
+}
+
+async fn hard_breaker_reached_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+) -> Result<bool> {
+    let reached = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT
+            (run.budget_tokens_limit > 0
+             AND run.input_tokens + run.output_tokens >= run.budget_tokens_limit)
+         OR (run.budget_cost_microusd_limit > 0
+             AND run.cost_microusd >= run.budget_cost_microusd_limit)
+         OR (mission.budget_tokens > 0 AND (
+                SELECT COALESCE(SUM(other.input_tokens + other.output_tokens), 0)::BIGINT
+                FROM runs other
+                JOIN tasks other_task ON other_task.id = other.task_id
+                WHERE other_task.mission_id = mission.id
+            ) >= mission.budget_tokens)
+         OR (mission.budget_cost_microusd > 0 AND (
+                SELECT COALESCE(SUM(other.cost_microusd), 0)::BIGINT
+                FROM runs other
+                JOIN tasks other_task ON other_task.id = other.task_id
+                WHERE other_task.mission_id = mission.id
+            ) >= mission.budget_cost_microusd)
+         OR (COALESCE(policy.actor_tokens_per_24h, 4000000) > 0 AND (
+                SELECT COALESCE(SUM(other.input_tokens + other.output_tokens), 0)::BIGINT
+                FROM runs other
+                JOIN tasks other_task ON other_task.id = other.task_id
+                JOIN missions other_mission ON other_mission.id = other_task.mission_id
+                WHERE other_mission.corp_id = run.corp_id
+                  AND other_mission.requested_by = mission.requested_by
+                  AND other.created_at >= now() - interval '24 hours'
+            ) >= COALESCE(policy.actor_tokens_per_24h, 4000000))
+         OR (COALESCE(policy.actor_cost_microusd_per_24h, 10000000) > 0 AND (
+                SELECT COALESCE(SUM(other.cost_microusd), 0)::BIGINT
+                FROM runs other
+                JOIN tasks other_task ON other_task.id = other.task_id
+                JOIN missions other_mission ON other_mission.id = other_task.mission_id
+                WHERE other_mission.corp_id = run.corp_id
+                  AND other_mission.requested_by = mission.requested_by
+                  AND other.created_at >= now() - interval '24 hours'
+            ) >= COALESCE(policy.actor_cost_microusd_per_24h, 10000000))
+         OR (COALESCE(policy.corp_tokens_per_24h, 20000000) > 0 AND (
+                SELECT COALESCE(SUM(other.input_tokens + other.output_tokens), 0)::BIGINT
+                FROM runs other
+                WHERE other.corp_id = run.corp_id
+                  AND other.created_at >= now() - interval '24 hours'
+            ) >= COALESCE(policy.corp_tokens_per_24h, 20000000))
+         OR (COALESCE(policy.corp_cost_microusd_per_24h, 100000000) > 0 AND (
+                SELECT COALESCE(SUM(other.cost_microusd), 0)::BIGINT
+                FROM runs other
+                WHERE other.corp_id = run.corp_id
+                  AND other.created_at >= now() - interval '24 hours'
+            ) >= COALESCE(policy.corp_cost_microusd_per_24h, 100000000))
+         OR (COALESCE(policy.no_progress_event_limit, 8) > 0
+             AND run.no_progress_events >= COALESCE(policy.no_progress_event_limit, 8))
+         OR (COALESCE(policy.repeated_tool_limit, 5) > 0
+             AND run.repeated_tool_count >= COALESCE(policy.repeated_tool_limit, 5))
+        FROM runs run
+        JOIN tasks task ON task.id = run.task_id
+        JOIN missions mission ON mission.id = task.mission_id
+        LEFT JOIN corp_budget_policies policy ON policy.corp_id = run.corp_id
+        WHERE run.id = $1 AND run.corp_id = $2
+        FOR UPDATE OF run
+        "#,
+    )
+    .bind(run_id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(reached)
+}
+
+fn runner_event_advances_run(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "run.started"
+            | "run.status"
+            | "run.approval_requested"
+            | "run.artifact_upload"
+            | "run.verification_started"
+            | "run.verification_evidence"
+            | "run.verification_passed"
+            | "run.verification_waiting"
+            | "run.completed"
+    )
+}
+
+fn breaker_blocks_runner_progress(stage: &str, event_type: &str) -> bool {
+    breaker_is_hard(stage) && runner_event_advances_run(event_type)
+}
+
 fn strongest_breaker_stage<'a>(
     inputs: &'a [(&'a str, i64, i64)],
 ) -> Option<(&'static str, &'a str, i64, i64)> {
@@ -6298,4 +6458,63 @@ fn strongest_breaker_stage<'a>(
         }
     }
     selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        breaker_blocks_runner_progress, ensure_breaker_allows_human_progress,
+        should_retry_runner_failure,
+    };
+
+    #[test]
+    fn hard_breakers_fence_progress_but_allow_terminal_cleanup() {
+        for stage in ["suspend", "stop"] {
+            for event_type in [
+                "run.started",
+                "run.status",
+                "run.approval_requested",
+                "run.artifact_upload",
+                "run.verification_started",
+                "run.verification_evidence",
+                "run.verification_passed",
+                "run.verification_waiting",
+                "run.completed",
+            ] {
+                assert!(
+                    breaker_blocks_runner_progress(stage, event_type),
+                    "{stage} should block {event_type}"
+                );
+            }
+            for event_type in [
+                "run.output",
+                "run.usage",
+                "run.session_terminated",
+                "run.failed",
+                "run.cancelled",
+                "run.workspace_preserved",
+                "run.workspace_removed",
+            ] {
+                assert!(
+                    !breaker_blocks_runner_progress(stage, event_type),
+                    "{stage} should allow terminal accounting event {event_type}"
+                );
+            }
+        }
+        assert!(!breaker_blocks_runner_progress(
+            "constrain",
+            "run.completed"
+        ));
+    }
+
+    #[test]
+    fn hard_breakers_block_retries_and_human_completion_paths() {
+        for stage in ["suspend", "stop"] {
+            assert!(!should_retry_runner_failure(stage, 1, 3));
+            assert!(ensure_breaker_allows_human_progress(stage, "decision").is_err());
+        }
+        assert!(should_retry_runner_failure("healthy", 1, 3));
+        assert!(!should_retry_runner_failure("healthy", 3, 3));
+        assert!(ensure_breaker_allows_human_progress("constrain", "decision").is_ok());
+    }
 }

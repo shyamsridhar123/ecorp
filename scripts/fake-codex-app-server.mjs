@@ -22,6 +22,7 @@ let completionTimer = null
 let terminal = false
 let finalMessage = 'Synthetic Codex turn completed.'
 let usageTotal = 0
+let emitUsageOnFinish = true
 
 function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`)
@@ -42,8 +43,9 @@ function textFromInput(input) {
     .join('\n')
 }
 
-function emitUsage() {
-  usageTotal += 12
+function emitUsage(inputTokens = 10, outputTokens = 2) {
+  const totalTokens = inputTokens + outputTokens
+  usageTotal += totalTokens
   emit('thread/tokenUsage/updated', {
     threadId,
     turnId,
@@ -53,15 +55,15 @@ function emitUsage() {
         inputTokens: usageTotal - 2,
         cachedInputTokens: 0,
         cacheWriteInputTokens: 0,
-        outputTokens: 2,
+        outputTokens,
         reasoningOutputTokens: 0,
       },
       last: {
-        totalTokens: 12,
-        inputTokens: 10,
+        totalTokens,
+        inputTokens,
         cachedInputTokens: 0,
         cacheWriteInputTokens: 0,
-        outputTokens: 2,
+        outputTokens,
         reasoningOutputTokens: 0,
       },
       modelContextWindow: 1000,
@@ -73,7 +75,7 @@ function finish(status, error = null) {
   if (terminal) return
   terminal = true
   if (completionTimer) clearTimeout(completionTimer)
-  emitUsage()
+  if (emitUsageOnFinish) emitUsage()
   if (status === 'completed') {
     const itemId = randomUUID()
     emit('item/started', {
@@ -114,6 +116,7 @@ function finish(status, error = null) {
 function startTurn(message) {
   turnId = randomUUID()
   terminal = false
+  emitUsageOnFinish = true
   const prompt = textFromInput(message.params?.input)
   respond(message.id, {
     turn: { id: turnId, items: [], status: 'inProgress', error: null },
@@ -167,7 +170,16 @@ function startTurn(message) {
     completedAtMs: Date.now(),
   })
 
-  if (prompt.includes('[fail]')) {
+  if (prompt.includes('[budget-stream]')) {
+    emitUsageOnFinish = false
+    setTimeout(() => {
+      if (!terminal) emitUsage(3_000, 0)
+    }, 40)
+    setTimeout(() => {
+      if (!terminal) emitUsage(3_000, 0)
+    }, 120)
+    completionTimer = setTimeout(() => finish('completed'), 1_000)
+  } else if (prompt.includes('[fail]')) {
     completionTimer = setTimeout(() => finish('failed', 'synthetic failure'), 80)
   } else {
     completionTimer = setTimeout(

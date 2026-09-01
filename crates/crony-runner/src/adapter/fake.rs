@@ -68,6 +68,8 @@ impl AgentAdapter for FakeProcessAdapter {
         sink.emit(AdapterEvent::Started {
             workspace: request.workspace.clone(),
         });
+        let ignore_hard_breaker = request.mission_title.contains("[budget-late-completion]")
+            || request.mission_title.contains("[approval-budget-race]");
 
         let mut child = Command::new("node")
             .arg(&self.script)
@@ -148,7 +150,9 @@ impl AgentAdapter for FakeProcessAdapter {
                             }).to_string());
                         }
                         Some(AdapterControl::CircuitBreaker { stage, reason }) => {
-                            if matches!(stage.as_str(), "suspend" | "stop") {
+                            if matches!(stage.as_str(), "suspend" | "stop")
+                                && !ignore_hard_breaker
+                            {
                                 let reason =
                                     format!("Circuit breaker {stage} checkpoint: {reason}");
                                 child.kill().await.context("kill breaker-stopped agent process")?;
