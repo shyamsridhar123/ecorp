@@ -523,6 +523,38 @@ const blocked = await postOk(blockedTransitionPath, {
 })
 assert.equal(blocked.work_item.state, 'blocked')
 await new Promise((resolve) => setTimeout(resolve, 31_000))
+const widenedReclaim = await post(claimPath, {
+  ...blockedClaimRequest,
+  actor_id: demo.bob_actor_id,
+  idempotency_key: `factory-e2e-bob-widened-takeover-${nonce}`,
+  lease_seconds: 300,
+  policy: {
+    ...blockedClaimRequest.policy,
+    write_scope: ['**'],
+    budget_tokens: 40_000,
+  },
+})
+assert.equal(widenedReclaim.response.status, 400)
+const revisedSourceReclaim = await post(claimPath, {
+  ...blockedClaimRequest,
+  actor_id: demo.bob_actor_id,
+  source_revision: '2026-09-01T00:02:00Z',
+  idempotency_key: `factory-e2e-bob-revised-source-takeover-${nonce}`,
+  lease_seconds: 300,
+})
+assert.equal(revisedSourceReclaim.response.status, 400)
+const afterRejectedReclaims = await snapshot(demo)
+const preservedBlockedClaim =
+  afterRejectedReclaims.snapshot.factory_work_items.find(
+    (item) => item.id === blockedClaim.work_item.id,
+  )
+assert.equal(preservedBlockedClaim.state, 'blocked')
+assert.equal(preservedBlockedClaim.claim_owner_id, demo.alice_actor_id)
+assert.equal(
+  preservedBlockedClaim.source_revision,
+  blockedClaim.work_item.source_revision,
+)
+assert.deepEqual(preservedBlockedClaim.policy, blockedClaim.work_item.policy)
 const failoverClaim = await postOk(claimPath, {
   ...blockedClaimRequest,
   actor_id: demo.bob_actor_id,
@@ -533,6 +565,8 @@ assert.equal(failoverClaim.work_item.id, blockedClaim.work_item.id)
 assert.equal(failoverClaim.work_item.state, 'claimed')
 assert.equal(failoverClaim.work_item.claim_owner_id, demo.bob_actor_id)
 assert.equal(failoverClaim.work_item.failure_detail, null)
+assert.equal(failoverClaim.work_item.source_revision, blockedClaim.work_item.source_revision)
+assert.deepEqual(failoverClaim.work_item.policy, blockedClaim.work_item.policy)
 const failoverMaterialize = await postOk(
   `/api/corps/${demo.corp_id}/factory/work-items/` +
     `${blockedClaim.work_item.id}/materialize`,
@@ -583,6 +617,9 @@ const report = {
   pre_verification_transition_rejected: true,
   publication_state_requires_dedicated_operation: true,
   invalid_state_regression_rejected: true,
+  expired_reclaim_policy_widening_rejected: true,
+  expired_reclaim_source_revision_change_rejected: true,
+  expired_reclaim_preserved_source_and_policy: true,
   expired_blocked_claim_recovered: true,
   expired_claim_taken_over_by_second_operator: true,
   fencing_token_absent_from_snapshot_and_events: true,

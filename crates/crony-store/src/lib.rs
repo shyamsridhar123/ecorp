@@ -2173,14 +2173,14 @@ impl PgStore {
             if current_token == claim_token {
                 return Err(anyhow!("factory claim token collision"));
             }
+            ensure_factory_source_matches(&current, &source)?;
+            if current.policy != policy {
+                return Err(anyhow!(
+                    "factory recovery policy does not match the persisted policy snapshot"
+                ));
+            }
             let preserves_materialized_state = current.mission_id.is_some();
             let row = if preserves_materialized_state {
-                ensure_factory_source_matches(&current, &source)?;
-                if current.policy != policy {
-                    return Err(anyhow!(
-                        "factory recovery policy does not match the persisted policy snapshot"
-                    ));
-                }
                 sqlx::query(
                     r#"
                     UPDATE factory_work_items
@@ -2210,22 +2210,14 @@ impl PgStore {
                 sqlx::query(
                     r#"
                     UPDATE factory_work_items
-                    SET source_repository_owner = $1,
-                        source_repository_name = $2,
-                        source_issue_number = $3,
-                        source_issue_node_id = $4,
-                        source_issue_url = $5,
-                        source_title = $6,
-                        source_revision = $7,
-                        state = 'claimed',
+                    SET state = 'claimed',
                         version = version + 1,
-                        claim_owner_id = $8,
-                        claim_token = $9,
-                        lease_expires_at = $10,
-                        policy = $11,
+                        claim_owner_id = $1,
+                        claim_token = $2,
+                        lease_expires_at = $3,
                         failure_detail = NULL,
                         updated_at = now()
-                    WHERE id = $12 AND corp_id = $13
+                    WHERE id = $4 AND corp_id = $5
                     RETURNING id, corp_id, source_kind, source_project_owner,
                               source_project_number, source_project_item_id,
                               source_repository_owner, source_repository_name,
@@ -2235,17 +2227,9 @@ impl PgStore {
                               created_at, updated_at
                     "#,
                 )
-                .bind(&source.repository_owner)
-                .bind(&source.repository_name)
-                .bind(source.issue_number)
-                .bind(&source.issue_node_id)
-                .bind(&source.issue_url)
-                .bind(&source.title)
-                .bind(&source.revision)
                 .bind(input.actor_id)
                 .bind(claim_token)
                 .bind(lease_expires_at)
-                .bind(&policy)
                 .bind(current.id)
                 .bind(input.corp_id)
                 .fetch_one(&mut *tx)

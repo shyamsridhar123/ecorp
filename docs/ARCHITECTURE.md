@@ -373,6 +373,8 @@ Claim, renewal, and mission materialization are Corp-scoped and idempotent. Comp
 are serialized in Postgres, while fencing tokens and expected versions reject stale automation.
 The claim token is a capability: it is returned only in the direct authorized response and is
 omitted from shared snapshots and immutable events.
+Every reclaim preserves and revalidates the original source and policy snapshots; only ownership,
+fencing, lease, and recoverable lifecycle fields can change.
 
 Mission and task creation is atomic with the `claimed -> mission_created` transition. A controller
 that loses its response or restarts can replay the same operation and recover the existing mission;

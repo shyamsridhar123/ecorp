@@ -167,7 +167,8 @@ methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-valid
 materialization, restarts the server between claim and renewal, rejects guest, cross-Corp, stale
 version, stale token, and duplicate-active operations, proves the fencing token is absent from
 snapshots and events, proves non-operators cannot read source metadata through factory snapshots or
-events, and launches the one linked mission through the real runner.
+events, rejects source or policy replacement during an expired pre-materialization reclaim, and
+launches the one linked mission through the real runner.
 
 `tools/e2e_factory_controller.mjs` gives the CLI a deterministic GitHub API boundary and proves
 Project eligibility, dependency parsing, a mutation-free dry run, durable claim-before-dispatch,

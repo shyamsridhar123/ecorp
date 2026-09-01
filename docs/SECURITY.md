@@ -50,6 +50,8 @@ events, prompts, logs, and artifacts. A GitHub label or Project status is never 
 execution lock. Mission materialization requires an active lease and atomically persists the
 issue-to-mission link. The trusted CLI invokes GitHub CLI without putting its credential in an
 argument, log, mission contract, or agent environment.
+Expired reclaims must exactly match the original source and policy snapshots and cannot widen
+permissions or replace the claimed revision before materialization.
 
 The persisted factory policy is enforced again during mission materialization. A later request
 cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required

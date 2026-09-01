@@ -29,10 +29,10 @@ real child-process stack.
 
 Latest result:
 
-- work item `2ab9211f-9315-4598-a3ce-75698db9adc4`
-- mission `32b9c95b-f006-45a7-af3b-bc70cf045f1a`
-- task `6ebf9fc1-eed0-4b8e-8efd-c7140492cc36`
-- run `bd9cf535-7313-43ba-8082-68e1ff6d9aab`
+- work item `3ee7fa4e-a1cc-48af-b978-fde73da4874a`
+- mission `fea261e9-26ad-46af-8a35-2a41587ee00b`
+- task `0095a564-6b72-4df9-89c1-5da1e52038b0`
+- run `30f94cc8-2272-453b-b92d-317885aa7559`
 - concurrent claim, renewal, and materialization requests collapsed to one effect
 - the server restarted between claim and renewal
 - guest and cross-Corp claims were rejected
@@ -45,6 +45,8 @@ Latest result:
 - `published` was rejected because no dedicated publication operation has run
 - an expired pre-materialization `blocked` claim was reclaimed by a second operator, returned to
   `claimed`, and materialized without creating a second work item
+- attempted expired reclaims with a wider policy or changed source revision were rejected, while
+  the original source and policy snapshots remained unchanged
 - the issue contract and write scope reached the persisted task contract
 - the one linked mission and run completed
 - the factory work item reached `verified`
@@ -153,6 +155,10 @@ A second review of the updated head found two more P1 gaps. Factory materializat
 omitted policy-pinned model or reasoning values. The controller now re-fetches source revision,
 state, labels, Project content, and blockers immediately before both the Project mutation and
 mission launch; a change is persisted as `blocked` before any later effect.
+
+A third review found that an expired pre-materialization reclaim could replace the original source
+and policy snapshots. Reclaims now require exact snapshot equality and update only ownership,
+fencing, lease, state, and failure detail.
 
 ## Browser evidence
 
