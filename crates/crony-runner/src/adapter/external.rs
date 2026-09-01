@@ -81,6 +81,42 @@ impl ExternalCliAdapter {
         command
     }
 
+    fn append_run_args(
+        &self,
+        command: &mut Command,
+        mission_title: &str,
+        resume_session_id: Option<&str>,
+    ) {
+        match self.flavor {
+            ExternalFlavor::ClaudeCode => {
+                command
+                    .arg("--safe-mode")
+                    .arg("--no-chrome")
+                    .arg("--disable-slash-commands")
+                    .arg("--strict-mcp-config")
+                    .arg("--mcp-config")
+                    .arg(r#"{"mcpServers":{}}"#)
+                    .arg("--print")
+                    .arg("--verbose")
+                    .arg("--output-format")
+                    .arg("stream-json")
+                    .arg("--permission-mode")
+                    .arg("acceptEdits");
+                if let Some(session_id) = resume_session_id {
+                    command.arg("--resume").arg(session_id);
+                }
+                command.arg(mission_title);
+            }
+            ExternalFlavor::OpenCode => {
+                command.arg("run").arg("--pure").arg("--format").arg("json");
+                if let Some(session_id) = resume_session_id {
+                    command.arg("--session").arg(session_id);
+                }
+                command.arg(mission_title);
+            }
+        }
+    }
+
     async fn run(
         &self,
         request: AdapterRunRequest,
@@ -101,28 +137,7 @@ impl ExternalCliAdapter {
         });
 
         let mut command = self.command();
-        match self.flavor {
-            ExternalFlavor::ClaudeCode => {
-                command
-                    .arg("--print")
-                    .arg("--verbose")
-                    .arg("--output-format")
-                    .arg("stream-json")
-                    .arg("--permission-mode")
-                    .arg("acceptEdits");
-                if let Some(session_id) = resume_session_id {
-                    command.arg("--resume").arg(session_id);
-                }
-                command.arg(&request.mission_title);
-            }
-            ExternalFlavor::OpenCode => {
-                command.arg("run").arg("--format").arg("json");
-                if let Some(session_id) = resume_session_id {
-                    command.arg("--session").arg(session_id);
-                }
-                command.arg(&request.mission_title);
-            }
-        }
+        self.append_run_args(&mut command, &request.mission_title, resume_session_id);
         command
             .current_dir(&request.workspace)
             .envs(&request.environment)
@@ -394,6 +409,54 @@ mod tests {
                 .join(run_id.to_string()),
             environment: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn claude_runs_without_user_plugins_mcp_or_browser_integrations() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut command = adapter.command();
+        adapter.append_run_args(&mut command, "bounded mission", None);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for required in [
+            "--safe-mode",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+        ] {
+            assert!(
+                args.iter().any(|argument| argument == required),
+                "Claude command omitted isolation argument {required}: {args:?}"
+            );
+        }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"]),
+            "Claude command must not bypass provider permission checks: {args:?}"
+        );
+    }
+
+    #[test]
+    fn opencode_runs_without_external_plugins() {
+        let adapter = adapter(ExternalFlavor::OpenCode);
+        let mut command = adapter.command();
+        adapter.append_run_args(&mut command, "bounded mission", None);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            args.iter().any(|argument| argument == "--pure"),
+            "OpenCode command must disable external plugins: {args:?}"
+        );
     }
 
     #[tokio::test]
