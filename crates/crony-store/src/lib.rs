@@ -6786,6 +6786,14 @@ fn validate_factory_plan_against_policy(
             "factory policy requires a non-empty verification policy for every task"
         ));
     }
+    if let Some(task) = plan.tasks.iter().find(|task| {
+        task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
+    }) {
+        return Err(anyhow!(
+            "factory task {} requires a manual verification gate for provider-backed execution",
+            task.key
+        ));
+    }
     let budget_tokens = factory_policy_positive_i64(policy, "budget_tokens")?;
     if plan.budget_tokens > budget_tokens {
         return Err(anyhow!(
@@ -7161,6 +7169,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
             to,
             FactoryWorkItemState::Running
                 | FactoryWorkItemState::Blocked
+                | FactoryWorkItemState::AwaitingApproval
                 | FactoryWorkItemState::VerificationFailed
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
@@ -7177,6 +7186,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
         FactoryWorkItemState::Blocked => matches!(
             to,
             FactoryWorkItemState::Running
+                | FactoryWorkItemState::AwaitingApproval
                 | FactoryWorkItemState::VerificationFailed
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
@@ -8308,8 +8318,8 @@ fn strongest_breaker_stage<'a>(
 mod tests {
     use chrono::{Duration, Utc};
     use crony_domain::{
-        FactoryWorkItem, FactoryWorkItemState, PlannedTask, TaskContract, TaskGraphPlan,
-        VerificationPolicy, VerifierCheck,
+        FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, PlannedTask, TaskContract,
+        TaskGraphPlan, VerificationPolicy, VerifierCheck,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -8462,7 +8472,10 @@ mod tests {
                 max_attempts: 1,
                 verification_policy: VerificationPolicy {
                     checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
-                    manual_gate: None,
+                    manual_gate: Some(ManualVerificationGate::IndependentReview {
+                        roles: vec!["member".to_owned()],
+                        exclude_requester: true,
+                    }),
                 },
             }],
         };
@@ -8552,6 +8565,15 @@ mod tests {
                 .to_string()
                 .contains("must preserve policy reasoning effort")
         );
+
+        let (_, mut missing_gate) = factory_policy_plan(Some("gpt-5.6-sol"), Some("high"));
+        missing_gate.tasks[0].verification_policy.manual_gate = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_gate)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a manual verification gate")
+        );
     }
 
     #[test]
@@ -8573,8 +8595,16 @@ mod tests {
             FactoryWorkItemState::VerificationFailed,
         ));
         assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::AwaitingApproval,
+        ));
+        assert!(factory_transition_allowed(
             FactoryWorkItemState::Blocked,
             FactoryWorkItemState::VerificationFailed,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Blocked,
+            FactoryWorkItemState::AwaitingApproval,
         ));
         assert!(factory_transition_allowed(
             FactoryWorkItemState::Verified,

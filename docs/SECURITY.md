@@ -61,6 +61,8 @@ prohibitions, write scope, token budget, or cost budget. Factory `verified` stat
 authoritative completed mission and passing task-verification records.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
+Provider-backed factory tasks require a manual verification gate; an artifact-only result cannot
+become accepted completion without an authorized evidence decision.
 Verifier rejection is persisted as `verification_failed`, not collapsed into an execution failure.
 Publication states cannot be asserted through the generic factory transition endpoint.
 
@@ -71,8 +73,9 @@ visibility.
 Controllers renew their fenced lease immediately before a GitHub mutation and again before launch.
 After each renewal they re-fetch and compare the Project item, issue revision, state, required
 label, and dependency eligibility. A changed or newly blocked source is durably blocked before the
-next effect. Factory tasks carry the claimed repository and base ref, and the scheduler accepts only
-a runner advertising the same normalized checkout.
+next effect. A final renewal follows each revalidation, and GitHub CLI subprocesses are killed on a
+bounded timeout below the effect lease. Factory tasks carry the claimed repository and base ref,
+and the scheduler accepts only a runner advertising the same normalized checkout.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

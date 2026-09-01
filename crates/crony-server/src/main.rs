@@ -25,7 +25,7 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
-use crony_domain::{DomainEvent, TaskGraphPlan, TaskSecretReference};
+use crony_domain::{DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference};
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
@@ -1271,6 +1271,14 @@ fn apply_factory_contract(
         append_unique(&mut task.contract.references, &contract.references);
         if !contract.write_scope.is_empty() {
             task.contract.write_scope = contract.write_scope.clone();
+        }
+        if task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
+        {
+            task.verification_policy.manual_gate =
+                Some(ManualVerificationGate::IndependentReview {
+                    roles: vec!["member".to_owned(), "owner".to_owned(), "admin".to_owned()],
+                    exclude_requester: true,
+                });
         }
     }
     Ok(())
@@ -3335,9 +3343,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crony_protocol::{RunnerCapability, RunnerModel};
+    use crony_domain::{ManualVerificationGate, TaskGraphPlan};
+    use crony_protocol::{FactoryMissionContract, RunnerCapability, RunnerModel};
+    use serde_json::json;
+    use uuid::Uuid;
 
-    use super::{capability_satisfies_requirement, runner_requirement_mismatch};
+    use super::{
+        apply_factory_contract, capability_satisfies_requirement, runner_requirement_mismatch,
+    };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
         RunnerModel {
@@ -3426,6 +3439,69 @@ mod tests {
             &capabilities,
             Some("shyamsridhar123/ecorp"),
             Some("main"),
+        ));
+    }
+
+    #[test]
+    fn provider_backed_factory_tasks_require_independent_verification() {
+        let mut plan: TaskGraphPlan = serde_json::from_value(json!({
+            "strategy": "single",
+            "max_nodes": 1,
+            "max_depth": 0,
+            "budget_tokens": 1_000,
+            "budget_cost_microusd": 1_000_000,
+            "tasks": [{
+                "key": "deliver",
+                "title": "Deliver",
+                "contract": {
+                    "objective": "Implement the issue",
+                    "expected_output": "A verified change",
+                    "source_repository": null,
+                    "source_base_ref": null,
+                    "acceptance_tests": ["tests pass"],
+                    "allowed_tools": ["filesystem", "shell"],
+                    "prohibited_actions": ["do not merge"],
+                    "references": [],
+                    "write_scope": ["**"],
+                    "budget_tokens": 1_000,
+                    "budget_cost_microusd": 1_000_000,
+                    "deadline_at": null,
+                    "escalation": "ask the operator",
+                    "secret_refs": [],
+                    "model": null,
+                    "reasoning_effort": null
+                },
+                "assigned_agent_id": Uuid::new_v4(),
+                "required_adapter": "codex",
+                "depends_on": [],
+                "depth": 0,
+                "max_attempts": 1,
+                "verification_policy": {
+                    "checks": [{"type": "artifact", "min_bytes": 1}],
+                    "manual_gate": null
+                }
+            }]
+        }))
+        .expect("valid plan");
+        apply_factory_contract(
+            &mut plan,
+            &FactoryMissionContract {
+                objective: String::new(),
+                expected_output: String::new(),
+                acceptance_tests: Vec::new(),
+                allowed_tools: Vec::new(),
+                prohibited_actions: Vec::new(),
+                references: Vec::new(),
+                write_scope: Vec::new(),
+            },
+        )
+        .expect("factory contract");
+        assert!(matches!(
+            plan.tasks[0].verification_policy.manual_gate,
+            Some(ManualVerificationGate::IndependentReview {
+                exclude_requester: true,
+                ..
+            })
         ));
     }
 }

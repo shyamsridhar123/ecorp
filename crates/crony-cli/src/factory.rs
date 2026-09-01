@@ -1,8 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,6 +15,8 @@ use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+const DEFAULT_GITHUB_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Args)]
 pub struct FactoryArgs {
@@ -429,6 +434,20 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         }
         return Err(error).context("revalidate GitHub source before Project status update");
     }
+    let renewed = renew_factory_control(
+        client,
+        server,
+        &args,
+        work_item_id,
+        control_token,
+        work_item_version,
+        effect_lease_seconds,
+        "project-status-ready",
+        &stable_prefix,
+    )
+    .await
+    .context("renew factory lease immediately before GitHub Project update")?;
+    work_item_version = renewed.1;
 
     let project_update = set_project_in_progress(
         &args.github_cli,
@@ -446,20 +465,23 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     });
     if let Err(error) = project_update {
-        let _ = transition_factory_state(
-            client,
-            server,
-            &args,
-            work_item_id,
-            control_token,
-            work_item_version,
-            "blocked",
-            Some(format!(
-                "GitHub Project status synchronization failed: {error}"
-            )),
-            &stable_prefix,
-        )
-        .await;
+        if work_item_state != "blocked" {
+            transition_factory_state(
+                client,
+                server,
+                &args,
+                work_item_id,
+                control_token,
+                work_item_version,
+                "blocked",
+                Some(format!(
+                    "GitHub Project status synchronization failed: {error}"
+                )),
+                &stable_prefix,
+            )
+            .await
+            .context("persist blocked state after GitHub Project status failure")?;
+        }
         return Err(error).context("update GitHub Project status after mission linkage");
     }
     let renewed = renew_factory_control(
@@ -500,12 +522,27 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         }
         return Err(error).context("revalidate GitHub source before mission launch");
     }
+    let renewed = renew_factory_control(
+        client,
+        server,
+        &args,
+        work_item_id,
+        control_token,
+        work_item_version,
+        effect_lease_seconds,
+        "mission-launch-ready",
+        &stable_prefix,
+    )
+    .await
+    .context("renew factory lease immediately before mission launch")?;
+    work_item_state = renewed.0;
+    work_item_version = renewed.1;
 
     let launch = match launch_or_recover(client, server, &args, mission_id).await {
         Ok(launch) => launch,
         Err(error) => {
             if work_item_state != "blocked" {
-                let _ = transition_factory_state(
+                transition_factory_state(
                     client,
                     server,
                     &args,
@@ -516,7 +553,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                     Some(format!("Mission launch or recovery failed: {error}")),
                     &stable_prefix,
                 )
-                .await;
+                .await
+                .context("persist blocked state after mission launch or recovery failure")?;
             }
             return Err(error);
         }
@@ -562,8 +600,34 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             work_item_state
         );
     }
+    let mission_awaiting_approval = launch
+        .get("awaiting_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if mission_awaiting_approval && work_item_state != "awaiting_approval" {
+        let transitioned = transition_factory_state(
+            client,
+            server,
+            &args,
+            work_item_id,
+            control_token,
+            work_item_version,
+            "awaiting_approval",
+            None,
+            &stable_prefix,
+        )
+        .await?;
+        work_item_version = transitioned.1;
+        work_item_state = transitioned.0;
+    }
     let mission_completed = mission_status == Some("completed");
-    if matches!(work_item_state.as_str(), "mission_created" | "blocked") {
+    if !mission_awaiting_approval
+        && !mission_completed
+        && matches!(
+            work_item_state.as_str(),
+            "mission_created" | "blocked" | "awaiting_approval"
+        )
+    {
         let transitioned = transition_factory_state(
             client,
             server,
@@ -579,7 +643,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         work_item_version = transitioned.1;
         work_item_state = transitioned.0;
     }
-    if mission_completed && work_item_state == "running" {
+    if mission_completed && matches!(work_item_state.as_str(), "running" | "awaiting_approval") {
         let transitioned = transition_factory_state(
             client,
             server,
@@ -1266,7 +1330,7 @@ async fn launch_or_recover(
         None,
     )
     .await?;
-    let (mission_status, task_ids, verification_failed) =
+    let (mission_status, task_ids, verification_failed, awaiting_approval) =
         factory_mission_snapshot(&snapshot, mission_id)?;
     let existing_runs = snapshot
         .pointer("/snapshot/runs")
@@ -1284,6 +1348,7 @@ async fn launch_or_recover(
             "recovered": true,
             "mission_status": mission_status,
             "verification_failed": verification_failed,
+            "awaiting_approval": awaiting_approval,
             "run_summary": existing_runs
                 .first()
                 .and_then(|run| run.get("summary"))
@@ -1326,7 +1391,7 @@ async fn launch_or_recover(
             None,
         )
         .await?;
-        let (mission_status, task_ids, verification_failed) =
+        let (mission_status, task_ids, verification_failed, awaiting_approval) =
             factory_mission_snapshot(&refreshed, mission_id)?;
         let existing_runs = refreshed
             .pointer("/snapshot/runs")
@@ -1344,6 +1409,7 @@ async fn launch_or_recover(
                 "recovered": true,
                 "mission_status": mission_status,
                 "verification_failed": verification_failed,
+                "awaiting_approval": awaiting_approval,
                 "run_summary": existing_runs
                     .first()
                     .and_then(|run| run.get("summary"))
@@ -1361,7 +1427,7 @@ async fn launch_or_recover(
 fn factory_mission_snapshot(
     snapshot: &Value,
     mission_id: Uuid,
-) -> Result<(String, HashSet<String>, bool)> {
+) -> Result<(String, HashSet<String>, bool, bool)> {
     let mission_id = mission_id.to_string();
     let mission_status = snapshot
         .pointer("/snapshot/missions")
@@ -1392,7 +1458,16 @@ fn factory_mission_snapshot(
         task.get("verification_status").and_then(Value::as_str) == Some("failed")
             || task.get("status").and_then(Value::as_str) == Some("verification_failed")
     });
-    Ok((mission_status, task_ids, verification_failed))
+    let awaiting_approval = mission_tasks.iter().any(|task| {
+        task.get("verification_status").and_then(Value::as_str) == Some("waiting_for_approval")
+            || task.get("status").and_then(Value::as_str) == Some("awaiting_approval")
+    });
+    Ok((
+        mission_status,
+        task_ids,
+        verification_failed,
+        awaiting_approval,
+    ))
 }
 
 fn blocked_dependency_numbers(body: &str) -> Vec<i64> {
@@ -1569,15 +1644,49 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
         })
         .transpose()?
         .unwrap_or_default();
-    let output = Command::new(github_cli)
+    let mut child = Command::new(github_cli)
         .args(prefix_args)
         .args(args)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("run {} {}", github_cli.display(), args.join(" ")))?;
-    if !output.status.success() {
-        let detail = sanitize_failure_detail(&String::from_utf8_lossy(&output.stderr));
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture GitHub CLI standard output")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture GitHub CLI standard error")?;
+    let stdout_reader = thread::spawn(move || read_process_output(stdout));
+    let stderr_reader = thread::spawn(move || read_process_output(stderr));
+    let timeout = github_command_timeout();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll GitHub CLI process")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_process_output(stdout_reader, "GitHub CLI standard output");
+            let _ = join_process_output(stderr_reader, "GitHub CLI standard error");
+            bail!(
+                "{} {} timed out after {} ms",
+                github_cli.display(),
+                args.join(" "),
+                timeout.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = join_process_output(stdout_reader, "GitHub CLI standard output")?;
+    let stderr = join_process_output(stderr_reader, "GitHub CLI standard error")?;
+    if !status.success() {
+        let detail = sanitize_failure_detail(&String::from_utf8_lossy(&stderr));
         bail!(
             "{} {} failed: {}",
             github_cli.display(),
@@ -1585,7 +1694,32 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
             detail
         );
     }
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+fn github_command_timeout() -> Duration {
+    let timeout_ms = env::var("ECORP_GITHUB_COMMAND_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GITHUB_COMMAND_TIMEOUT_MS)
+        .clamp(100, DEFAULT_GITHUB_COMMAND_TIMEOUT_MS);
+    Duration::from_millis(timeout_ms)
+}
+
+fn read_process_output(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_process_output(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("{stream} reader panicked"))?
+        .with_context(|| format!("read {stream}"))
 }
 
 async fn server_json(

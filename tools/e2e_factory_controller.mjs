@@ -50,6 +50,7 @@ async function runController(
     leaseSeconds = 300,
     repository = 'ShyamSridhar123/ECorp',
     strategy = 'single',
+    githubTimeoutMs,
   } = {},
 ) {
   const args = [
@@ -83,6 +84,9 @@ async function runController(
       ...process.env,
       ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
       ECORP_FAKE_GITHUB_STATE: statePath,
+      ...(githubTimeoutMs
+        ? { ECORP_GITHUB_COMMAND_TIMEOUT_MS: String(githubTimeoutMs) }
+        : {}),
     },
     maxBuffer: 4 * 1024 * 1024,
     windowsHide: true,
@@ -101,6 +105,29 @@ async function waitForMission(demo, missionId, timeoutMs = 30_000) {
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   throw new Error(`timed out waiting for factory controller mission ${missionId}`)
+}
+
+async function waitForApproval(demo, missionId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const taskIds = new Set(
+      state.snapshot.tasks
+        .filter((task) => task.mission_id === missionId)
+        .map((task) => task.id),
+    )
+    const run = state.snapshot.runs.find((item) => taskIds.has(item.task_id))
+    const request = run
+      ? state.snapshot.verification_requests.find(
+          (item) => item.run_id === run.id && item.status === 'pending',
+        )
+      : undefined
+    if (run?.status === 'waiting_for_approval' && request) {
+      return { state, run, request }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for factory approval ${missionId}`)
 }
 
 const demo = await post('/api/demo/reset', {})
@@ -344,6 +371,64 @@ assert.equal(recoveredFakeState.items[0].status, 'In Progress')
 assert.equal(recoveredFakeState.item_edit_failures, 1)
 const recoveredProjectStatus = recoveredFakeState.items[0].status
 
+const timeoutDemo = await post('/api/demo/reset', {})
+const timeoutIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9011',
+  number: 9011,
+  title: 'Bound a stalled GitHub Project mutation',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9011',
+  createdAt: '2026-09-01T14:11:00Z',
+  updatedAt: '2026-09-01T14:11:00Z',
+}
+const timeoutState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9011',
+      status: 'Todo',
+      content: {
+        body: timeoutIssue.body,
+        number: timeoutIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: timeoutIssue.title,
+        type: 'Issue',
+        url: timeoutIssue.url,
+      },
+    },
+  ],
+  issues: { '9011': timeoutIssue },
+  item_edits: 0,
+  item_edit_delay_ms: 3_000,
+}
+await writeFile(statePath, `${JSON.stringify(timeoutState, null, 2)}\n`)
+let timeoutFailure
+try {
+  await runController(timeoutDemo, 9011, false, { githubTimeoutMs: 1_500 })
+} catch (error) {
+  timeoutFailure = error
+}
+assert.ok(timeoutFailure, 'stalled Project mutation did not time out')
+const timeoutSnapshot = await snapshot(timeoutDemo)
+const timeoutItem = timeoutSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9011,
+)
+assert.equal(timeoutItem.state, 'blocked')
+assert.match(timeoutItem.failure_detail, /timed out after 1500 ms/i)
+const timeoutTaskIds = new Set(
+  timeoutSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === timeoutItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  timeoutSnapshot.snapshot.runs.filter((run) => timeoutTaskIds.has(run.task_id)).length,
+  0,
+)
+const timeoutFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(timeoutFakeState.items[0].status, 'Todo')
+assert.equal(timeoutFakeState.item_edits, 0)
+
 const failureDemo = await post('/api/demo/reset', {})
 const failureIssue = {
   ...issue,
@@ -464,6 +549,74 @@ const verificationFailureRuns = verificationFailureState.snapshot.runs.filter((r
 )
 assert.equal(verificationFailureRuns.length, 1)
 assert.equal(verificationFailureRuns[0].verification_status, 'failed')
+
+const approvalDemo = await post('/api/demo/reset', {})
+const approvalIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9012',
+  number: 9012,
+  title: 'Require substantive independent factory verification',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9012',
+  createdAt: '2026-09-01T14:12:00Z',
+  updatedAt: '2026-09-01T14:12:00Z',
+}
+const approvalState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9012',
+      status: 'Todo',
+      content: {
+        body: approvalIssue.body,
+        number: approvalIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: approvalIssue.title,
+        type: 'Issue',
+        url: approvalIssue.url,
+      },
+    },
+  ],
+  issues: { '9012': approvalIssue },
+  item_edits: 0,
+}
+await writeFile(statePath, `${JSON.stringify(approvalState, null, 2)}\n`)
+const approvalStarted = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+const waitingApproval = await waitForApproval(approvalDemo, approvalStarted.mission_id)
+const awaitingFactory = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+assert.equal(awaitingFactory.factory_state, 'awaiting_approval')
+const requesterDecision = await fetch(
+  `${server}/api/corps/${approvalDemo.corp_id}/runs/` +
+    `${waitingApproval.run.id}/verification-decision`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: approvalDemo.alice_actor_id,
+      approved: true,
+      note: 'Requester must not self-review factory evidence.',
+    }),
+  },
+)
+assert.equal(requesterDecision.status, 403)
+await post(
+  `/api/corps/${approvalDemo.corp_id}/runs/` +
+    `${waitingApproval.run.id}/verification-decision`,
+  {
+    actor_id: approvalDemo.bob_actor_id,
+    approved: true,
+    note: 'Independent reviewer approved the factory evidence.',
+  },
+)
+await waitForMission(approvalDemo, approvalStarted.mission_id)
+const approvedFactory = await runController(approvalDemo, 9012, false, {
+  strategy: 'independent-review',
+})
+assert.equal(approvedFactory.factory_state, 'verified')
 
 const mismatchDemo = await post('/api/demo/reset', {})
 const mismatchIssue = {
@@ -717,6 +870,15 @@ const report = {
     recovered_factory_state: recoveredItem.state,
     project_status: recoveredProjectStatus,
   },
+  project_status_timeout: {
+    issue_number: 9011,
+    factory_work_item_id: timeoutItem.id,
+    mission_id: timeoutItem.mission_id,
+    factory_state: timeoutItem.state,
+    project_status: timeoutFakeState.items[0].status,
+    project_mutations: timeoutFakeState.item_edits,
+    run_count: 0,
+  },
   terminal_mission_failure: {
     issue_number: 9004,
     factory_work_item_id: failedItem.id,
@@ -734,6 +896,16 @@ const report = {
     factory_state: verificationFailureItem.state,
     task_statuses: verificationFailureTasks.map((task) => task.status),
     controller_returned_error: true,
+  },
+  independent_verification: {
+    issue_number: 9012,
+    factory_work_item_id: approvalStarted.factory_work_item_id,
+    mission_id: approvalStarted.mission_id,
+    run_id: waitingApproval.run.id,
+    requester_decision_status: requesterDecision.status,
+    reviewer_actor_id: approvalDemo.bob_actor_id,
+    waiting_factory_state: awaitingFactory.factory_state,
+    final_factory_state: approvedFactory.factory_state,
   },
   repository_routing: {
     issue_number: 9006,

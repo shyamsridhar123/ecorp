@@ -86,6 +86,9 @@ if (args[0] === 'project' && args[1] === 'item-list') {
   if (!item || !status) {
     fail('project item edit referenced an unknown item or option')
   }
+  if (state.item_edit_delay_ms) {
+    await new Promise((resolve) => setTimeout(resolve, state.item_edit_delay_ms))
+  }
   if (state.fail_next_item_edit) {
     state.fail_next_item_edit = false
     state.item_edit_failures = (state.item_edit_failures ?? 0) + 1

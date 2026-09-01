@@ -177,14 +177,17 @@ Todo-to-In-Progress synchronization only after mission linkage, one real child-p
 duplicate controller recovery without a second work item, mission, or run. It also injects a
 GitHub Project status failure, verifies durable `blocked` state before launch, and proves retry
 reuses the existing mission. The failure fixture emits multi-line stderr to prove error text cannot
-prevent the durable transition. Additional regressions prove verified items leave the intake queue
+prevent the durable transition, and a stalled Project mutation is killed before the lease window
+can expire. Additional regressions prove verified items leave the intake queue
 and terminal mission failure becomes terminal factory failure while verifier rejection remains
 `verification_failed`. It also proves lease renewal around external effects, source revision and
 label revalidation before the Project mutation,
 reopened-dependency revalidation before launch, persistence of the claimed repository/base
 requirement, and rejection of a runner checked out to another repository before run creation.
 `crony-store` unit coverage separately proves exact retention of policy-pinned model and reasoning
-settings on every materialized task. CLI unit coverage verifies Markdown section boundaries for
+settings on every materialized task and rejects provider-backed tasks without a manual gate. The
+controller E2E proves an independent reviewer, not the requester, advances
+`awaiting_approval -> verified`. CLI unit coverage verifies Markdown section boundaries for
 dependency and acceptance parsing. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
 

@@ -391,6 +391,9 @@ policy. The server derives `verified` authority from a completed mission whose t
 verification; a controller cannot assert it directly.
 When policy pins a model or reasoning effort, every materialized task must retain that exact value;
 omission cannot fall back to a provider default.
+Provider-backed factory tasks also receive a manual verification gate before accepted completion.
+The deterministic `fake-process` harness remains gate-free so offline systems tests can terminate
+without pretending to be production evidence.
 The generic transition endpoint cannot assert `publishing` or `published`; those states are
 reserved for the verifier-gated publication operation in #61.
 
@@ -403,7 +406,9 @@ with separate authorization and idempotency boundaries. See ADR 0020.
 
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
-After the mutation it renews and repeats the source-eligibility check immediately before launch.
+It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded
+deadline below the minimum effect lease. After the mutation it renews, repeats the
+source-eligibility check, and renews once more immediately before launch.
 Any changed or newly blocked source durably moves the factory item to `blocked` without launching a
 run. Factory tasks persist the claimed GitHub repository and source base ref. Runners advertise a
 normalized `remote` and `base`, and scheduling rejects a runner whose configured checkout does not
