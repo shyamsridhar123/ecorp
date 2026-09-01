@@ -29,6 +29,21 @@ function assertProject() {
 
 if (args[0] === 'project' && args[1] === 'item-list') {
   assertProject()
+  state.item_list_calls = (state.item_list_calls ?? 0) + 1
+  const mutation = state.item_list_mutation
+  if (mutation && mutation.call === state.item_list_calls) {
+    const issue = state.issues[String(mutation.issue_number)]
+    if (!issue) {
+      fail(`scheduled item-list mutation references unknown issue ${mutation.issue_number}`)
+    }
+    Object.assign(issue, mutation.patch ?? {})
+    if (mutation.remove_label) {
+      issue.labels = issue.labels.filter((label) => label.name !== mutation.remove_label)
+    }
+    state.item_list_mutations_applied = (state.item_list_mutations_applied ?? 0) + 1
+    state.item_list_mutation = null
+  }
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   console.log(
     JSON.stringify({
       items: state.items,

@@ -55,15 +55,19 @@ The persisted factory policy is enforced again during mission materialization. A
 cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
 prohibitions, write scope, token budget, or cost budget. Factory `verified` state requires
 authoritative completed mission and passing task-verification records.
+Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
+rejected rather than interpreted as permission to use a provider default.
 Publication states cannot be asserted through the generic factory transition endpoint.
 
 Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
 events omit GitHub source metadata; once a mission exists, factory events inherit its room
 visibility.
 
-Controllers renew their fenced lease immediately before a GitHub mutation and revalidate it after
-that mutation before launch. Factory tasks carry the claimed repository and base ref, and the
-scheduler accepts only a runner advertising the same normalized checkout.
+Controllers renew their fenced lease immediately before a GitHub mutation and again before launch.
+After each renewal they re-fetch and compare the Project item, issue revision, state, required
+label, and dependency eligibility. A changed or newly blocked source is durably blocked before the
+next effect. Factory tasks carry the claimed repository and base ref, and the scheduler accepts only
+a runner advertising the same normalized checkout.
 
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state

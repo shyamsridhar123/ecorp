@@ -6686,49 +6686,59 @@ fn validate_factory_plan_against_policy(
         ));
     }
     let allowed_model = factory_policy_optional_string(policy, "model")?;
-    if let Some((task, model)) = plan.tasks.iter().find_map(|task| {
-        task.contract
-            .model
-            .as_deref()
-            .filter(|model| Some(*model) != allowed_model.as_deref())
-            .map(|model| (task, model))
-    }) {
-        return Err(anyhow!(
-            "factory policy does not allow model {model} for task {}",
-            task.key
-        ));
-    }
-    if allowed_model.is_none()
-        && let Some(task) = plan.tasks.iter().find(|task| task.contract.model.is_some())
-    {
-        return Err(anyhow!(
-            "factory policy does not allow a model override for task {}",
-            task.key
-        ));
+    match allowed_model.as_deref() {
+        Some(allowed_model) => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.model.as_deref() != Some(allowed_model))
+            {
+                return Err(anyhow!(
+                    "factory task {} must preserve policy model {allowed_model}; got {}",
+                    task.key,
+                    task.contract.model.as_deref().unwrap_or("provider default")
+                ));
+            }
+        }
+        None => {
+            if let Some(task) = plan.tasks.iter().find(|task| task.contract.model.is_some()) {
+                return Err(anyhow!(
+                    "factory policy does not allow a model override for task {}",
+                    task.key
+                ));
+            }
+        }
     }
     let allowed_reasoning = factory_policy_optional_string(policy, "reasoning_effort")?;
-    if let Some((task, effort)) = plan.tasks.iter().find_map(|task| {
-        task.contract
-            .reasoning_effort
-            .as_deref()
-            .filter(|effort| Some(*effort) != allowed_reasoning.as_deref())
-            .map(|effort| (task, effort))
-    }) {
-        return Err(anyhow!(
-            "factory policy does not allow reasoning effort {effort} for task {}",
-            task.key
-        ));
-    }
-    if allowed_reasoning.is_none()
-        && let Some(task) = plan
-            .tasks
-            .iter()
-            .find(|task| task.contract.reasoning_effort.is_some())
-    {
-        return Err(anyhow!(
-            "factory policy does not allow a reasoning override for task {}",
-            task.key
-        ));
+    match allowed_reasoning.as_deref() {
+        Some(allowed_reasoning) => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.reasoning_effort.as_deref() != Some(allowed_reasoning))
+            {
+                return Err(anyhow!(
+                    "factory task {} must preserve policy reasoning effort {allowed_reasoning}; got {}",
+                    task.key,
+                    task.contract
+                        .reasoning_effort
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ));
+            }
+        }
+        None => {
+            if let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.contract.reasoning_effort.is_some())
+            {
+                return Err(anyhow!(
+                    "factory policy does not allow a reasoning override for task {}",
+                    task.key
+                ));
+            }
+        }
     }
     let write_scope = factory_policy_string_array(policy, "write_scope")?;
     if let Some((task, scope)) = plan.tasks.iter().find_map(|task| {
@@ -8307,7 +8317,10 @@ fn strongest_breaker_stage<'a>(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use crony_domain::{FactoryWorkItem, FactoryWorkItemState};
+    use crony_domain::{
+        FactoryWorkItem, FactoryWorkItemState, PlannedTask, TaskContract, TaskGraphPlan,
+        VerificationPolicy, VerifierCheck,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -8315,6 +8328,7 @@ mod tests {
         FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
         ensure_breaker_allows_human_progress, factory_transition_allowed, normalize_factory_source,
         should_retry_runner_failure, validate_factory_lease_seconds,
+        validate_factory_plan_against_policy,
     };
 
     #[test]
@@ -8401,6 +8415,70 @@ mod tests {
         )
     }
 
+    fn factory_policy_plan(
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> (FactoryWorkItem, TaskGraphPlan) {
+        let (mut work_item, _) = factory_work_item(Utc::now() + Duration::minutes(5));
+        work_item.policy = json!({
+            "schema_version": 1,
+            "source_of_truth": "github_project",
+            "auto_merge": false,
+            "repository_allowlist": ["owner/repo"],
+            "source_base_ref": "HEAD",
+            "adapter_allowlist": ["codex"],
+            "strategy_allowlist": ["single"],
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "write_scope": ["src/**"],
+            "allowed_tools": ["filesystem"],
+            "prohibited_actions": ["merge requires separate authorization"],
+            "secret_ids": [],
+            "verification_required": true,
+            "budget_tokens": 1_000,
+            "budget_cost_microusd": 1_000_000
+        });
+        let plan = TaskGraphPlan {
+            strategy: "single".to_owned(),
+            max_nodes: 1,
+            max_depth: 0,
+            budget_tokens: 1_000,
+            budget_cost_microusd: 1_000_000,
+            tasks: vec![PlannedTask {
+                key: "deliver".to_owned(),
+                title: "Deliver".to_owned(),
+                contract: TaskContract {
+                    objective: "Deliver the issue".to_owned(),
+                    expected_output: "A verified change".to_owned(),
+                    source_repository: Some("owner/repo".to_owned()),
+                    source_base_ref: Some("HEAD".to_owned()),
+                    acceptance_tests: vec!["tests pass".to_owned()],
+                    allowed_tools: vec!["filesystem".to_owned()],
+                    prohibited_actions: vec!["merge requires separate authorization".to_owned()],
+                    references: Vec::new(),
+                    write_scope: vec!["src/**".to_owned()],
+                    budget_tokens: 1_000,
+                    budget_cost_microusd: 1_000_000,
+                    deadline_at: None,
+                    escalation: "ask the operator".to_owned(),
+                    secret_refs: Vec::new(),
+                    model: model.map(str::to_owned),
+                    reasoning_effort: reasoning_effort.map(str::to_owned),
+                },
+                assigned_agent_id: Uuid::new_v4(),
+                required_adapter: "codex".to_owned(),
+                depends_on: Vec::new(),
+                depth: 0,
+                max_attempts: 1,
+                verification_policy: VerificationPolicy {
+                    checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+                    manual_gate: None,
+                },
+            }],
+        };
+        (work_item, plan)
+    }
+
     #[test]
     fn factory_claims_reject_expired_tokens_and_stale_versions() {
         let now = Utc::now();
@@ -8456,6 +8534,31 @@ mod tests {
         assert!(validate_factory_lease_seconds(30).is_ok());
         assert!(validate_factory_lease_seconds(3_600).is_ok());
         assert!(validate_factory_lease_seconds(3_601).is_err());
+    }
+
+    #[test]
+    fn factory_policy_requires_every_task_to_retain_pinned_provider_settings() {
+        let (work_item, plan) = factory_policy_plan(Some("gpt-5.6-sol"), Some("high"));
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("matching provider settings should pass");
+
+        let mut missing_model = plan.clone();
+        missing_model.tasks[0].contract.model = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_model)
+                .unwrap_err()
+                .to_string()
+                .contains("must preserve policy model")
+        );
+
+        let mut missing_reasoning = plan;
+        missing_reasoning.tasks[0].contract.reasoning_effort = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_reasoning)
+                .unwrap_err()
+                .to_string()
+                .contains("must preserve policy reasoning effort")
+        );
     }
 
     #[test]

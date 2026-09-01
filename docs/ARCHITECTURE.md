@@ -384,6 +384,8 @@ non-terminal lease without changing the original source revision or policy snaps
 Materialization may only narrow the persisted repository, adapter, write-scope, token, and cost
 policy. The server derives `verified` authority from a completed mission whose tasks all passed
 verification; a controller cannot assert it directly.
+When policy pins a model or reasoning effort, every materialized task must retain that exact value;
+omission cannot fall back to a provider default.
 The generic transition endpoint cannot assert `publishing` or `published`; those states are
 reserved for the verifier-gated publication operation in #61.
 
@@ -394,10 +396,13 @@ GitHub remains the planning and status source of truth, but external status chan
 durable ECorp transitions. Pull-request publication, merge, and deployment are separate effects
 with separate authorization and idempotency boundaries. See ADR 0020.
 
-Before changing GitHub Project state, the controller renews its lease to an external-effect window;
-after the mutation it renews again before launch. Factory tasks persist the claimed GitHub
-repository and source base ref. Runners advertise a normalized `remote` and `base`, and scheduling
-rejects a runner whose configured checkout does not match before creating a run.
+Before changing GitHub Project state, the controller renews its lease to an external-effect window,
+then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
+After the mutation it renews and repeats the source-eligibility check immediately before launch.
+Any changed or newly blocked source durably moves the factory item to `blocked` without launching a
+run. Factory tasks persist the claimed GitHub repository and source base ref. Runners advertise a
+normalized `remote` and `base`, and scheduling rejects a runner whose configured checkout does not
+match before creating a run.
 
 ## Near-term architecture work
 

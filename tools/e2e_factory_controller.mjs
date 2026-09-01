@@ -443,6 +443,164 @@ assert.equal(
   0,
 )
 
+const sourceChangeDemo = await post('/api/demo/reset', {})
+const sourceChangedIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9007',
+  number: 9007,
+  title: 'Block dispatch when the claimed issue changes',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9007',
+  createdAt: '2026-09-01T14:06:00Z',
+  updatedAt: '2026-09-01T14:06:00Z',
+}
+const sourceChangeState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9007',
+      status: 'Todo',
+      content: {
+        body: sourceChangedIssue.body,
+        number: sourceChangedIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: sourceChangedIssue.title,
+        type: 'Issue',
+        url: sourceChangedIssue.url,
+      },
+    },
+  ],
+  issues: { '9007': sourceChangedIssue },
+  item_edits: 0,
+  item_list_calls: 0,
+  item_list_mutation: {
+    call: 3,
+    issue_number: 9007,
+    patch: { updatedAt: '2026-09-01T14:06:30Z' },
+    remove_label: 'factory:ready',
+  },
+}
+await writeFile(statePath, `${JSON.stringify(sourceChangeState, null, 2)}\n`)
+let sourceChangeFailure
+try {
+  await runController(sourceChangeDemo, 9007)
+} catch (error) {
+  sourceChangeFailure = error
+}
+assert.ok(sourceChangeFailure, 'source revision change did not stop the controller')
+const sourceChangeSnapshot = await snapshot(sourceChangeDemo)
+const sourceChangeItem = sourceChangeSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9007,
+)
+assert.equal(sourceChangeItem.state, 'blocked')
+assert.match(sourceChangeItem.failure_detail, /source revalidation failed before Project status/i)
+const sourceChangeTaskIds = new Set(
+  sourceChangeSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === sourceChangeItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  sourceChangeSnapshot.snapshot.runs.filter((run) =>
+    sourceChangeTaskIds.has(run.task_id),
+  ).length,
+  0,
+)
+const sourceChangeFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(sourceChangeFakeState.items[0].status, 'Todo')
+assert.equal(sourceChangeFakeState.item_edits, 0)
+assert.equal(sourceChangeFakeState.item_list_mutations_applied, 1)
+
+const dependencyChangeDemo = await post('/api/demo/reset', {})
+const dependencyChangedIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9008',
+  number: 9008,
+  title: 'Block launch when a dependency reopens',
+  body: `${issue.body}
+
+## Dependencies
+
+Blocked by #9009.
+`,
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9008',
+  createdAt: '2026-09-01T14:07:00Z',
+  updatedAt: '2026-09-01T14:07:00Z',
+}
+const reopenedDependency = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9009',
+  number: 9009,
+  title: 'Dependency that reopens before launch',
+  body: 'Dependency fixture.',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9009',
+  state: 'CLOSED',
+  createdAt: '2026-09-01T14:08:00Z',
+  updatedAt: '2026-09-01T14:08:00Z',
+  labels: [],
+}
+const dependencyChangeState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9008',
+      status: 'Todo',
+      content: {
+        body: dependencyChangedIssue.body,
+        number: dependencyChangedIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: dependencyChangedIssue.title,
+        type: 'Issue',
+        url: dependencyChangedIssue.url,
+      },
+    },
+  ],
+  issues: {
+    '9008': dependencyChangedIssue,
+    '9009': reopenedDependency,
+  },
+  item_edits: 0,
+  item_list_calls: 0,
+  item_list_mutation: {
+    call: 5,
+    issue_number: 9009,
+    patch: {
+      state: 'OPEN',
+      updatedAt: '2026-09-01T14:08:30Z',
+    },
+  },
+}
+await writeFile(statePath, `${JSON.stringify(dependencyChangeState, null, 2)}\n`)
+let dependencyChangeFailure
+try {
+  await runController(dependencyChangeDemo, 9008)
+} catch (error) {
+  dependencyChangeFailure = error
+}
+assert.ok(dependencyChangeFailure, 'reopened dependency did not stop mission launch')
+const dependencyChangeSnapshot = await snapshot(dependencyChangeDemo)
+const dependencyChangeItem = dependencyChangeSnapshot.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9008,
+)
+assert.equal(dependencyChangeItem.state, 'blocked')
+assert.match(dependencyChangeItem.failure_detail, /source revalidation failed before mission launch/i)
+assert.match(dependencyChangeItem.failure_detail, /blocked by open issue #9009/i)
+const dependencyChangeTaskIds = new Set(
+  dependencyChangeSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === dependencyChangeItem.mission_id)
+    .map((task) => task.id),
+)
+assert.equal(
+  dependencyChangeSnapshot.snapshot.runs.filter((run) =>
+    dependencyChangeTaskIds.has(run.task_id),
+  ).length,
+  0,
+)
+const dependencyChangeFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(dependencyChangeFakeState.items[0].status, 'In Progress')
+assert.equal(dependencyChangeFakeState.item_edits, 1)
+assert.equal(dependencyChangeFakeState.item_list_mutations_applied, 1)
+
 const report = {
   checked_at: new Date().toISOString(),
   issue_number: 9001,
@@ -494,6 +652,25 @@ const report = {
     mismatched_runner_rejected: true,
     run_count: 0,
     factory_state: mismatchItem.state,
+  },
+  source_revalidation: {
+    source_change_before_project_status: {
+      issue_number: 9007,
+      factory_work_item_id: sourceChangeItem.id,
+      factory_state: sourceChangeItem.state,
+      project_status: sourceChangeFakeState.items[0].status,
+      project_mutations: sourceChangeFakeState.item_edits,
+      run_count: 0,
+    },
+    dependency_reopened_before_launch: {
+      issue_number: 9008,
+      dependency_issue_number: 9009,
+      factory_work_item_id: dependencyChangeItem.id,
+      factory_state: dependencyChangeItem.state,
+      project_status: dependencyChangeFakeState.items[0].status,
+      project_mutations: dependencyChangeFakeState.item_edits,
+      run_count: 0,
+    },
   },
 }
 await writeFile(

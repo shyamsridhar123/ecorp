@@ -29,15 +29,17 @@ real child-process stack.
 
 Latest result:
 
-- work item `f3c86a7b-9891-4f5a-bf65-d0bf4b869535`
-- mission `ba31e540-3ce8-4bcf-b19a-78cc6cb18d90`
-- task `a75aac5b-e872-4964-934e-0a5c6d7db7a5`
-- run `2c9afb29-4a3f-49d5-9e94-6acfdbacd648`
+- work item `2ab9211f-9315-4598-a3ce-75698db9adc4`
+- mission `32b9c95b-f006-45a7-af3b-bc70cf045f1a`
+- task `6ebf9fc1-eed0-4b8e-8efd-c7140492cc36`
+- run `bd9cf535-7313-43ba-8082-68e1ff6d9aab`
 - concurrent claim, renewal, and materialization requests collapsed to one effect
 - the server restarted between claim and renewal
 - guest and cross-Corp claims were rejected
 - stale versions, stale tokens, and an invalid verified-to-running regression were rejected
 - a wider write scope and budget than the persisted factory policy were rejected
+- unit coverage proves a task cannot omit a policy-pinned model or reasoning effort and silently
+  fall back to provider defaults
 - undeclared tools and secret references were rejected
 - `verified` was rejected while the linked mission was still running
 - `published` was rejected because no dedicated publication operation has run
@@ -66,9 +68,9 @@ journal.
 Successful issue:
 
 - Project item `PVTI_FAKE_FACTORY_9001`
-- work item `5c185cf6-dad8-469f-a31d-b498cbf42620`
-- mission `4b3bffc7-4cbf-479f-994e-c4acc2d74c22`
-- run `4370149e-9339-4239-b6bc-c4f72cafa6cc`
+- work item `d7e8cf79-595d-4c32-9623-a84850c83ba6`
+- mission `0c7ed378-e0c6-4fa0-ad5b-51b9f7925b55`
+- run `f977b064-ed00-4334-b8b4-aafd7057817c`
 - dry run changed neither ECorp nor GitHub state
 - Project status changed from `Todo` to `In Progress` only after mission linkage
 - replay recovered the same work item, mission, and run
@@ -81,9 +83,9 @@ Successful issue:
 Injected GitHub Project failure:
 
 - Project item `PVTI_FAKE_FACTORY_9002`
-- work item `7c5ee5d2-9798-416f-8342-23638ac78ba5`
-- mission `632502ac-cfb6-4d6e-9b5c-a9f7439cbe6a`
-- run `432ae234-3dd0-4da5-8949-f7265294e010`
+- work item `1f5e33c7-279a-436b-b268-1fc0120b3957`
+- mission `c01730b7-3c56-4c97-b3dc-b6766ab5e8c8`
+- run `7af916cb-4181-4589-8729-b69df6a024fb`
 - the failed status update persisted a `blocked` factory state and failure detail
 - no run launched before the external status effect succeeded
 - retry reused the existing mission, moved the Project item to `In Progress`, launched one run,
@@ -91,19 +93,33 @@ Injected GitHub Project failure:
 
 Terminal mission failure:
 
-- work item `cc48e57a-9052-46ea-a736-aa525b7eea49`
-- mission `faa9415f-fcba-4038-9941-fb7b449b497c`
+- work item `f3c3c4c9-4333-4a53-b783-36ac3c31ecde`
+- mission `160efe81-3839-4350-a509-a888f038d04c`
 - the mission exhausted its bounded retries and ended `failed`
 - the next controller pass persisted factory state `failed` and returned an error rather than
   reporting a healthy running factory item
 
 Repository routing rejection:
 
-- work item `be7f9cd6-2871-4c57-a2d2-dea4d0c98473`
-- mission `1613c2ef-7f95-43f0-94ae-6bc39bbd128d`
+- work item `ef22d2d8-9ee8-43c0-afb4-9ac90723e48e`
+- mission `c82fcc3b-adf4-41ec-bb7c-4bb379344771`
 - required checkout `acme/widget @ HEAD`
 - the connected ECorp runner was rejected before a run was created
 - the factory work item durably entered `blocked`
+
+Source changed before Project mutation:
+
+- work item `41b53d57-d602-4110-88a3-b375b9622e40`
+- the issue revision changed and `factory:ready` was removed after mission materialization
+- the controller durably entered `blocked`
+- the Project item remained `Todo`
+- no GitHub Project mutation and no run occurred
+
+Dependency reopened before launch:
+
+- work item `ca66e3bc-62fe-4d5a-8e90-a657860eba83`
+- dependency issue `#9009` reopened after the Project item reached `In Progress`
+- the controller re-evaluated dependency eligibility, durably entered `blocked`, and created no run
 
 ## Live GitHub Project canary
 
@@ -132,6 +148,11 @@ GitHub's review of PR #65 found two additional P1 gaps. The controller now renew
 the Project mutation and revalidates it before launch. Factory materialization now persists the
 claimed repository and base ref into each task, runners advertise their normalized GitHub checkout,
 and scheduling rejects a mismatched checkout before creating a run.
+
+A second review of the updated head found two more P1 gaps. Factory materialization now rejects
+omitted policy-pinned model or reasoning values. The controller now re-fetches source revision,
+state, labels, Project content, and blockers immediately before both the Project mutation and
+mission launch; a change is persisted as `blocked` before any later effect.
 
 ## Browser evidence
 

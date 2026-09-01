@@ -400,7 +400,34 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
         &stable_prefix,
     )
     .await?;
+    let mut work_item_state = renewed.0;
     work_item_version = renewed.1;
+
+    if let Err(error) = revalidate_selected_for_effect(
+        &args,
+        &refreshed,
+        &refreshed.project_item.status,
+        "GitHub Project status update",
+    ) {
+        if work_item_state != "blocked" {
+            transition_factory_state(
+                client,
+                server,
+                &args,
+                work_item_id,
+                control_token,
+                work_item_version,
+                "blocked",
+                Some(format!(
+                    "GitHub source revalidation failed before Project status update: {error}"
+                )),
+                &stable_prefix,
+            )
+            .await
+            .context("persist blocked state after GitHub source revalidation failure")?;
+        }
+        return Err(error).context("revalidate GitHub source before Project status update");
+    }
 
     let project_update = set_project_in_progress(
         &args.github_cli,
@@ -447,8 +474,31 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
     )
     .await
     .context("revalidate factory lease after GitHub Project update")?;
-    let mut work_item_state = renewed.0;
+    work_item_state = renewed.0;
     work_item_version = renewed.1;
+
+    if let Err(error) =
+        revalidate_selected_for_effect(&args, &refreshed, "In Progress", "mission launch")
+    {
+        if work_item_state != "blocked" {
+            transition_factory_state(
+                client,
+                server,
+                &args,
+                work_item_id,
+                control_token,
+                work_item_version,
+                "blocked",
+                Some(format!(
+                    "GitHub source revalidation failed before mission launch: {error}"
+                )),
+                &stable_prefix,
+            )
+            .await
+            .context("persist blocked state after GitHub source revalidation failure")?;
+        }
+        return Err(error).context("revalidate GitHub source before mission launch");
+    }
 
     let launch = match launch_or_recover(client, server, &args, mission_id).await {
         Ok(launch) => launch,
@@ -833,6 +883,107 @@ fn refresh_selected(
         );
     }
     Ok(refreshed)
+}
+
+fn revalidate_selected_for_effect(
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    expected_project_status: &str,
+    stage: &str,
+) -> Result<()> {
+    let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
+    if project.items.len() < project.total_count {
+        bail!(
+            "GitHub Project returned {} of {} items while revalidating before {stage}",
+            project.items.len(),
+            project.total_count
+        );
+    }
+    let item = project
+        .items
+        .into_iter()
+        .find(|item| item.id == selected.project_item.id)
+        .with_context(|| format!("selected GitHub Project item disappeared before {stage}"))?;
+    let mut reasons = Vec::new();
+    if item.content.kind != "Issue" {
+        reasons.push(format!(
+            "Project item type is {}, not Issue",
+            item.content.kind
+        ));
+    }
+    if item.content.repository != args.repository {
+        reasons.push(format!(
+            "Project item repository is {}, not {}",
+            item.content.repository, args.repository
+        ));
+    }
+    if item.content.number != selected.issue.number {
+        reasons.push(format!(
+            "Project item issue number changed from {} to {}",
+            selected.issue.number, item.content.number
+        ));
+    }
+    if item.status != expected_project_status {
+        reasons.push(format!(
+            "Project status is {}, expected {expected_project_status}",
+            item.status
+        ));
+    }
+
+    let issue = load_issue(&args.github_cli, &args.repository, selected.issue.number)?;
+    if issue.id != selected.issue.id {
+        reasons.push("GitHub issue identity changed".to_owned());
+    }
+    if issue.updated_at != selected.issue.updated_at {
+        reasons.push(format!(
+            "source revision changed from {} to {}",
+            selected.issue.updated_at, issue.updated_at
+        ));
+    }
+    if issue.state != "OPEN" {
+        reasons.push("issue is not open".to_owned());
+    }
+    if issue.title != selected.issue.title
+        || issue.body != selected.issue.body
+        || issue.url != selected.issue.url
+    {
+        reasons.push("GitHub issue content changed after claim".to_owned());
+    }
+    if issue.title != item.content.title
+        || issue.url != item.content.url
+        || issue.body != item.content.body
+    {
+        reasons.push("Project item content is stale relative to the issue".to_owned());
+    }
+    if !issue
+        .labels
+        .iter()
+        .any(|label| label.name == "factory:ready")
+    {
+        reasons.push("missing factory:ready label".to_owned());
+    }
+
+    let dependencies = blocked_dependency_numbers(&issue.body);
+    let mut issue_cache = HashMap::new();
+    issue_cache.insert(issue.number, issue);
+    for dependency in dependencies {
+        let dependency_issue = cached_issue(
+            &args.github_cli,
+            &args.repository,
+            dependency,
+            &mut issue_cache,
+        )?;
+        if dependency_issue.state == "OPEN" {
+            reasons.push(format!("blocked by open issue #{dependency}"));
+        }
+    }
+    if !reasons.is_empty() {
+        bail!(
+            "selected issue became ineligible before {stage}: {}",
+            reasons.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn cached_issue(

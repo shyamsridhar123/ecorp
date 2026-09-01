@@ -176,8 +176,11 @@ duplicate controller recovery without a second work item, mission, or run. It al
 GitHub Project status failure, verifies durable `blocked` state before launch, and proves retry
 reuses the existing mission. Additional regressions prove verified items leave the intake queue
 and terminal mission failure becomes terminal factory failure. It also proves lease renewal around
-external effects, persistence of the claimed repository/base requirement, and rejection of a
-runner checked out to another repository before run creation. See
+external effects, source revision and label revalidation before the Project mutation,
+reopened-dependency revalidation before launch, persistence of the claimed repository/base
+requirement, and rejection of a runner checked out to another repository before run creation.
+`crony-store` unit coverage separately proves exact retention of policy-pinned model and reasoning
+settings on every materialized task. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
 
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
