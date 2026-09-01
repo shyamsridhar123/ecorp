@@ -1,3 +1,5 @@
+mod factory;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crony_domain::EntityLink;
@@ -37,6 +39,10 @@ enum Command {
     Snapshot {
         corp_id: Uuid,
         actor_id: Uuid,
+    },
+    Factory {
+        #[command(flatten)]
+        args: factory::FactoryArgs,
     },
     Mission {
         corp_id: Uuid,
@@ -163,6 +169,9 @@ async fn main() -> Result<()> {
                 None,
             )
             .await?
+        }
+        Command::Factory { args: factory_args } => {
+            factory::run(&client, &args.server, factory_args).await?
         }
         Command::Mission {
             corp_id,

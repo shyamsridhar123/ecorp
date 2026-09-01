@@ -1,5 +1,6 @@
 use crony_domain::{
-    CorpSnapshot, DomainEvent, EntityLink, TaskSecretReference, VerificationPolicy,
+    CorpSnapshot, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
+    TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -333,6 +334,104 @@ pub struct CreateMissionResponse {
     pub task_id: Uuid,
     pub task_ids: Vec<Uuid>,
     pub strategy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimFactoryWorkItemRequest {
+    pub actor_id: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_project_item_id: String,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub source_issue_number: i64,
+    pub source_issue_node_id: String,
+    pub source_issue_url: String,
+    pub source_title: String,
+    pub source_revision: String,
+    pub idempotency_key: String,
+    #[serde(default = "default_factory_lease_seconds")]
+    pub lease_seconds: i64,
+    #[serde(default)]
+    pub policy: Value,
+}
+
+const fn default_factory_lease_seconds() -> i64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewFactoryWorkItemRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    #[serde(default = "default_factory_lease_seconds")]
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryWorkItemResponse {
+    pub work_item: FactoryWorkItem,
+    pub claim_token: Option<Uuid>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionFactoryWorkItemRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub state: FactoryWorkItemState,
+    pub failure_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactoryMissionContract {
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub expected_output: String,
+    #[serde(default)]
+    pub acceptance_tests: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub prohibited_actions: Vec<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeFactoryMissionRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub title: String,
+    pub preferred_adapter: Option<String>,
+    pub preferred_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub secret_refs: Vec<TaskSecretReference>,
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_microusd: Option<i64>,
+    #[serde(default)]
+    pub contract: FactoryMissionContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeFactoryMissionResponse {
+    pub work_item: FactoryWorkItem,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub task_ids: Vec<Uuid>,
+    pub strategy: String,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

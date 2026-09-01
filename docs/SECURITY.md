@@ -44,6 +44,23 @@ transactionally enqueue durable runner commands. Commands remain pending until t
 acknowledges application, command IDs fence duplicate delivery, and expiry automatically rejects
 the action and repairs run/task/mission/agent state.
 
+Dark-factory claims use a separate opaque fencing token plus a monotonic work-item version.
+Claim tokens are returned only to the authorized operator and are omitted from shared snapshots,
+events, prompts, logs, and artifacts. A GitHub label or Project status is never treated as an
+execution lock. Mission materialization requires an active lease and atomically persists the
+issue-to-mission link. The trusted CLI invokes GitHub CLI without putting its credential in an
+argument, log, mission contract, or agent environment.
+
+The persisted factory policy is enforced again during mission materialization. A later request
+cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
+prohibitions, write scope, token budget, or cost budget. Factory `verified` state requires
+authoritative completed mission and passing task-verification records.
+Publication states cannot be asserted through the generic factory transition endpoint.
+
+Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
+events omit GitHub source metadata; once a mission exists, factory events inherit its room
+visibility.
+
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state
 directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.
@@ -70,6 +87,8 @@ length, and media type before returning an attachment with content sniffing disa
 - Runners connect outbound and receive scoped assignments.
 - Long-lived secrets never enter prompts, logs, command arguments, or agent-readable files.
 - Irreversible effects require authorization and idempotency.
+- GitHub Project status, pull-request publication, merge, and deployment remain separate effects;
+  no factory claim implicitly authorizes a later effect.
 - Artifacts are content-hashed.
 - Agent control uses rotating fencing tokens; stale tokens are rejected.
 - Lease tokens are returned only when the current controller explicitly claims or renews control;

@@ -169,6 +169,32 @@ pnpm install --frozen-lockfile
 pnpm check
 ```
 
+### Run a GitHub Project issue through the factory
+
+The controller reads the **ECorp Build** GitHub Project, not `docs/BACKLOG.md`. An issue is eligible
+when it is open, in `Todo`, labeled `factory:ready`, and has no open `Blocked by` dependencies.
+
+With the local stack running and GitHub CLI authenticated:
+
+```powershell
+cargo run -p crony-cli -- factory `
+  00000000-0000-4000-8000-000000000001 `
+  00000000-0000-4000-8000-000000000011 `
+  --owner shyamsridhar123 `
+  --project-number 3 `
+  --repository shyamsridhar123/ecorp `
+  --adapter codex `
+  --budget-tokens 500000 `
+  --budget-cost-microusd 1000000 `
+  --issue 123 `
+  --dry-run
+```
+
+Remove `--dry-run` to claim the issue, atomically create its mission, move the Project item to
+`In Progress`, and dispatch the runner. Repeating the command recovers the durable work item rather
+than creating another mission. Pull-request publication, merge, and deployment remain separate;
+the controller never enables auto-merge.
+
 ## What to try first
 
 1. Choose **GitHub Copilot**, **Codex**, **Claude Code**, or **OpenCode**.
@@ -191,7 +217,8 @@ Example mission:
 
 ECorp is an active alpha with a working web console, Rust control plane, Postgres event journal,
 outbound runner, provider adapters, thin Tauri desktop shell, protocol gateways, approval system,
-budget circuit breakers, worktree isolation, and evidence-gated completion.
+budget circuit breakers, worktree isolation, evidence-gated completion, and governed GitHub
+Project-to-mission factory intake.
 
 It is not yet a safe sandbox for fully untrusted child processes. Development mode intentionally
 includes fixed demo identities, permissive local CORS, and a deterministic process that runs with
@@ -214,7 +241,8 @@ The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environme
 - [Threat model](docs/THREAT_MODEL.md)
 - [Evaluation strategy](docs/EVALS.md)
 - [Product and technical plan](docs/PRODUCT_AND_TECHNICAL_PLAN.md)
-- [Backlog](docs/BACKLOG.md)
+- [ECorp Build — operational source of truth](https://github.com/users/shyamsridhar123/projects/3)
+- [Historical backlog seed](docs/BACKLOG.md)
 
 ## License
 

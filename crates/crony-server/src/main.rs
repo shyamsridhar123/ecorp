@@ -25,23 +25,27 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
-use crony_domain::DomainEvent;
+use crony_domain::{DomainEvent, TaskGraphPlan, TaskSecretReference};
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
-    ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest, CreateMissionResponse,
-    CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
-    CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
-    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, InterruptRunRequest,
-    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
-    QueueMessageRequest, QueueMessageResponse, ReleaseLeaseRequest, ResolvedSecret,
+    ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
+    CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
+    CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, CreateSecretRequest,
+    CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
+    FactoryMissionContract, FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse,
+    LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse, QueueMessageRequest,
+    QueueMessageResponse, ReleaseLeaseRequest, RenewFactoryWorkItemRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest, VerificationDecisionRequest,
-    VerificationDecisionResponse,
+    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest,
+    TransitionFactoryWorkItemRequest, VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    LaunchRecord, NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage, RunClaim,
-    RunnerConnectInput, RunnerEventInput,
+    ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
+    NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage,
+    RenewFactoryWorkItemInput, RunClaim, RunnerConnectInput, RunnerEventInput,
+    TransitionFactoryWorkItemInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -58,7 +62,7 @@ use uuid::Uuid;
 
 use artifacts::{ArtifactIdentity, ArtifactStore};
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
-use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness};
+use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness, validate_plan};
 use secrets::SecretCipher;
 
 #[derive(Debug, Parser)]
@@ -238,6 +242,8 @@ impl IntoResponse for ApiError {
 fn map_store_error(error: anyhow::Error) -> ApiError {
     if error.to_string().starts_with("forbidden:") {
         ApiError::forbidden(error)
+    } else if error.to_string().starts_with("conflict:") {
+        ApiError::conflict(error)
     } else {
         ApiError::bad_request(error)
     }
@@ -347,6 +353,22 @@ async fn main() -> anyhow::Result<()> {
             get(download_artifact),
         )
         .route("/api/corps/{corp_id}/missions", post(create_mission))
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/claim",
+            post(claim_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/renew",
+            post(renew_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
+            post(transition_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
+            post(materialize_factory_mission),
+        )
         .route(
             "/api/corps/{corp_id}/rooms/{room_id}/messages",
             post(create_room_message),
@@ -1128,6 +1150,140 @@ struct ArtifactDownloadQuery {
     actor_id: Uuid,
 }
 
+struct MissionPlanInput<'a> {
+    title: &'a str,
+    preferred_adapter: Option<&'a str>,
+    preferred_model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    strategy: Option<&'a str>,
+    secret_refs: &'a [TaskSecretReference],
+    budget_tokens: Option<i64>,
+    budget_cost_microusd: Option<i64>,
+    factory_contract: Option<&'a FactoryMissionContract>,
+}
+
+async fn plan_mission(
+    state: &AppState,
+    corp_id: Uuid,
+    input: MissionPlanInput<'_>,
+) -> Result<TaskGraphPlan, ApiError> {
+    let strategy = input.strategy.unwrap_or("single");
+    if !input.secret_refs.is_empty() && strategy != "single" {
+        return Err(ApiError::bad_request(
+            "secret references currently require the single-task strategy",
+        ));
+    }
+    let (preferred_adapter, preferred_model, reasoning_effort) =
+        if uses_deterministic_harness(strategy) {
+            (Some("fake-process"), None, None)
+        } else {
+            (
+                input.preferred_adapter,
+                input.preferred_model,
+                input.reasoning_effort,
+            )
+        };
+    validate_requested_model(
+        state,
+        corp_id,
+        preferred_adapter,
+        preferred_model,
+        reasoning_effort,
+    )?;
+    let agents = state
+        .store
+        .agents_for_planning(corp_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut plan = state
+        .strategies
+        .plan(
+            strategy,
+            &PlanningRequest {
+                mission_title: input.title,
+                preferred_adapter,
+                preferred_model,
+                reasoning_effort,
+                secret_refs: input.secret_refs,
+                budget_tokens: input.budget_tokens,
+                budget_cost_microusd: input.budget_cost_microusd,
+            },
+            &agents,
+        )
+        .map_err(ApiError::bad_request)?;
+    if let Some(contract) = input.factory_contract {
+        apply_factory_contract(&mut plan, contract)?;
+        validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
+    }
+    Ok(plan)
+}
+
+fn apply_factory_contract(
+    plan: &mut TaskGraphPlan,
+    contract: &FactoryMissionContract,
+) -> Result<(), ApiError> {
+    if contract.objective.len() > 100_000 || contract.expected_output.len() > 10_000 {
+        return Err(ApiError::bad_request(
+            "factory mission objective or expected output is too large",
+        ));
+    }
+    for (name, values) in [
+        ("acceptance tests", &contract.acceptance_tests),
+        ("allowed tools", &contract.allowed_tools),
+        ("prohibited actions", &contract.prohibited_actions),
+        ("references", &contract.references),
+        ("write scope", &contract.write_scope),
+    ] {
+        if values.len() > 64 {
+            return Err(ApiError::bad_request(format!(
+                "factory mission {name} cannot contain more than 64 entries"
+            )));
+        }
+    }
+
+    let multi_task = plan.tasks.len() > 1;
+    for task in &mut plan.tasks {
+        if !contract.objective.trim().is_empty() {
+            task.contract.objective = if multi_task {
+                format!(
+                    "{}\n\nROLE-SPECIFIC OBJECTIVE:\n{}",
+                    contract.objective.trim(),
+                    task.contract.objective
+                )
+            } else {
+                contract.objective.trim().to_owned()
+            };
+        }
+        if !contract.expected_output.trim().is_empty() {
+            task.contract.expected_output = contract.expected_output.trim().to_owned();
+        }
+        append_unique(
+            &mut task.contract.acceptance_tests,
+            &contract.acceptance_tests,
+        );
+        if !contract.allowed_tools.is_empty() {
+            task.contract.allowed_tools = contract.allowed_tools.clone();
+        }
+        append_unique(
+            &mut task.contract.prohibited_actions,
+            &contract.prohibited_actions,
+        );
+        append_unique(&mut task.contract.references, &contract.references);
+        if !contract.write_scope.is_empty() {
+            task.contract.write_scope = contract.write_scope.clone();
+        }
+    }
+    Ok(())
+}
+
+fn append_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.contains(value) {
+            target.push(value.clone());
+        }
+    }
+}
+
 async fn create_mission(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1142,50 +1298,22 @@ async fn create_mission(
         Permission::Operate,
     )
     .await?;
-    let strategy = request.strategy.as_deref().unwrap_or("single");
-    if !request.secret_refs.is_empty() && strategy != "single" {
-        return Err(ApiError::bad_request(
-            "secret references currently require the single-task strategy",
-        ));
-    }
-    let (preferred_adapter, preferred_model, reasoning_effort) =
-        if uses_deterministic_harness(strategy) {
-            (Some("fake-process"), None, None)
-        } else {
-            (
-                request.preferred_adapter.as_deref(),
-                request.preferred_model.as_deref(),
-                request.reasoning_effort.as_deref(),
-            )
-        };
-    validate_requested_model(
+    let plan = plan_mission(
         &state,
         corp_id,
-        preferred_adapter,
-        preferred_model,
-        reasoning_effort,
-    )?;
-    let agents = state
-        .store
-        .agents_for_planning(corp_id)
-        .await
-        .map_err(ApiError::internal)?;
-    let plan = state
-        .strategies
-        .plan(
-            strategy,
-            &PlanningRequest {
-                mission_title: &request.title,
-                preferred_adapter,
-                preferred_model,
-                reasoning_effort,
-                secret_refs: &request.secret_refs,
-                budget_tokens: request.budget_tokens,
-                budget_cost_microusd: request.budget_cost_microusd,
-            },
-            &agents,
-        )
-        .map_err(ApiError::bad_request)?;
+        MissionPlanInput {
+            title: &request.title,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            factory_contract: None,
+        },
+    )
+    .await?;
     let (ids, events) = state
         .store
         .create_mission(corp_id, requested_by, &request.title, &plan)
@@ -1199,6 +1327,212 @@ async fn create_mission(
         task_id: ids.task_ids[0],
         task_ids: ids.task_ids,
         strategy: plan.strategy,
+    }))
+}
+
+async fn claim_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<ClaimFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .claim_factory_work_item(ClaimFactoryWorkItemInput {
+            corp_id,
+            actor_id,
+            source: FactorySourceInput {
+                project_owner: request.source_project_owner,
+                project_number: request.source_project_number,
+                project_item_id: request.source_project_item_id,
+                repository_owner: request.source_repository_owner,
+                repository_name: request.source_repository_name,
+                issue_number: request.source_issue_number,
+                issue_node_id: request.source_issue_node_id,
+                issue_url: request.source_issue_url,
+                title: request.source_title,
+                revision: request.source_revision,
+            },
+            idempotency_key: request.idempotency_key,
+            lease_seconds: request.lease_seconds,
+            policy: request.policy,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn renew_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RenewFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .renew_factory_work_item(RenewFactoryWorkItemInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            lease_seconds: request.lease_seconds,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn transition_factory_work_item(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<TransitionFactoryWorkItemRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .transition_factory_work_item(TransitionFactoryWorkItemInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            state: request.state,
+            failure_detail: request.failure_detail,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn materialize_factory_mission(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MaterializeFactoryMissionRequest>,
+) -> Result<Json<MaterializeFactoryMissionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let operation_request = json!({
+        "title": &request.title,
+        "preferred_adapter": &request.preferred_adapter,
+        "preferred_model": &request.preferred_model,
+        "reasoning_effort": &request.reasoning_effort,
+        "strategy": &request.strategy,
+        "secret_refs": &request.secret_refs,
+        "budget_tokens": request.budget_tokens,
+        "budget_cost_microusd": request.budget_cost_microusd,
+        "contract": &request.contract
+    });
+    let materialize_input = MaterializeFactoryMissionInput {
+        corp_id,
+        work_item_id,
+        actor_id,
+        claim_token: request.claim_token,
+        expected_version: request.expected_version,
+        idempotency_key: request.idempotency_key.clone(),
+        title: request.title.clone(),
+        request: operation_request,
+    };
+    if let Some(outcome) = state
+        .store
+        .replay_factory_materialization(&materialize_input)
+        .await
+        .map_err(map_store_error)?
+    {
+        return Ok(Json(MaterializeFactoryMissionResponse {
+            mission_id: outcome.ids.mission_id,
+            task_id: outcome.ids.task_ids[0],
+            task_ids: outcome.ids.task_ids,
+            strategy: outcome.strategy,
+            work_item: outcome.work_item,
+            replayed: true,
+        }));
+    }
+    let plan = plan_mission(
+        &state,
+        corp_id,
+        MissionPlanInput {
+            title: &request.title,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            factory_contract: Some(&request.contract),
+        },
+    )
+    .await?;
+    let outcome = state
+        .store
+        .materialize_factory_mission(materialize_input, &plan)
+        .await
+        .map_err(map_store_error)?;
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    Ok(Json(MaterializeFactoryMissionResponse {
+        mission_id: outcome.ids.mission_id,
+        task_id: outcome.ids.task_ids[0],
+        task_ids: outcome.ids.task_ids,
+        strategy: outcome.strategy,
+        work_item: outcome.work_item,
+        replayed: outcome.replayed,
     }))
 }
 

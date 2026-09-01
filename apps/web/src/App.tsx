@@ -150,6 +150,37 @@ type CircuitBreakerIncident = {
   created_at: string
 }
 
+type FactoryWorkItem = {
+  id: string
+  source_project_owner: string
+  source_project_number: number
+  source_project_item_id: string
+  source_repository_owner: string
+  source_repository_name: string
+  source_issue_number: number
+  source_issue_url: string
+  source_title: string
+  source_revision: string
+  state:
+    | 'claimed'
+    | 'mission_created'
+    | 'running'
+    | 'blocked'
+    | 'awaiting_approval'
+    | 'verification_failed'
+    | 'verified'
+    | 'publishing'
+    | 'published'
+    | 'failed'
+    | 'cancelled'
+  version: number
+  claim_owner_id: string
+  lease_expires_at: string
+  policy: Record<string, unknown>
+  mission_id: string | null
+  failure_detail: string | null
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -231,6 +262,7 @@ type SnapshotResponse = {
     verification_requests: VerificationRequest[]
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
+    factory_work_items: FactoryWorkItem[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -434,6 +466,103 @@ function leaseTokenKey(actorId: string, agentId: string): string {
 
 function StatusMark({ status }: { status: Agent['status'] }) {
   return <span className={`status-mark status-${status}`} aria-label={status} />
+}
+
+function FactoryPanel({
+  items,
+  missions,
+}: {
+  items: FactoryWorkItem[]
+  missions: Mission[]
+}) {
+  const stateTone = (state: FactoryWorkItem['state']) => {
+    if (['verified', 'published'].includes(state)) return 'completed'
+    if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
+      return 'failed'
+    }
+    if (['running', 'awaiting_approval', 'publishing'].includes(state)) return 'running'
+    return 'ready'
+  }
+  const active = items.filter(
+    (item) => !['published', 'failed', 'cancelled'].includes(item.state),
+  )
+  return (
+    <section className="factory-panel panel" id="factory" data-testid="factory-panel">
+      <div className="panel-heading factory-heading">
+        <div>
+          <span className="section-code">DARK FACTORY / 02</span>
+          <h2>Governed issue intake</h2>
+          <p>
+            GitHub Project work is claimed once, fenced, linked to one mission, and advanced by
+            durable evidence—not labels alone.
+          </p>
+        </div>
+        <div className="operations-summary">
+          <span>{active.length} active</span>
+          <span>{items.filter((item) => item.state === 'verified').length} verified</span>
+          <span>auto-merge off</span>
+        </div>
+      </div>
+      <div className="factory-list">
+        {items.length ? (
+          items.map((item) => {
+            const mission = missions.find((candidate) => candidate.id === item.mission_id)
+            return (
+              <article className="factory-card" key={item.id}>
+                <div className="factory-card-top">
+                  <span className="factory-source">
+                    GitHub issue #{item.source_issue_number}
+                  </span>
+                  <span className={`status-chip status-chip-${stateTone(item.state)}`}>
+                    {statusLabel(item.state)}
+                  </span>
+                </div>
+                <h3>
+                  <a href={item.source_issue_url} target="_blank" rel="noreferrer">
+                    {item.source_title}
+                  </a>
+                </h3>
+                <dl>
+                  <div>
+                    <dt>Project</dt>
+                    <dd>
+                      {item.source_project_owner} / #{item.source_project_number}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Mission</dt>
+                    <dd>{mission ? shortId(mission.id) : 'Not materialized'}</dd>
+                  </div>
+                  <div>
+                    <dt>Controller</dt>
+                    <dd>{shortId(item.claim_owner_id)}</dd>
+                  </div>
+                  <div>
+                    <dt>Lease</dt>
+                    <dd>{time(item.lease_expires_at)}</dd>
+                  </div>
+                </dl>
+                {item.failure_detail ? (
+                  <p className="factory-failure">{item.failure_detail}</p>
+                ) : null}
+                <footer>
+                  <span>rev {item.source_revision}</span>
+                  <span>v{item.version}</span>
+                </footer>
+              </article>
+            )
+          })
+        ) : (
+          <div className="empty-state">
+            <strong>No factory work claimed</strong>
+            <span>
+              Eligible GitHub Project issues appear here after the controller persists its lease.
+            </span>
+          </div>
+        )}
+      </div>
+    </section>
+  )
 }
 
 function AgentAvatar({ agent }: { agent: Agent }) {
@@ -1969,6 +2098,7 @@ function App() {
 
       <nav className="workspace-nav" aria-label="ECorp workspace sections">
         <a href="#floor">Control floor</a>
+        <a href="#factory">Factory</a>
         <a href="#missions">Missions</a>
         <a href="#room">Comms</a>
         <a href="#activity">Audit</a>
@@ -2109,6 +2239,11 @@ function App() {
           </button>
         </div>
       ) : null}
+
+      <FactoryPanel
+        items={data.snapshot.factory_work_items}
+        missions={data.snapshot.missions}
+      />
 
       <section className="office-grid">
         <div className="floor-panel panel" id="floor">

@@ -79,7 +79,7 @@ try {
         pnpm install --frozen-lockfile
     }
     if (-not $SkipBuild) {
-        cargo build -p crony-server -p crony-runner
+        cargo build -p crony-server -p crony-runner -p crony-cli
     }
 
     $logs = @(

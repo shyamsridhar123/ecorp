@@ -163,6 +163,21 @@ finish with verified worktree evidence. See
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
 methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.
 
+`tools/e2e_factory_claims.mjs` races duplicate factory claims, renewals, and mission
+materialization, restarts the server between claim and renewal, rejects guest, cross-Corp, stale
+version, stale token, and duplicate-active operations, proves the fencing token is absent from
+snapshots and events, proves non-operators cannot read source metadata through factory snapshots or
+events, and launches the one linked mission through the real runner.
+
+`tools/e2e_factory_controller.mjs` gives the CLI a deterministic GitHub API boundary and proves
+Project eligibility, dependency parsing, a mutation-free dry run, durable claim-before-dispatch,
+Todo-to-In-Progress synchronization only after mission linkage, one real child-process run, and
+duplicate controller recovery without a second work item, mission, or run. It also injects a
+GitHub Project status failure, verifies durable `blocked` state before launch, and proves retry
+reuses the existing mission. Additional regressions prove verified items leave the intake queue
+and terminal mission failure becomes terminal factory failure. See
+`docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before

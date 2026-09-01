@@ -229,6 +229,109 @@
   color: var(--ink-soft);
 }
 
+.factory-panel {
+  margin-top: 16px;
+}
+
+.factory-heading {
+  align-items: center;
+}
+
+.factory-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  padding: 16px;
+  background:
+    linear-gradient(90deg, rgb(23 39 45 / 6%) 1px, transparent 1px),
+    var(--paper-deep);
+  background-size: 24px 24px;
+}
+
+.factory-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--ink);
+  background: var(--paper-light);
+  box-shadow: 3px 3px 0 rgb(23 39 45 / 24%);
+}
+
+.factory-card-top,
+.factory-card footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.factory-source {
+  color: var(--cobalt-dark);
+  font: 700 9px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.factory-card h3 {
+  margin: 13px 0;
+  font: 700 17px/1.16 var(--sans);
+}
+
+.factory-card h3 a {
+  color: var(--ink);
+  text-decoration-color: var(--signal);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.factory-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.factory-card dl div {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+}
+
+.factory-card dt,
+.factory-card footer {
+  color: var(--ink-soft);
+  font: 700 8px/1.2 var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.factory-card dd {
+  margin: 5px 0 0;
+  overflow: hidden;
+  font: 700 10px/1.25 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.factory-failure {
+  margin: 9px 0 0;
+  padding: 8px;
+  color: #77232a;
+  font: 700 10px/1.35 var(--mono);
+  border-left: 4px solid var(--signal);
+  background: #f2d7d8;
+}
+
+.factory-card footer {
+  margin-top: 10px;
+}
+
+.factory-card footer span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .floor-legend {
   display: flex;
   flex-wrap: wrap;

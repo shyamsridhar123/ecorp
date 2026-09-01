@@ -60,7 +60,7 @@ jobs:
           cache: pnpm
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
-      - run: cargo build -p crony-server -p crony-runner -p crony-gateways
+      - run: cargo build -p crony-server -p crony-runner -p crony-cli -p crony-gateways
       - name: Start control and execution planes
         shell: bash
         run: |
@@ -151,6 +151,15 @@ jobs:
         run: node tools/e2e_runner_reconnect.mjs
       - name: Verify duplicate runner delivery is idempotent
         run: node tools/e2e_idempotency.mjs
+      - name: Verify fenced factory claims, restart recovery, and one linked mission
+        env:
+          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.pid
+          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
+          CRONY_TEST_SERVER_BIND: 127.0.0.1:8791
+          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
+        run: node tools/e2e_factory_claims.mjs
+      - name: Verify Project eligibility, dry run, dispatch, status sync, and replay
+        run: node tools/e2e_factory_controller.mjs
       - name: Verify OIDC, Corp RBAC, runner enrollment, rotation, replay defense, and revocation
         run: node tools/e2e_identity.mjs
       - name: Verify scoped secret brokering without plaintext leakage
@@ -195,6 +204,9 @@ jobs:
             output/eval-report.json
             output/e2e-runner-reconnect.json
             output/e2e-idempotency.json
+            output/e2e-factory-claims.json
+            output/e2e-factory-controller.json
+            output/fake-github-factory-state.json
             output/e2e-replay.json
             output/e2e-leases.json
             output/server-ci.log
