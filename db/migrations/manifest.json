@@ -100,6 +100,11 @@
       "version": 20,
       "file": "0020_factory_state_transitions.sql",
       "sha384": "02c6dcdd62885880ade91aeb47b7d1fdaebaed592ed97a3714c53de281214268b3bd4c055b86ddcc738ad7ee05c77745"
+    },
+    {
+      "version": 21,
+      "file": "0021_artifact_staging.sql",
+      "sha384": "82601d7466e7517f66b35923d6e342bd6702bacf828ea263b362a99236a5f93805d8ea09f476793ae2fe4756374f787d"
     }
   ]
 }

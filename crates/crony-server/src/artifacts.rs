@@ -5,12 +5,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use crony_store::StoredArtifact;
+use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
 use object_store::{
     ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectPath,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use uuid::Uuid;
 
 pub const ARTIFACT_VERIFIER: &str = "crony-server:artifact-ingest-v1";
@@ -30,6 +32,38 @@ pub struct ArtifactIdentity<'a> {
     pub run_id: Uuid,
     pub agent_id: Uuid,
     pub runner_id: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct StagedArtifact {
+    pub artifact: StoredArtifact,
+    pub staging_key: String,
+    pub bytes: Bytes,
+}
+
+#[derive(Debug, Error)]
+enum PermanentArtifactError {
+    #[error("artifact provenance metadata is invalid: {0}")]
+    InvalidProvenance(String),
+    #[error("staged and final artifact objects are both unavailable")]
+    MissingObjects,
+    #[error("{0} failed integrity verification")]
+    Integrity(String),
+    #[error("{0} media validation failed: {1}")]
+    Media(String, String),
+    #[error("{0} media type changed")]
+    MediaTypeChanged(String),
+}
+
+pub fn artifact_error_is_permanent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PermanentArtifactError>().is_some()
+}
+
+pub fn artifact_error_is_missing_objects(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PermanentArtifactError>(),
+        Some(PermanentArtifactError::MissingObjects)
+    )
 }
 
 impl ArtifactStore {
@@ -104,12 +138,27 @@ impl ArtifactStore {
         })
     }
 
+    #[cfg(test)]
     pub async fn ingest(
         &self,
         identity: ArtifactIdentity<'_>,
         payload: &Value,
         retention_until: DateTime<Utc>,
     ) -> Result<StoredArtifact> {
+        let staged = self.prepare_staging(identity, payload, retention_until)?;
+        self.write_staged(&staged).await?;
+        self.finalize_staged(&staged.artifact, &staged.staging_key)
+            .await?;
+        self.discard_staged(&staged.staging_key).await?;
+        Ok(staged.artifact)
+    }
+
+    pub fn prepare_staging(
+        &self,
+        identity: ArtifactIdentity<'_>,
+        payload: &Value,
+        retention_until: DateTime<Utc>,
+    ) -> Result<StagedArtifact> {
         let declared_bytes = payload
             .get("bytes")
             .and_then(Value::as_u64)
@@ -174,15 +223,9 @@ impl ArtifactStore {
             &actual_sha[..2],
             actual_sha
         );
-        self.store
-            .put(
-                &ObjectPath::from(object_key.clone()),
-                Bytes::from(bytes).into(),
-            )
-            .await
-            .context("write artifact object")?;
+        let staging_key = format!("staging/corps/{}/{}", identity.corp_id, identity.id);
         let uri = format!("/api/corps/{}/artifacts/{}", identity.corp_id, identity.id);
-        let bytes = i64::try_from(declared_bytes).context("artifact size exceeds i64")?;
+        let byte_count = i64::try_from(declared_bytes).context("artifact size exceeds i64")?;
         let artifact = StoredArtifact {
             id: identity.id,
             corp_id: identity.corp_id,
@@ -195,15 +238,97 @@ impl ArtifactStore {
             uri,
             sha256: actual_sha,
             media_type,
-            bytes,
+            bytes: byte_count,
             provenance_signature: String::new(),
             retention_until,
         };
         let provenance_signature = self.sign(&artifact)?;
-        Ok(StoredArtifact {
-            provenance_signature,
-            ..artifact
+        Ok(StagedArtifact {
+            artifact: StoredArtifact {
+                provenance_signature,
+                ..artifact
+            },
+            staging_key,
+            bytes: Bytes::from(bytes),
         })
+    }
+
+    pub async fn write_staged(&self, staged: &StagedArtifact) -> Result<()> {
+        verify_artifact_bytes(&staged.artifact, &staged.bytes, "prepared artifact")?;
+        self.store
+            .put(
+                &ObjectPath::from(staged.staging_key.clone()),
+                staged.bytes.clone().into(),
+            )
+            .await
+            .context("write staged artifact object")?;
+        Ok(())
+    }
+
+    pub async fn finalize_staged(
+        &self,
+        artifact: &StoredArtifact,
+        staging_key: &str,
+    ) -> Result<()> {
+        self.verify_signature(artifact).map_err(|error| {
+            anyhow!(PermanentArtifactError::InvalidProvenance(error.to_string()))
+        })?;
+        let bytes = match self.store.get(&ObjectPath::from(staging_key)).await {
+            Ok(result) => result.bytes().await.context("read staged artifact bytes")?,
+            Err(object_store::Error::NotFound { .. }) => {
+                let final_object = match self
+                    .store
+                    .get(&ObjectPath::from(artifact.object_key.clone()))
+                    .await
+                {
+                    Ok(final_object) => final_object,
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return Err(anyhow!(PermanentArtifactError::MissingObjects));
+                    }
+                    Err(error) => {
+                        return Err(error).context("read final artifact object during recovery");
+                    }
+                };
+                let bytes = final_object
+                    .bytes()
+                    .await
+                    .context("read final artifact bytes during recovery")?;
+                verify_artifact_bytes(artifact, &bytes, "final artifact")?;
+                return Ok(());
+            }
+            Err(error) => return Err(error).context("read staged artifact object"),
+        };
+        verify_artifact_bytes(artifact, &bytes, "staged artifact")?;
+        self.store
+            .put(&ObjectPath::from(artifact.object_key.clone()), bytes.into())
+            .await
+            .context("publish final artifact object")?;
+        Ok(())
+    }
+
+    pub async fn discard_staged(&self, staging_key: &str) -> Result<()> {
+        match self.store.delete(&ObjectPath::from(staging_key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error).context("delete staged artifact object"),
+        }
+    }
+
+    pub async fn staged_keys(&self) -> Result<Vec<String>> {
+        let prefix = ObjectPath::from("staging");
+        let mut objects = self.store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(object) = objects
+            .try_next()
+            .await
+            .context("list staged artifact objects")?
+        {
+            let key = object.location.to_string();
+            if is_staging_key(&key) {
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 
     pub async fn read_verified(&self, artifact: &StoredArtifact) -> Result<Bytes> {
@@ -219,14 +344,7 @@ impl ArtifactStore {
             .bytes()
             .await
             .context("read artifact bytes")?;
-        let actual_sha = hex::encode(Sha256::digest(&bytes));
-        if actual_sha != artifact.sha256 || bytes.len() as i64 != artifact.bytes {
-            return Err(anyhow!("stored artifact failed integrity verification"));
-        }
-        let verified_media = normalize_and_verify_media_type(&artifact.media_type, &bytes)?;
-        if verified_media != artifact.media_type {
-            return Err(anyhow!("stored artifact media type changed"));
-        }
+        verify_artifact_bytes(artifact, &bytes, "stored artifact")?;
         Ok(bytes)
     }
 
@@ -246,6 +364,35 @@ impl ArtifactStore {
         mac.verify_slice(&signature)
             .map_err(|_| anyhow!("artifact provenance signature is invalid"))
     }
+}
+
+fn verify_artifact_bytes(artifact: &StoredArtifact, bytes: &[u8], label: &str) -> Result<()> {
+    let actual_sha = hex::encode(Sha256::digest(bytes));
+    if actual_sha != artifact.sha256 || bytes.len() as i64 != artifact.bytes {
+        return Err(anyhow!(PermanentArtifactError::Integrity(label.to_owned())));
+    }
+    let verified_media =
+        normalize_and_verify_media_type(&artifact.media_type, bytes).map_err(|error| {
+            anyhow!(PermanentArtifactError::Media(
+                label.to_owned(),
+                error.to_string(),
+            ))
+        })?;
+    if verified_media != artifact.media_type {
+        return Err(anyhow!(PermanentArtifactError::MediaTypeChanged(
+            label.to_owned()
+        )));
+    }
+    Ok(())
+}
+
+fn is_staging_key(key: &str) -> bool {
+    let parts = key.split('/').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "staging"
+        && parts[1] == "corps"
+        && Uuid::parse_str(parts[2]).is_ok()
+        && Uuid::parse_str(parts[3]).is_ok()
 }
 
 fn provenance_message(artifact: &StoredArtifact) -> String {
@@ -400,6 +547,102 @@ mod tests {
         tampered.bytes += 1;
         assert!(store.read_verified(&tampered).await.is_err());
         std::fs::remove_dir_all(root).expect("remove artifact test directory");
+    }
+
+    #[tokio::test]
+    async fn staged_objects_finalize_idempotently_and_cleanup_safely() {
+        let root = std::env::temp_dir()
+            .join("crony-artifact-staging-tests")
+            .join(Uuid::new_v4().to_string());
+        let store = ArtifactStore::initialize(
+            "local",
+            root.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            1_024,
+            false,
+        )
+        .expect("initialize artifact store");
+        let content = br#"{"staged":true}"#;
+        let staged = store
+            .prepare_staging(
+                identity(),
+                &json!({
+                    "sha256": hex::encode(Sha256::digest(content)),
+                    "bytes": content.len(),
+                    "media_type": "application/json",
+                    "content_base64": BASE64.encode(content),
+                }),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .expect("prepare artifact staging");
+        store.write_staged(&staged).await.expect("stage artifact");
+        assert!(store.read_verified(&staged.artifact).await.is_err());
+        store
+            .finalize_staged(&staged.artifact, &staged.staging_key)
+            .await
+            .expect("finalize staged artifact");
+        store
+            .discard_staged(&staged.staging_key)
+            .await
+            .expect("discard staging");
+        store
+            .finalize_staged(&staged.artifact, &staged.staging_key)
+            .await
+            .expect("recover finalization after staging cleanup");
+        store
+            .discard_staged(&staged.staging_key)
+            .await
+            .expect("repeat staging cleanup");
+        assert!(store.staged_keys().await.expect("list staging").is_empty());
+        assert_eq!(
+            store
+                .read_verified(&staged.artifact)
+                .await
+                .expect("read final artifact"),
+            Bytes::from_static(content)
+        );
+
+        let duplicate = store
+            .prepare_staging(
+                ArtifactIdentity {
+                    id: Uuid::new_v4(),
+                    ..identity()
+                },
+                &json!({
+                    "sha256": hex::encode(Sha256::digest(content)),
+                    "bytes": content.len(),
+                    "media_type": "application/json",
+                    "content_base64": BASE64.encode(content),
+                }),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .expect("prepare duplicate digest");
+        store
+            .write_staged(&duplicate)
+            .await
+            .expect("stage duplicate digest");
+        assert_eq!(
+            store.staged_keys().await.expect("list duplicate staging"),
+            vec![duplicate.staging_key.clone()]
+        );
+        store
+            .discard_staged(&duplicate.staging_key)
+            .await
+            .expect("discard rejected duplicate staging");
+        assert_eq!(
+            store
+                .read_verified(&staged.artifact)
+                .await
+                .expect("accepted shared digest remains"),
+            Bytes::from_static(content)
+        );
+        std::fs::remove_dir_all(root).expect("remove artifact staging test directory");
     }
 
     #[test]

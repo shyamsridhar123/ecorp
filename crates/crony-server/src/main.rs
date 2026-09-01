@@ -3,7 +3,9 @@ mod auth;
 mod planning;
 mod secrets;
 
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration,
+};
 
 use anyhow::Context;
 use axum::{
@@ -60,7 +62,10 @@ use tower_http::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use artifacts::{ArtifactIdentity, ArtifactStore};
+use artifacts::{
+    ArtifactIdentity, ArtifactStore, StagedArtifact, artifact_error_is_missing_objects,
+    artifact_error_is_permanent,
+};
 use auth::{AuthService, CorpRole, Permission, Principal, ServerMode};
 use planning::{PlanningRequest, StrategyRegistry, uses_deterministic_harness, validate_plan};
 use secrets::SecretCipher;
@@ -152,6 +157,14 @@ struct Args {
 
     #[arg(long, env = "CRONY_ARTIFACT_RETENTION_DAYS", default_value_t = 30)]
     artifact_retention_days: i64,
+
+    #[arg(
+        long,
+        env = "CRONY_ARTIFACT_RECOVERY_GRACE_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(i64).range(0..=3_600)
+    )]
+    artifact_recovery_grace_secs: i64,
 }
 
 #[derive(Clone)]
@@ -295,6 +308,26 @@ async fn main() -> anyhow::Result<()> {
         args.artifact_max_bytes,
         args.mode == ServerMode::Production,
     )?;
+    let artifact_recovery_grace = ChronoDuration::seconds(args.artifact_recovery_grace_secs);
+    recover_pending_artifacts(&store, &artifacts, artifact_recovery_grace).await?;
+    let recovery_store = store.clone();
+    let recovery_artifacts = artifacts.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(StdDuration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = recover_pending_artifacts(
+                &recovery_store,
+                &recovery_artifacts,
+                artifact_recovery_grace,
+            )
+            .await
+            {
+                warn!(%error, "periodic artifact recovery pass failed");
+            }
+        }
+    });
     let (event_tx, _) = broadcast::channel(2_048);
     let state = AppState {
         store,
@@ -3302,22 +3335,282 @@ async fn process_runner_event(
         )
         .await?;
     let retention_until = Utc::now() + ChronoDuration::days(state.artifact_retention_days);
-    let artifact = state
-        .artifacts
-        .ingest(
-            ArtifactIdentity {
-                id: input.event_id,
-                corp_id: input.corp_id,
-                task_id: context.task_id,
-                run_id: input.run_id,
-                agent_id: input.agent_id,
-                runner_id: &input.runner_id,
-            },
-            &input.payload,
-            retention_until,
-        )
+    let staged = state.artifacts.prepare_staging(
+        ArtifactIdentity {
+            id: input.event_id,
+            corp_id: input.corp_id,
+            task_id: context.task_id,
+            run_id: input.run_id,
+            agent_id: input.agent_id,
+            runner_id: &input.runner_id,
+        },
+        &input.payload,
+        retention_until,
+    )?;
+    let prepared = state
+        .store
+        .prepare_artifact_upload(input, staged.artifact.clone(), &staged.staging_key)
         .await?;
-    state.store.record_artifact_upload(input, artifact).await
+    match prepared.status.as_str() {
+        "ready" => {
+            cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
+            Ok(None)
+        }
+        "rejected" => {
+            cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
+            Err(anyhow::anyhow!("artifact upload was previously rejected"))
+        }
+        "staged" => {
+            let staging_key = prepared
+                .staging_key
+                .as_deref()
+                .context("staged artifact omitted its staging key")?;
+            let reserved = StagedArtifact {
+                artifact: prepared.artifact.clone(),
+                staging_key: staging_key.to_owned(),
+                bytes: staged.bytes,
+            };
+            state.artifacts.write_staged(&reserved).await?;
+            if let Err(error) = state
+                .artifacts
+                .finalize_staged(&prepared.artifact, staging_key)
+                .await
+            {
+                if artifact_error_is_permanent(&error) {
+                    let cleanup_key = state
+                        .store
+                        .reject_staged_artifact(
+                            prepared.artifact.corp_id,
+                            prepared.artifact.id,
+                            &error.to_string(),
+                        )
+                        .await;
+                    match cleanup_key {
+                        Ok(Some(cleanup_key))
+                            if state.artifacts.discard_staged(&cleanup_key).await.is_ok() =>
+                        {
+                            let _ = state
+                                .store
+                                .clear_artifact_staging_key(
+                                    prepared.artifact.corp_id,
+                                    prepared.artifact.id,
+                                    &cleanup_key,
+                                )
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(reject_error) => {
+                            return Err(error).context(format!(
+                                "artifact rejection persistence also failed: {reject_error}"
+                            ));
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            let event = state
+                .store
+                .finalize_artifact_upload(prepared.artifact.corp_id, prepared.artifact.id)
+                .await?;
+            cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
+            Ok(event)
+        }
+        status => Err(anyhow::anyhow!("unknown prepared artifact status {status}")),
+    }
+}
+
+async fn recover_pending_artifacts(
+    store: &PgStore,
+    artifacts: &ArtifactStore,
+    recovery_grace: ChronoDuration,
+) -> anyhow::Result<()> {
+    let pending = store.pending_artifact_uploads(500).await?;
+    let known_staging_keys = pending
+        .iter()
+        .filter_map(|prepared| prepared.staging_key.clone())
+        .collect::<HashSet<_>>();
+    match artifacts.staged_keys().await {
+        Ok(staging_keys) => {
+            for staging_key in staging_keys {
+                if !known_staging_keys.contains(&staging_key) {
+                    match store.artifact_staging_key_is_reserved(&staging_key).await {
+                        Ok(true) => continue,
+                        Ok(false) => match artifacts.discard_staged(&staging_key).await {
+                            Ok(()) => {
+                                info!(%staging_key, "removed orphan artifact staging object")
+                            }
+                            Err(error) => warn!(
+                                %error,
+                                %staging_key,
+                                "orphan artifact staging cleanup deferred"
+                            ),
+                        },
+                        Err(error) => warn!(
+                            %error,
+                            %staging_key,
+                            "orphan artifact reservation check deferred"
+                        ),
+                    }
+                }
+            }
+        }
+        Err(error) => warn!(%error, "artifact staging discovery deferred"),
+    }
+
+    for prepared in pending {
+        if prepared.status == "staged" && prepared.created_at > Utc::now() - recovery_grace {
+            tracing::debug!(
+                artifact_id = %prepared.artifact.id,
+                created_at = %prepared.created_at,
+                "staged artifact remains inside the recovery grace window"
+            );
+            continue;
+        }
+        match prepared.status.as_str() {
+            "staged" => {
+                let staging_key = prepared
+                    .staging_key
+                    .as_deref()
+                    .context("staged artifact omitted its staging key")?;
+                if let Err(error) = artifacts
+                    .finalize_staged(&prepared.artifact, staging_key)
+                    .await
+                {
+                    if artifact_error_is_missing_objects(&error) {
+                        warn!(
+                            %error,
+                            artifact_id = %prepared.artifact.id,
+                            %staging_key,
+                            "expired artifact reservation has no bytes; releasing it for retry"
+                        );
+                        match store
+                            .abandon_staged_artifact(
+                                prepared.artifact.corp_id,
+                                prepared.artifact.id,
+                            )
+                            .await
+                        {
+                            Ok(Some(cleanup_key)) => {
+                                if let Err(cleanup_error) =
+                                    artifacts.discard_staged(&cleanup_key).await
+                                {
+                                    warn!(
+                                        %cleanup_error,
+                                        %cleanup_key,
+                                        "released artifact staging cleanup deferred"
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(abandon_error) => warn!(
+                                %abandon_error,
+                                artifact_id = %prepared.artifact.id,
+                                "artifact reservation release deferred"
+                            ),
+                        }
+                    } else if artifact_error_is_permanent(&error) {
+                        warn!(
+                            %error,
+                            artifact_id = %prepared.artifact.id,
+                            %staging_key,
+                            "staged artifact recovery failed permanently; rejecting metadata"
+                        );
+                        match store
+                            .reject_staged_artifact(
+                                prepared.artifact.corp_id,
+                                prepared.artifact.id,
+                                &error.to_string(),
+                            )
+                            .await
+                        {
+                            Ok(Some(cleanup_key))
+                                if artifacts.discard_staged(&cleanup_key).await.is_ok() =>
+                            {
+                                let _ = store
+                                    .clear_artifact_staging_key(
+                                        prepared.artifact.corp_id,
+                                        prepared.artifact.id,
+                                        &cleanup_key,
+                                    )
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(reject_error) => warn!(
+                                %reject_error,
+                                artifact_id = %prepared.artifact.id,
+                                "artifact recovery rejection persistence deferred"
+                            ),
+                        }
+                    } else {
+                        warn!(
+                            %error,
+                            artifact_id = %prepared.artifact.id,
+                            %staging_key,
+                            "transient staged artifact recovery deferred"
+                        );
+                    }
+                    continue;
+                }
+                if let Err(error) = store
+                    .finalize_artifact_upload(prepared.artifact.corp_id, prepared.artifact.id)
+                    .await
+                {
+                    warn!(
+                        %error,
+                        artifact_id = %prepared.artifact.id,
+                        "artifact metadata finalization recovery deferred"
+                    );
+                    continue;
+                }
+            }
+            "ready" | "rejected" => {}
+            status => {
+                warn!(
+                    artifact_id = %prepared.artifact.id,
+                    %status,
+                    "artifact recovery skipped unknown status"
+                );
+                continue;
+            }
+        }
+        cleanup_prepared_artifact(store, artifacts, &prepared).await;
+    }
+    Ok(())
+}
+
+async fn cleanup_prepared_artifact(
+    store: &PgStore,
+    artifacts: &ArtifactStore,
+    prepared: &crony_store::PreparedArtifactUpload,
+) {
+    let Some(staging_key) = prepared.staging_key.as_deref() else {
+        return;
+    };
+    match artifacts.discard_staged(staging_key).await {
+        Ok(()) => {
+            if let Err(error) = store
+                .clear_artifact_staging_key(
+                    prepared.artifact.corp_id,
+                    prepared.artifact.id,
+                    staging_key,
+                )
+                .await
+            {
+                warn!(
+                    %error,
+                    artifact_id = %prepared.artifact.id,
+                    %staging_key,
+                    "artifact staging metadata cleanup failed"
+                );
+            }
+        }
+        Err(error) => warn!(
+            %error,
+            artifact_id = %prepared.artifact.id,
+            %staging_key,
+            "artifact staging object cleanup deferred"
+        ),
+    }
 }
 
 fn publish(state: &AppState, event: DomainEvent) {

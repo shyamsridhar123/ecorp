@@ -389,6 +389,14 @@ pub struct StoredArtifact {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedArtifactUpload {
+    pub artifact: StoredArtifact,
+    pub staging_key: Option<String>,
+    pub status: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DependencyArtifactContext {
     pub task_id: Uuid,
     pub plan_key: String,
@@ -3475,11 +3483,12 @@ impl PgStore {
         })
     }
 
-    pub async fn record_artifact_upload(
+    pub async fn prepare_artifact_upload(
         &self,
         input: RunnerEventInput,
         artifact: StoredArtifact,
-    ) -> Result<Option<DomainEvent>> {
+        staging_key: &str,
+    ) -> Result<PreparedArtifactUpload> {
         let RunnerEventInput {
             event_id,
             runner_id,
@@ -3499,6 +3508,12 @@ impl PgStore {
             || artifact.producer_runner_id != runner_id
         {
             return Err(anyhow!("artifact metadata does not match the runner event"));
+        }
+        let expected_staging_key = format!("staging/corps/{corp_id}/{event_id}");
+        if staging_key != expected_staging_key {
+            return Err(anyhow!(
+                "artifact staging key does not match the runner event"
+            ));
         }
 
         let mut tx = self.pool.begin().await?;
@@ -3525,8 +3540,6 @@ impl PgStore {
         .await
         .context("artifact upload does not match an active run")?;
         let task_id: Uuid = row.get("task_id");
-        let mission_id: Uuid = row.get("mission_id");
-        let room_id: Uuid = row.get("room_id");
         let breaker_stage: String = row.get("breaker_stage");
         ensure_run_not_hard_blocked_tx(&mut tx, corp_id, run_id, &breaker_stage, "artifact upload")
             .await?;
@@ -3534,47 +3547,58 @@ impl PgStore {
             return Err(anyhow!("artifact task does not match the active run"));
         }
 
-        let event = append_event_tx(
-            &mut tx,
-            NewEvent {
-                id: event_id,
-                room_id: Some(room_id),
-                correlation_id: Some(mission_id),
-                ..NewEvent::new(
-                    corp_id,
-                    None,
-                    "run.artifact",
-                    "run",
-                    run_id,
-                    format!("runner:{runner_id}:event:{event_id}"),
-                    json!({
-                        "artifact_id": artifact.id,
-                        "uri": artifact.uri,
-                        "sha256": artifact.sha256,
-                        "bytes": artifact.bytes,
-                        "media_type": artifact.media_type,
-                        "producer_agent_id": artifact.producer_agent_id,
-                        "producer_runner_id": artifact.producer_runner_id,
-                        "verifier": artifact.verifier,
-                        "retention_until": artifact.retention_until,
-                        "provenance_signature": artifact.provenance_signature,
-                    }),
-                )
-            },
+        let existing_by_id = sqlx::query(
+            r#"
+            SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+                   verifier, object_key, uri, sha256, media_type, bytes,
+                   provenance_signature, retention_until, status, staging_key, created_at
+            FROM artifacts
+            WHERE corp_id = $1 AND id = $2
+            FOR UPDATE
+            "#,
         )
+        .bind(corp_id)
+        .bind(artifact.id)
+        .fetch_optional(&mut *tx)
         .await?;
-        let Some(event) = event else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
+        if let Some(row) = existing_by_id {
+            let prepared = map_prepared_artifact(row)?;
+            ensure_artifact_upload_matches(&prepared.artifact, &artifact, true)?;
+            tx.commit().await?;
+            return Ok(prepared);
+        }
 
-        sqlx::query(
+        let existing_by_digest = sqlx::query(
+            r#"
+            SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+                   verifier, object_key, uri, sha256, media_type, bytes,
+                   provenance_signature, retention_until, status, staging_key, created_at
+            FROM artifacts
+            WHERE corp_id = $1 AND run_id = $2 AND sha256 = $3
+            FOR UPDATE
+            "#,
+        )
+        .bind(corp_id)
+        .bind(run_id)
+        .bind(&artifact.sha256)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = existing_by_digest {
+            let prepared = map_prepared_artifact(row)?;
+            ensure_artifact_upload_matches(&prepared.artifact, &artifact, false)?;
+            tx.commit().await?;
+            return Ok(prepared);
+        }
+
+        let created_at = sqlx::query_scalar(
             r#"
             INSERT INTO artifacts
                 (id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
                  verifier, object_key, uri, sha256, media_type, bytes,
-                 retention_until, provenance_signature)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 retention_until, provenance_signature, status, staging_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    'staged', $15)
+            RETURNING created_at
             "#,
         )
         .bind(artifact.id)
@@ -3591,8 +3615,125 @@ impl PgStore {
         .bind(artifact.bytes)
         .bind(artifact.retention_until)
         .bind(&artifact.provenance_signature)
+        .bind(staging_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PreparedArtifactUpload {
+            artifact,
+            staging_key: Some(staging_key.to_owned()),
+            status: "staged".to_owned(),
+            created_at,
+        })
+    }
+
+    pub async fn finalize_artifact_upload(
+        &self,
+        corp_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<DomainEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let run_id: Uuid =
+            sqlx::query_scalar("SELECT run_id FROM artifacts WHERE id = $1 AND corp_id = $2")
+                .bind(artifact_id)
+                .bind(corp_id)
+                .fetch_one(&mut *tx)
+                .await
+                .context("staged artifact not found")?;
+        sqlx::query("SELECT id FROM runs WHERE id = $1 AND corp_id = $2 FOR UPDATE")
+            .bind(run_id)
+            .bind(corp_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("staged artifact run not found")?;
+        let row = sqlx::query(
+            r#"
+            SELECT artifact.id, artifact.corp_id, artifact.task_id, artifact.run_id,
+                   artifact.producer_agent_id, artifact.producer_runner_id,
+                   artifact.verifier, artifact.object_key, artifact.uri,
+                   artifact.sha256, artifact.media_type, artifact.bytes,
+                   artifact.provenance_signature, artifact.retention_until,
+                   artifact.status, artifact.staging_key,
+                   run.status AS run_status, run.agent_id,
+                   task.mission_id, mission.room_id
+            FROM artifacts artifact
+            JOIN runs run ON run.id = artifact.run_id
+            JOIN tasks task ON task.id = artifact.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE artifact.id = $1 AND artifact.corp_id = $2 AND artifact.run_id = $3
+            FOR UPDATE OF artifact, task, mission
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("staged artifact not found")?;
+        let status: String = row.get("status");
+        if status == "ready" {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        if status != "staged" {
+            return Err(anyhow!("artifact cannot finalize from status {status}"));
+        }
+        let run_status: String = row.get("run_status");
+        let agent_id: Uuid = row.get("agent_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        let artifact = map_stored_artifact(row);
+
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    artifact.corp_id,
+                    None,
+                    "run.artifact",
+                    "run",
+                    artifact.run_id,
+                    format!("artifact:{}:ready", artifact.id),
+                    json!({
+                        "artifact_id": artifact.id,
+                        "uri": artifact.uri,
+                        "sha256": artifact.sha256,
+                        "bytes": artifact.bytes,
+                        "media_type": artifact.media_type,
+                        "producer_agent_id": artifact.producer_agent_id,
+                        "producer_runner_id": artifact.producer_runner_id,
+                        "verifier": artifact.verifier,
+                        "retention_until": artifact.retention_until,
+                        "provenance_signature": artifact.provenance_signature,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("artifact finalization event unexpectedly existed")?;
+
+        sqlx::query(
+            r#"
+            UPDATE artifacts
+            SET status = 'ready', finalized_at = now(),
+                rejection_reason = NULL
+            WHERE id = $1 AND status = 'staged'
+            "#,
+        )
+        .bind(artifact.id)
         .execute(&mut *tx)
         .await?;
+        let run_active = matches!(
+            run_status.as_str(),
+            "provisioning"
+                | "starting"
+                | "running"
+                | "waiting_for_input"
+                | "waiting_for_approval"
+                | "verifying"
+        );
         sqlx::query(
             r#"
             UPDATE runs
@@ -3602,7 +3743,6 @@ impl PgStore {
                 artifact_signature = $4,
                 artifact_path = NULL,
                 artifact_sha256 = $5,
-                status = 'verifying',
                 updated_at = now()
             WHERE id = $6
             "#,
@@ -3612,21 +3752,134 @@ impl PgStore {
         .bind(&artifact.media_type)
         .bind(&artifact.provenance_signature)
         .bind(&artifact.sha256)
-        .bind(run_id)
+        .bind(artifact.run_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE tasks SET status = 'review', updated_at = now() WHERE id = $1")
-            .bind(task_id)
+        if run_active {
+            sqlx::query("UPDATE runs SET status = 'verifying', updated_at = now() WHERE id = $1")
+                .bind(artifact.run_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE tasks SET status = 'review', updated_at = now() WHERE id = $1")
+                .bind(artifact.task_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE agents SET status = 'reviewing', station = 'review', current_run_id = NULL WHERE id = $1",
+            )
+            .bind(agent_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "UPDATE agents SET status = 'reviewing', station = 'review', current_run_id = NULL WHERE id = $1",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
+        }
         tx.commit().await?;
         Ok(Some(event))
+    }
+
+    pub async fn reject_staged_artifact(
+        &self,
+        corp_id: Uuid,
+        artifact_id: Uuid,
+        reason: &str,
+    ) -> Result<Option<String>> {
+        let reason = normalize_artifact_rejection_reason(reason);
+        let mut tx = self.pool.begin().await?;
+        let staging_key: Option<String> = sqlx::query_scalar(
+            "SELECT staging_key FROM artifacts WHERE id = $1 AND corp_id = $2 AND status = 'staged' FOR UPDATE",
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if staging_key.is_some() {
+            sqlx::query(
+                r#"
+                UPDATE artifacts
+                SET status = 'rejected', rejection_reason = $1
+                WHERE id = $2 AND corp_id = $3 AND status = 'staged'
+                "#,
+            )
+            .bind(&reason)
+            .bind(artifact_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(staging_key)
+    }
+
+    pub async fn abandon_staged_artifact(
+        &self,
+        corp_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            r#"
+            DELETE FROM artifacts
+            WHERE id = $1 AND corp_id = $2 AND status = 'staged'
+            RETURNING staging_key
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    pub async fn artifact_staging_key_is_reserved(&self, staging_key: &str) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifacts WHERE staging_key = $1)")
+            .bind(staging_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn clear_artifact_staging_key(
+        &self,
+        corp_id: Uuid,
+        artifact_id: Uuid,
+        staging_key: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query(
+            "UPDATE artifacts SET staging_key = NULL WHERE id = $1 AND corp_id = $2 AND staging_key = $3 AND status <> 'staged'",
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .bind(staging_key)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn pending_artifact_uploads(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PreparedArtifactUpload>> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(anyhow!(
+                "artifact recovery limit must be between 1 and 1000"
+            ));
+        }
+        sqlx::query(
+            r#"
+            SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+                   verifier, object_key, uri, sha256, media_type, bytes,
+                   provenance_signature, retention_until, status, staging_key, created_at
+            FROM artifacts
+            WHERE status = 'staged' OR staging_key IS NOT NULL
+            ORDER BY created_at, id
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_prepared_artifact)
+        .collect()
     }
 
     pub async fn artifact_for_download(
@@ -3648,6 +3901,7 @@ impl PgStore {
             JOIN room_memberships membership
               ON membership.room_id = mission.room_id AND membership.actor_id = $3
             WHERE artifact.id = $1 AND artifact.corp_id = $2
+              AND artifact.status = 'ready'
             "#,
         )
         .bind(artifact_id)
@@ -3692,7 +3946,8 @@ impl PgStore {
                 JOIN tasks child ON child.id = dependency.task_id
                 JOIN tasks parent ON parent.id = dependency.depends_on_task_id
                 JOIN runs run ON run.task_id = parent.id AND run.status = 'completed'
-                JOIN artifacts artifact ON artifact.run_id = run.id
+                JOIN artifacts artifact
+                  ON artifact.run_id = run.id AND artifact.status = 'ready'
                 WHERE child.id = $1 AND child.corp_id = $2
             )
             SELECT dependency_task_id, plan_key, task_title, run_summary,
@@ -7519,6 +7774,7 @@ async fn validate_room_link_tx(
                     JOIN missions m ON m.id = t.mission_id
                     WHERE artifact.id = $1
                       AND artifact.corp_id = $2
+                      AND artifact.status = 'ready'
                       AND m.room_id = $3
                 )
                 "#,
@@ -7555,7 +7811,7 @@ async fn sanitize_verification_evidence_tx(
                verifier, object_key, uri, sha256, media_type, bytes,
                provenance_signature, retention_until
         FROM artifacts
-        WHERE run_id = $1
+        WHERE run_id = $1 AND status = 'ready'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -7905,6 +8161,69 @@ fn map_stored_artifact(row: sqlx::postgres::PgRow) -> StoredArtifact {
         provenance_signature: row.get("provenance_signature"),
         retention_until: row.get("retention_until"),
     }
+}
+
+fn map_prepared_artifact(row: sqlx::postgres::PgRow) -> Result<PreparedArtifactUpload> {
+    let status: String = row.get("status");
+    let staging_key: Option<String> = row.get("staging_key");
+    if status == "staged" && staging_key.is_none() {
+        return Err(anyhow!("staged artifact omitted its staging key"));
+    }
+    let created_at = row.get("created_at");
+    Ok(PreparedArtifactUpload {
+        artifact: map_stored_artifact(row),
+        staging_key,
+        status,
+        created_at,
+    })
+}
+
+fn ensure_artifact_upload_matches(
+    existing: &StoredArtifact,
+    candidate: &StoredArtifact,
+    require_event_id: bool,
+) -> Result<()> {
+    if (require_event_id && existing.id != candidate.id)
+        || existing.corp_id != candidate.corp_id
+        || existing.task_id != candidate.task_id
+        || existing.run_id != candidate.run_id
+        || existing.producer_agent_id != candidate.producer_agent_id
+        || existing.producer_runner_id != candidate.producer_runner_id
+        || existing.verifier != candidate.verifier
+        || existing.sha256 != candidate.sha256
+        || existing.media_type != candidate.media_type
+        || existing.bytes != candidate.bytes
+    {
+        return Err(anyhow!(
+            "duplicate artifact upload conflicts with persisted metadata"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_artifact_rejection_reason(reason: &str) -> String {
+    let normalized = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let mut normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        normalized = "artifact finalization failed permanently".to_owned();
+    }
+    if normalized.len() > 2_000 {
+        let mut end = 2_000;
+        while !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        normalized.truncate(end);
+    }
+    normalized
 }
 
 fn map_verification_evidence(row: sqlx::postgres::PgRow) -> VerificationEvidence {
@@ -8326,9 +8645,9 @@ mod tests {
 
     use super::{
         FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
-        ensure_breaker_allows_human_progress, factory_transition_allowed, normalize_factory_source,
-        should_retry_runner_failure, validate_factory_lease_seconds,
-        validate_factory_plan_against_policy,
+        ensure_breaker_allows_human_progress, factory_transition_allowed,
+        normalize_artifact_rejection_reason, normalize_factory_source, should_retry_runner_failure,
+        validate_factory_lease_seconds, validate_factory_plan_against_policy,
     };
 
     #[test]
@@ -8540,6 +8859,13 @@ mod tests {
         assert!(validate_factory_lease_seconds(30).is_ok());
         assert!(validate_factory_lease_seconds(3_600).is_ok());
         assert!(validate_factory_lease_seconds(3_601).is_err());
+    }
+
+    #[test]
+    fn artifact_rejection_reasons_are_bounded_single_line_text() {
+        let normalized = normalize_artifact_rejection_reason("object store failed\r\nretry\tlater");
+        assert_eq!(normalized, "object store failed retry later");
+        assert!(normalize_artifact_rejection_reason(&"🙂".repeat(1_000)).len() <= 2_000);
     }
 
     #[test]

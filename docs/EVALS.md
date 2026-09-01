@@ -213,3 +213,13 @@ required-key schemas, screenshot signatures, and path traversal. See
 media type, signed producer/run/task/verifier/retention provenance, path-free shared state,
 authorized download, and non-member denial. The same flow was exercised against MinIO as the
 S3-compatible backend. See `docs/evidence/2026-08-30-artifact-storage-validation.md`.
+
+`tools/e2e_artifact_staging.mjs` holds the run row, applies a hard breaker, and proves authoritative
+rejection occurs before staging while an accepted artifact with the same digest remains
+downloadable. It injects a Postgres reservation failure and proves no object bytes are written, then
+injects a metadata-finalization failure after both staged and final bytes exist and proves restart
+recovery completes the commit. The same recovery pass finalizes staged metadata, rejects an old row
+whose bytes fail validation, releases an old reservation whose staged and final objects are both
+missing, retries cleanup for a ready row, removes an unreserved staging object only after a fresh
+reservation check, and restores accepted run-to-artifact links. See
+`docs/evidence/2026-09-01-artifact-staging-recovery.md`.

@@ -90,10 +90,14 @@ Budget policies constrain run, mission, requester, and Corp usage. Repeated tool
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
 
 Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
-declared media type before object commit, stores objects under Corp-namespaced content-addressed
-keys, signs provenance with a deployment key, and never exposes backend bucket URLs. Downloads
-require Corp authorization and room membership, then revalidate signature, retention, digest,
-length, and media type before returning an attachment with content sniffing disabled.
+declared media type in memory, then performs authoritative assignment, task, budget, and breaker
+checks while reserving the event-specific staging key in Postgres. No object bytes are written
+before that reservation commits. Finalization is idempotent, transient failures remain recoverable,
+old missing-object reservations are released for retry, and rejected or orphaned staging cleanup
+rechecks ownership before deletion and never deletes shared content-addressed bytes. The server
+signs provenance with a deployment key and never exposes backend bucket URLs. Downloads require
+`ready` metadata, Corp authorization, and room membership, then revalidate signature, retention,
+digest, length, and media type before returning an attachment with content sniffing disabled.
 
 ## Required production boundaries
 

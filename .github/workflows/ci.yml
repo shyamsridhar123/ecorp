@@ -151,6 +151,11 @@ jobs:
         run: node tools/e2e_runner_reconnect.mjs
       - name: Verify duplicate runner delivery is idempotent
         run: node tools/e2e_idempotency.mjs
+      - name: Verify atomic artifact staging, cleanup, and restart recovery
+        env:
+          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.pid
+          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
+        run: node tools/e2e_artifact_staging.mjs
       - name: Verify fenced factory claims, restart recovery, and one linked mission
         env:
           CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.pid
@@ -187,6 +192,7 @@ jobs:
           path: |
             output/e2e-smoke.json
             output/e2e-artifacts.json
+            output/e2e-artifact-staging.json
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json
             output/e2e-external-adapters.json
@@ -210,6 +216,8 @@ jobs:
             output/e2e-replay.json
             output/e2e-leases.json
             output/server-ci.log
+            output/artifact-recovery-server.stdout.log
+            output/artifact-recovery-server.stderr.log
             output/runner-ci.log
             output/runner/**/result.md
             output/runner/**/evidence/*.json
