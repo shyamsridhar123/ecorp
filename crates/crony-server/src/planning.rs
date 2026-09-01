@@ -476,6 +476,8 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
     TaskContract {
         objective,
         expected_output: expected_output.to_owned(),
+        source_repository: None,
+        source_base_ref: None,
         acceptance_tests: vec![
             "the declared artifact exists".to_owned(),
             "the task reports concrete verification evidence".to_owned(),
@@ -627,6 +629,11 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
     if !(1..=10_000_000).contains(&contract.budget_cost_microusd) {
         return Err(anyhow!("task {task_key} cost budget is invalid"));
     }
+    validate_source_requirement(
+        task_key,
+        contract.source_repository.as_deref(),
+        contract.source_base_ref.as_deref(),
+    )?;
     if contract
         .model
         .as_ref()
@@ -686,6 +693,51 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
         {
             return Err(anyhow!("task {task_key} secret scope is invalid"));
         }
+    }
+    Ok(())
+}
+
+fn validate_source_requirement(
+    task_key: &str,
+    repository: Option<&str>,
+    base_ref: Option<&str>,
+) -> Result<()> {
+    let (Some(repository), Some(base_ref)) = (repository, base_ref) else {
+        if repository.is_some() || base_ref.is_some() {
+            return Err(anyhow!(
+                "task {task_key} must specify source repository and base ref together"
+            ));
+        }
+        return Ok(());
+    };
+    let mut repository_parts = repository.split('/');
+    let owner = repository_parts.next().unwrap_or_default();
+    let name = repository_parts.next().unwrap_or_default();
+    let valid_component = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 100
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+    };
+    if !valid_component(owner)
+        || !valid_component(name)
+        || repository_parts.next().is_some()
+        || base_ref.is_empty()
+        || base_ref.len() > 240
+        || base_ref.starts_with('-')
+        || base_ref.starts_with('/')
+        || base_ref.ends_with('/')
+        || base_ref.ends_with('.')
+        || base_ref.contains("..")
+        || base_ref.contains("@{")
+        || base_ref
+            .chars()
+            .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
+    {
+        return Err(anyhow!(
+            "task {task_key} contains an invalid source repository requirement"
+        ));
     }
     Ok(())
 }

@@ -166,6 +166,8 @@ pub struct LaunchRecord {
     pub mission_title: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -177,6 +179,8 @@ pub struct SchedulableTask {
     pub required_adapter: String,
     pub required_model: Option<String>,
     pub required_reasoning_effort: Option<String>,
+    pub required_source_repository: Option<String>,
+    pub required_source_base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +199,8 @@ pub struct ResumeLaunchRecord {
     pub provider_session_id: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -2790,10 +2796,18 @@ impl PgStore {
             input.expected_version,
             now,
         )?;
-        validate_factory_plan_against_policy(&current, plan)?;
+        let mut constrained_plan = plan.clone();
+        apply_factory_source_constraints(&current, &mut constrained_plan)?;
+        validate_factory_plan_against_policy(&current, &constrained_plan)?;
 
-        let (ids, mut events) =
-            create_mission_tx(&mut tx, input.corp_id, input.actor_id, &title, plan).await?;
+        let (ids, mut events) = create_mission_tx(
+            &mut tx,
+            input.corp_id,
+            input.actor_id,
+            &title,
+            &constrained_plan,
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             UPDATE factory_work_items
@@ -2861,7 +2875,7 @@ impl PgStore {
         Ok(FactoryMissionOutcome {
             work_item,
             ids,
-            strategy: plan.strategy.clone(),
+            strategy: constrained_plan.strategy,
             events,
             replayed: false,
         })
@@ -2929,7 +2943,9 @@ impl PgStore {
             SELECT t.id AS task_id,
                    COALESCE(t.required_adapter, a.adapter) AS required_adapter,
                    t.contract->>'model' AS required_model,
-                   t.contract->>'reasoning_effort' AS required_reasoning_effort
+                   t.contract->>'reasoning_effort' AS required_reasoning_effort,
+                   t.contract->>'source_repository' AS required_source_repository,
+                   t.contract->>'source_base_ref' AS required_source_base_ref
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -2970,6 +2986,8 @@ impl PgStore {
                 required_adapter: row.get("required_adapter"),
                 required_model: row.get("required_model"),
                 required_reasoning_effort: row.get("required_reasoning_effort"),
+                required_source_repository: row.get("required_source_repository"),
+                required_source_base_ref: row.get("required_source_base_ref"),
             })
         })
         .collect()
@@ -3185,6 +3203,8 @@ impl PgStore {
                 mission_title: task_prompt,
                 model,
                 reasoning_effort,
+                source_repository: contract.source_repository.clone(),
+                source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -3349,6 +3369,8 @@ impl PgStore {
                 provider_session_id,
                 model,
                 reasoning_effort,
+                source_repository: contract.source_repository.clone(),
+                source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -6131,6 +6153,8 @@ fn format_task_prompt(
         "MISSION: {mission_title}\n\
          TASK: {task_title}\n\
          ATTEMPT: {attempt}\n\
+         SOURCE REPOSITORY: {}\n\
+         SOURCE BASE REF: {}\n\
          OBJECTIVE: {}\n\
          EXPECTED OUTPUT: {}\n\
          ACCEPTANCE TESTS:\n{}\n\
@@ -6145,6 +6169,14 @@ fn format_task_prompt(
          SECRET CAPABILITIES:\n{}\n\
          DEADLINE: {}\n\
          ESCALATION: {}",
+        contract
+            .source_repository
+            .as_deref()
+            .unwrap_or("runner default"),
+        contract
+            .source_base_ref
+            .as_deref()
+            .unwrap_or("runner default"),
         contract.objective,
         contract.expected_output,
         list(&contract.acceptance_tests),
@@ -6574,6 +6606,27 @@ fn normalize_mission_title(value: &str) -> Result<String> {
     normalize_factory_text(value, "mission title", 240)
 }
 
+fn apply_factory_source_constraints(
+    work_item: &FactoryWorkItem,
+    plan: &mut TaskGraphPlan,
+) -> Result<()> {
+    let policy = work_item
+        .policy
+        .as_object()
+        .context("factory policy snapshot must be a JSON object")?;
+    let source_repository = format!(
+        "{}/{}",
+        work_item.source_repository_owner, work_item.source_repository_name
+    );
+    let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    validate_factory_base_ref(&source_base_ref)?;
+    for task in &mut plan.tasks {
+        task.contract.source_repository = Some(source_repository.clone());
+        task.contract.source_base_ref = Some(source_base_ref.clone());
+    }
+    Ok(())
+}
+
 fn validate_factory_plan_against_policy(
     work_item: &FactoryWorkItem,
     plan: &TaskGraphPlan,
@@ -6601,6 +6654,16 @@ fn validate_factory_plan_against_policy(
     if !repositories.contains(&source_repository) {
         return Err(anyhow!(
             "factory policy does not allow source repository {source_repository}"
+        ));
+    }
+    let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    if let Some(task) = plan.tasks.iter().find(|task| {
+        task.contract.source_repository.as_deref() != Some(source_repository.as_str())
+            || task.contract.source_base_ref.as_deref() != Some(source_base_ref.as_str())
+    }) {
+        return Err(anyhow!(
+            "factory task {} does not preserve the claimed repository and base ref",
+            task.key
         ));
     }
     let adapters = factory_policy_string_array(policy, "adapter_allowlist")?;
@@ -6794,6 +6857,35 @@ fn factory_policy_optional_string(
             "factory policy {key} must be null or a non-empty string"
         )),
     }
+}
+
+fn factory_policy_required_string(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+    max_len: usize,
+) -> Result<String> {
+    policy
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= max_len)
+        .map(str::to_owned)
+        .with_context(|| format!("factory policy {key} must be a non-empty string"))
+}
+
+fn validate_factory_base_ref(value: &str) -> Result<()> {
+    if value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
+    {
+        return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
+    }
+    Ok(())
 }
 
 fn factory_policy_positive_i64(policy: &serde_json::Map<String, Value>, key: &str) -> Result<i64> {

@@ -183,6 +183,7 @@ cargo run -p crony-cli -- factory `
   --owner shyamsridhar123 `
   --project-number 3 `
   --repository shyamsridhar123/ecorp `
+  --source-base-ref HEAD `
   --adapter codex `
   --budget-tokens 500000 `
   --budget-cost-microusd 1000000 `
@@ -193,7 +194,8 @@ cargo run -p crony-cli -- factory `
 Remove `--dry-run` to claim the issue, atomically create its mission, move the Project item to
 `In Progress`, and dispatch the runner. Repeating the command recovers the durable work item rather
 than creating another mission. Pull-request publication, merge, and deployment remain separate;
-the controller never enables auto-merge.
+the controller never enables auto-merge. The connected runner must advertise the same GitHub
+repository and source base ref or dispatch fails closed.
 
 ## What to try first
 

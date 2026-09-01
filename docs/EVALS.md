@@ -175,7 +175,9 @@ Todo-to-In-Progress synchronization only after mission linkage, one real child-p
 duplicate controller recovery without a second work item, mission, or run. It also injects a
 GitHub Project status failure, verifies durable `blocked` state before launch, and proves retry
 reuses the existing mission. Additional regressions prove verified items leave the intake queue
-and terminal mission failure becomes terminal factory failure. See
+and terminal mission failure becomes terminal factory failure. It also proves lease renewal around
+external effects, persistence of the claimed repository/base requirement, and rejection of a
+runner checked out to another repository before run creation. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
 
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI

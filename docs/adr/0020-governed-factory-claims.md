@@ -50,6 +50,10 @@ GitHub Project status changes and pull-request publication are later effects. Th
 after the corresponding ECorp state is durable. Pull-request publication does not authorize merge
 or deployment.
 
+The controller renews its lease before a GitHub effect and again before launching the mission.
+Every factory task carries the claimed GitHub repository and source base ref. A runner is eligible
+only when its advertised normalized remote and configured base ref match those requirements.
+
 ## Consequences
 
 - Server restart and duplicate delivery cannot create a second mission for one claimed issue.

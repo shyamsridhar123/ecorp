@@ -1648,6 +1648,8 @@ async fn schedule_ready_tasks(
             &candidate.required_adapter,
             candidate.required_model.as_deref(),
             candidate.required_reasoning_effort.as_deref(),
+            candidate.required_source_repository.as_deref(),
+            candidate.required_source_base_ref.as_deref(),
         ) else {
             outcome.failures.push(format!(
                 "task {} {}",
@@ -1657,6 +1659,8 @@ async fn schedule_ready_tasks(
                     &candidate.required_adapter,
                     candidate.required_model.as_deref(),
                     candidate.required_reasoning_effort.as_deref(),
+                    candidate.required_source_repository.as_deref(),
+                    candidate.required_source_base_ref.as_deref(),
                 )
             ));
             continue;
@@ -1932,7 +1936,22 @@ fn runner_requirement_mismatch(
     required_adapter: &str,
     required_model: Option<&str>,
     required_reasoning_effort: Option<&str>,
+    required_source_repository: Option<&str>,
+    required_source_base_ref: Option<&str>,
 ) -> String {
+    if required_source_repository.is_some()
+        && !runner_workspace_satisfies_requirement(
+            capabilities,
+            required_source_repository,
+            required_source_base_ref,
+        )
+    {
+        return format!(
+            "requires source repository {} at {}, but no connected runner advertises that checkout",
+            required_source_repository.unwrap_or("unknown"),
+            required_source_base_ref.unwrap_or("unknown")
+        );
+    }
     let adapter_capabilities = capabilities
         .iter()
         .filter(|capability| capability.name == required_adapter)
@@ -1998,12 +2017,19 @@ fn select_runner(
     required_adapter: &str,
     required_model: Option<&str>,
     required_reasoning_effort: Option<&str>,
+    required_source_repository: Option<&str>,
+    required_source_base_ref: Option<&str>,
 ) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
     let mut runners = state
         .runners
         .iter()
         .filter(|entry| {
             entry.corp_id == corp_id
+                && runner_workspace_satisfies_requirement(
+                    &entry.capabilities,
+                    required_source_repository,
+                    required_source_base_ref,
+                )
                 && entry.capabilities.iter().any(|capability| {
                     capability_satisfies_requirement(
                         capability,
@@ -2017,6 +2043,35 @@ fn select_runner(
         .collect::<Vec<_>>();
     runners.sort_by(|left, right| left.0.cmp(&right.0));
     runners.into_iter().next()
+}
+
+fn runner_workspace_satisfies_requirement(
+    capabilities: &[RunnerCapability],
+    required_repository: Option<&str>,
+    required_base_ref: Option<&str>,
+) -> bool {
+    let Some(required_repository) = required_repository else {
+        return required_base_ref.is_none();
+    };
+    let Some(required_base_ref) = required_base_ref else {
+        return false;
+    };
+    capabilities.iter().any(|capability| {
+        capability.name == "workspace-isolation"
+            && capability.available
+            && capability_detail_value(capability.detail.as_deref(), "remote")
+                .is_some_and(|repository| repository.eq_ignore_ascii_case(required_repository))
+            && capability_detail_value(capability.detail.as_deref(), "base")
+                == Some(required_base_ref)
+    })
+}
+
+fn capability_detail_value<'a>(detail: Option<&'a str>, key: &str) -> Option<&'a str> {
+    detail?
+        .split([';', ','])
+        .map(str::trim)
+        .find_map(|entry| entry.strip_prefix(&format!("{key}=")))
+        .map(str::trim)
 }
 
 fn validate_requested_model(
@@ -2124,6 +2179,26 @@ async fn resume_run(
             "source run's runner is enrolled to a different Corp",
         ));
     }
+    if !runner_workspace_satisfies_requirement(
+        &runner.capabilities,
+        record.source_repository.as_deref(),
+        record.source_base_ref.as_deref(),
+    ) {
+        drop(runner);
+        let failure = state
+            .store
+            .fail_run_before_dispatch(
+                corp_id,
+                record.run_id,
+                "source run's runner no longer advertises the required repository checkout",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        publish(&state, failure);
+        return Err(ApiError::conflict(
+            "source run's runner no longer advertises the required repository checkout",
+        ));
+    }
     let runner_tx = runner.tx.clone();
     drop(runner);
     let launch_record = LaunchRecord {
@@ -2139,6 +2214,8 @@ async fn resume_run(
         mission_title: prompt.to_owned(),
         model: record.model.clone(),
         reasoning_effort: record.reasoning_effort.clone(),
+        source_repository: record.source_repository.clone(),
+        source_base_ref: record.source_base_ref.clone(),
         verification_policy: record.verification_policy.clone(),
         secret_refs: record.secret_refs.clone(),
         queued_messages: record.queued_messages.clone(),
@@ -3295,6 +3372,8 @@ mod tests {
                 "fake-process",
                 Some("gpt-5.6-sol"),
                 Some("max"),
+                None,
+                None,
             ),
             "requires model gpt-5.6-sol on fake-process, but connected runners expose no selectable models for that adapter"
         );
@@ -3319,6 +3398,34 @@ mod tests {
             "github-copilot",
             Some("gpt-5.6-sol"),
             Some("minimal"),
+        ));
+    }
+
+    #[test]
+    fn runner_matching_enforces_repository_and_base_ref() {
+        let capabilities = vec![RunnerCapability {
+            name: "workspace-isolation".to_owned(),
+            available: true,
+            detail: Some(
+                "root=/tmp/runner; repository=/src/ecorp; remote=shyamsridhar123/ecorp; base=HEAD"
+                    .to_owned(),
+            ),
+            models: Vec::new(),
+        }];
+        assert!(super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("shyamsridhar123/ecorp"),
+            Some("HEAD"),
+        ));
+        assert!(!super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("acme/widget"),
+            Some("HEAD"),
+        ));
+        assert!(!super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("shyamsridhar123/ecorp"),
+            Some("main"),
         ));
     }
 }

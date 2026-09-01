@@ -449,9 +449,10 @@ async fn run_connection(
         name: "workspace-isolation".to_owned(),
         available: true,
         detail: Some(format!(
-            "root={}; repository={}; base={}",
+            "root={}; repository={}; remote={}; base={}",
             workspaces.root().display(),
             workspaces.repository().display(),
+            workspaces.repository_identity().unwrap_or("unidentified"),
             workspaces.base_ref()
         )),
         models: Vec::new(),

@@ -48,6 +48,7 @@ async function runController(
   {
     actorId = demo.alice_actor_id,
     leaseSeconds = 300,
+    repository = 'shyamsridhar123/ecorp',
   } = {},
 ) {
   const args = [
@@ -59,7 +60,7 @@ async function runController(
     '--project-number',
     '7',
     '--repository',
-    'acme/widget',
+    repository,
     '--adapter',
     'fake-process',
     '--budget-tokens',
@@ -118,7 +119,7 @@ Run one governed issue through ECorp and produce verified evidence.
 
 No blockers.
 `,
-  url: 'https://github.com/acme/widget/issues/9001',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9001',
   state: 'OPEN',
   createdAt: '2026-09-01T14:00:00Z',
   updatedAt: '2026-09-01T14:00:00Z',
@@ -128,7 +129,7 @@ await writeFile(
   statePath,
   `${JSON.stringify(
     {
-      repository: 'acme/widget',
+      repository: 'shyamsridhar123/ecorp',
       project: {
         id: 'PVT_FAKE_FACTORY',
         number: 7,
@@ -148,7 +149,7 @@ await writeFile(
           content: {
             body: issue.body,
             number: issue.number,
-            repository: 'acme/widget',
+            repository: 'shyamsridhar123/ecorp',
             title: issue.title,
             type: 'Issue',
             url: issue.url,
@@ -177,6 +178,22 @@ assert.equal(first.project_status, 'In Progress')
 assert.equal(first.materialized_now, true)
 assert.equal(first.factory_state, 'running')
 assert.equal(first.auto_merge, false)
+const fencedState = await snapshot(demo)
+const fencedItem = fencedState.snapshot.factory_work_items.find(
+  (item) => item.id === first.factory_work_item_id,
+)
+assert.ok(Date.parse(fencedItem.lease_expires_at) > Date.now() + 240_000)
+const fencedEvents = fencedState.snapshot.events.filter(
+  (event) => event.aggregate_id === first.factory_work_item_id,
+)
+assert.ok(
+  fencedEvents.filter((event) => event.type === 'factory.claim_renewed').length >= 2,
+)
+const fencedTask = fencedState.snapshot.tasks.find(
+  (task) => task.mission_id === first.mission_id,
+)
+assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
 
 const completed = await waitForMission(demo, first.mission_id)
 assert.equal(completed.mission.status, 'completed')
@@ -216,7 +233,7 @@ const queuedIssue = {
   id: 'I_FAKE_FACTORY_9003',
   number: 9003,
   title: 'Advance to the next eligible issue after verification',
-  url: 'https://github.com/acme/widget/issues/9003',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9003',
   createdAt: '2026-09-01T14:02:00Z',
   updatedAt: '2026-09-01T14:02:00Z',
 }
@@ -226,7 +243,7 @@ fakeState.items.push({
   content: {
     body: queuedIssue.body,
     number: queuedIssue.number,
-    repository: 'acme/widget',
+    repository: 'shyamsridhar123/ecorp',
     title: queuedIssue.title,
     type: 'Issue',
     url: queuedIssue.url,
@@ -247,7 +264,7 @@ const recoveryIssue = {
   id: 'I_FAKE_FACTORY_9002',
   number: 9002,
   title: 'Recover a factory mission after Project status synchronization fails',
-  url: 'https://github.com/acme/widget/issues/9002',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9002',
   createdAt: '2026-09-01T14:01:00Z',
   updatedAt: '2026-09-01T14:01:00Z',
 }
@@ -258,7 +275,7 @@ fakeState.items = [
     content: {
       body: recoveryIssue.body,
       number: recoveryIssue.number,
-      repository: 'acme/widget',
+      repository: 'shyamsridhar123/ecorp',
       title: recoveryIssue.title,
       type: 'Issue',
       url: recoveryIssue.url,
@@ -327,7 +344,7 @@ const failureIssue = {
   id: 'I_FAKE_FACTORY_9004',
   number: 9004,
   title: '[always-fail] Persist a terminal factory failure',
-  url: 'https://github.com/acme/widget/issues/9004',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9004',
   createdAt: '2026-09-01T14:03:00Z',
   updatedAt: '2026-09-01T14:03:00Z',
 }
@@ -338,7 +355,7 @@ recoveredFakeState.items = [
     content: {
       body: failureIssue.body,
       number: failureIssue.number,
-      repository: 'acme/widget',
+      repository: 'shyamsridhar123/ecorp',
       title: failureIssue.title,
       type: 'Issue',
       url: failureIssue.url,
@@ -366,62 +383,65 @@ const failedItem = failureState.snapshot.factory_work_items.find(
 assert.equal(failedItem.state, 'failed')
 assert.match(failedItem.failure_detail, /fail/i)
 
-const failoverDemo = await post('/api/demo/reset', {})
-const failoverIssue = {
+const mismatchDemo = await post('/api/demo/reset', {})
+const mismatchIssue = {
   ...issue,
-  id: 'I_FAKE_FACTORY_9005',
-  number: 9005,
-  title: 'Allow a second controller to take over an expired mission lease',
-  url: 'https://github.com/acme/widget/issues/9005',
-  createdAt: '2026-09-01T14:04:00Z',
-  updatedAt: '2026-09-01T14:04:00Z',
+  id: 'I_FAKE_FACTORY_9006',
+  number: 9006,
+  title: 'Reject a runner checked out to the wrong repository',
+  url: 'https://github.com/acme/widget/issues/9006',
+  createdAt: '2026-09-01T14:05:00Z',
+  updatedAt: '2026-09-01T14:05:00Z',
 }
+recoveredFakeState.repository = 'acme/widget'
 recoveredFakeState.items = [
   {
-    id: 'PVTI_FAKE_FACTORY_9005',
+    id: 'PVTI_FAKE_FACTORY_9006',
     status: 'Todo',
     content: {
-      body: failoverIssue.body,
-      number: failoverIssue.number,
+      body: mismatchIssue.body,
+      number: mismatchIssue.number,
       repository: 'acme/widget',
-      title: failoverIssue.title,
+      title: mismatchIssue.title,
       type: 'Issue',
-      url: failoverIssue.url,
+      url: mismatchIssue.url,
     },
   },
 ]
-recoveredFakeState.issues = { '9005': failoverIssue }
+recoveredFakeState.issues = { '9006': mismatchIssue }
 recoveredFakeState.item_edits = 0
 await writeFile(statePath, `${JSON.stringify(recoveredFakeState, null, 2)}\n`)
-const originalController = await runController(failoverDemo, 9005, false, {
-  leaseSeconds: 30,
-})
-await waitForMission(failoverDemo, originalController.mission_id)
-await new Promise((resolve) => setTimeout(resolve, 31_000))
-const replacementController = await runController(failoverDemo, 9005, false, {
-  actorId: failoverDemo.bob_actor_id,
-  leaseSeconds: 30,
-})
+let repositoryMismatch
+try {
+  await runController(mismatchDemo, 9006, false, {
+    repository: 'acme/widget',
+  })
+} catch (error) {
+  repositoryMismatch = error
+}
+assert.ok(repositoryMismatch, 'repository mismatch did not fail the controller')
+const mismatchState = await snapshot(mismatchDemo)
+const mismatchItem = mismatchState.snapshot.factory_work_items.find(
+  (item) => item.source_issue_number === 9006,
+)
+assert.equal(mismatchItem.state, 'blocked')
+assert.match(mismatchItem.failure_detail, /repository|runner|dispatch/i)
+const mismatchTasks = mismatchState.snapshot.tasks.filter(
+  (task) => task.mission_id === mismatchItem.mission_id,
+)
+assert.ok(mismatchTasks.length > 0)
+assert.ok(
+  mismatchTasks.every(
+    (task) =>
+      task.contract.source_repository === 'acme/widget' &&
+      task.contract.source_base_ref === 'HEAD',
+  ),
+)
+const mismatchTaskIds = new Set(mismatchTasks.map((task) => task.id))
 assert.equal(
-  replacementController.factory_work_item_id,
-  originalController.factory_work_item_id,
+  mismatchState.snapshot.runs.filter((run) => mismatchTaskIds.has(run.task_id)).length,
+  0,
 )
-assert.equal(replacementController.mission_id, originalController.mission_id)
-assert.equal(replacementController.factory_state, 'verified')
-const failoverState = await snapshot(failoverDemo)
-const failoverItem = failoverState.snapshot.factory_work_items.find(
-  (item) => item.id === originalController.factory_work_item_id,
-)
-assert.equal(failoverItem.claim_owner_id, failoverDemo.bob_actor_id)
-const failoverTaskIds = new Set(
-  failoverState.snapshot.tasks
-    .filter((task) => task.mission_id === originalController.mission_id)
-    .map((task) => task.id),
-)
-const failoverRuns = failoverState.snapshot.runs.filter((run) =>
-  failoverTaskIds.has(run.task_id),
-)
-assert.equal(failoverRuns.length, 1)
 
 const report = {
   checked_at: new Date().toISOString(),
@@ -436,6 +456,8 @@ const report = {
   exactly_one_mission: true,
   exactly_one_run: true,
   replay_recovered_existing_mission: true,
+  external_effect_lease_revalidated: true,
+  claimed_repository_persisted_to_task: true,
   factory_state: factoryItems[0].state,
   claim_token_absent_from_snapshot: true,
   mission_status: missions[0].status,
@@ -463,14 +485,15 @@ const report = {
     factory_state: failedItem.state,
     controller_returned_error: true,
   },
-  expired_controller_failover: {
-    issue_number: 9005,
-    factory_work_item_id: failoverItem.id,
-    mission_id: originalController.mission_id,
-    run_ids: failoverRuns.map((run) => run.id),
-    replacement_actor_id: failoverDemo.bob_actor_id,
-    reused_existing_work: true,
-    factory_state: failoverItem.state,
+  repository_routing: {
+    issue_number: 9006,
+    factory_work_item_id: mismatchItem.id,
+    mission_id: mismatchItem.mission_id,
+    required_repository: 'acme/widget',
+    required_base_ref: 'HEAD',
+    mismatched_runner_rejected: true,
+    run_count: 0,
+    factory_state: mismatchItem.state,
   },
 }
 await writeFile(

@@ -248,6 +248,10 @@ pub struct FactoryWorkItem {
 pub struct TaskContract {
     pub objective: String,
     pub expected_output: String,
+    #[serde(default)]
+    pub source_repository: Option<String>,
+    #[serde(default)]
+    pub source_base_ref: Option<String>,
     pub acceptance_tests: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub prohibited_actions: Vec<String>,

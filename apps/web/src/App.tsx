@@ -36,6 +36,8 @@ type Mission = {
 type TaskContract = {
   objective: string
   expected_output: string
+  source_repository: string | null
+  source_base_ref: string | null
   acceptance_tests: string[]
   allowed_tools: string[]
   prohibited_actions: string[]
@@ -954,6 +956,15 @@ function MissionCard({
                   <div><dt>Agent</dt><dd>{assignedAgent?.name ?? 'Unassigned'} · {adapterLabel(task.required_adapter ?? assignedAgent?.adapter ?? 'unknown')}</dd></div>
                   <div><dt>Depends on</dt><dd>{dependencies.length ? dependencies.join(', ') : 'Nothing — ready independently'}</dd></div>
                   <div><dt>Expected output</dt><dd>{task.contract.expected_output}</dd></div>
+                  <div>
+                    <dt>Repository</dt>
+                    <dd>
+                      {task.contract.source_repository ?? 'Runner default'}
+                      {task.contract.source_base_ref
+                        ? ` @ ${task.contract.source_base_ref}`
+                        : ''}
+                    </dd>
+                  </div>
                   <div><dt>Budget</dt><dd>{task.contract.budget_tokens.toLocaleString()} tokens</dd></div>
                   <div><dt>Write scope</dt><dd>{task.contract.write_scope.length ? task.contract.write_scope.join(', ') : 'No repository writes declared'}</dd></div>
                 </dl>

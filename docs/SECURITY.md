@@ -61,6 +61,10 @@ Guests and spectators do not receive factory work items in snapshots. Pre-materi
 events omit GitHub source metadata; once a mission exists, factory events inherit its room
 visibility.
 
+Controllers renew their fenced lease immediately before a GitHub mutation and revalidate it after
+that mutation before launch. Factory tasks carry the claimed repository and base ref, and the
+scheduler accepts only a runner advertising the same normalized checkout.
+
 The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
 read-only operations it can prove are scoped to that worktree, and reads from the SDK state
 directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.

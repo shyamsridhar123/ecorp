@@ -152,6 +152,7 @@ const claimRequest = {
     source_of_truth: 'github_project',
     project_status: 'Todo',
     repository_allowlist: ['shyamsridhar123/ecorp'],
+    source_base_ref: 'HEAD',
     adapter_allowlist: ['fake-process'],
     strategy_allowlist: ['single'],
     model: null,
@@ -363,6 +364,8 @@ const linkedTask = afterMaterialize.snapshot.tasks.find(
   (task) => task.id === materialized[0].task_id,
 )
 assert.match(linkedTask.contract.objective, /linked GitHub issue/)
+assert.equal(linkedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(linkedTask.contract.source_base_ref, 'HEAD')
 assert.deepEqual(linkedTask.contract.write_scope, materializeRequest.contract.write_scope)
 assert.ok(
   linkedTask.contract.references.includes(

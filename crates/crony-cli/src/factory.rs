@@ -35,6 +35,9 @@ pub struct FactoryArgs {
     )]
     pub repository: String,
 
+    #[arg(long, env = "ECORP_FACTORY_SOURCE_BASE_REF", default_value = "HEAD")]
+    pub source_base_ref: String,
+
     #[arg(long)]
     pub adapter: String,
 
@@ -272,6 +275,7 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
             "required_label": "factory:ready",
             "dependencies": refreshed.dependencies,
             "repository_allowlist": [args.repository],
+            "source_base_ref": args.source_base_ref,
             "adapter_allowlist": adapter_allowlist,
             "strategy_allowlist": [args.strategy],
             "model": args.model,
@@ -328,7 +332,6 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
     let control_token = value_uuid(&claim, "/claim_token")
         .context("factory work item has no usable controller fencing token")?;
     let mut work_item_version = value_i64(&claim, "/work_item/version")?;
-    let mut work_item_state = value_string(&claim, "/work_item/state")?;
     let mut materialized = false;
     if mission_id.is_none() {
         let materialize_body = json!({
@@ -378,13 +381,26 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
         .await?;
         mission_id = Some(value_uuid(&materialize, "/mission_id")?);
         work_item_version = value_i64(&materialize, "/work_item/version")?;
-        work_item_state = value_string(&materialize, "/work_item/state")?;
         materialized = !materialize
             .get("replayed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
     }
     let mission_id = mission_id.context("factory work item did not produce a mission")?;
+    let effect_lease_seconds = args.lease_seconds.max(300);
+    let renewed = renew_factory_control(
+        client,
+        server,
+        &args,
+        work_item_id,
+        control_token,
+        work_item_version,
+        effect_lease_seconds,
+        "project-status",
+        &stable_prefix,
+    )
+    .await?;
+    work_item_version = renewed.1;
 
     let project_update = set_project_in_progress(
         &args.github_cli,
@@ -418,6 +434,21 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
         .await;
         return Err(error).context("update GitHub Project status after mission linkage");
     }
+    let renewed = renew_factory_control(
+        client,
+        server,
+        &args,
+        work_item_id,
+        control_token,
+        work_item_version,
+        effect_lease_seconds,
+        "mission-launch",
+        &stable_prefix,
+    )
+    .await
+    .context("revalidate factory lease after GitHub Project update")?;
+    let mut work_item_state = renewed.0;
+    work_item_version = renewed.1;
 
     let launch = match launch_or_recover(client, server, &args, mission_id).await {
         Ok(launch) => launch,
@@ -523,6 +554,7 @@ pub async fn run(client: &Client, server: &str, args: FactoryArgs) -> Result<Val
 
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
+    validate_source_base_ref(&args.source_base_ref)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
         bail!("GitHub Project owner is invalid");
     }
@@ -546,6 +578,24 @@ fn validate_args(args: &FactoryArgs) -> Result<()> {
             .any(|scope| scope.trim().is_empty() || scope.len() > 500)
     {
         bail!("factory write scope is invalid");
+    }
+    Ok(())
+}
+
+fn validate_source_base_ref(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 240
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
+    {
+        bail!("factory source base ref is invalid");
     }
     Ok(())
 }
@@ -902,6 +952,47 @@ fn verify_project_status(
         bail!("GitHub Project item status is {status}, not {expected}");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn renew_factory_control(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    work_item_id: Uuid,
+    claim_token: Uuid,
+    expected_version: i64,
+    lease_seconds: i64,
+    stage: &str,
+    stable_prefix: &str,
+) -> Result<(String, i64)> {
+    let response = server_json(
+        client,
+        Method::POST,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{work_item_id}/renew",
+            args.corp_id
+        ),
+        Some(json!({
+            "actor_id": args.actor_id,
+            "claim_token": claim_token,
+            "expected_version": expected_version,
+            "idempotency_key": format!(
+                "{stable_prefix}:renew:{stage}:{expected_version}"
+            ),
+            "lease_seconds": lease_seconds,
+        })),
+    )
+    .await?;
+    let returned_token = value_uuid(&response, "/claim_token")
+        .context("factory renewal did not return its fencing token")?;
+    if returned_token != claim_token {
+        bail!("factory renewal rotated the controller token unexpectedly");
+    }
+    Ok((
+        value_string(&response, "/work_item/state")?,
+        value_i64(&response, "/work_item/version")?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

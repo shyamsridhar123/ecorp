@@ -394,6 +394,11 @@ GitHub remains the planning and status source of truth, but external status chan
 durable ECorp transitions. Pull-request publication, merge, and deployment are separate effects
 with separate authorization and idempotency boundaries. See ADR 0020.
 
+Before changing GitHub Project state, the controller renews its lease to an external-effect window;
+after the mutation it renews again before launch. Factory tasks persist the claimed GitHub
+repository and source base ref. Runners advertise a normalized `remote` and `base`, and scheduling
+rejects a runner whose configured checkout does not match before creating a run.
+
 ## Near-term architecture work
 
 1. Connect eligible GitHub Project items to the durable factory claim API.
