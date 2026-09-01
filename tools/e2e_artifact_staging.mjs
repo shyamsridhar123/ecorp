@@ -91,6 +91,48 @@ async function waitForFile(filePath, expected, timeoutMs = 10_000) {
   )
 }
 
+function waitForLiveEvent({
+  corpId,
+  actorId,
+  afterSeq,
+  predicate,
+  trigger,
+  timeoutMs = 10_000,
+}) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(
+      `${server.replace(/^http/, 'ws')}/ws/corps/${corpId}` +
+        `?actor_id=${actorId}&after_seq=${afterSeq}`,
+    )
+    const timeout = setTimeout(() => {
+      socket.close()
+      reject(new Error('timed out waiting for live artifact recovery event'))
+    }, timeoutMs)
+
+    function fail(error) {
+      clearTimeout(timeout)
+      socket.close()
+      reject(error)
+    }
+
+    socket.onerror = () => fail(new Error('artifact recovery websocket failed'))
+    socket.onmessage = (message) => {
+      const payload = JSON.parse(message.data)
+      if (payload.type === 'event' && predicate(payload.event)) {
+        clearTimeout(timeout)
+        socket.close()
+        resolve(payload.event)
+        return
+      }
+      if (payload.type === 'ready') {
+        Promise.resolve()
+          .then(trigger)
+          .catch(fail)
+      }
+    }
+  })
+}
+
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex')
 }
@@ -567,6 +609,8 @@ async function restartLocalServer() {
       databaseUrl,
       '--artifact-recovery-grace-secs',
       '0',
+      '--artifact-recovery-interval-secs',
+      '1',
     ],
     {
       cwd: root,
@@ -937,6 +981,60 @@ assert.equal(
   '1',
 )
 
+const periodicRecoveryCursor = Number(
+  await psql(
+    `SELECT COALESCE(max(seq), 0) FROM events ` +
+      `WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
+  ),
+)
+assert.ok(Number.isSafeInteger(periodicRecoveryCursor))
+const periodicRecoveryEvent = await waitForLiveEvent({
+  corpId: demo.corp_id,
+  actorId: demo.alice_actor_id,
+  afterSeq: periodicRecoveryCursor,
+  predicate: (event) =>
+    event.type === 'run.artifact' &&
+    event.payload.artifact_id === cleanupRetry.run.artifact_id,
+  trigger: () =>
+    psql(`
+      BEGIN;
+      DELETE FROM events
+      WHERE idempotency_key =
+        ${sqlLiteral(`artifact:${cleanupRetry.run.artifact_id}:ready`)};
+      UPDATE runs
+      SET artifact_id = NULL,
+          artifact_uri = NULL,
+          artifact_media_type = NULL,
+          artifact_signature = NULL,
+          artifact_sha256 = NULL
+      WHERE id = ${sqlLiteral(cleanupRetry.run.id)}::uuid;
+      UPDATE artifacts
+      SET status = 'staged',
+          staging_key = ${sqlLiteral(cleanupStageKey)},
+          finalized_at = NULL,
+          rejection_reason = NULL,
+          created_at = now() - interval '1 second'
+      WHERE id = ${sqlLiteral(cleanupRetry.run.artifact_id)}::uuid;
+      COMMIT;
+    `),
+})
+assert.equal(periodicRecoveryEvent.aggregate_id, cleanupRetry.run.id)
+assert.equal(
+  await psql(
+    `SELECT status || '|' || COALESCE(staging_key, '') FROM artifacts ` +
+      `WHERE id = ${sqlLiteral(cleanupRetry.run.artifact_id)}::uuid;`,
+  ),
+  'ready|',
+)
+assert.equal(
+  await psql(
+    `SELECT artifact_id::text FROM runs ` +
+      `WHERE id = ${sqlLiteral(cleanupRetry.run.id)}::uuid;`,
+  ),
+  cleanupRetry.run.artifact_id,
+)
+assert.equal(await exists(cleanupFinalPath), true)
+
 const report = {
   checked_at: new Date().toISOString(),
   accepted_shared_digest: {
@@ -976,6 +1074,11 @@ const report = {
     missing_object_reservation_released: true,
     ready_staging_cleanup_retried: true,
     orphan_staging_removed: true,
+  },
+  periodic_recovery: {
+    recovered_artifact_id: cleanupRetry.run.artifact_id,
+    websocket_event_seq: periodicRecoveryEvent.seq,
+    connected_client_notified: true,
   },
 }
 await writeFile(

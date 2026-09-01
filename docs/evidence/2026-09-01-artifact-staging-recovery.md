@@ -45,12 +45,12 @@ download paths.
 
 ### Accepted and rejected uploads sharing one digest
 
-- accepted run `bc8a174a-a289-4ab3-ba3f-35a6b4272597`
-- accepted artifact `9d32a172-fbff-4369-a065-6f9faead8f0e`
-- digest `b496a76ce1f0dd4c0b0471514ffa472d3e6fbeea5ffddf357df0bc60aa859f6f`
-- duplicate digest event `9603692b-bf80-44af-8f17-47ea77029c9a`
-- competing run `50ed1273-e00d-4671-8e95-81907a4580d5`
-- competing artifact event `41e52188-ad2a-45e9-a7c4-c676e7539ef3`
+- accepted run `53d492fe-8f07-4813-9fd9-d734075d5808`
+- accepted artifact `72daa8f8-4f11-4607-92c7-399cfa0f5a94`
+- digest `6329816b50fb934537ddccad76eadfedbb79b2cc0782c751462e8fb8cc0d8f21`
+- duplicate digest event `1d93e13b-c992-40a8-baa2-f70454887f97`
+- competing run `181a71f1-7174-499d-b6a2-2192f3c4da63`
+- competing artifact event `65a7de30-e687-4453-b9d4-0cd2a5e6c052`
 
 Two distinct events with the same run and digest collapsed to one metadata row and one immutable
 artifact event. The test then held a competing run row before sending the same digest, advanced the
@@ -60,8 +60,8 @@ artifact remained downloadable.
 
 ### Database reservation failure before staging
 
-- run `33433f89-02f1-4300-b00c-d66a9cdcca67`
-- artifact event `99518c7f-8f88-4767-9ab4-928036188409`
+- run `cb73e049-8b4a-4eec-a23a-56bc3c78a365`
+- artifact event `b9578a05-b565-4e09-bef1-246b2ec98e58`
 
 A temporary Postgres trigger raised during the artifact metadata insert. A non-transactional
 sequence proved the reservation path was reached. The run failed, no staging object was written, no
@@ -70,8 +70,8 @@ function, and sequence were removed in a `finally` cleanup path.
 
 ### Database failure after object publication
 
-- run `9914980b-8839-4dfd-a55f-f13b18538b93`
-- artifact event `5d05a7dd-d38a-4ed4-b7bd-4329345313be`
+- run `44971504-a891-496b-8462-24f4e69f9e01`
+- artifact event `a22506c7-cd18-48a4-9aa0-d24d7e099376`
 
 A second trigger raised when the staged metadata attempted to transition to `ready`, after both the
 staging and content-addressed final bytes existed. The transaction rolled back without an artifact
@@ -81,11 +81,11 @@ idempotent artifact event, marked the metadata `ready`, and removed the staging 
 
 ### Restart recovery and cleanup retries
 
-- recoverable staged artifact `455ee3cd-7a13-45c1-b168-fb72226d7aa7`
-- missing-object artifact `89a7b063-a177-4ee3-826b-760eb5f0f83f`
-- ready artifact with deferred cleanup `7eaaf10f-7fe1-4933-b0b6-d44f5506147d`
+- recoverable staged artifact `a990448b-a5e5-4f58-81b2-8d8806d3512b`
+- missing-object artifact `e8945581-2845-4b6c-bb18-a14e772a914c`
+- ready artifact with deferred cleanup `22b5a6a8-305f-4d93-b45e-44eb79953d5b`
 - unreserved staging key
-  `staging/corps/00000000-0000-4000-8000-000000000001/da74d3dc-45ee-4e9d-a118-bbfc478f986a`
+  `staging/corps/00000000-0000-4000-8000-000000000001/9785ab01-0254-4f49-92f0-d1263605d046`
 
 Before restart, the test constructed four crash-boundary states:
 
@@ -102,6 +102,15 @@ On restart:
 - the ready row's staging object was removed and its staging key cleared;
 - the unreserved staging object was removed;
 - the local runner reconnected before the test returned.
+
+### Periodic recovery event delivery
+
+With a browser WebSocket connected and fully replayed, the test returned a completed run's
+artifact metadata to `staged` while preserving its verified final object. The one-second test
+recovery interval finalized the metadata, restored the run-to-artifact link, and delivered the new
+`run.artifact` event to the already-connected client. This proves periodic recovery updates live
+clients without requiring an unrelated event or reconnect. The recovered artifact was
+`22b5a6a8-305f-4d93-b45e-44eb79953d5b`, and the live event sequence was `12955`.
 
 ## Existing artifact contract
 

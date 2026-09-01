@@ -165,6 +165,14 @@ struct Args {
         value_parser = clap::value_parser!(i64).range(0..=3_600)
     )]
     artifact_recovery_grace_secs: i64,
+
+    #[arg(
+        long,
+        env = "CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..=3_600)
+    )]
+    artifact_recovery_interval_secs: u64,
 }
 
 #[derive(Clone)]
@@ -309,26 +317,35 @@ async fn main() -> anyhow::Result<()> {
         args.mode == ServerMode::Production,
     )?;
     let artifact_recovery_grace = ChronoDuration::seconds(args.artifact_recovery_grace_secs);
-    recover_pending_artifacts(&store, &artifacts, artifact_recovery_grace).await?;
+    let (event_tx, _) = broadcast::channel(2_048);
+    for event in recover_pending_artifacts(&store, &artifacts, artifact_recovery_grace).await? {
+        let _ = event_tx.send(event);
+    }
     let recovery_store = store.clone();
     let recovery_artifacts = artifacts.clone();
+    let recovery_event_tx = event_tx.clone();
+    let artifact_recovery_interval = StdDuration::from_secs(args.artifact_recovery_interval_secs);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(StdDuration::from_secs(60));
+        let mut interval = tokio::time::interval(artifact_recovery_interval);
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Err(error) = recover_pending_artifacts(
+            match recover_pending_artifacts(
                 &recovery_store,
                 &recovery_artifacts,
                 artifact_recovery_grace,
             )
             .await
             {
-                warn!(%error, "periodic artifact recovery pass failed");
+                Ok(events) => {
+                    for event in events {
+                        let _ = recovery_event_tx.send(event);
+                    }
+                }
+                Err(error) => warn!(%error, "periodic artifact recovery pass failed"),
             }
         }
     });
-    let (event_tx, _) = broadcast::channel(2_048);
     let state = AppState {
         store,
         event_tx,
@@ -3423,7 +3440,8 @@ async fn recover_pending_artifacts(
     store: &PgStore,
     artifacts: &ArtifactStore,
     recovery_grace: ChronoDuration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<DomainEvent>> {
+    let mut recovered_events = Vec::new();
     let pending = store.pending_artifact_uploads(500).await?;
     let known_staging_keys = pending
         .iter()
@@ -3551,16 +3569,20 @@ async fn recover_pending_artifacts(
                     }
                     continue;
                 }
-                if let Err(error) = store
+                match store
                     .finalize_artifact_upload(prepared.artifact.corp_id, prepared.artifact.id)
                     .await
                 {
-                    warn!(
-                        %error,
-                        artifact_id = %prepared.artifact.id,
-                        "artifact metadata finalization recovery deferred"
-                    );
-                    continue;
+                    Ok(Some(event)) => recovered_events.push(event),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            artifact_id = %prepared.artifact.id,
+                            "artifact metadata finalization recovery deferred"
+                        );
+                        continue;
+                    }
                 }
             }
             "ready" | "rejected" => {}
@@ -3575,7 +3597,7 @@ async fn recover_pending_artifacts(
         }
         cleanup_prepared_artifact(store, artifacts, &prepared).await;
     }
-    Ok(())
+    Ok(recovered_events)
 }
 
 async fn cleanup_prepared_artifact(
