@@ -29,8 +29,11 @@ const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
 const secretProbe = mission.includes("[secret-probe]");
 const approvalExpiry = mission.includes("[approval-expiry]");
-const approvalAction = mission.includes("[approval-action]") || approvalExpiry;
+const approvalBudgetRace = mission.includes("[approval-budget-race]");
+const approvalAction =
+  mission.includes("[approval-action]") || approvalExpiry || approvalBudgetRace;
 const budgetLoop = mission.includes("[budget-loop]");
+const budgetLateCompletion = mission.includes("[budget-late-completion]");
 const healthyConversation = mission.includes("[healthy-conversation]");
 const externalEvidence = cleanWorktree || ignoredWorktree;
 const briefingDelay = slowRun ? 4_000 : graphSlowRun ? 1_200 : 700;
@@ -55,7 +58,7 @@ input.on("line", (line) => {
       return;
     }
     if (message.type === "circuit_breaker") {
-      if (message.stage === "stop") {
+      if (message.stage === "stop" && !budgetLateCompletion) {
         breakerStopped = true;
         breakerStopResolver();
       }
@@ -98,6 +101,15 @@ if (approvalAction) {
     required_roles: ["owner", "admin", "member"],
     expires_in_seconds: approvalExpiry ? 1 : 300,
   });
+  if (approvalBudgetRace) {
+    emit({
+      type: "usage",
+      input_tokens: 6_000,
+      output_tokens: 0,
+      cost_microusd: 0,
+    });
+    await wait(900);
+  }
   const decision = await new Promise((resolvePromise) => {
     approvalResolver = resolvePromise;
   });
@@ -153,6 +165,16 @@ if (budgetLoop) {
     input.close();
     process.exit(0);
   }
+}
+
+if (budgetLateCompletion) {
+  emit({
+    type: "usage",
+    input_tokens: 6_000,
+    output_tokens: 0,
+    cost_microusd: 0,
+  });
+  await wait(900);
 }
 
 emit({

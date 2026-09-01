@@ -1,6 +1,8 @@
-# Product backlog
+# Historical product backlog seed
 
-This file is the local source for the initial GitHub milestones and issues.
+This file is a historical seed for the initial milestones. The **ECorp Build GitHub Project** and
+its linked GitHub Issues are the operational source of truth for priorities, status, sequencing,
+parity decisions, and the current product differentiation gate.
 
 ## M0 — Foundation
 
@@ -53,5 +55,3 @@ This file is the local source for the initial GitHub milestones and issues.
 | P1 | Add MCP, ACP, and A2A boundaries | Conformance tests for each supported protocol |
 | P1 | Complete public-name and licensing review | Brand, domain, package, art, and attribution decisions recorded |
 | P1 | Dogfood with three real teams | Measured setup, completion, recovery, and rework results |
-
-

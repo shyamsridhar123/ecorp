@@ -12,8 +12,17 @@ Known development-only shortcuts:
 - permissive CORS
 - fake process runs with the local user's permissions
 - no network sandbox
+- external CLI adapters do not yet have a complete durable provider-permission bridge or verified
+  descendant-process cleanup
 
 These are explicit backlog items, not production claims.
+
+Claude Code is launched in safe mode without user plugins, hooks, MCP servers, browser integration,
+slash commands, or auto-memory. OpenCode uses its plugin-free `--pure` mode. These controls prevent
+the customization leakage observed during the September 1, 2026 enterprise dogfood pass, but they
+are only a partial boundary. GitHub issue #51 tracks isolated provider homes,
+inherited-environment allowlisting, durable permission translation, stop deadlines, and
+process-tree verification.
 
 Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
 maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.

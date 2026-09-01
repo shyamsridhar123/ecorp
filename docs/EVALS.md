@@ -49,9 +49,10 @@ An implementation claim needs evidence at the same scope:
 
 ## Terminal provider cleanup
 
-`node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active,
-`run.session_terminated` records that the provider process is gone before verification and accepted
-completion, and the persistent agent identity returns to `idle` with no `current_run_id`.
+`node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active, that
+the runner emits `run.session_terminated` before verification and accepted completion, and that the
+persistent agent identity returns to `idle` with no `current_run_id`. It does not yet verify the
+entire operating-system descendant tree; that stronger cleanup boundary is tracked in #51.
 
 ## Quality gates
 
@@ -106,8 +107,11 @@ logs. See `docs/evidence/2026-08-30-secret-broker-validation.md`.
 `tools/e2e_approvals.mjs` restarts the server during a suspended risky action, approves from a
 second actor, proves duplicate decisions do not duplicate effects, requires runner
 acknowledgment, and verifies that an expired approval cancels coherently. `tools/e2e_budgets.mjs`
-proves spend, repeated-tool, rolling requester/Corp budgets, resumable suspend checkpoints, hard
-stops, and the healthy-conversation exemption. See
+proves spend, repeated-tool, rolling requester/Corp budget evaluation, suspend and stop
+transitions, non-retryable rejection of a misbehaving provider's late completion after a stop-stage
+breaker, rejection of a pending action approval after the hard limit, and the healthy-conversation
+exemption. Authorized recovery after suspension remains open in #50, and cross-run fan-out for
+aggregate limits remains open in #56. See
 `docs/evidence/2026-08-30-approval-and-budget-validation.md`.
 
 `tests/scenarios/v1.jsonl` is a versioned 100-scenario corpus. `tools/run_evals.mjs` keeps
@@ -126,6 +130,14 @@ Copilot action approvals, independent review across Alice and Bob, failed-verifi
 production OIDC login with a one-time WebSocket ticket, and a 390-pixel responsive layout with no
 horizontal overflow.
 
+On September 1, 2026, one operator ran three enterprise-application scenarios through the live
+browser-to-server-to-runner path. VendorGuard passed 13 tests and its browser workflow; Incident
+Command passed 12 tests and its browser workflow; Credit Exception remained incomplete with 84
+failures and two errors. The pass exposed hard-breaker, budget-recovery, provider-isolation,
+permission-bridging, mission-contract, and portable-deliverable gaps. It is internal systems
+dogfood and does not satisfy the three-external-team requirement in GitHub issue #27. See
+`docs/evidence/2026-09-01-enterprise-application-dogfood.md`.
+
 The runner unit suite applies one provider-independent lifecycle conformance harness to the
 `fake-process` adapter. It verifies spawn, stream, steer, artifact, stop, capability reporting, and
 typed errors for unsupported resume and usage operations.
@@ -133,6 +145,8 @@ typed errors for unsupported resume and usage operations.
 The Codex adapter suite uses a protocol-faithful fake app-server to verify availability reporting,
 start, streaming, usage de-duplication, live `turn/steer`, graceful `turn/interrupt`, stop, durable
 resume, completed evidence, cancelled evidence, and failed evidence without requiring credentials.
+`tools/e2e_codex.mjs` also emits multiple usage updates during an active turn and proves the
+resulting stop-stage breaker interrupts the Codex path before accepted artifact or completion.
 
 The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and

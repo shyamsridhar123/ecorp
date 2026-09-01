@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -39,6 +40,38 @@ async function waitForRun(demo, runId, timeoutMs = 30_000) {
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   throw new Error(`timed out waiting for budget run ${runId}`)
+}
+
+async function waitForMission(demo, missionId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const mission = state.snapshot.missions.find(
+      (candidate) => candidate.id === missionId,
+    )
+    if (mission && ['completed', 'cancelled', 'failed'].includes(mission.status)) {
+      return { state, mission }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for budget mission ${missionId}`)
+}
+
+async function waitForApprovalAtHardBreaker(demo, runId, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const run = state.snapshot.runs.find((candidate) => candidate.id === runId)
+    const approval = state.snapshot.action_approvals.find(
+      (candidate) =>
+        candidate.run_id === runId && candidate.status === 'pending',
+    )
+    if (run?.breaker_stage === 'stop' && approval) {
+      return { run, approval }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for hard-breaker approval ${runId}`)
 }
 
 async function setPolicy(demo, overrides = {}) {
@@ -106,6 +139,85 @@ const stopStages = stopped.state.snapshot.circuit_breaker_incidents
 assert.deepEqual(new Set(stopStages), new Set(['stop']))
 
 await post('/api/demo/reset', {})
+await setPolicy(demo)
+const lateMission = await post(`/api/corps/${demo.corp_id}/missions`, {
+  requested_by: demo.alice_actor_id,
+  preferred_adapter: 'fake-process',
+  title: '[budget-late-completion] ignore stop and attempt late completion',
+  budget_tokens: 5_000,
+  budget_cost_microusd: 10_000_000,
+})
+await post(
+  `/api/corps/${demo.corp_id}/missions/${lateMission.mission_id}/launch`,
+  { requested_by: demo.alice_actor_id },
+)
+const late = await waitForMission(demo, lateMission.mission_id)
+assert.equal(late.mission.status, 'failed')
+const lateTasks = late.state.snapshot.tasks.filter(
+  (task) => task.mission_id === lateMission.mission_id,
+)
+const lateTaskIds = new Set(lateTasks.map((task) => task.id))
+const lateRuns = late.state.snapshot.runs.filter((run) =>
+  lateTaskIds.has(run.task_id),
+)
+assert.equal(lateRuns.length, 1)
+assert.ok(lateRuns.every((run) => run.status === 'failed'))
+assert.ok(lateRuns.every((run) => run.breaker_stage === 'stop'))
+assert.ok(lateRuns.every((run) => run.artifact_id === null))
+assert.equal(
+  late.state.snapshot.events.filter(
+    (event) =>
+      event.type === 'run.completed' &&
+      lateRuns.some((run) => run.id === event.aggregate_id),
+  ).length,
+  0,
+)
+
+await post('/api/demo/reset', {})
+await setPolicy(demo)
+const approvalRaceMission = await post(`/api/corps/${demo.corp_id}/missions`, {
+  requested_by: demo.alice_actor_id,
+  preferred_adapter: 'fake-process',
+  title: '[approval-budget-race] pending action cannot cross a hard breaker',
+  budget_tokens: 5_000,
+  budget_cost_microusd: 10_000_000,
+})
+const approvalRaceLaunch = await post(
+  `/api/corps/${demo.corp_id}/missions/${approvalRaceMission.mission_id}/launch`,
+  { requested_by: demo.alice_actor_id },
+)
+const approvalRace = await waitForApprovalAtHardBreaker(
+  demo,
+  approvalRaceLaunch.run_id,
+)
+const approvalResponse = await fetch(
+  `${server}/api/corps/${demo.corp_id}/approvals/${approvalRace.approval.id}/decision`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: demo.bob_actor_id,
+      approved: true,
+      note: 'This decision must be rejected after the hard breaker.',
+      decision_key: randomUUID(),
+    }),
+  },
+)
+assert.equal(approvalResponse.status, 400)
+assert.match(
+  JSON.stringify(await approvalResponse.json()),
+  /blocked.*(?:hard breaker|breaker stage)|(?:hard breaker|breaker stage).*blocked/i,
+)
+await post(
+  `/api/corps/${demo.corp_id}/agents/${approvalRace.run.agent_id}/emergency-stop`,
+  {
+    actor_id: demo.alice_actor_id,
+    reason: 'Clean up the approval-budget race fixture.',
+  },
+)
+await waitForRun(demo, approvalRaceLaunch.run_id)
+
+await post('/api/demo/reset', {})
 await setPolicy(demo, { repeated_tool_limit: 10 })
 const loopLaunch = await launch(
   demo,
@@ -168,6 +280,10 @@ const report = {
   checked_at: new Date().toISOString(),
   spend_stages: spendStages,
   hard_stop_stages: stopStages,
+  late_completion_status: late.mission.status,
+  late_completion_run_statuses: lateRuns.map((run) => run.status),
+  late_completion_accepted_events: 0,
+  approval_after_hard_breaker_status: approvalResponse.status,
   repeated_tool_reasons: loopReasons,
   actor_budget_reasons: actorReasons,
   corp_budget_reasons: corpReasons,

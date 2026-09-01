@@ -5,6 +5,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function ConvertTo-ProcessArgument {
+    param([Parameter(Mandatory)][string]$Value)
+
+    if ($Value.Contains('"')) {
+        throw 'Process arguments cannot contain a double quote.'
+    }
+    $trailingBackslashes = $Value.Length - $Value.TrimEnd('\').Length
+    $escaped = $Value + ('\' * $trailingBackslashes)
+    "`"$escaped`""
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $output = Join-Path $root 'output'
 $serverPort = 8791
@@ -14,8 +26,26 @@ $databaseUrl = if ($env:DATABASE_URL) {
 } else {
     'postgres://crony:crony@127.0.0.1:54329/crony'
 }
+$sourceRepository = if ($env:CRONY_SOURCE_REPOSITORY) {
+    (Resolve-Path -LiteralPath $env:CRONY_SOURCE_REPOSITORY).Path
+} else {
+    $root
+}
+$sourceBaseRef = if ($env:CRONY_SOURCE_BASE_REF) {
+    $env:CRONY_SOURCE_BASE_REF
+} else {
+    'HEAD'
+}
+$runnerWorkspace = if ($env:CRONY_RUNNER_WORKSPACE) {
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $env:CRONY_RUNNER_WORKSPACE
+    )
+} else {
+    Join-Path $root 'output\runner'
+}
 
 New-Item -ItemType Directory -Path $output -Force | Out-Null
+New-Item -ItemType Directory -Path $runnerWorkspace -Force | Out-Null
 
 & (Join-Path $PSScriptRoot 'stop_local.ps1')
 
@@ -127,12 +157,12 @@ try {
         -ArgumentList @(
             '--server-ws', "ws://127.0.0.1:$serverPort/ws/runner",
             '--corp-id', $demo.corp_id,
-            '--credential-file', $credentialFile,
-            '--enrollment-token-file', $enrollmentFile,
-            '--workspace', (Join-Path $root 'output\runner'),
-            '--source-repository', $root,
-            '--source-base-ref', 'HEAD',
-            '--fake-agent-script', (Join-Path $root 'scripts\fake-agent.mjs')
+            '--credential-file', (ConvertTo-ProcessArgument $credentialFile),
+            '--enrollment-token-file', (ConvertTo-ProcessArgument $enrollmentFile),
+            '--workspace', (ConvertTo-ProcessArgument $runnerWorkspace),
+            '--source-repository', (ConvertTo-ProcessArgument $sourceRepository),
+            '--source-base-ref', $sourceBaseRef,
+            '--fake-agent-script', (ConvertTo-ProcessArgument (Join-Path $root 'scripts\fake-agent.mjs'))
         ) `
         -WorkingDirectory $root `
         -RedirectStandardOutput (Join-Path $output 'runner.stdout.log') `
@@ -179,6 +209,8 @@ try {
     Write-Host "ECorp server: http://127.0.0.1:$serverPort"
     Write-Host "ECorp web:    http://127.0.0.1:$webPort"
     Write-Host "Runner count: $($health.runners)"
+    Write-Host "Source repo:  $sourceRepository ($sourceBaseRef)"
+    Write-Host "Worktrees:    $runnerWorkspace"
 } finally {
     Pop-Location
 }

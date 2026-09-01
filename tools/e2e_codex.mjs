@@ -52,11 +52,12 @@ async function assertArtifact(demo, run) {
   return run.artifact_uri
 }
 
-async function createCodexMission(demo, title) {
+async function createCodexMission(demo, title, overrides = {}) {
   const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
     preferred_adapter: 'codex',
     title,
+    ...overrides,
   })
   const launch = await post(
     `/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`,
@@ -255,11 +256,58 @@ async function stopScenario() {
   }
 }
 
+async function budgetStopScenario() {
+  const demo = await post('/api/demo/reset', {})
+  const { launch } = await createCodexMission(
+    demo,
+    '[budget-stream] stream usage before attempting late completion',
+    {
+      budget_tokens: 5_000,
+      budget_cost_microusd: 10_000_000,
+    },
+  )
+  const terminal = await waitForRun(demo, launch.run_id, isSettled, 30_000)
+  assert.equal(terminal.run.status, 'failed')
+  assert.equal(terminal.run.breaker_stage, 'stop')
+  assert.equal(terminal.run.artifact_id, null)
+  assert.ok(terminal.run.input_tokens >= 6_000)
+  const events = terminal.state.snapshot.events.filter(
+    (event) => event.aggregate_id === launch.run_id,
+  )
+  const usageIndex = events.findIndex((event) => event.type === 'run.usage')
+  const breakerIndex = events.findIndex(
+    (event) =>
+      event.type === 'run.breaker_transition' &&
+      event.payload?.stage === 'stop',
+  )
+  assert.ok(usageIndex >= 0)
+  assert.ok(breakerIndex > usageIndex)
+  assert.equal(
+    events.filter((event) => event.type === 'run.completed').length,
+    0,
+  )
+  assert.equal(
+    terminal.state.snapshot.runs.filter(
+      (run) => run.task_id === terminal.run.task_id,
+    ).length,
+    1,
+  )
+  return {
+    run_id: launch.run_id,
+    status: terminal.run.status,
+    breaker_stage: terminal.run.breaker_stage,
+    input_tokens: terminal.run.input_tokens,
+    accepted_artifact: terminal.run.artifact_id,
+    completed_events: 0,
+  }
+}
+
 const report = {
   checked_at: new Date().toISOString(),
   start_steer_resume: await startSteerResumeScenario(),
   interrupt: await interruptScenario(),
   stop: await stopScenario(),
+  budget_stop: await budgetStopScenario(),
 }
 
 await writeFile(

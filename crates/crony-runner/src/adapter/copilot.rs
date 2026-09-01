@@ -1090,13 +1090,25 @@ fn simple_property_list(value: &str) -> bool {
 }
 
 fn path_is_inside(workspace: &Path, candidate: &str) -> bool {
+    if contains_parent_path_segment(candidate) {
+        return false;
+    }
     path_is_inside_path(workspace, Path::new(candidate))
 }
 
 fn path_is_inside_workspace(workspace: &Path, candidate: &str) -> bool {
+    if contains_parent_path_segment(candidate) {
+        return false;
+    }
     let candidate = map_copilot_workspace_path(workspace, candidate)
         .unwrap_or_else(|| PathBuf::from(candidate));
     path_is_inside_path(workspace, &candidate)
+}
+
+fn contains_parent_path_segment(candidate: &str) -> bool {
+    candidate
+        .split(['\\', '/'])
+        .any(|component| component == "..")
 }
 
 fn path_is_inside_path(workspace: &Path, candidate: &Path) -> bool {
