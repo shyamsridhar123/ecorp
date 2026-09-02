@@ -32,6 +32,8 @@ pub struct ExportedDeliverable {
     pub base_commit: String,
     pub head_commit: Option<String>,
     pub branch: String,
+    pub git_bundle_sha256: Option<String>,
+    pub publication_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +49,8 @@ struct ArchivedChange {
 
 struct TemporaryExportPaths<'a> {
     index: &'a Path,
+    bundle: &'a Path,
+    bundle_ref: &'a str,
 }
 
 pub async fn export(
@@ -65,11 +69,20 @@ pub async fn export(
         .parent()
         .context("deliverable worktree has no managed parent")?
         .join(format!(".ecorp-deliverable-{}.index", run_id.simple()));
+    let temporary_bundle = workspace
+        .path
+        .parent()
+        .context("deliverable worktree has no managed parent")?
+        .join(format!(".ecorp-deliverable-{}.bundle", run_id.simple()));
+    let temporary_bundle_ref = format!("refs/ecorp/deliverables/{}", run_id.simple());
     let _ = tokio::fs::remove_file(&temporary_index).await;
+    let _ = tokio::fs::remove_file(&temporary_bundle).await;
+
     let temporary_paths = TemporaryExportPaths {
         index: &temporary_index,
+        bundle: &temporary_bundle,
+        bundle_ref: &temporary_bundle_ref,
     };
-
     let result = export_with_index(
         spec,
         workspace,
@@ -81,6 +94,7 @@ pub async fn export(
     )
     .await;
     let _ = tokio::fs::remove_file(&temporary_index).await;
+    let _ = tokio::fs::remove_file(&temporary_bundle).await;
     result
 }
 
@@ -182,6 +196,28 @@ async fn export_with_index(
     )
     .await?
     .stdout;
+    let git_bundle = if spec.form == DeliverableForm::CommitBranch {
+        let head_commit = head_commit
+            .as_deref()
+            .context("commit/branch deliverable omitted its committed head")?;
+        Some(
+            create_git_bundle(
+                workspace_root,
+                temporary_paths.index,
+                temporary_paths.bundle,
+                temporary_paths.bundle_ref,
+                &workspace.branch,
+                &workspace.base_commit,
+                head_commit,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let git_bundle_sha256 = git_bundle
+        .as_ref()
+        .map(|bundle| hex::encode(Sha256::digest(bundle)));
 
     let (bytes, file_name, media_type) = match spec.form {
         DeliverableForm::Patch => (
@@ -212,6 +248,8 @@ async fn export_with_index(
                 "verification_sha256": verification_sha256,
                 "patch_sha256": hex::encode(Sha256::digest(&patch)),
                 "patch_base64": include_content.then(|| BASE64.encode(&patch)),
+                "git_bundle_sha256": git_bundle_sha256,
+                "git_bundle_base64": git_bundle.as_ref().map(|bundle| BASE64.encode(bundle)),
                 "changes": archived,
             });
             let name = match form {
@@ -249,7 +287,95 @@ async fn export_with_index(
         base_commit: workspace.base_commit.clone(),
         head_commit,
         branch: workspace.branch.clone(),
+        git_bundle_sha256,
+        publication_ready: spec.form == DeliverableForm::CommitBranch,
     })
+}
+
+async fn create_git_bundle(
+    workspace: &Path,
+    index: &Path,
+    bundle_path: &Path,
+    bundle_ref: &str,
+    branch: &str,
+    base_commit: &str,
+    head_commit: &str,
+) -> Result<Vec<u8>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let resolved_head = git_text(
+        workspace,
+        index,
+        &[
+            OsString::from("rev-parse"),
+            OsString::from(format!("{branch_ref}^{{commit}}")),
+        ],
+    )
+    .await?;
+    if resolved_head != head_commit {
+        return Err(anyhow!(
+            "commit/branch deliverable head no longer matches its isolated branch"
+        ));
+    }
+    git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("merge-base"),
+            OsString::from("--is-ancestor"),
+            OsString::from(base_commit),
+            OsString::from(head_commit),
+        ],
+    )
+    .await?;
+    git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("update-ref"),
+            OsString::from(bundle_ref),
+            OsString::from(head_commit),
+        ],
+    )
+    .await?;
+    let bundle_result = async {
+        git_success(
+            workspace,
+            index,
+            &[
+                OsString::from("bundle"),
+                OsString::from("create"),
+                bundle_path.as_os_str().to_owned(),
+                OsString::from(bundle_ref),
+                OsString::from(format!("^{base_commit}")),
+            ],
+        )
+        .await?;
+        tokio::fs::read(bundle_path)
+            .await
+            .context("read portable Git bundle")
+    }
+    .await;
+    let cleanup_result = git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("update-ref"),
+            OsString::from("-d"),
+            OsString::from(bundle_ref),
+        ],
+    )
+    .await;
+    let bundle = match (bundle_result, cleanup_result) {
+        (Ok(bundle), Ok(())) => bundle,
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => {
+            return Err(error).context("remove temporary deliverable bundle ref");
+        }
+    };
+    if bundle.is_empty() {
+        return Err(anyhow!("portable Git bundle is empty"));
+    }
+    Ok(bundle)
 }
 
 async fn changed_paths(
@@ -965,7 +1091,80 @@ mod tests {
                 .contains(&exported.verification_sha256)
         );
         assert!(git(&root, &["show", "--format=", "--name-only", "HEAD"]).contains("new.txt"));
+        assert!(exported.publication_ready);
+        let document: Value =
+            serde_json::from_slice(&exported.bytes).expect("parse commit/branch deliverable");
+        let bundle = BASE64
+            .decode(
+                document["git_bundle_base64"]
+                    .as_str()
+                    .expect("bundle base64"),
+            )
+            .expect("decode bundle");
+        let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+        assert_eq!(
+            document["git_bundle_sha256"].as_str(),
+            Some(bundle_sha256.as_str())
+        );
+        let bundle_path = root.join("published.bundle");
+        fs::write(&bundle_path, bundle).expect("write bundle");
+        let listed = git(&root, &["bundle", "list-heads", "published.bundle"]);
+        assert!(listed.starts_with(&head));
+        assert!(listed.contains("refs/ecorp/deliverables/"));
+        fs::remove_file(bundle_path).expect("remove bundle");
         assert_eq!(git(&root, &["status", "--porcelain=v1"]), "?? provider.md");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn commit_form_bundles_validated_branch_when_head_is_detached() {
+        let (root, lease, report) = fixture();
+        git(&root, &["checkout", "--detach", &lease.base_commit]);
+        fs::write(root.join("tracked.txt"), b"detached commit\n").expect("modify tracked");
+
+        let exported = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: Vec::new(),
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect("detached commit export");
+
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), lease.base_commit);
+        let head_commit = exported.head_commit.expect("committed branch head");
+        assert_ne!(head_commit, lease.base_commit);
+        let document: Value =
+            serde_json::from_slice(&exported.bytes).expect("parse commit/branch deliverable");
+        let bundle = BASE64
+            .decode(
+                document["git_bundle_base64"]
+                    .as_str()
+                    .expect("bundle base64"),
+            )
+            .expect("decode bundle");
+        let bundle_path = root.join("detached.bundle");
+        fs::write(&bundle_path, bundle).expect("write bundle");
+        let listed = git(&root, &["bundle", "list-heads", "detached.bundle"]);
+        assert!(listed.starts_with(&head_commit));
+        assert!(listed.contains("refs/ecorp/deliverables/"));
+        assert_eq!(
+            git(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/ecorp/deliverables"
+                ]
+            ),
+            ""
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

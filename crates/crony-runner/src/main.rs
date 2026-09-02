@@ -1416,6 +1416,8 @@ async fn send_verification_events(
             "base_commit": exported.base_commit,
             "head_commit": exported.head_commit,
             "branch": exported.branch,
+            "git_bundle_sha256": exported.git_bundle_sha256,
+            "publication_ready": exported.publication_ready,
             "integration_state": if exported.form == crony_domain::DeliverableForm::ReviewOnlyReport {
                 "not_applicable"
             } else {

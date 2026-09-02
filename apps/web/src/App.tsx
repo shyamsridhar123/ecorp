@@ -127,6 +127,78 @@ type SourceDeliverable = {
   retention_until: string
 }
 
+type PullRequestPublication = {
+  id: string
+  factory_work_item_id: string
+  mission_id: string
+  source_deliverable_id: string
+  artifact_id: string
+  task_id: string
+  run_id: string
+  source_issue_number: number
+  source_issue_url: string
+  target_repository: string
+  base_ref: string
+  branch: string
+  commit_sha: string
+  title: string
+  body: string
+  actor_id: string
+  authorization_id: string
+  authorization_snapshot: {
+    actor_role?: string
+    permission?: string
+    reason?: string
+    authorized_at?: string
+  }
+  effect_key: string
+  idempotency_key: string
+  state: 'requested' | 'publishing' | 'branch_pushed' | 'pull_request_created' | 'published'
+  version: number
+  attempt_count: number
+  publisher_id: string | null
+  publisher_lease_expires_at: string | null
+  failure_detail: string | null
+  branch_pushed_at: string | null
+  pull_request_number: number | null
+  pull_request_node_id: string | null
+  pull_request_url: string | null
+  pull_request_state: string | null
+  pull_request_draft: boolean | null
+  pull_request_base_ref: string | null
+  pull_request_head_sha: string | null
+  pull_request_head_repository_owner: string | null
+  pull_request_is_cross_repository: boolean | null
+  project_owner: string
+  project_number: number
+  project_item_id: string
+  project_status_before: string
+  project_status_after: string | null
+  project_status_updated_at: string | null
+  auto_merge_enabled: boolean
+  merge_authorized: boolean
+  deployment_authorized: boolean
+}
+
+type PullRequestPublicationAttempt = {
+  id: string
+  publication_id: string
+  attempt: number
+  actor_id: string
+  authorization_id: string
+  authorization_snapshot: {
+    actor_role?: string
+    permission?: string
+    reason?: string
+    authorized_at?: string
+  }
+  publisher_id: string
+  state: 'running' | 'failed' | 'abandoned' | 'published'
+  failure_detail: string | null
+  started_at: string
+  finished_at: string | null
+}
+
 type Lease = {
   agent_id: string
   actor_id: string
@@ -294,6 +366,8 @@ type SnapshotResponse = {
     verification_evidence: VerificationEvidence[]
     verification_requests: VerificationRequest[]
     source_deliverables: SourceDeliverable[]
+    pull_request_publications: PullRequestPublication[]
+    pull_request_publication_attempts: PullRequestPublicationAttempt[]
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
@@ -505,9 +579,13 @@ function StatusMark({ status }: { status: Agent['status'] }) {
 function FactoryPanel({
   items,
   missions,
+  publications,
+  publicationAttempts,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
+  publications: PullRequestPublication[]
+  publicationAttempts: PullRequestPublicationAttempt[]
 }) {
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
@@ -541,6 +619,12 @@ function FactoryPanel({
         {items.length ? (
           items.map((item) => {
             const mission = missions.find((candidate) => candidate.id === item.mission_id)
+            const publication = publications.find(
+              (candidate) => candidate.factory_work_item_id === item.id,
+            )
+            const attempts = publicationAttempts
+              .filter((attempt) => attempt.publication_id === publication?.id)
+              .sort((left, right) => right.attempt - left.attempt)
             return (
               <article className="factory-card" key={item.id}>
                 <div className="factory-card-top">
@@ -578,6 +662,98 @@ function FactoryPanel({
                 </dl>
                 {item.failure_detail ? (
                   <p className="factory-failure">{item.failure_detail}</p>
+                ) : null}
+                {publication ? (
+                  <div className="publication-proof" data-testid="factory-publication">
+                    <div className="publication-proof-heading">
+                      <strong>Verified pull-request publication</strong>
+                      <span
+                        className={`status-chip status-chip-${
+                          publication.state === 'published'
+                            ? 'completed'
+                            : publication.failure_detail
+                              ? 'failed'
+                              : 'running'
+                        }`}
+                      >
+                        {statusLabel(publication.state)}
+                      </span>
+                    </div>
+                    <dl>
+                      <div>
+                        <dt>Target</dt>
+                        <dd>
+                          {publication.target_repository} · {publication.base_ref}
+                          {publication.pull_request_base_ref &&
+                          publication.pull_request_base_ref !== publication.base_ref
+                            ? ` → ${publication.pull_request_base_ref}`
+                            : ''}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Branch</dt>
+                        <dd>
+                          {publication.branch} @ {shortId(publication.commit_sha)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Authorization</dt>
+                        <dd>
+                          {publication.authorization_snapshot.actor_role ?? 'authorized'} ·{' '}
+                          {shortId(publication.actor_id)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Attempts</dt>
+                        <dd>
+                          {publication.attempt_count}
+                          {attempts[0] ? ` · latest ${statusLabel(attempts[0].state)}` : ''}
+                        </dd>
+                      </div>
+                    </dl>
+                    {publication.authorization_snapshot.reason ? (
+                      <p>{publication.authorization_snapshot.reason}</p>
+                    ) : null}
+                    {publication.pull_request_url ? (
+                      <>
+                        <a
+                          className="publication-link"
+                          href={publication.pull_request_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Pull request #{publication.pull_request_number} ·{' '}
+                          {publication.pull_request_draft ? 'draft' : 'open for review'}
+                        </a>
+                        <span className="publication-pending">
+                          Verified head {publication.pull_request_head_repository_owner} @{' '}
+                          {publication.pull_request_head_sha
+                            ? shortId(publication.pull_request_head_sha)
+                            : 'pending'}
+                          {publication.pull_request_is_cross_repository === false
+                            ? ' · same repository'
+                            : ''}
+                          {publication.pull_request_base_ref
+                            ? ` · PR base ${publication.pull_request_base_ref}`
+                            : ''}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="publication-pending">Pull request not created yet</span>
+                    )}
+                    <footer>
+                      <span>
+                        Project {publication.project_status_before}
+                        {publication.project_status_after
+                          ? ` → ${publication.project_status_after}`
+                          : ''}
+                      </span>
+                      <span>auto-merge off · merge/deploy unauthorized</span>
+                    </footer>
+                    {publication.failure_detail ? (
+                      <p className="factory-failure">{publication.failure_detail}</p>
+                    ) : null}
+                  </div>
                 ) : null}
                 <footer>
                   <span>rev {item.source_revision}</span>
@@ -2378,6 +2554,8 @@ function App() {
       <FactoryPanel
         items={data.snapshot.factory_work_items}
         missions={data.snapshot.missions}
+        publications={data.snapshot.pull_request_publications}
+        publicationAttempts={data.snapshot.pull_request_publication_attempts}
       />
 
       <section className="office-grid">

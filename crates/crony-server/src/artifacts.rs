@@ -481,6 +481,11 @@ fn source_deliverable_metadata(payload: &Value) -> Result<Value> {
     let head_commit = payload.get("head_commit").and_then(Value::as_str);
     let branch = required("branch")?;
     let integration_state = required("integration_state")?;
+    let git_bundle_sha256 = payload.get("git_bundle_sha256").and_then(Value::as_str);
+    let publication_ready = payload
+        .get("publication_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if !valid_hex(verification_sha256, 64, 64)
         || !valid_hex(base_commit, 40, 64)
         || head_commit.is_some_and(|value| !valid_hex(value, 40, 64))
@@ -493,6 +498,20 @@ fn source_deliverable_metadata(payload: &Value) -> Result<Value> {
     {
         return Err(anyhow!("source deliverable metadata is invalid"));
     }
+    if form == "commit_branch" {
+        if head_commit.is_none()
+            || git_bundle_sha256.is_none_or(|value| !valid_hex(value, 64, 64))
+            || !publication_ready
+        {
+            return Err(anyhow!(
+                "commit/branch deliverable omitted its portable publication bundle"
+            ));
+        }
+    } else if git_bundle_sha256.is_some() || publication_ready {
+        return Err(anyhow!(
+            "only commit/branch deliverables may be publication-ready"
+        ));
+    }
     Ok(json!({
         "form": form,
         "verification_sha256": verification_sha256,
@@ -500,6 +519,8 @@ fn source_deliverable_metadata(payload: &Value) -> Result<Value> {
         "head_commit": head_commit,
         "branch": branch,
         "integration_state": integration_state,
+        "git_bundle_sha256": git_bundle_sha256,
+        "publication_ready": publication_ready,
     }))
 }
 
@@ -686,6 +707,8 @@ mod tests {
                     "head_commit": Value::Null,
                     "branch": "crony/task-test/run-test",
                     "integration_state": "ready_for_review",
+                    "git_bundle_sha256": Value::Null,
+                    "publication_ready": false,
                 }),
                 Utc::now() + chrono::Duration::days(30),
             )
@@ -696,6 +719,10 @@ mod tests {
         assert_eq!(
             artifact.metadata["verification_sha256"].as_str(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            artifact.metadata["publication_ready"].as_bool(),
+            Some(false)
         );
         let mut tampered = artifact.clone();
         tampered.metadata["verification_sha256"] = json!("c".repeat(64));

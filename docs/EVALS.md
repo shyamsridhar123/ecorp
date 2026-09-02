@@ -264,3 +264,52 @@ download, denies a non-member, optionally creates a commit only on the isolated 
 receives durable storage acknowledgment before a clean worktree is reclaimed. Browser validation
 checks that provider evidence, verification evidence, source deliverables, and integration state
 are visibly distinct. See `docs/evidence/2026-09-02-portable-deliverables.md`.
+
+`tools/e2e_factory_publication.mjs` uses a real server, runner, isolated worktrees, portable Git
+bundle, bare Git remote, and deterministic fake GitHub API. It proves policy, role, Corp, budget,
+and breaker rejection; manage-only publisher enrollment; independent publisher workload
+authentication on start, renewal, failure, and every checkpoint; exact publisher-ID binding;
+revoked, expired, invalid, missing, and cross-Corp credential rejection; workload-auth recovery
+after server restart; branch-push recovery after a publisher crash and server restart; pull-request
+adoption after external success plus local failure; Project-status recovery after another crash;
+duplicate concurrent publication convergence; credential non-disclosure; exactly one branch and
+pull request; same-named fork rejection; exact PR-head SHA binding; symbolic `HEAD` verification;
+separate persistence of policy base `HEAD` and resolved GitHub PR base;
+post-start role, breaker, run-budget, and Corp-budget revocation; and the required
+pull-request-before-review ordering. It also proves the resolved base branch cannot be pushed as the
+publication branch, implicit authorization IDs survive duplicate/restart invocation, and CRLF body
+files canonicalize before idempotency comparison. The base-collision case leaves no durable
+publication and accepts a corrected branch afterward, while a second manager's recovery attempt
+receives a distinct actor-bound authorization identity. A completed-publication retry also returns
+the persisted result after the remote base advances, without another PR or Project mutation.
+The same harness injects an exact same-repository/SHA PR with an unauthorized title/body and proves
+it is rejected before Project movement. Unit coverage pins retries to the persisted deliverable when
+multiple mission deliverables are otherwise eligible. It also creates 501 newer work items,
+deliverables, and publications, proves the requested objects fall outside each 500-row snapshot,
+then publishes and replays the completed result through the exact publication context. Recovery
+changes publisher ID, authorization reason, and lease duration; invalid `ecorp/foo//bar` and
+`ecorp/foo.lock` branches fail before durable start. The Project regression places the authorized
+item after 1,001 fillers and proves publication uses exact GraphQL node lookup without another
+bounded item-list read. A separate same-Corp manager belongs only to another room: start and
+recovery return `403`, exact publication status returns `404` without sensitive fields, and removing
+the active publisher from the mission room makes each pre-branch, pre-PR, and pre-Project renewal
+return `403` before its external effect. A whitespace-padded custom pull-request title is normalized
+before start and idempotency, reaches post-plan validation, and recovers with the exact persisted
+title. The cross-room context read also returns `404` without work-item source/policy/failure data,
+and the controller rejects `refs/tags/v1` as a publication base before Project reads or durable
+claim. A direct control-character base policy returns `400`; a mixed-case target repository
+canonicalizes before plan validation; and a Project with 32 fields, with Status after the default
+30-field page, completes through exact Status-field GraphQL lookup. A canonical PR URL retaining
+mixed-case owner/repository components is accepted and persisted. The controller's omitted
+publication base follows the selected source ref (`HEAD` or `release`); a scheduled PR close after
+Project-stage renewal is detected after Project refresh and before any Project mutation. Runner unit
+coverage detaches worktree HEAD and proves the validated branch still produces an importable bundle
+with no temporary ref left behind. See
+`docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
+
+The controller recovery preview also proves a source `release` item with persisted publication base
+`main` continues to report `main` when a later dry run omits the override. At the Project boundary,
+the publication harness pauses after the slow Project/PR reads but before the final authority
+renewal, removes the human publisher from the mission room, receives `403`, and proves no Project
+edit or status movement occurred. This demonstrates the second renewal fences the irreversible
+effect rather than merely protecting the earlier reads.

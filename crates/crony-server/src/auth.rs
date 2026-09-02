@@ -25,6 +25,7 @@ pub enum Permission {
     Operate,
     Approve,
     EmergencyStop,
+    Publish,
     Manage,
 }
 
@@ -62,6 +63,9 @@ impl CorpRole {
                 )
             }
             Permission::EmergencyStop => {
+                matches!(self, Self::Owner | Self::Admin | Self::Manager)
+            }
+            Permission::Publish => {
                 matches!(self, Self::Owner | Self::Admin | Self::Manager)
             }
             Permission::Manage => matches!(self, Self::Owner | Self::Admin),
@@ -291,6 +295,8 @@ mod tests {
     fn role_matrix_is_fail_closed() {
         assert!(CorpRole::Manager.allows(Permission::EmergencyStop));
         assert!(CorpRole::Owner.allows(Permission::Manage));
+        assert!(CorpRole::Manager.allows(Permission::Publish));
+        assert!(!CorpRole::Member.allows(Permission::Publish));
         assert!(CorpRole::Member.allows(Permission::Operate));
         assert!(CorpRole::Guest.allows(Permission::PostMessage));
         assert!(!CorpRole::Guest.allows(Permission::Operate));

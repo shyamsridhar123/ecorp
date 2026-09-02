@@ -1,4 +1,5 @@
 mod factory;
+mod publish;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -43,6 +44,10 @@ enum Command {
     Factory {
         #[command(flatten)]
         args: Box<factory::FactoryArgs>,
+    },
+    FactoryPublish {
+        #[command(flatten)]
+        args: Box<publish::FactoryPublishArgs>,
     },
     Mission {
         corp_id: Uuid,
@@ -197,6 +202,9 @@ async fn main() -> Result<()> {
         }
         Command::Factory { args: factory_args } => {
             factory::run(&client, &args.server, *factory_args).await?
+        }
+        Command::FactoryPublish { args: publish_args } => {
+            publish::run(&client, &args.server, *publish_args).await?
         }
         Command::Mission {
             corp_id,

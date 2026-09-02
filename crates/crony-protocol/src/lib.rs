@@ -1,6 +1,6 @@
 use crony_domain::{
     CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    TaskSecretReference, VerificationPolicy,
+    PullRequestPublication, SourceDeliverable, TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -485,6 +485,126 @@ pub struct MaterializeFactoryMissionResponse {
     pub task_ids: Vec<Uuid>,
     pub strategy: String,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryPublicationContextResponse {
+    pub work_item: FactoryWorkItem,
+    pub publication: Option<PullRequestPublication>,
+    pub source_deliverables: Vec<SourceDeliverable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePublicationPublisherCredentialRequest {
+    pub actor_id: Uuid,
+    pub publisher_id: String,
+    #[serde(default = "default_publication_publisher_credential_ttl_seconds")]
+    pub expires_in_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePublicationPublisherCredentialResponse {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub credential: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokePublicationPublisherCredentialRequest {
+    pub actor_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokePublicationPublisherCredentialResponse {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub revoked: bool,
+}
+
+const fn default_publication_publisher_credential_ttl_seconds() -> i64 {
+    86_400
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartPullRequestPublicationRequest {
+    pub actor_id: Uuid,
+    pub source_deliverable_id: Uuid,
+    pub target_repository: String,
+    pub base_ref: String,
+    pub branch: String,
+    pub title: String,
+    pub body: String,
+    pub authorization_id: Uuid,
+    pub authorization_reason: String,
+    pub effect_key: String,
+    pub idempotency_key: String,
+    pub publisher_id: String,
+    #[serde(default = "default_publication_lease_seconds")]
+    pub lease_seconds: i64,
+}
+
+const fn default_publication_lease_seconds() -> i64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewPullRequestPublicationRequest {
+    pub actor_id: Uuid,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    #[serde(default = "default_publication_lease_seconds")]
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PullRequestPublicationCheckpoint {
+    BranchPushed {
+        commit_sha: String,
+    },
+    PullRequestCreated {
+        number: i64,
+        node_id: String,
+        url: String,
+        state: String,
+        draft: bool,
+        title: String,
+        body: String,
+        head_ref: String,
+        base_ref: String,
+        head_sha: String,
+        head_repository_owner: String,
+        is_cross_repository: bool,
+        auto_merge_enabled: bool,
+    },
+    Published {
+        project_status: String,
+        project_field_id: String,
+        project_option_id: String,
+    },
+    Failed {
+        failure_detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordPullRequestPublicationCheckpointRequest {
+    pub actor_id: Uuid,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub checkpoint: PullRequestPublicationCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestPublicationResponse {
+    pub publication: PullRequestPublication,
+    pub publisher_token: Option<Uuid>,
+    pub replayed: bool,
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -154,6 +154,8 @@ async function runController(
     strategy = 'single',
     githubTimeoutMs,
     sourceRepositoryPath = root,
+    sourceBaseRef = 'HEAD',
+    publicationBaseRef,
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
     writeScope = ['**'],
@@ -171,6 +173,8 @@ async function runController(
     repository,
     '--source-repository-path',
     sourceRepositoryPath,
+    '--source-base-ref',
+    sourceBaseRef,
     '--adapter',
     'fake-process',
     '--strategy',
@@ -184,6 +188,9 @@ async function runController(
     '--github-cli',
     process.execPath,
   ]
+  if (publicationBaseRef) {
+    args.push('--publication-base-ref', publicationBaseRef)
+  }
   for (const scope of writeScope) args.push('--write-scope', scope)
   if (issueNumber !== null) args.push('--issue', String(issueNumber))
   if (dryRun) args.push('--dry-run')
@@ -264,6 +271,15 @@ No blockers.
   updatedAt: '2026-09-01T14:00:00Z',
   labels: [{ name: 'factory:ready' }],
 }
+const recoveryBaseIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9097',
+  number: 9097,
+  title: 'Preview the persisted publication base during recovery',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9097',
+  createdAt: '2026-09-01T13:59:00Z',
+  updatedAt: '2026-09-02T00:09:07Z',
+}
 await writeFile(
   statePath,
   `${JSON.stringify(
@@ -294,14 +310,174 @@ await writeFile(
             url: issue.url,
           },
         },
+        {
+          id: 'PVTI_FAKE_FACTORY_9097',
+          status: 'Todo',
+          content: {
+            body: recoveryBaseIssue.body,
+            number: recoveryBaseIssue.number,
+            repository: 'shyamsridhar123/ecorp',
+            title: recoveryBaseIssue.title,
+            type: 'Issue',
+            url: recoveryBaseIssue.url,
+          },
+        },
       ],
-      issues: { '9001': issue },
+      issues: { '9001': issue, '9097': recoveryBaseIssue },
       item_edits: 0,
     },
     null,
     2,
   )}\n`,
 )
+
+const controlCharacterPolicyResponse = await fetch(
+  `${server}/api/corps/${demo.corp_id}/factory/work-items/claim`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+    actor_id: demo.alice_actor_id,
+    source_project_owner: 'acme',
+    source_project_number: 7,
+    source_project_item_id: 'PVTI_FAKE_FACTORY_CONTROL_REF',
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    source_issue_number: 9098,
+    source_issue_node_id: 'I_FAKE_FACTORY_CONTROL_REF',
+    source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/9098',
+    source_title: 'Reject control characters in publication base policy',
+    source_revision: '2026-09-02T00:00:00Z',
+    idempotency_key: 'factory-control-ref-rejected',
+    lease_seconds: 300,
+    policy: {
+      ...factoryPolicy(),
+      publication: {
+        allowed: true,
+        repository_allowlist: ['shyamsridhar123/ecorp'],
+        base_ref: 'main\tbad',
+        branch_prefix: 'ecorp/',
+        status_before: 'In Progress',
+        review_status: 'In Review',
+        auto_merge: false,
+        merge: false,
+        deploy: false,
+      },
+    },
+    }),
+  },
+)
+const controlCharacterPolicyRejected =
+  await controlCharacterPolicyResponse.json()
+assert.equal(controlCharacterPolicyResponse.status, 400)
+assert.match(controlCharacterPolicyRejected.error, /safe Git ref/)
+
+let invalidPublicationBaseRejected = false
+try {
+  await runController(demo, 9001, true, {
+    publicationBaseRef: 'refs/tags/v1',
+  })
+  assert.fail('non-branch publication base unexpectedly passed validation')
+} catch (error) {
+  assert.match(
+    String(error.stderr ?? error),
+    /publication base ref must be HEAD or a branch ref/,
+  )
+  invalidPublicationBaseRejected = true
+}
+const preValidationSnapshot = await snapshot(demo)
+assert.equal(preValidationSnapshot.snapshot.factory_work_items.length, 0)
+assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
+
+const releaseSourceRepository = await createSourceFixture(
+  'shyamsridhar123/ecorp',
+)
+await execFile('git', ['branch', 'release', 'HEAD'], {
+  cwd: releaseSourceRepository,
+  windowsHide: true,
+})
+const releaseDryRun = await runController(demo, 9001, true, {
+  sourceRepositoryPath: releaseSourceRepository,
+  sourceBaseRef: 'release',
+})
+assert.equal(releaseDryRun.source_base_ref, 'release')
+assert.equal(releaseDryRun.publication_base_ref, 'release')
+const recoveryClaim = await post(
+  `/api/corps/${demo.corp_id}/factory/work-items/claim`,
+  {
+    actor_id: demo.alice_actor_id,
+    source_project_owner: 'acme',
+    source_project_number: 7,
+    source_project_item_id: 'PVTI_FAKE_FACTORY_9097',
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    source_issue_number: recoveryBaseIssue.number,
+    source_issue_node_id: recoveryBaseIssue.id,
+    source_issue_url: recoveryBaseIssue.url,
+    source_title: recoveryBaseIssue.title,
+    source_revision: recoveryBaseIssue.updatedAt,
+    idempotency_key: 'factory-recovery-base-preview',
+    lease_seconds: 300,
+    policy: {
+      ...factoryPolicy(),
+      source_base_ref: 'release',
+      publication: {
+        allowed: true,
+        repository_allowlist: ['shyamsridhar123/ecorp'],
+        base_ref: 'main',
+        branch_prefix: 'ecorp/',
+        status_before: 'In Progress',
+        review_status: 'In Review',
+        auto_merge: false,
+        merge: false,
+        deploy: false,
+      },
+    },
+  },
+)
+const recoveryBaseDryRun = await runController(demo, 9097, true, {
+  sourceRepositoryPath: releaseSourceRepository,
+  sourceBaseRef: 'release',
+})
+assert.equal(recoveryBaseDryRun.selected.recovery, true)
+assert.equal(recoveryBaseDryRun.source_base_ref, 'release')
+assert.equal(recoveryBaseDryRun.publication_base_ref, 'main')
+assert.deepEqual(recoveryBaseDryRun.mutations, [])
+const recoveryBaseAfterDryRun = await snapshot(demo)
+assert.equal(
+  recoveryBaseAfterDryRun.snapshot.factory_work_items.find(
+    (item) => item.id === recoveryClaim.work_item.id,
+  ).version,
+  recoveryClaim.work_item.version,
+)
+await post(
+  `/api/corps/${demo.corp_id}/factory/work-items/${recoveryClaim.work_item.id}/transition`,
+  {
+    actor_id: demo.alice_actor_id,
+    claim_token: recoveryClaim.claim_token,
+    expected_version: recoveryClaim.work_item.version,
+    idempotency_key: 'factory-recovery-base-preview-cleanup',
+    state: 'cancelled',
+    failure_detail: 'Test-only cleanup after mutation-free recovery preview.',
+  },
+)
+const recoveryFixtureState = JSON.parse(await readFile(statePath, 'utf8'))
+await writeFile(
+  statePath,
+  `${JSON.stringify(
+    {
+      ...recoveryFixtureState,
+      items: recoveryFixtureState.items.map((item) =>
+        item.id === 'PVTI_FAKE_FACTORY_9097'
+          ? { ...item, status: 'Done' }
+          : item,
+      ),
+    },
+    null,
+    2,
+  )}\n`,
+)
+await rm(releaseSourceRepository, { recursive: true, force: true })
 
 const dryRun = await runController(demo, 9001, true)
 assert.equal(dryRun.mode, 'dry_run')
@@ -355,6 +531,7 @@ const factoryItems = finalState.snapshot.factory_work_items.filter(
 )
 assert.equal(factoryItems.length, 1)
 assert.equal(factoryItems[0].state, 'verified')
+assert.equal(factoryItems[0].policy.publication.base_ref, 'HEAD')
 assert.equal(Object.hasOwn(factoryItems[0], 'claim_token'), false)
 const missions = finalState.snapshot.missions.filter(
   (item) => item.id === first.mission_id,
@@ -1238,6 +1415,15 @@ const report = {
   mission_status: missions[0].status,
   run_status: runs[0].status,
   auto_merge: false,
+  default_publication_base_ref: factoryItems[0].policy.publication.base_ref,
+  selected_source_publication_base_ref:
+    releaseDryRun.publication_base_ref,
+  persisted_recovery_publication_base_ref:
+    recoveryBaseDryRun.publication_base_ref,
+  control_character_publication_base_policy_rejected:
+    controlCharacterPolicyResponse.status,
+  non_branch_publication_base_rejected_before_claim:
+    invalidPublicationBaseRejected,
   queue_progression: {
     next_issue_number: nextIssue.issue_number,
     verified_items_do_not_starve_todo_work: true,

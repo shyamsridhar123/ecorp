@@ -5,14 +5,17 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
     Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
-    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage,
-    Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract, TaskGraphPlan,
-    TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy, VerificationRequest,
-    write_scope_is_valid,
+    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent,
+    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
+    TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
+    VerificationRequest, write_scope_is_valid,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
+
+mod publication;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
@@ -141,6 +144,115 @@ pub struct FactoryMissionOutcome {
     pub strategy: String,
     pub events: Vec<DomainEvent>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartPullRequestPublicationInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub actor_role: String,
+    pub source_deliverable_id: Uuid,
+    pub target_repository: String,
+    pub base_ref: String,
+    pub branch: String,
+    pub title: String,
+    pub body: String,
+    pub authorization_id: Uuid,
+    pub authorization_reason: String,
+    pub effect_key: String,
+    pub idempotency_key: String,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenewPullRequestPublicationInput {
+    pub corp_id: Uuid,
+    pub publication_id: Uuid,
+    pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PullRequestPublicationCheckpointInput {
+    BranchPushed {
+        commit_sha: String,
+    },
+    PullRequestCreated {
+        number: i64,
+        node_id: String,
+        url: String,
+        state: String,
+        draft: bool,
+        title: String,
+        body: String,
+        head_ref: String,
+        base_ref: String,
+        head_sha: String,
+        head_repository_owner: String,
+        is_cross_repository: bool,
+        auto_merge_enabled: bool,
+    },
+    Published {
+        project_status: String,
+        project_field_id: String,
+        project_option_id: String,
+    },
+    Failed {
+        failure_detail: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPullRequestPublicationCheckpointInput {
+    pub corp_id: Uuid,
+    pub publication_id: Uuid,
+    pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub checkpoint: PullRequestPublicationCheckpointInput,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestPublicationOutcome {
+    pub publication: PullRequestPublication,
+    pub publisher_token: Option<Uuid>,
+    pub events: Vec<DomainEvent>,
+    pub replayed: bool,
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryPublicationContext {
+    pub work_item: FactoryWorkItem,
+    pub publication: Option<PullRequestPublication>,
+    pub source_deliverables: Vec<SourceDeliverable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialRevocationOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub revoked: bool,
+    pub event: Option<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -1017,6 +1129,14 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM pull_request_publication_attempts WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pull_request_publications WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM factory_work_items WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1330,6 +1450,89 @@ impl PgStore {
         .map(map_source_deliverable)
         .collect::<Result<Vec<_>>>()?;
 
+        let pull_request_publications = sqlx::query(
+            r#"
+            SELECT publication.id, publication.corp_id, publication.factory_work_item_id,
+                   publication.mission_id, publication.source_deliverable_id,
+                   publication.artifact_id, publication.task_id, publication.run_id,
+                   publication.source_issue_number, publication.source_issue_url,
+                   publication.target_repository, publication.base_ref, publication.branch,
+                   publication.commit_sha, publication.title, publication.body,
+                   publication.actor_id, publication.authorization_id,
+                   publication.authorization_snapshot, publication.effect_key,
+                   publication.idempotency_key, publication.state, publication.version,
+                   publication.attempt_count, publication.publisher_id,
+                   publication.publisher_lease_expires_at, publication.failure_detail,
+                   publication.branch_pushed_at, publication.pull_request_number,
+                   publication.pull_request_node_id, publication.pull_request_url,
+                   publication.pull_request_state, publication.pull_request_draft,
+                   publication.pull_request_base_ref,
+                   publication.pull_request_head_sha,
+                   publication.pull_request_head_repository_owner,
+                   publication.pull_request_is_cross_repository,
+                   publication.project_owner, publication.project_number,
+                   publication.project_item_id, publication.project_status_before,
+                   publication.project_status_after, publication.project_status_updated_at,
+                   publication.auto_merge_enabled, publication.merge_authorized,
+                   publication.deployment_authorized, publication.provenance,
+                   publication.created_at, publication.updated_at
+            FROM pull_request_publications publication
+            JOIN missions mission ON mission.id = publication.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE publication.corp_id = $1
+              AND membership.actor_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = publication.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY publication.created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_pull_request_publication)
+        .collect::<Result<Vec<_>>>()?;
+
+        let pull_request_publication_attempts = sqlx::query(
+            r#"
+            SELECT attempt.id, attempt.corp_id, attempt.publication_id, attempt.attempt,
+                   attempt.actor_id, attempt.authorization_id, attempt.authorization_snapshot,
+                   attempt.publisher_id, attempt.state, attempt.failure_detail,
+                   attempt.started_at, attempt.finished_at
+            FROM pull_request_publication_attempts attempt
+            JOIN pull_request_publications publication ON publication.id = attempt.publication_id
+            JOIN missions mission ON mission.id = publication.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE attempt.corp_id = $1
+              AND membership.actor_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = attempt.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY attempt.started_at DESC
+            LIMIT 1000
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_pull_request_publication_attempt)
+        .collect();
+
         let action_approvals = sqlx::query(
             r#"
             SELECT approval.id, approval.corp_id, approval.room_id, approval.mission_id,
@@ -1444,6 +1647,8 @@ impl PgStore {
             verification_evidence,
             verification_requests,
             source_deliverables,
+            pull_request_publications,
+            pull_request_publication_attempts,
             action_approvals,
             circuit_breaker_incidents,
             factory_work_items,
@@ -1580,6 +1785,196 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rooms)
+    }
+
+    pub async fn create_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        publisher_id: &str,
+        credential_hash: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<PublicationPublisherCredentialOutcome> {
+        let publisher_id = normalize_factory_identifier(publisher_id, "trusted publisher id", 160)?;
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "publication publisher credential hash must be a SHA-256 digest"
+            ));
+        }
+        if expires_at <= Utc::now() {
+            return Err(anyhow!(
+                "publication publisher credential expiry must be in the future"
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can enroll a publication publisher"
+            ));
+        }
+
+        let credential_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO publication_publisher_credentials
+                (id, corp_id, publisher_id, credential_hash, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .bind(&publisher_id)
+        .bind(&credential_hash)
+        .bind(actor_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "factory.publication_publisher_enrolled",
+                "publication_publisher",
+                credential_id,
+                format!("publication-publisher-enrolled:{credential_id}"),
+                json!({
+                    "publisher_id": publisher_id,
+                    "expires_at": expires_at
+                }),
+            ),
+        )
+        .await?
+        .context("publication publisher enrollment event was unexpectedly deduplicated")?;
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialOutcome {
+            credential_id,
+            publisher_id,
+            expires_at,
+            event,
+        })
+    }
+
+    pub async fn authenticate_publication_publisher(
+        &self,
+        corp_id: Uuid,
+        credential_hash: &str,
+    ) -> Result<String> {
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "forbidden: invalid publication publisher credential"
+            ));
+        }
+        let publisher_id = sqlx::query_scalar(
+            r#"
+            UPDATE publication_publisher_credentials
+            SET last_used_at = now()
+            WHERE id = (
+                SELECT id
+                FROM publication_publisher_credentials
+                WHERE corp_id = $1
+                  AND credential_hash = $2
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+                FOR UPDATE
+            )
+            RETURNING publisher_id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(&credential_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("forbidden: unknown, expired, or revoked publication publisher credential")?;
+        Ok(publisher_id)
+    }
+
+    pub async fn revoke_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        credential_id: Uuid,
+        reason: &str,
+    ) -> Result<PublicationPublisherCredentialRevocationOutcome> {
+        let reason =
+            normalize_factory_text(reason, "publisher credential revocation reason", 2_000)?;
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can revoke a publication publisher"
+            ));
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT publisher_id, revoked_at
+            FROM publication_publisher_credentials
+            WHERE id = $1 AND corp_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("publication publisher credential was not found")?;
+        let publisher_id: String = row.get("publisher_id");
+        let already_revoked = row
+            .get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
+            .is_some();
+        let event = if already_revoked {
+            None
+        } else {
+            sqlx::query(
+                "UPDATE publication_publisher_credentials SET revoked_at = now() WHERE id = $1",
+            )
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+            append_event_tx(
+                &mut tx,
+                NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "factory.publication_publisher_revoked",
+                    "publication_publisher",
+                    credential_id,
+                    format!("publication-publisher-revoked:{credential_id}"),
+                    json!({
+                        "publisher_id": publisher_id.clone(),
+                        "reason": reason
+                    }),
+                ),
+            )
+            .await?
+        };
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialRevocationOutcome {
+            credential_id,
+            publisher_id,
+            revoked: !already_revoked,
+            event,
+        })
     }
 
     pub async fn create_runner_enrollment(
@@ -7706,11 +8101,46 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
         || value.ends_with('.')
         || value.contains("..")
         || value.contains("@{")
+        || value.chars().any(char::is_control)
         || value
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
     {
         return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
+    }
+    Ok(())
+}
+
+fn validate_factory_publication_base_ref(value: &str) -> Result<()> {
+    validate_factory_base_ref(value)?;
+    if value == "HEAD" {
+        return Ok(());
+    }
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        if branch.is_empty() {
+            return Err(anyhow!(
+                "factory publication base ref must be HEAD or a branch ref"
+            ));
+        }
+        return validate_factory_branch_ref(branch);
+    }
+    if value.starts_with("refs/") {
+        return Err(anyhow!(
+            "factory publication base ref must be HEAD or a branch ref"
+        ));
+    }
+    validate_factory_branch_ref(value)
+}
+
+fn validate_factory_branch_ref(value: &str) -> Result<()> {
+    validate_factory_base_ref(value)?;
+    if value == "HEAD"
+        || value.contains("//")
+        || value
+            .split('/')
+            .any(|component| component.starts_with('.') || component.ends_with(".lock"))
+    {
+        return Err(anyhow!("publication branch is not a valid Git branch name"));
     }
     Ok(())
 }
@@ -7837,6 +8267,15 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         .context("factory policy snapshot must be a JSON object")?;
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
+    if let Some(publication) = policy_object.get("publication") {
+        let publication = publication
+            .as_object()
+            .context("factory publication policy must be a JSON object")?;
+        if publication.get("allowed").and_then(Value::as_bool) == Some(true) {
+            let base_ref = factory_policy_required_string(publication, "base_ref", 240)?;
+            validate_factory_publication_base_ref(&base_ref)?;
+        }
+    }
     if policy_object.contains_key("write_scope")
         && let Some(scope) = factory_policy_string_array(policy_object, "write_scope")?
             .iter()
@@ -8959,6 +9398,79 @@ fn map_source_deliverable(row: sqlx::postgres::PgRow) -> Result<SourceDeliverabl
     })
 }
 
+fn map_pull_request_publication(row: sqlx::postgres::PgRow) -> Result<PullRequestPublication> {
+    Ok(PullRequestPublication {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        factory_work_item_id: row.get("factory_work_item_id"),
+        mission_id: row.get("mission_id"),
+        source_deliverable_id: row.get("source_deliverable_id"),
+        artifact_id: row.get("artifact_id"),
+        task_id: row.get("task_id"),
+        run_id: row.get("run_id"),
+        source_issue_number: row.get("source_issue_number"),
+        source_issue_url: row.get("source_issue_url"),
+        target_repository: row.get("target_repository"),
+        base_ref: row.get("base_ref"),
+        branch: row.get("branch"),
+        commit_sha: row.get("commit_sha"),
+        title: row.get("title"),
+        body: row.get("body"),
+        actor_id: row.get("actor_id"),
+        authorization_id: row.get("authorization_id"),
+        authorization_snapshot: row.get("authorization_snapshot"),
+        effect_key: row.get("effect_key"),
+        idempotency_key: row.get("idempotency_key"),
+        state: parse_pull_request_publication_state(row.get::<String, _>("state").as_str())?,
+        version: row.get("version"),
+        attempt_count: row.get("attempt_count"),
+        publisher_id: row.get("publisher_id"),
+        publisher_lease_expires_at: row.get("publisher_lease_expires_at"),
+        failure_detail: row.get("failure_detail"),
+        branch_pushed_at: row.get("branch_pushed_at"),
+        pull_request_number: row.get("pull_request_number"),
+        pull_request_node_id: row.get("pull_request_node_id"),
+        pull_request_url: row.get("pull_request_url"),
+        pull_request_state: row.get("pull_request_state"),
+        pull_request_draft: row.get("pull_request_draft"),
+        pull_request_base_ref: row.get("pull_request_base_ref"),
+        pull_request_head_sha: row.get("pull_request_head_sha"),
+        pull_request_head_repository_owner: row.get("pull_request_head_repository_owner"),
+        pull_request_is_cross_repository: row.get("pull_request_is_cross_repository"),
+        project_owner: row.get("project_owner"),
+        project_number: row.get("project_number"),
+        project_item_id: row.get("project_item_id"),
+        project_status_before: row.get("project_status_before"),
+        project_status_after: row.get("project_status_after"),
+        project_status_updated_at: row.get("project_status_updated_at"),
+        auto_merge_enabled: row.get("auto_merge_enabled"),
+        merge_authorized: row.get("merge_authorized"),
+        deployment_authorized: row.get("deployment_authorized"),
+        provenance: row.get("provenance"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_pull_request_publication_attempt(
+    row: sqlx::postgres::PgRow,
+) -> PullRequestPublicationAttempt {
+    PullRequestPublicationAttempt {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        publication_id: row.get("publication_id"),
+        attempt: row.get("attempt"),
+        actor_id: row.get("actor_id"),
+        authorization_id: row.get("authorization_id"),
+        authorization_snapshot: row.get("authorization_snapshot"),
+        publisher_id: row.get("publisher_id"),
+        state: row.get("state"),
+        failure_detail: row.get("failure_detail"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+    }
+}
+
 fn map_action_approval(row: sqlx::postgres::PgRow) -> ActionApproval {
     ActionApproval {
         id: row.get("id"),
@@ -9157,6 +9669,17 @@ fn parse_factory_work_item_state(value: &str) -> Result<FactoryWorkItemState> {
         "failed" => Ok(FactoryWorkItemState::Failed),
         "cancelled" => Ok(FactoryWorkItemState::Cancelled),
         other => Err(anyhow!("unknown factory work-item state {other}")),
+    }
+}
+
+fn parse_pull_request_publication_state(value: &str) -> Result<PullRequestPublicationState> {
+    match value {
+        "requested" => Ok(PullRequestPublicationState::Requested),
+        "publishing" => Ok(PullRequestPublicationState::Publishing),
+        "branch_pushed" => Ok(PullRequestPublicationState::BranchPushed),
+        "pull_request_created" => Ok(PullRequestPublicationState::PullRequestCreated),
+        "published" => Ok(PullRequestPublicationState::Published),
+        other => Err(anyhow!("unknown pull-request publication state {other}")),
     }
 }
 
@@ -9606,6 +10129,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be pinned and require a legacy upgrade")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "refs/tags/v1"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("HEAD or a branch ref")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "main\tbad"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("safe Git ref")
         );
         assert!(
             normalize_factory_policy(json!({

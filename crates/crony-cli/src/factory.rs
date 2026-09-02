@@ -46,6 +46,9 @@ pub struct FactoryArgs {
     #[arg(long, env = "ECORP_FACTORY_SOURCE_BASE_REF", default_value = "HEAD")]
     pub source_base_ref: String,
 
+    #[arg(long, env = "ECORP_FACTORY_PUBLICATION_BASE_REF")]
+    pub publication_base_ref: Option<String>,
+
     #[arg(
         long,
         env = "ECORP_FACTORY_SOURCE_REPOSITORY_PATH",
@@ -255,6 +258,21 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             }
         })
         .transpose()?;
+    let preview_publication_base_ref = selected_index
+        .map(|index| {
+            if evaluated[index].recovery {
+                resolve_recovery_publication_base_ref(
+                    &args,
+                    existing.get(&evaluated[index].project_item.id).context(
+                        "recoverable factory item disappeared from the selected-item lookup",
+                    )?,
+                )
+            } else {
+                Ok(selected_publication_base_ref(&args).to_owned())
+            }
+        })
+        .transpose()?
+        .unwrap_or_else(|| selected_publication_base_ref(&args).to_owned());
     let evaluated_json = evaluated
         .iter()
         .map(EvaluatedItem::as_json)
@@ -268,6 +286,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "project_number": args.project_number,
             "repository": args.repository,
             "source_base_ref": args.source_base_ref,
+            "publication_base_ref": preview_publication_base_ref,
             "source_base_commit": selected_source_base_commit
                 .as_ref()
                 .map(|resolved| resolved.commit.as_str()),
@@ -306,6 +325,16 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         legacy_upgrade_required,
     } = source_resolution;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
+    let publication_base_ref = if refreshed.recovery {
+        resolve_recovery_publication_base_ref(
+            &args,
+            persisted
+                .as_ref()
+                .context("recoverable factory item disappeared from the selected-item lookup")?,
+        )?
+    } else {
+        selected_publication_base_ref(&args).to_owned()
+    };
     let stable_prefix = format!(
         "github-project:{}:{}:{}:{}",
         args.owner, args.project_number, refreshed.project_item.id, refreshed.issue.updated_at
@@ -345,9 +374,21 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             ],
             "secret_ids": [],
             "verification_required": true,
+            "deliverable_form": "commit_branch",
             "budget_tokens": args.budget_tokens,
             "budget_cost_microusd": args.budget_cost_microusd,
             "auto_merge": false,
+            "publication": {
+                "allowed": true,
+                "repository_allowlist": [args.repository],
+                "base_ref": publication_base_ref,
+                "branch_prefix": "ecorp/",
+                "status_before": "In Progress",
+                "review_status": "In Review",
+                "auto_merge": false,
+                "merge": false,
+                "deploy": false
+            },
         })
     };
     let claim_generation = persisted.as_ref().map(|item| item.version).unwrap_or(0);
@@ -365,6 +406,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_revision": refreshed.issue.updated_at,
         "source_base_ref": args.source_base_ref,
         "source_base_commit": source_base_commit,
+        "publication_base_ref": publication_base_ref,
         "idempotency_key": format!(
             "{stable_prefix}:claim:{}:{claim_generation}:lease:{}",
             args.actor_id, args.lease_seconds
@@ -772,6 +814,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
     validate_source_base_ref(&args.source_base_ref)?;
+    validate_publication_base_ref(args)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
         bail!("GitHub Project owner is invalid");
     }
@@ -809,6 +852,11 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
         normalize_github_component(repository_name, "repository name")?
     );
     args.source_base_ref = args.source_base_ref.trim().to_owned();
+    args.publication_base_ref = args
+        .publication_base_ref
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     args.adapter = args.adapter.trim().to_owned();
     args.strategy = args.strategy.trim().to_owned();
     args.allowed_adapters = args
@@ -824,7 +872,7 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
     Ok(())
 }
 
-fn normalize_github_component(value: &str, field: &str) -> Result<String> {
+pub(crate) fn normalize_github_component(value: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 100
@@ -846,6 +894,7 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
         || value.ends_with('.')
         || value.contains("..")
         || value.contains("@{")
+        || value.chars().any(char::is_control)
         || value
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
@@ -853,6 +902,72 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
         bail!("factory source base ref is invalid");
     }
     Ok(())
+}
+
+fn validate_publication_base_ref(args: &FactoryArgs) -> Result<()> {
+    let publication_base_ref = selected_publication_base_ref(args);
+    let Some(branch) = publication_base_branch(publication_base_ref)? else {
+        return Ok(());
+    };
+    source_git_output(
+        &args.source_repository_path,
+        &["check-ref-format", "--branch", branch],
+    )
+    .map(|_| ())
+    .with_context(|| {
+        format!(
+            "factory publication base ref {} is not a valid Git branch",
+            publication_base_ref
+        )
+    })
+}
+
+fn selected_publication_base_ref(args: &FactoryArgs) -> &str {
+    args.publication_base_ref
+        .as_deref()
+        .unwrap_or(&args.source_base_ref)
+}
+
+fn resolve_recovery_publication_base_ref(
+    args: &FactoryArgs,
+    item: &ExistingFactoryItem,
+) -> Result<String> {
+    let publication = item
+        .policy
+        .get("publication")
+        .and_then(Value::as_object)
+        .context("persisted factory policy has no publication object")?;
+    let persisted = publication
+        .get("base_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("persisted factory publication policy has no base_ref")?;
+    publication_base_branch(persisted)?;
+    if let Some(requested) = args.publication_base_ref.as_deref()
+        && requested != persisted
+    {
+        bail!(
+            "factory recovery publication base ref mismatch: persisted policy requires {persisted}, controller requested {requested}"
+        );
+    }
+    Ok(persisted.to_owned())
+}
+
+fn publication_base_branch(value: &str) -> Result<Option<&str>> {
+    validate_source_base_ref(value)?;
+    if value == "HEAD" {
+        return Ok(None);
+    }
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        if branch.is_empty() {
+            bail!("factory publication base ref must be HEAD or a branch ref");
+        }
+        return Ok(Some(branch));
+    }
+    if value.starts_with("refs/") {
+        bail!("factory publication base ref must be HEAD or a branch ref");
+    }
+    Ok(Some(value))
 }
 
 fn resolve_recovery_source_base_commit(
@@ -1874,7 +1989,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn sanitize_failure_detail(value: &str) -> String {
+pub(crate) fn sanitize_failure_detail(value: &str) -> String {
     let normalized = value
         .chars()
         .map(|character| {
@@ -1894,7 +2009,7 @@ fn sanitize_failure_detail(value: &str) -> String {
     truncate_utf8(collapsed, 2_000)
 }
 
-fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
+pub(crate) fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
     let output = gh_output(github_cli, args)?;
     serde_json::from_slice(&output).with_context(|| {
         format!(
@@ -1905,11 +2020,11 @@ fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
     })
 }
 
-fn gh_run(github_cli: &Path, args: &[&str]) -> Result<()> {
+pub(crate) fn gh_run(github_cli: &Path, args: &[&str]) -> Result<()> {
     gh_output(github_cli, args).map(|_| ())
 }
 
-fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let prefix_args = env::var("ECORP_GITHUB_CLI_PREFIX_ARGS_JSON")
         .ok()
         .map(|value| {
@@ -1971,7 +2086,7 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(stdout)
 }
 
-fn source_git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn source_git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repository)
@@ -2057,7 +2172,7 @@ fn join_process_output(
         .with_context(|| format!("read {stream}"))
 }
 
-async fn server_json(
+pub(crate) async fn server_json(
     client: &Client,
     method: Method,
     url: String,
@@ -2138,10 +2253,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ExistingFactoryItem, acceptance_tests, blocked_dependency_numbers,
+        ExistingFactoryItem, FactoryArgs, acceptance_tests, blocked_dependency_numbers,
         factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        parse_github_repository_identity, sanitize_failure_detail, truncate_utf8,
-        validate_source_base_commit,
+        parse_github_repository_identity, publication_base_branch,
+        resolve_recovery_publication_base_ref, sanitize_failure_detail,
+        selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
     };
 
     #[test]
@@ -2216,6 +2332,97 @@ Blocked by #999 outside the section.
         assert!(validate_source_base_commit(&"B".repeat(64)).is_ok());
         assert!(validate_source_base_commit(&"a".repeat(39)).is_err());
         assert!(validate_source_base_commit(&"g".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn publication_base_requires_head_or_a_branch_ref() {
+        assert_eq!(publication_base_branch("HEAD").unwrap(), None);
+        assert_eq!(publication_base_branch("main").unwrap(), Some("main"));
+        assert_eq!(
+            publication_base_branch("refs/heads/release").unwrap(),
+            Some("release")
+        );
+        assert!(publication_base_branch("refs/tags/v1").is_err());
+        assert!(publication_base_branch("refs/remotes/origin/main").is_err());
+        assert!(publication_base_branch("refs/heads/").is_err());
+        assert!(publication_base_branch("main\tbad").is_err());
+    }
+
+    #[test]
+    fn publication_base_defaults_to_the_selected_source_ref() {
+        let mut args = FactoryArgs {
+            corp_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            owner: "owner".to_owned(),
+            project_number: 1,
+            repository: "owner/repo".to_owned(),
+            source_base_ref: "release".to_owned(),
+            publication_base_ref: None,
+            source_repository_path: ".".into(),
+            adapter: "fake-process".to_owned(),
+            allowed_adapters: Vec::new(),
+            strategy: "single".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            budget_tokens: 1,
+            budget_cost_microusd: 1,
+            lease_seconds: 30,
+            write_scope: vec!["**".to_owned()],
+            issue: None,
+            dry_run: true,
+            github_cli: "gh".into(),
+        };
+        assert_eq!(selected_publication_base_ref(&args), "release");
+        args.publication_base_ref = Some("main".to_owned());
+        assert_eq!(selected_publication_base_ref(&args), "main");
+    }
+
+    #[test]
+    fn recovery_publication_base_reuses_persisted_policy() {
+        let now = Utc::now();
+        let mut item = ExistingFactoryItem {
+            version: 1,
+            source_revision: "2026-09-02T00:00:00Z".to_owned(),
+            claim_owner_id: Uuid::new_v4(),
+            state: "running".to_owned(),
+            mission_id: Some(Uuid::new_v4()),
+            policy: json!({
+                "publication": {
+                    "base_ref": "main"
+                }
+            }),
+            lease_expires_at: now + Duration::minutes(5),
+        };
+        let mut args = FactoryArgs {
+            corp_id: Uuid::new_v4(),
+            actor_id: item.claim_owner_id,
+            owner: "owner".to_owned(),
+            project_number: 1,
+            repository: "owner/repo".to_owned(),
+            source_base_ref: "release".to_owned(),
+            publication_base_ref: None,
+            source_repository_path: ".".into(),
+            adapter: "fake-process".to_owned(),
+            allowed_adapters: Vec::new(),
+            strategy: "single".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            budget_tokens: 1,
+            budget_cost_microusd: 1,
+            lease_seconds: 30,
+            write_scope: vec!["**".to_owned()],
+            issue: None,
+            dry_run: true,
+            github_cli: "gh".into(),
+        };
+        assert_eq!(
+            resolve_recovery_publication_base_ref(&args, &item).unwrap(),
+            "main"
+        );
+        args.publication_base_ref = Some("release".to_owned());
+        assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
+        item.policy = json!({});
+        assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
     }
 
     #[test]
