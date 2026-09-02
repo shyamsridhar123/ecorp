@@ -146,6 +146,8 @@ exact signed Git bundle, never force-pushes a conflicting branch, refuses closed
 pull requests, and records the pull-request identity before changing Project status. Duplicate,
 restart, timeout, and external-success/local-failure recovery adopt only matching remote effects.
 The database constrains auto-merge, merge authorization, and deployment authorization to false.
+The publisher reads its requested work item, publication, and mission deliverables through an exact
+Corp-authorized context endpoint rather than trusting bounded shared snapshots.
 
 Before every branch push, pull-request creation, and Project mutation, lease renewal transactionally
 rechecks the current attempt actor against its persisted role snapshot and reruns current run,
@@ -159,6 +161,16 @@ PR adoption also requires the exact authorized title and body. A collaborator-cr
 right branch and SHA but altered content is ignored and cannot advance Project state. Publication
 retries remain pinned to the persisted deliverable ID even when the mission contains other
 merge-ready outputs.
+
+Publication branches pass `git check-ref-format --branch` before the durable start request; the
+server independently rejects invalid path components such as doubled separators and `.lock`
+suffixes. Default start keys hash the complete normalized request, including publisher identity,
+authorization reason, and lease duration, so changed recovery authority cannot reuse a request key
+whose persisted operation has different fields.
+
+GitHub Project status is read from the exact stored Project item node ID. The publisher verifies the
+returned Project ID, owner, number, item ID, Status field ID, and field type before any mutation, so
+truncated item listings cannot turn a present item into an apparent disappearance.
 
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before
