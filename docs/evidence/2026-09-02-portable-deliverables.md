@@ -125,7 +125,55 @@ Screenshots:
 Cleanup stopped only the verified process tree rooted in this worktree. Ports `55433`, `8891`, and
 `5287` were closed, and container `ecorp-issue53-integration-live` was absent.
 
-The hosted CI run triggered by this dependency refresh was rejected before any step executed
-because the GitHub account has a payment or Actions spending-limit block. Landing remains paused
-until hosted CI can actually run; this is recorded as an external infrastructure failure rather
-than a passing or failing code gate.
+## Export-boundary review hardening — September 2, 2026
+
+Commit `cd016427685508b2dfdb5d1d37d6db2e4c4acce2` closes the three later review
+findings against the portable export boundary:
+
+- each start and resume assignment now carries the persisted task `write_scope` to the runner;
+- export rejects any selected changed path outside that scope, including the default
+  `deliverable.paths: []` case;
+- the temporary export index starts from the verified base commit rather than the current task
+  `HEAD`, so an existing agent commit cannot silently add unselected paths;
+- commit/branch exports create a bounded commit directly on the verified base, then atomically move
+  only the isolated task branch while preserving unselected work in the worktree index; and
+- sensitive runner and credential directories such as nested `.azure`, `.ssh`, and
+  `.config/gcloud` paths are rejected at every path depth.
+
+The focused runner suite passed `38/38`, including regressions for narrowed write scope, nested
+credential directories, unselected committed changes, selected-commit ancestry, and preservation
+of unrelated staged work.
+
+A fresh isolated stack used PostgreSQL `pr71review` on `55434`, server `8892`, runner
+`runner-pr71-review`, and Vite `5288`. `tools/e2e_portable_deliverables.mjs` passed twice and
+`tools/e2e_artifacts.mjs` passed between those runs. The final portable run recorded:
+
+- archive run `f651113a-0dbe-494b-a972-70170bfa1421`
+- archive artifact `4b35d49c-638f-4206-9914-2ebac5ae1af5`
+- archive SHA-256 `5fcc011dda886c4709f36e8a08a97d6c390711278290736e2935980b4ca8ac9e`
+- commit run `117a9cf7-30c7-4adf-a1c3-f8f90bf22c03`
+- commit artifact `096a9a35-e16e-477d-ab98-c4ff436c63d1`
+- bounded isolated commit `ef549f2b292b45a0c33996c8ad69c1746067f4bb`
+- reclaimed run `2e88ae33-8df2-4abc-b577-75ae10edd952`
+- retained-before-cleanup ordering `true`
+- unauthorized download HTTP `404`
+
+Headless Chromium loaded the resulting source-deliverable cards with zero console or page errors.
+Desktop had `scrollWidth == clientWidth == 1440`; mobile had
+`scrollWidth == clientWidth == 390`. Both displayed the source deliverable, download action, and
+`INTEGRATION · READY FOR REVIEW`.
+
+Screenshots:
+
+- `output/playwright/pr71-deliverable-desktop.png`
+- `output/playwright/pr71-deliverable-mobile.png`
+
+The exact code head `cd016427685508b2dfdb5d1d37d6db2e4c4acce2` passed all 23 immutable
+migration checks, formatting, warning-free workspace clippy, all 73 Rust tests, the production web
+build, web lint, and `git diff --check`. The test-owned process tree and container were removed;
+ports `55434`, `8892`, and `5288` were closed.
+
+GitHub Actions is unavailable because the account has exhausted its hosted-runner credits for the
+month. Those zero-step billing failures are not treated as product validation or as a landing
+blocker. Landing uses the complete local gate, focused E2Es, browser evidence, and clean review
+threads; auto-merge remains disabled.

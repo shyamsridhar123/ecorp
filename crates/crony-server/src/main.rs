@@ -2137,6 +2137,7 @@ async fn schedule_ready_tasks(
                 source_base_ref: record.source_base_ref.clone(),
                 source_base_commit: record.source_base_commit.clone(),
                 verification_policy: record.verification_policy.clone(),
+                write_scope: record.write_scope.clone(),
                 deliverable: record.deliverable.clone(),
                 secrets,
             })
@@ -2622,6 +2623,7 @@ async fn resume_run(
         source_base_ref: record.source_base_ref.clone(),
         source_base_commit: record.source_base_commit.clone(),
         verification_policy: record.verification_policy.clone(),
+        write_scope: record.write_scope.clone(),
         deliverable: record.deliverable.clone(),
         secret_refs: record.secret_refs.clone(),
         queued_messages: record.queued_messages.clone(),
@@ -2666,6 +2668,7 @@ async fn resume_run(
             source_base_commit: record.source_base_commit,
             workspace_base_commit: Some(record.workspace_base_commit),
             verification_policy: record.verification_policy,
+            write_scope: record.write_scope,
             deliverable: record.deliverable,
             secrets,
         })
