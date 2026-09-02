@@ -1702,7 +1702,7 @@ async fn get_pull_request_publication(
     Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<PullRequestPublicationResponse>, ApiError> {
-    authorize_actor(
+    let actor_id = authorize_actor(
         &state,
         &principal,
         corp_id,
@@ -1712,7 +1712,7 @@ async fn get_pull_request_publication(
     .await?;
     let publication = state
         .store
-        .pull_request_publication_for_work_item(corp_id, work_item_id)
+        .pull_request_publication_for_work_item(corp_id, actor_id, work_item_id)
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("pull-request publication was not found"))?;

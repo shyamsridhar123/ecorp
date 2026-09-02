@@ -119,28 +119,10 @@ impl PgStore {
             return Ok(None);
         };
 
-        let publication = if work_item.mission_id.is_some() {
-            let query = format!(
-                r#"
-                {PUBLICATION_SELECT}
-                JOIN missions mission ON mission.id = publication.mission_id
-                JOIN room_memberships membership ON membership.room_id = mission.room_id
-                WHERE publication.factory_work_item_id = $1
-                  AND publication.corp_id = $2
-                  AND membership.actor_id = $3
-                "#
-            );
-            sqlx::query(&query)
-                .bind(work_item_id)
-                .bind(corp_id)
-                .bind(viewer_actor_id)
-                .fetch_optional(&mut *tx)
+        let publication =
+            publication_for_work_item_viewer_tx(&mut tx, corp_id, viewer_actor_id, work_item_id)
                 .await?
-                .map(map_pull_request_publication)
-                .transpose()?
-        } else {
-            None
-        };
+                .map(|(publication, _)| publication);
 
         let source_deliverables = if let Some(mission_id) = work_item.mission_id {
             sqlx::query(
@@ -188,11 +170,14 @@ impl PgStore {
     pub async fn pull_request_publication_for_work_item(
         &self,
         corp_id: Uuid,
+        viewer_actor_id: Uuid,
         work_item_id: Uuid,
     ) -> Result<Option<PullRequestPublication>> {
         let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, corp_id, viewer_actor_id).await?;
         let publication =
-            publication_for_work_item_tx(&mut tx, corp_id, work_item_id, false).await?;
+            publication_for_work_item_viewer_tx(&mut tx, corp_id, viewer_actor_id, work_item_id)
+                .await?;
         tx.commit().await?;
         Ok(publication.map(|(publication, _)| publication))
     }
@@ -252,6 +237,8 @@ impl PgStore {
                 publication_by_id_tx(&mut tx, normalized.corp_id, operation.publication_id, false)
                     .await?
                     .context("idempotent publication start references a missing publication")?;
+            assert_publication_room_membership_tx(&mut tx, &publication, normalized.actor_id)
+                .await?;
             let publisher_token =
                 replayable_publication_token(&publication, current_token, &operation, now);
             let busy = publication.state != PullRequestPublicationState::Published
@@ -280,6 +267,8 @@ impl PgStore {
         .await?;
         if let Some((publication, current_token)) = existing {
             ensure_publication_matches_start(&publication, &normalized)?;
+            assert_publication_room_membership_tx(&mut tx, &publication, normalized.actor_id)
+                .await?;
             if publication.state == PullRequestPublicationState::Published {
                 record_publication_operation_tx(
                     &mut tx,
@@ -424,6 +413,13 @@ impl PgStore {
             &mut tx,
             &PublicationPrerequisiteRequest::from_start(&normalized),
             false,
+        )
+        .await?;
+        assert_room_membership_tx(
+            &mut tx,
+            normalized.corp_id,
+            prerequisites.room_id,
+            normalized.actor_id,
         )
         .await?;
         let publication_id = Uuid::new_v4();
@@ -1533,6 +1529,7 @@ async fn revalidate_publication_authority_tx(
         true,
     )
     .await?;
+    assert_room_membership_tx(tx, publication.corp_id, prerequisites.room_id, actor_id).await?;
     let provenance_deliverable_sha = publication
         .provenance
         .pointer("/deliverable/sha256")
@@ -2243,17 +2240,33 @@ async fn publication_by_id_tx(
     publication_query_tx(tx, &query, publication_id, corp_id).await
 }
 
-async fn publication_for_work_item_tx(
+async fn publication_for_work_item_viewer_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
+    viewer_actor_id: Uuid,
     work_item_id: Uuid,
-    for_update: bool,
 ) -> Result<Option<(PullRequestPublication, Option<Uuid>)>> {
-    let suffix = if for_update { " FOR UPDATE" } else { "" };
     let query = format!(
-        "{PUBLICATION_SELECT} WHERE publication.factory_work_item_id = $1 AND publication.corp_id = $2{suffix}"
+        r#"
+        {PUBLICATION_SELECT}
+        JOIN missions mission ON mission.id = publication.mission_id
+        JOIN room_memberships membership ON membership.room_id = mission.room_id
+        WHERE publication.factory_work_item_id = $1
+          AND publication.corp_id = $2
+          AND membership.actor_id = $3
+        "#
     );
-    publication_query_tx(tx, &query, work_item_id, corp_id).await
+    let row = sqlx::query(&query)
+        .bind(work_item_id)
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(|row| {
+        let publisher_token = row.get("publisher_token");
+        Ok((map_pull_request_publication(row)?, publisher_token))
+    })
+    .transpose()
 }
 
 async fn publication_query_tx(
@@ -2272,6 +2285,15 @@ async fn publication_query_tx(
         Ok((map_pull_request_publication(row)?, publisher_token))
     })
     .transpose()
+}
+
+async fn assert_publication_room_membership_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    publication: &PullRequestPublication,
+    actor_id: Uuid,
+) -> Result<()> {
+    let room_id = publication_room_id_tx(tx, publication.corp_id, publication.mission_id).await?;
+    assert_room_membership_tx(tx, publication.corp_id, room_id, actor_id).await
 }
 
 async fn publication_collision_tx(
