@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use crony_domain::{DeliverableForm, DeliverableSpec};
+use crony_domain::{
+    DeliverableForm, DeliverableSpec, repository_relative_path_is_valid, write_scope_allows_path,
+    write_scope_is_valid,
+};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -44,12 +47,19 @@ struct ArchivedChange {
     content_base64: Option<String>,
 }
 
+struct TemporaryExportPaths<'a> {
+    index: &'a Path,
+    bundle: &'a Path,
+    bundle_ref: &'a str,
+}
+
 pub async fn export(
     run_id: Uuid,
     spec: &DeliverableSpec,
     workspace: &WorkspaceLease,
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
+    write_scope: &[String],
 ) -> Result<ExportedDeliverable> {
     let workspace_root = tokio::fs::canonicalize(&workspace.path)
         .await
@@ -64,17 +74,23 @@ pub async fn export(
         .parent()
         .context("deliverable worktree has no managed parent")?
         .join(format!(".ecorp-deliverable-{}.bundle", run_id.simple()));
+    let temporary_bundle_ref = format!("refs/ecorp/deliverables/{}", run_id.simple());
     let _ = tokio::fs::remove_file(&temporary_index).await;
     let _ = tokio::fs::remove_file(&temporary_bundle).await;
 
+    let temporary_paths = TemporaryExportPaths {
+        index: &temporary_index,
+        bundle: &temporary_bundle,
+        bundle_ref: &temporary_bundle_ref,
+    };
     let result = export_with_index(
         spec,
         workspace,
         &workspace_root,
         report,
         provider_artifacts,
-        &temporary_index,
-        &temporary_bundle,
+        write_scope,
+        &temporary_paths,
     )
     .await;
     let _ = tokio::fs::remove_file(&temporary_index).await;
@@ -88,13 +104,16 @@ async fn export_with_index(
     workspace_root: &Path,
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
-    temporary_index: &Path,
-    temporary_bundle: &Path,
+    write_scope: &[String],
+    temporary_paths: &TemporaryExportPaths<'_>,
 ) -> Result<ExportedDeliverable> {
     git_success(
         workspace_root,
-        temporary_index,
-        &[OsString::from("read-tree"), OsString::from("HEAD")],
+        temporary_paths.index,
+        &[
+            OsString::from("read-tree"),
+            OsString::from(&workspace.base_commit),
+        ],
     )
     .await?;
 
@@ -111,7 +130,7 @@ async fn export_with_index(
             add_args.push(OsString::from(path));
         }
     }
-    git_success(workspace_root, temporary_index, &add_args).await?;
+    git_success(workspace_root, temporary_paths.index, &add_args).await?;
 
     for artifact in provider_artifacts {
         let Ok(artifact_path) = tokio::fs::canonicalize(&artifact.path).await else {
@@ -123,11 +142,11 @@ async fn export_with_index(
         let relative = portable_path(path)?;
         git_success(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             &[
                 OsString::from("reset"),
                 OsString::from("-q"),
-                OsString::from("HEAD"),
+                OsString::from(&workspace.base_commit),
                 OsString::from("--"),
                 OsString::from(relative),
             ],
@@ -135,8 +154,14 @@ async fn export_with_index(
         .await?;
     }
 
-    let changes = changed_paths(workspace_root, temporary_index, &workspace.base_commit).await?;
-    reject_unsafe_changes(workspace_root, temporary_index, &changes).await?;
+    let changes = changed_paths(
+        workspace_root,
+        temporary_paths.index,
+        &workspace.base_commit,
+    )
+    .await?;
+    reject_out_of_scope_changes(&changes, write_scope)?;
+    reject_unsafe_changes(workspace_root, temporary_paths.index, &changes).await?;
     let verification_bytes =
         serde_json::to_vec(report).context("serialize verification report for linkage")?;
     let verification_sha256 = hex::encode(Sha256::digest(&verification_bytes));
@@ -146,7 +171,7 @@ async fn export_with_index(
     let head_commit = if should_commit {
         commit_index(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             workspace,
             &verification_sha256,
             &changes,
@@ -158,7 +183,7 @@ async fn export_with_index(
 
     let patch = git_output(
         workspace_root,
-        temporary_index,
+        temporary_paths.index,
         &[
             OsString::from("diff"),
             OsString::from("--cached"),
@@ -178,8 +203,9 @@ async fn export_with_index(
         Some(
             create_git_bundle(
                 workspace_root,
-                temporary_index,
-                temporary_bundle,
+                temporary_paths.index,
+                temporary_paths.bundle,
+                temporary_paths.bundle_ref,
                 &workspace.branch,
                 &workspace.base_commit,
                 head_commit,
@@ -206,8 +232,13 @@ async fn export_with_index(
                     | DeliverableForm::TypedArtifactSet
                     | DeliverableForm::CommitBranch
             );
-            let archived =
-                archive_changes(workspace_root, temporary_index, &changes, include_content).await?;
+            let archived = archive_changes(
+                workspace_root,
+                temporary_paths.index,
+                &changes,
+                include_content,
+            )
+            .await?;
             let document = json!({
                 "schema_version": 1,
                 "form": form.as_str(),
@@ -265,6 +296,7 @@ async fn create_git_bundle(
     workspace: &Path,
     index: &Path,
     bundle_path: &Path,
+    bundle_ref: &str,
     branch: &str,
     base_commit: &str,
     head_commit: &str,
@@ -299,17 +331,47 @@ async fn create_git_bundle(
         workspace,
         index,
         &[
-            OsString::from("bundle"),
-            OsString::from("create"),
-            bundle_path.as_os_str().to_owned(),
-            OsString::from("HEAD"),
-            OsString::from(format!("^{base_commit}")),
+            OsString::from("update-ref"),
+            OsString::from(bundle_ref),
+            OsString::from(head_commit),
         ],
     )
     .await?;
-    let bundle = tokio::fs::read(bundle_path)
-        .await
-        .context("read portable Git bundle")?;
+    let bundle_result = async {
+        git_success(
+            workspace,
+            index,
+            &[
+                OsString::from("bundle"),
+                OsString::from("create"),
+                bundle_path.as_os_str().to_owned(),
+                OsString::from(bundle_ref),
+                OsString::from(format!("^{base_commit}")),
+            ],
+        )
+        .await?;
+        tokio::fs::read(bundle_path)
+            .await
+            .context("read portable Git bundle")
+    }
+    .await;
+    let cleanup_result = git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("update-ref"),
+            OsString::from("-d"),
+            OsString::from(bundle_ref),
+        ],
+    )
+    .await;
+    let bundle = match (bundle_result, cleanup_result) {
+        (Ok(bundle), Ok(())) => bundle,
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => {
+            return Err(error).context("remove temporary deliverable bundle ref");
+        }
+    };
     if bundle.is_empty() {
         return Err(anyhow!("portable Git bundle is empty"));
     }
@@ -453,49 +515,46 @@ async fn commit_index(
     changes: &[(String, String)],
 ) -> Result<Option<String>> {
     let tree = git_text(workspace, index, &[OsString::from("write-tree")]).await?;
-    let head_tree = git_text(
+    let base_tree = git_text(
         workspace,
         index,
-        &[OsString::from("rev-parse"), OsString::from("HEAD^{tree}")],
+        &[
+            OsString::from("rev-parse"),
+            OsString::from(format!("{}^{{tree}}", lease.base_commit)),
+        ],
     )
     .await?;
-    if tree == head_tree {
-        return Ok(Some(
-            git_text(
-                workspace,
-                index,
-                &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
-            )
-            .await?,
-        ));
-    }
     let old_head = git_text(
         workspace,
         index,
         &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
     )
     .await?;
-    let message =
-        format!("ECorp verified deliverable\n\nVerification-SHA256: {verification_sha256}\n");
-    let commit = git_text_with_env(
-        workspace,
-        index,
-        &[
-            OsString::from("commit-tree"),
-            OsString::from(&tree),
-            OsString::from("-p"),
-            OsString::from(&old_head),
-            OsString::from("-m"),
-            OsString::from(message),
-        ],
-        &[
-            ("GIT_AUTHOR_NAME", "ECorp Runner"),
-            ("GIT_AUTHOR_EMAIL", "runner@ecorp.invalid"),
-            ("GIT_COMMITTER_NAME", "ECorp Runner"),
-            ("GIT_COMMITTER_EMAIL", "runner@ecorp.invalid"),
-        ],
-    )
-    .await?;
+    let commit = if tree == base_tree {
+        lease.base_commit.clone()
+    } else {
+        let message =
+            format!("ECorp verified deliverable\n\nVerification-SHA256: {verification_sha256}\n");
+        git_text_with_env(
+            workspace,
+            index,
+            &[
+                OsString::from("commit-tree"),
+                OsString::from(&tree),
+                OsString::from("-p"),
+                OsString::from(&lease.base_commit),
+                OsString::from("-m"),
+                OsString::from(message),
+            ],
+            &[
+                ("GIT_AUTHOR_NAME", "ECorp Runner"),
+                ("GIT_AUTHOR_EMAIL", "runner@ecorp.invalid"),
+                ("GIT_COMMITTER_NAME", "ECorp Runner"),
+                ("GIT_COMMITTER_EMAIL", "runner@ecorp.invalid"),
+            ],
+        )
+        .await?
+    };
     git_success(
         workspace,
         index,
@@ -507,35 +566,57 @@ async fn commit_index(
         ],
     )
     .await?;
-    let mut command = Command::new("git");
-    command
-        .args(["reset", "--mixed", "HEAD", "--"])
-        .args(changes.iter().map(|(_, path)| path))
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = command
-        .output()
-        .await
-        .context("refresh committed paths in the worktree index")?;
-    if !output.status.success() {
-        return Err(git_error(&output));
+    if !changes.is_empty() {
+        let mut command = Command::new("git");
+        command
+            .args(["reset", "--mixed", "HEAD", "--"])
+            .args(changes.iter().map(|(_, path)| path))
+            .current_dir(workspace)
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = command
+            .output()
+            .await
+            .context("refresh committed paths in the worktree index")?;
+        if !output.status.success() {
+            return Err(git_error(&output));
+        }
     }
     Ok(Some(commit))
 }
 
 fn validate_relative(value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 500
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !repository_relative_path_is_valid(value) {
         return Err(anyhow!("deliverable path must stay inside the worktree"));
+    }
+    Ok(())
+}
+
+fn reject_out_of_scope_changes(changes: &[(String, String)], write_scope: &[String]) -> Result<()> {
+    if write_scope.is_empty() {
+        return Err(anyhow!(
+            "deliverable export requires an explicit task write scope"
+        ));
+    }
+    for scope in write_scope {
+        if !write_scope_is_valid(scope) {
+            return Err(anyhow!(
+                "task write scope must be an exact relative path or end in /**"
+            ));
+        }
+    }
+    for (_, path) in changes {
+        if !write_scope
+            .iter()
+            .any(|scope| write_scope_allows_path(scope, path))
+        {
+            return Err(anyhow!(
+                "deliverable contains path outside the task write scope: {path}"
+            ));
+        }
     }
     Ok(())
 }
@@ -558,23 +639,92 @@ fn portable_path(path: &Path) -> Result<String> {
 fn sensitive_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    normalized.starts_with(".git/")
-        || normalized.starts_with(".codex/")
-        || normalized.starts_with(".claude/")
-        || normalized.starts_with(".ssh/")
-        || normalized.starts_with(".aws/")
-        || normalized.starts_with(".azure/")
-        || normalized.starts_with(".config/gcloud/")
-        || normalized.contains("/.git/")
-        || file_name.starts_with(".env")
+    let components = normalized.split('/').collect::<Vec<_>>();
+    components.iter().any(|component| {
+        matches!(
+            *component,
+            ".git"
+                | ".codex"
+                | ".claude"
+                | ".ssh"
+                | ".aws"
+                | ".azure"
+                | ".kube"
+                | ".docker"
+                | ".gnupg"
+                | ".password-store"
+                | ".terraform.d"
+                | ".pulumi"
+                | ".oci"
+                | ".gem"
+                | ".nuget"
+                | ".m2"
+                | ".gradle"
+                | ".composer"
+                | ".vercel"
+                | ".netlify"
+                | ".wrangler"
+                | ".fly"
+                | ".yarn"
+        )
+    }) || components.windows(2).any(|pair| {
+        pair[0] == ".config"
+            && matches!(
+                pair[1],
+                "gcloud"
+                    | "gh"
+                    | "hub"
+                    | "glab"
+                    | "doctl"
+                    | "heroku"
+                    | "op"
+                    | "rclone"
+                    | "containers"
+                    | "github-copilot"
+                    | "openai"
+                    | "anthropic"
+                    | "huggingface"
+                    | "kaggle"
+                    | "wandb"
+                    | "pypoetry"
+                    | "composer"
+                    | "pip"
+                    | "uv"
+                    | "npm"
+                    | "yarn"
+                    | "pnpm"
+                    | "bun"
+                    | "deno"
+                    | "vercel"
+                    | "netlify"
+                    | "cloudflare"
+                    | "fly"
+                    | "azure-devops"
+            )
+    }) || file_name.starts_with(".env")
         || matches!(
             file_name,
             ".npmrc"
                 | ".pypirc"
+                | ".netrc"
+                | "_netrc"
+                | ".git-credentials"
+                | ".vault-token"
+                | ".sentryclirc"
+                | ".terraformrc"
+                | ".yarnrc"
+                | ".yarnrc.yml"
+                | ".yarnrc.yaml"
+                | "terraform.rc"
+                | "npmrc"
                 | "id_rsa"
                 | "id_ed25519"
+                | "application_default_credentials.json"
+                | "accesstokens.json"
+                | "kubeconfig"
                 | "credentials"
                 | "credentials.json"
+                | "credentials.toml"
                 | "secrets.json"
         )
         || file_name.ends_with(".pem")
@@ -626,6 +776,7 @@ async fn git_text_with_env(
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -650,6 +801,7 @@ async fn git_output(workspace: &Path, index: &Path, args: &[OsString]) -> Result
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -749,12 +901,20 @@ mod tests {
             &lease,
             &report,
             std::slice::from_ref(&provider),
+            &["**".to_owned()],
         )
         .await
         .expect("first export");
-        let second = export(Uuid::new_v4(), &spec, &lease, &report, &[provider])
-            .await
-            .expect("second export");
+        let second = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[provider],
+            &["**".to_owned()],
+        )
+        .await
+        .expect("second export");
         assert_eq!(first.bytes, second.bytes);
         let document: Value = serde_json::from_slice(&first.bytes).expect("parse archive");
         let paths = document["changes"]
@@ -785,10 +945,116 @@ mod tests {
             &lease,
             &report,
             &[],
+            &["**".to_owned()],
         )
         .await
         .expect_err("secret-like path must fail");
         assert!(error.to_string().contains("secret-like"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn nested_secret_directories_are_rejected_before_export() {
+        let (root, lease, report) = fixture();
+        let credential_dir = root.join("services").join("api").join(".azure");
+        fs::create_dir_all(&credential_dir).expect("create nested credential directory");
+        fs::write(
+            credential_dir.join("accessTokens.json"),
+            b"{\"token\":\"secret\"}\n",
+        )
+        .expect("write nested credential");
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::Patch,
+                commit_after_verification: false,
+                paths: Vec::new(),
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect_err("nested secret-like path must fail");
+        assert!(error.to_string().contains("secret-like"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn sensitive_directories_match_at_every_depth() {
+        assert!(sensitive_path(
+            "services/api/.config/gcloud/application_default_credentials.json"
+        ));
+        assert!(sensitive_path("packages/web/.azure/accessTokens.json"));
+        assert!(sensitive_path("nested/.ssh/id_ed25519"));
+        assert!(sensitive_path("services/api/.kube/config"));
+        assert!(sensitive_path("nested/.docker/config.json"));
+        assert!(sensitive_path("services/api/.config/gh/hosts.yml"));
+        assert!(sensitive_path(
+            "services/api/.config/github-copilot/hosts.json"
+        ));
+        assert!(sensitive_path("services/api/.config/huggingface/token"));
+        assert!(sensitive_path("services/api/.cargo/credentials.toml"));
+        assert!(!sensitive_path("services/api/.cargo/config.toml"));
+        assert!(sensitive_path("services/api/.config/composer/auth.json"));
+        assert!(sensitive_path("services/api/.config/npm/npmrc"));
+        assert!(sensitive_path("services/api/.vercel/auth.json"));
+        assert!(sensitive_path("nested/.config/rclone/rclone.conf"));
+        assert!(sensitive_path("nested/.git-credentials"));
+        assert!(!sensitive_path("docs/azure/guide.json"));
+    }
+
+    #[tokio::test]
+    async fn git_pathspec_magic_is_rejected_before_staging() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"selected\n").expect("modify selected path");
+        fs::write(root.join("other.txt"), b"must remain unselected\n")
+            .expect("modify unselected path");
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::Archive,
+                commit_after_verification: false,
+                paths: vec![":(exclude)tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect_err("Git pathspec magic must fail");
+        assert!(error.to_string().contains("stay inside the worktree"));
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn default_export_rejects_changes_outside_task_write_scope() {
+        let (root, lease, report) = fixture();
+        fs::create_dir_all(root.join("src")).expect("create scoped directory");
+        fs::write(root.join("src").join("allowed.txt"), b"allowed\n").expect("write scoped source");
+        fs::write(root.join("outside.txt"), b"outside\n").expect("write outside source");
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::Archive,
+                commit_after_verification: false,
+                paths: Vec::new(),
+            },
+            &lease,
+            &report,
+            &[],
+            &["src/**".to_owned()],
+        )
+        .await
+        .expect_err("out-of-scope source must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the task write scope: outside.txt")
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -814,6 +1080,7 @@ mod tests {
             &lease,
             &report,
             &[provider],
+            &["**".to_owned()],
         )
         .await
         .expect("commit export");
@@ -841,9 +1108,63 @@ mod tests {
         );
         let bundle_path = root.join("published.bundle");
         fs::write(&bundle_path, bundle).expect("write bundle");
-        assert!(git(&root, &["bundle", "list-heads", "published.bundle"]).ends_with(" HEAD"));
+        let listed = git(&root, &["bundle", "list-heads", "published.bundle"]);
+        assert!(listed.starts_with(&head));
+        assert!(listed.contains("refs/ecorp/deliverables/"));
         fs::remove_file(bundle_path).expect("remove bundle");
         assert_eq!(git(&root, &["status", "--porcelain=v1"]), "?? provider.md");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn commit_form_bundles_validated_branch_when_head_is_detached() {
+        let (root, lease, report) = fixture();
+        git(&root, &["checkout", "--detach", &lease.base_commit]);
+        fs::write(root.join("tracked.txt"), b"detached commit\n").expect("modify tracked");
+
+        let exported = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: Vec::new(),
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect("detached commit export");
+
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), lease.base_commit);
+        let head_commit = exported.head_commit.expect("committed branch head");
+        assert_ne!(head_commit, lease.base_commit);
+        let document: Value =
+            serde_json::from_slice(&exported.bytes).expect("parse commit/branch deliverable");
+        let bundle = BASE64
+            .decode(
+                document["git_bundle_base64"]
+                    .as_str()
+                    .expect("bundle base64"),
+            )
+            .expect("decode bundle");
+        let bundle_path = root.join("detached.bundle");
+        fs::write(&bundle_path, bundle).expect("write bundle");
+        let listed = git(&root, &["bundle", "list-heads", "detached.bundle"]);
+        assert!(listed.starts_with(&head_commit));
+        assert!(listed.contains("refs/ecorp/deliverables/"));
+        assert_eq!(
+            git(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/ecorp/deliverables"
+                ]
+            ),
+            ""
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -863,6 +1184,7 @@ mod tests {
             &lease,
             &report,
             &[],
+            &["**".to_owned()],
         )
         .await
         .expect("scoped commit export");
@@ -874,6 +1196,98 @@ mod tests {
         assert_eq!(
             git(&root, &["show", "--format=", "--name-only", "HEAD"]),
             "tracked.txt"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn scoped_commit_reset_treats_selected_paths_literally() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("foo[bar]"), b"before selected\n").expect("write selected base");
+        fs::write(root.join("foob"), b"before staged\n").expect("write staged base");
+        git(&root, &["add", "foo[bar]", "foob"]);
+        git(&root, &["commit", "-m", "add wildcard-shaped paths"]);
+
+        fs::write(root.join("foo[bar]"), b"after selected\n").expect("modify selected path");
+        fs::write(root.join("foob"), b"after staged\n").expect("modify staged path");
+        git(&root, &["add", "foob"]);
+
+        export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: vec!["foo[bar]".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect("literal scoped commit export");
+
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "foob");
+        assert_eq!(
+            git(&root, &["show", "--format=", "--name-only", "HEAD"]),
+            "foo[bar]"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn scoped_commit_excludes_unselected_committed_changes() {
+        let (root, lease, report) = fixture();
+        fs::write(
+            root.join("other.txt"),
+            b"agent committed outside selection\n",
+        )
+        .expect("modify unselected path");
+        git(&root, &["add", "other.txt"]);
+        git(&root, &["commit", "-m", "agent commit outside selection"]);
+        let agent_head = git(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("tracked.txt"), b"selected\n").expect("modify selected path");
+
+        let exported = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: vec!["tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+        )
+        .await
+        .expect("scoped commit export");
+
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(exported.head_commit.as_deref(), Some(head.as_str()));
+        assert_ne!(head, agent_head);
+        assert_eq!(
+            git(&root, &["rev-list", "--parents", "-n", "1", "HEAD"]),
+            format!("{head} {}", lease.base_commit)
+        );
+        assert_eq!(
+            git(
+                &root,
+                &[
+                    "diff",
+                    "--name-only",
+                    &format!("{}..HEAD", lease.base_commit)
+                ]
+            ),
+            "tracked.txt"
+        );
+        assert_eq!(
+            git(&root, &["diff", "--cached", "--name-only"]),
+            "other.txt"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("other.txt")).expect("read preserved path"),
+            "agent committed outside selection\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -900,6 +1314,7 @@ mod tests {
             &lease,
             &report,
             &[],
+            &["**".to_owned()],
         )
         .await
         .expect_err("symlink must fail");

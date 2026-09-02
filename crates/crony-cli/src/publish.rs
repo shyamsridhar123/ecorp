@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::factory::{
-    gh_json, gh_output, gh_run, sanitize_failure_detail, server_json, source_git_output,
+    gh_json, gh_output, gh_run, normalize_github_component, sanitize_failure_detail, server_json,
+    source_git_output,
 };
 
 #[derive(Debug, Args)]
@@ -60,6 +61,9 @@ pub struct FactoryPublishArgs {
 
     #[arg(long, env = "ECORP_PUBLICATION_PUBLISHER_ID")]
     pub publisher_id: Option<String>,
+
+    #[arg(long, env = "ECORP_PUBLICATION_PUBLISHER_CREDENTIAL_FILE")]
+    pub publisher_credential_file: Option<PathBuf>,
 
     #[arg(long, env = "ECORP_GITHUB_CLI", default_value = "gh")]
     pub github_cli: PathBuf,
@@ -152,13 +156,26 @@ struct ProjectView {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectFields {
-    #[serde(default)]
-    fields: Vec<ProjectField>,
+struct GraphQlProjectFieldEnvelope {
+    data: GraphQlProjectFieldData,
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectField {
+struct GraphQlProjectFieldData {
+    node: Option<GraphQlProjectFieldNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectFieldNode {
+    #[serde(rename = "__typename")]
+    kind: String,
+    field: Option<GraphQlProjectField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectField {
+    #[serde(rename = "__typename")]
+    kind: String,
     id: String,
     name: String,
     #[serde(default)]
@@ -325,7 +342,7 @@ async fn start_publication(
     plan: &PublicationPlan,
     idempotency_key: &str,
 ) -> Result<PullRequestPublicationResponse> {
-    let response = server_json(
+    let response = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -347,6 +364,7 @@ async fn start_publication(
             "publisher_id": plan.publisher_id,
             "lease_seconds": args.lease_seconds,
         })),
+        args,
     )
     .await?;
     serde_json::from_value(response).context("decode publication start response")
@@ -414,6 +432,7 @@ async fn execute_publication(
     publisher_token: Uuid,
 ) -> Result<()> {
     ensure_publication_matches_plan(&response.publication, plan)?;
+    test_crash("after_plan_validation");
     renew_publication(
         client,
         server,
@@ -544,7 +563,7 @@ async fn execute_publication(
     }
 
     if response.publication.state != PullRequestPublicationState::Published {
-        let (project_id, _, _, status) = project_status(args, plan)?;
+        let (project_id, status_field_id, review_option_id, status) = project_status(args, plan)?;
         if status != plan.project_status_before && status != plan.project_review_status {
             bail!(
                 "GitHub Project item status is {status}, expected {} or {}",
@@ -559,12 +578,28 @@ async fn execute_publication(
             plan,
             response,
             publisher_token,
-            "project-review",
+            "project-review-read",
         )
         .await?;
-        let (_, refreshed_field_id, refreshed_option_id, refreshed_status) =
-            project_status(args, plan)?;
+        let refreshed_status = project_item_status(args, plan, &project_id, &status_field_id)?;
+        revalidate_durable_pull_request(
+            args,
+            plan,
+            &resolved_base.pull_request_base_ref,
+            &response.publication,
+        )?;
         if refreshed_status == plan.project_status_before {
+            test_pause("before_project_effect_renewal");
+            renew_publication(
+                client,
+                server,
+                args,
+                plan,
+                response,
+                publisher_token,
+                "project-review-effect",
+            )
+            .await?;
             let edit_result = gh_run(
                 &args.github_cli,
                 &[
@@ -575,25 +610,42 @@ async fn execute_publication(
                     "--project-id",
                     &project_id,
                     "--field-id",
-                    &refreshed_field_id,
+                    &status_field_id,
                     "--single-select-option-id",
-                    &refreshed_option_id,
+                    &review_option_id,
                 ],
             );
             if let Err(error) = edit_result {
-                let (_, _, _, recovered_status) = project_status(args, plan)?;
+                let recovered_status =
+                    project_item_status(args, plan, &project_id, &status_field_id)?;
                 if recovered_status != plan.project_review_status {
                     return Err(error).context("move GitHub Project item into review");
                 }
             }
         }
-        let (_, _, _, final_status) = project_status(args, plan)?;
+        let final_status = project_item_status(args, plan, &project_id, &status_field_id)?;
         if final_status != plan.project_review_status {
             bail!(
                 "GitHub Project item status is {final_status}, not {}",
                 plan.project_review_status
             );
         }
+        revalidate_durable_pull_request(
+            args,
+            plan,
+            &resolved_base.pull_request_base_ref,
+            &response.publication,
+        )?;
+        renew_publication(
+            client,
+            server,
+            args,
+            plan,
+            response,
+            publisher_token,
+            "project-review-complete",
+        )
+        .await?;
         test_crash("after_project_remote");
         checkpoint(
             client,
@@ -606,13 +658,44 @@ async fn execute_publication(
             json!({
                 "kind": "published",
                 "project_status": final_status,
-                "project_field_id": refreshed_field_id,
-                "project_option_id": refreshed_option_id
+                "project_field_id": status_field_id,
+                "project_option_id": review_option_id
             }),
         )
         .await?;
     }
     Ok(())
+}
+
+fn project_item_status(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+    project_id: &str,
+    status_field_id: &str,
+) -> Result<String> {
+    let item = load_project_item(args, plan)?;
+    if item.kind != "ProjectV2Item"
+        || item.id != plan.project_item_id
+        || item.project.id != project_id
+        || item.project.number != plan.project_number
+        || !item
+            .project
+            .owner
+            .login
+            .eq_ignore_ascii_case(&plan.project_owner)
+    {
+        bail!("GitHub Project item does not match the authorized publication Project");
+    }
+    let status = item
+        .status
+        .context("GitHub Project item has no Status value")?;
+    if status.kind != "ProjectV2ItemFieldSingleSelectValue"
+        || status.field.id != status_field_id
+        || status.field.name != "Status"
+    {
+        bail!("GitHub Project item Status value does not match the Project Status field");
+    }
+    Ok(status.name)
 }
 
 async fn renew_publication(
@@ -625,7 +708,7 @@ async fn renew_publication(
     stage: &str,
 ) -> Result<()> {
     let version = response.publication.version;
-    let value = server_json(
+    let value = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -639,6 +722,7 @@ async fn renew_publication(
             "idempotency_key": format!("{}:renew:{stage}:{version}", plan.effect_key),
             "lease_seconds": effect_lease_seconds(args),
         })),
+        args,
     )
     .await?;
     *response = serde_json::from_value(value).context("decode publication renewal response")?;
@@ -660,7 +744,7 @@ async fn checkpoint(
     checkpoint: Value,
 ) -> Result<()> {
     let version = response.publication.version;
-    let value = server_json(
+    let value = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -674,6 +758,7 @@ async fn checkpoint(
             "idempotency_key": format!("{}:checkpoint:{stage}:{version}", plan.effect_key),
             "checkpoint": checkpoint
         })),
+        args,
     )
     .await?;
     *response = serde_json::from_value(value).context("decode publication checkpoint response")?;
@@ -818,7 +903,9 @@ fn prepare_repository(
     )
     .context("verify portable Git bundle prerequisites")?;
     let import_ref = "refs/heads/ecorp-import";
-    let refspec = format!("HEAD:{import_ref}");
+    let bundle_head =
+        portable_bundle_head(&workspace.repository, &workspace.bundle, &plan.commit_sha)?;
+    let refspec = format!("{bundle_head}:{import_ref}");
     source_git_output(
         &workspace.repository,
         &[
@@ -850,6 +937,38 @@ fn prepare_repository(
     )
     .context("verify publication commit descends from the authorized base")?;
     Ok(resolved_base)
+}
+
+fn portable_bundle_head(repository: &Path, bundle: &Path, expected_commit: &str) -> Result<String> {
+    let output = source_git_output(repository, &["bundle", "list-heads", path_text(bundle)?])?;
+    let output = String::from_utf8(output).context("portable Git bundle heads are not UTF-8")?;
+    parse_portable_bundle_head(&output, expected_commit)
+}
+
+fn parse_portable_bundle_head(output: &str, expected_commit: &str) -> Result<String> {
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    let line = lines
+        .next()
+        .context("portable Git bundle omitted its head")?;
+    if lines.next().is_some() {
+        bail!("portable Git bundle exposed multiple heads");
+    }
+    let mut fields = line.split_whitespace();
+    let commit = fields.next().unwrap_or_default();
+    let reference = fields.next().unwrap_or_default();
+    if fields.next().is_some() || !commit.eq_ignore_ascii_case(expected_commit) {
+        bail!("portable Git bundle head does not match the verified publication commit");
+    }
+    let valid_reference = reference == "HEAD"
+        || reference
+            .strip_prefix("refs/ecorp/deliverables/")
+            .is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+    if !valid_reference {
+        bail!("portable Git bundle exposed an unauthorized head reference");
+    }
+    Ok(reference.to_owned())
 }
 
 fn preflight_publication_target(plan: &PublicationPlan) -> Result<()> {
@@ -1162,6 +1281,45 @@ fn ensure_remote_pull_request_matches(
     Ok(())
 }
 
+fn ensure_pull_request_matches_publication(
+    pull_request: &PullRequestView,
+    publication: &PullRequestPublication,
+) -> Result<()> {
+    if publication.pull_request_number != Some(pull_request.number)
+        || publication.pull_request_node_id.as_deref() != Some(pull_request.id.as_str())
+        || publication.pull_request_url.as_deref() != Some(pull_request.url.as_str())
+        || publication.pull_request_state.as_deref() != Some(pull_request.state.as_str())
+        || publication.pull_request_draft != Some(pull_request.is_draft)
+        || publication.pull_request_base_ref.as_deref() != Some(pull_request.base_ref_name.as_str())
+        || !publication
+            .pull_request_head_sha
+            .as_deref()
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(&pull_request.head_ref_oid))
+        || !publication
+            .pull_request_head_repository_owner
+            .as_deref()
+            .is_some_and(|owner| {
+                owner.eq_ignore_ascii_case(&pull_request.head_repository_owner.login)
+            })
+        || publication.pull_request_is_cross_repository != Some(pull_request.is_cross_repository)
+    {
+        bail!("GitHub pull request no longer matches the durable publication identity");
+    }
+    Ok(())
+}
+
+fn revalidate_durable_pull_request(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+    pull_request_base_ref: &str,
+    publication: &PullRequestPublication,
+) -> Result<()> {
+    let pull_request = find_pull_request(args, plan, pull_request_base_ref)?
+        .context("persisted publication pull request no longer matches its durable identity")?;
+    ensure_remote_pull_request_matches(&pull_request, plan, pull_request_base_ref)?;
+    ensure_pull_request_matches_publication(&pull_request, publication)
+}
+
 fn project_status(
     args: &FactoryPublishArgs,
     plan: &PublicationPlan,
@@ -1179,24 +1337,7 @@ fn project_status(
         ],
     )?)
     .context("decode GitHub Project")?;
-    let fields: ProjectFields = serde_json::from_value(gh_json(
-        &args.github_cli,
-        &[
-            "project",
-            "field-list",
-            &plan.project_number.to_string(),
-            "--owner",
-            &plan.project_owner,
-            "--format",
-            "json",
-        ],
-    )?)
-    .context("decode GitHub Project fields")?;
-    let status_field = fields
-        .fields
-        .iter()
-        .find(|field| field.name == "Status")
-        .context("GitHub Project has no Status field")?;
+    let status_field = load_project_status_field(args, &project.id)?;
     let review_option = status_field
         .options
         .iter()
@@ -1235,6 +1376,32 @@ fn project_status(
         review_option.id.clone(),
         status.name,
     ))
+}
+
+fn load_project_status_field(
+    args: &FactoryPublishArgs,
+    project_id: &str,
+) -> Result<GraphQlProjectField> {
+    const QUERY: &str = r#"query($id:ID!){node(id:$id){__typename ... on ProjectV2{field(name:"Status"){__typename ... on ProjectV2SingleSelectField{id name options{id name}}}}}}"#;
+    let id = format!("id={project_id}");
+    let query = format!("query={QUERY}");
+    let envelope: GraphQlProjectFieldEnvelope = serde_json::from_value(gh_json(
+        &args.github_cli,
+        &["api", "graphql", "-f", &query, "-F", &id],
+    )?)
+    .context("decode exact GitHub Project Status field")?;
+    let node = envelope
+        .data
+        .node
+        .context("GitHub Project disappeared during publication")?;
+    let field = node.field.context("GitHub Project has no Status field")?;
+    if node.kind != "ProjectV2"
+        || field.kind != "ProjectV2SingleSelectField"
+        || field.name != "Status"
+    {
+        bail!("GitHub Project Status field has an unexpected identity");
+    }
+    Ok(field)
 }
 
 fn load_project_item(
@@ -1317,6 +1484,7 @@ fn publication_plan(args: &FactoryPublishArgs, context: &Value) -> Result<Public
         .map(str::to_owned)
         .or_else(|| args.repository.clone())
         .unwrap_or_else(|| format!("{source_owner}/{source_name}"));
+    let target_repository = normalize_publication_repository(&target_repository)?;
     let base_ref = existing_publication
         .and_then(|publication| publication.get("base_ref"))
         .and_then(Value::as_str)
@@ -1349,6 +1517,7 @@ fn publication_plan(args: &FactoryPublishArgs, context: &Value) -> Result<Public
         .map(str::to_owned)
         .or_else(|| args.title.clone())
         .unwrap_or_else(|| value_string(work_item, "/source_title").unwrap_or_default());
+    let title = normalize_publication_title(&title)?;
     let issue_url = value_string(work_item, "/source_issue_url")?;
     let body = if let Some(body) = existing_publication
         .and_then(|publication| publication.get("body"))
@@ -1488,6 +1657,39 @@ fn normalize_publication_body(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn normalize_publication_repository(value: &str) -> Result<String> {
+    let repository = value.trim();
+    let mut parts = repository.split('/');
+    let owner = parts
+        .next()
+        .context("publication target repository omitted owner")?;
+    let name = parts
+        .next()
+        .context("publication target repository omitted name")?;
+    if parts.next().is_some() {
+        bail!("publication target repository must use owner/name form");
+    }
+    Ok(format!(
+        "{}/{}",
+        normalize_github_component(owner, "publication repository owner")?,
+        normalize_github_component(name, "publication repository name")?
+    ))
+}
+
+fn normalize_publication_title(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("pull request title cannot be empty");
+    }
+    if value.len() > 256 {
+        bail!("pull request title cannot exceed 256 bytes");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("pull request title cannot contain control characters");
+    }
+    Ok(value.to_owned())
+}
+
 fn validate_publication_branch(branch: &str) -> Result<()> {
     source_git_output(Path::new("."), &["check-ref-format", "--branch", branch])
         .map(|_| ())
@@ -1620,7 +1822,51 @@ fn validate_args(args: &FactoryPublishArgs) -> Result<()> {
     if args.body_file.as_ref().is_some_and(|path| !path.is_file()) {
         bail!("pull request body file does not exist");
     }
+    if args
+        .publisher_credential_file
+        .as_ref()
+        .is_some_and(|path| !path.is_file())
+    {
+        bail!("trusted publication publisher credential file does not exist");
+    }
     Ok(())
+}
+
+async fn publisher_server_json(
+    client: &Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    args: &FactoryPublishArgs,
+) -> Result<Value> {
+    let path = args
+        .publisher_credential_file
+        .as_ref()
+        .context("trusted publication publisher credential file is required")?;
+    let credential =
+        fs::read_to_string(path).context("read trusted publication publisher credential file")?;
+    let credential = credential.trim();
+    if credential.is_empty() || credential.len() > 256 || credential.chars().any(char::is_control) {
+        bail!("trusted publication publisher credential file is invalid");
+    }
+    let mut request = client
+        .request(method, &url)
+        .header("x-crony-publication-publisher-credential", credential);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("request {url}"))?;
+    let status = response.status();
+    let text = response.text().await?;
+    let body: Value = serde_json::from_str(&text)
+        .with_context(|| format!("decode response from {url}: {text}"))?;
+    if !status.is_success() {
+        bail!("ECorp API returned {status}: {body}");
+    }
+    Ok(body)
 }
 
 fn default_publisher_id() -> String {
@@ -1687,6 +1933,21 @@ fn test_crash(stage: &str) {
     }
 }
 
+fn test_pause(stage: &str) {
+    if env::var("ECORP_PUBLICATION_TEST_PAUSE_AT").as_deref() != Ok(stage) {
+        return;
+    }
+    if let Ok(marker) = env::var("ECORP_PUBLICATION_TEST_PAUSE_MARKER") {
+        let _ = fs::write(marker, stage.as_bytes());
+    }
+    let milliseconds = env::var("ECORP_PUBLICATION_TEST_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000)
+        .min(30_000);
+    std::thread::sleep(Duration::from_millis(milliseconds));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,6 +1992,34 @@ mod tests {
     }
 
     #[test]
+    fn portable_bundle_head_is_single_exact_and_bounded() {
+        let commit = "a".repeat(40);
+        assert_eq!(
+            parse_portable_bundle_head(
+                &format!("{commit} refs/ecorp/deliverables/0123456789abcdef0123456789abcdef\n"),
+                &commit
+            )
+            .expect("temporary bundle ref"),
+            "refs/ecorp/deliverables/0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            parse_portable_bundle_head(&format!("{commit} HEAD\n"), &commit)
+                .expect("legacy HEAD bundle"),
+            "HEAD"
+        );
+        assert!(
+            parse_portable_bundle_head(&format!("{commit} refs/heads/main\n"), &commit).is_err()
+        );
+        assert!(
+            parse_portable_bundle_head(
+                &format!("{commit} HEAD\n{commit} refs/heads/other\n"),
+                &commit
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn publication_branch_authorization_and_body_are_retry_stable() {
         assert!(ensure_distinct_publication_branch("feature", "main").is_ok());
         assert!(ensure_distinct_publication_branch("main", "main").is_err());
@@ -1738,6 +2027,19 @@ mod tests {
             normalize_publication_body("line one\r\nline two\r\n").expect("normalize"),
             "line one\nline two"
         );
+        assert_eq!(
+            normalize_publication_title("  Review title  ").expect("normalize title"),
+            "Review title"
+        );
+        assert_eq!(
+            normalize_publication_repository(" ShyamSridhar123 / ECorp ")
+                .expect("normalize repository"),
+            "shyamsridhar123/ecorp"
+        );
+        assert!(normalize_publication_repository("owner/repo/extra").is_err());
+        assert!(normalize_publication_title("   ").is_err());
+        assert!(normalize_publication_title("bad\ntitle").is_err());
+        assert!(normalize_publication_title(&"x".repeat(257)).is_err());
         let actor = Uuid::new_v4();
         let first = stable_authorization_id(actor, "effect");
         assert_eq!(first, stable_authorization_id(actor, "effect"));

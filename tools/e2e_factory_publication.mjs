@@ -9,6 +9,7 @@ import {
   existsSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs'
 import { readFile, rm, writeFile } from 'node:fs/promises'
@@ -35,6 +36,16 @@ const remotePath = path.join(root, 'output', `fake-publication-remote-${nonce}.g
 const reportPath = path.join(root, 'output', 'e2e-factory-publication.json')
 const publisherToken = `publisher-secret-${crypto.randomUUID()}`
 const authorizationId = crypto.randomUUID()
+const publisherCredentials = new Map()
+const publisherCredentialFiles = new Map()
+const publisherCredentialIds = new Map()
+const publisherCredentialPaths = []
+const publisherCredentialSecrets = []
+process.on('exit', () => {
+  for (const credentialPath of publisherCredentialPaths) {
+    rmSync(credentialPath, { force: true })
+  }
+})
 const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
   cwd: root,
   encoding: 'utf8',
@@ -75,6 +86,51 @@ function postOk(url, body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+function publisherCredentialHeaders(publisherId) {
+  const credential = publisherCredentials.get(publisherId)
+  assert.ok(credential, `missing enrolled credential for ${publisherId}`)
+  return publisherHeadersForCredential(credential)
+}
+
+function publisherHeadersForCredential(credential) {
+  return {
+    'content-type': 'application/json',
+    'x-crony-publication-publisher-credential': credential,
+  }
+}
+
+function postWithPublisherCredential(url, body, credential) {
+  return request(url, {
+    method: 'POST',
+    headers: publisherHeadersForCredential(credential),
+    body: JSON.stringify(body),
+  })
+}
+
+function postPublisher(url, body, publisherId) {
+  return request(url, {
+    method: 'POST',
+    headers: publisherCredentialHeaders(publisherId),
+    body: JSON.stringify(body),
+  })
+}
+
+function postPublisherOk(url, body, publisherId) {
+  return requestOk(url, {
+    method: 'POST',
+    headers: publisherCredentialHeaders(publisherId),
+    body: JSON.stringify(body),
+  })
+}
+
+function postPublicationStart(url, body) {
+  return postPublisher(url, body, body.publisher_id)
+}
+
+function postPublicationStartOk(url, body) {
+  return postPublisherOk(url, body, body.publisher_id)
 }
 
 function snapshot(demo, actorId = demo.alice_actor_id) {
@@ -163,7 +219,13 @@ async function runPublisher(
     omitAuthorizationId = false,
     actorId = demo.alice_actor_id,
     sourceDeliverableId,
+    title,
+    repository,
     publisherId = 'trusted-publication-e2e',
+    publisherCredentialFile,
+    pauseAt,
+    pauseMarker,
+    pauseMs,
     authorizationReason =
       'Publication E2E authorizes review-only branch and pull request creation.',
     leaseSeconds = 5,
@@ -185,12 +247,19 @@ async function runPublisher(
     '--github-cli',
     process.execPath,
   ]
+  const credentialFile =
+    publisherCredentialFile ?? publisherCredentialFiles.get(publisherId)
+  if (credentialFile) {
+    args.push('--publisher-credential-file', credentialFile)
+  }
   if (!omitAuthorizationId) {
     args.push('--authorization-id', authorizationId)
   }
   if (sourceDeliverableId) {
     args.push('--source-deliverable-id', sourceDeliverableId)
   }
+  if (title) args.push('--title', title)
+  if (repository) args.push('--repository', repository)
   if (idempotencyKey) args.push('--idempotency-key', idempotencyKey)
   if (branch) args.push('--branch', branch)
   if (bodyFile) args.push('--body-file', bodyFile)
@@ -210,6 +279,13 @@ async function runPublisher(
         ...(crashAfter
           ? { ECORP_PUBLICATION_TEST_CRASH_AFTER: crashAfter }
           : {}),
+        ...(pauseAt ? { ECORP_PUBLICATION_TEST_PAUSE_AT: pauseAt } : {}),
+        ...(pauseMarker
+          ? { ECORP_PUBLICATION_TEST_PAUSE_MARKER: pauseMarker }
+          : {}),
+        ...(pauseMs === undefined
+          ? {}
+          : { ECORP_PUBLICATION_TEST_PAUSE_MS: String(pauseMs) }),
       },
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
@@ -219,10 +295,18 @@ async function runPublisher(
     }
     assert.equal(stdout.includes(publisherToken), false)
     assert.equal(stderr.includes(publisherToken), false)
+    for (const credential of publisherCredentialSecrets) {
+      assert.equal(stdout.includes(credential), false)
+      assert.equal(stderr.includes(credential), false)
+    }
     return JSON.parse(stdout)
   } catch (error) {
     assert.equal(String(error.stdout ?? '').includes(publisherToken), false)
     assert.equal(String(error.stderr ?? '').includes(publisherToken), false)
+    for (const credential of publisherCredentialSecrets) {
+      assert.equal(String(error.stdout ?? '').includes(credential), false)
+      assert.equal(String(error.stderr ?? '').includes(credential), false)
+    }
     if (expectCrash && error.code === 86) {
       return { crashed: true, stage: crashAfter }
     }
@@ -661,6 +745,46 @@ async function setFakeState(patch) {
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
 }
 
+async function waitForFile(filePath, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(filePath)) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`timed out waiting for file ${filePath}`)
+}
+
+async function enrollPublicationPublisher(
+  demo,
+  publisherId,
+  { register = true } = {},
+) {
+  const enrollment = await postOk(
+    `/api/corps/${demo.corp_id}/factory/publication-publishers/credentials`,
+    {
+      actor_id: demo.alice_actor_id,
+      publisher_id: publisherId,
+      expires_in_seconds: 3600,
+    },
+  )
+  assert.equal(enrollment.publisher_id, publisherId)
+  assert.ok(enrollment.credential)
+  publisherCredentialSecrets.push(enrollment.credential)
+  const credentialPath = path.join(
+    root,
+    'output',
+    `publication-publisher-${publisherId.replaceAll(/[^A-Za-z0-9_.-]/g, '_')}-${enrollment.credential_id}.credential`,
+  )
+  await writeFile(credentialPath, enrollment.credential)
+  if (register) {
+    publisherCredentials.set(publisherId, enrollment.credential)
+    publisherCredentialFiles.set(publisherId, credentialPath)
+    publisherCredentialIds.set(publisherId, enrollment.credential_id)
+  }
+  publisherCredentialPaths.push(credentialPath)
+  return { ...enrollment, credentialPath }
+}
+
 async function publicationState(demo, workItemId) {
   const state = await snapshot(demo)
   return {
@@ -685,13 +809,17 @@ async function renewPublicationAttempt(
   publisherToken,
   idempotencyKey,
 ) {
-  return post(publicationRenewPath(demo, publication.id), {
-    actor_id: demo.alice_actor_id,
-    publisher_token: publisherToken,
-    expected_version: publication.version,
-    idempotency_key: idempotencyKey,
-    lease_seconds: 10,
-  })
+  return postPublisher(
+    publicationRenewPath(demo, publication.id),
+    {
+      actor_id: demo.alice_actor_id,
+      publisher_token: publisherToken,
+      expected_version: publication.version,
+      idempotency_key: idempotencyKey,
+      lease_seconds: 10,
+    },
+    publication.publisher_id,
+  )
 }
 
 async function failPublicationAttempt(
@@ -701,16 +829,20 @@ async function failPublicationAttempt(
   idempotencyKey,
   detail,
 ) {
-  return postOk(publicationCheckpointPath(demo, publication.id), {
-    actor_id: demo.alice_actor_id,
-    publisher_token: publisherToken,
-    expected_version: publication.version,
-    idempotency_key: idempotencyKey,
-    checkpoint: {
-      kind: 'failed',
-      failure_detail: detail,
+  return postPublisherOk(
+    publicationCheckpointPath(demo, publication.id),
+    {
+      actor_id: demo.alice_actor_id,
+      publisher_token: publisherToken,
+      expected_version: publication.version,
+      idempotency_key: idempotencyKey,
+      checkpoint: {
+        kind: 'failed',
+        failure_detail: detail,
+      },
     },
-  })
+    publication.publisher_id,
+  )
 }
 
 async function remoteBranchExists(branch) {
@@ -814,6 +946,7 @@ await writeFile(
   `${JSON.stringify(
     {
       repository: 'shyamsridhar123/ecorp',
+      canonical_repository: 'ShyamSridhar123/ECorp',
       project: {
         id: 'PVT_PUBLICATION',
         number: 7,
@@ -870,6 +1003,71 @@ await writeFile(
 )
 
 const demo = await postOk('/api/demo/reset', {})
+const memberPublisherEnrollment = await post(
+  `/api/corps/${demo.corp_id}/factory/publication-publishers/credentials`,
+  {
+    actor_id: demo.bob_actor_id,
+    publisher_id: 'member-must-not-enroll',
+    expires_in_seconds: 3600,
+  },
+)
+assert.equal(memberPublisherEnrollment.response.status, 403)
+for (const publisherId of [
+  'trusted-publication-e2e',
+  'trusted-publication-host-a',
+  'trusted-publication-host-b',
+  'trusted-publication-host-c',
+]) {
+  await enrollPublicationPublisher(demo, publisherId)
+}
+const revokedPublisherCredential = await enrollPublicationPublisher(
+  demo,
+  'trusted-publication-e2e',
+  { register: false },
+)
+const revokedPublisher = await postOk(
+  `/api/corps/${demo.corp_id}/factory/publication-publishers/credentials/${revokedPublisherCredential.credential_id}/revoke`,
+  {
+    actor_id: demo.alice_actor_id,
+    reason: 'Publication E2E revocation test.',
+  },
+)
+assert.equal(revokedPublisher.revoked, true)
+const expiredPublisherCredential = await enrollPublicationPublisher(
+  demo,
+  'trusted-publication-e2e',
+  { register: false },
+)
+await psql(
+  `UPDATE publication_publisher_credentials SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 second' WHERE id = ${sqlLiteral(expiredPublisherCredential.credential_id)}::uuid;`,
+)
+const otherCorpId = crypto.randomUUID()
+const otherCorpOwnerId = crypto.randomUUID()
+await psql(`
+  INSERT INTO corps (id, slug, name)
+  VALUES (
+    ${sqlLiteral(otherCorpId)}::uuid,
+    ${sqlLiteral(`publisher-other-${nonce}`)},
+    'Other publisher Corp'
+  );
+  INSERT INTO actors (id, corp_id, name, kind, role)
+  VALUES (
+    ${sqlLiteral(otherCorpOwnerId)}::uuid,
+    ${sqlLiteral(otherCorpId)}::uuid,
+    'Other publisher owner',
+    'human',
+    'owner'
+  );
+`)
+const crossCorpPublisherCredential = await postOk(
+  `/api/corps/${otherCorpId}/factory/publication-publishers/credentials`,
+  {
+    actor_id: otherCorpOwnerId,
+    publisher_id: 'trusted-publication-e2e',
+    expires_in_seconds: 3600,
+  },
+)
+publisherCredentialSecrets.push(crossCorpPublisherCredential.credential)
 const crossRoomActorId = crypto.randomUUID()
 const crossRoomId = crypto.randomUUID()
 await psql(`
@@ -924,6 +1122,36 @@ const collisionSource = collisionSnapshot.snapshot.source_deliverables.find(
     deliverable.integration_state === 'ready_for_review',
 )
 assert.ok(collisionSource)
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: `ecorp/missing-credential-${nonce.slice(0, 8)}`,
+  sourceDeliverableId: collisionSource.id,
+  publisherId: 'missing-publication-publisher',
+  expectFailure: /credential file is required/,
+})
+assert.equal(
+  (await publicationContext(demo, collisionWorkItem.id)).publication,
+  null,
+)
+const invalidPublisherCredential = `invalid-publisher-${crypto.randomUUID()}`
+publisherCredentialSecrets.push(invalidPublisherCredential)
+const invalidPublisherCredentialPath = path.join(
+  root,
+  'output',
+  `publication-publisher-invalid-${nonce}.credential`,
+)
+await writeFile(invalidPublisherCredentialPath, invalidPublisherCredential)
+publisherCredentialPaths.push(invalidPublisherCredentialPath)
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: `ecorp/invalid-credential-${nonce.slice(0, 8)}`,
+  sourceDeliverableId: collisionSource.id,
+  publisherId: 'trusted-publication-host-a',
+  publisherCredentialFile: invalidPublisherCredentialPath,
+  expectFailure: /403|credential was rejected/,
+})
+assert.equal(
+  (await publicationContext(demo, collisionWorkItem.id)).publication,
+  null,
+)
 for (const invalidBranch of ['ecorp/foo//bar', 'ecorp/foo.lock']) {
   await runPublisher(demo, collisionWorkItem.id, {
     branch: invalidBranch,
@@ -977,14 +1205,17 @@ assert.equal(
   'verified',
 )
 const collisionRecoveryBranch = `main-safe-${collisionSource.head_commit.slice(0, 12)}`
+const collisionCustomTitle = `Collision recovery ${nonce}`
 await runPublisher(demo, collisionWorkItem.id, {
   branch: collisionRecoveryBranch,
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  title: `  ${collisionCustomTitle}  `,
+  repository: 'ShyamSridhar123/ECorp',
   publisherId: 'trusted-publication-host-a',
   authorizationReason: 'Host A authorizes the first recoverable publication attempt.',
   leaseSeconds: 5,
-  crashAfter: 'after_start',
+  crashAfter: 'after_plan_validation',
   expectCrash: true,
 })
 const collisionRestartedServerPid = await restartLocalServer()
@@ -1014,6 +1245,8 @@ const collisionPublication = (await snapshot(demo)).snapshot.pull_request_public
   (publication) => publication.factory_work_item_id === collisionWorkItem.id,
 )
 assert.equal(collisionPublication.branch, collisionRecoveryBranch)
+assert.equal(collisionPublication.title, collisionCustomTitle)
+assert.equal(collisionPublication.target_repository, 'shyamsridhar123/ecorp')
 assert.equal(collisionPublication.publisher_id, 'trusted-publication-host-b')
 assert.equal(collisionPublication.attempt_count, 2)
 assert.equal(
@@ -1079,6 +1312,33 @@ assert.equal(
   ),
   true,
 )
+const workItemFailureCanary = `cross-room-work-item-${nonce}`
+await psql(
+  `UPDATE factory_work_items SET failure_detail = ${sqlLiteral(workItemFailureCanary)} WHERE id = ${sqlLiteral(workItem.id)}::uuid;`,
+)
+const crossRoomPublicationContext = await fetch(
+  `${server}/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication-context?actor_id=${crossRoomActorId}`,
+)
+const crossRoomPublicationContextBody =
+  await crossRoomPublicationContext.text()
+assert.equal(crossRoomPublicationContext.status, 404)
+for (const secret of [
+  workItem.id,
+  workItem.source_issue_url,
+  workItem.source_title,
+  workItem.claim_owner_id,
+  workItemFailureCanary,
+  JSON.stringify(workItem.policy),
+]) {
+  assert.equal(
+    crossRoomPublicationContextBody.includes(secret),
+    false,
+    `cross-room publication context leaked ${secret}`,
+  )
+}
+await psql(
+  `UPDATE factory_work_items SET failure_detail = NULL WHERE id = ${sqlLiteral(workItem.id)}::uuid;`,
+)
 const guestPublicationContext = await fetch(
   `${server}/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication-context?actor_id=${demo.eve_actor_id}`,
 )
@@ -1090,6 +1350,8 @@ assert.equal(guestPublicationContextBody.includes(source.id), false)
 const prePublicationFakeState = JSON.parse(await readFile(statePath, 'utf8'))
 const projectItemListCallsBeforePublication =
   prePublicationFakeState.item_list_calls ?? 0
+const projectFieldListCallsBeforePublication =
+  prePublicationFakeState.field_list_calls ?? 0
 const projectItems = prePublicationFakeState.items
 const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
   id: `PVTI_PUBLICATION_FILLER_${String(index).padStart(4, '0')}_${nonce}`,
@@ -1104,12 +1366,28 @@ const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
   },
 }))
 const expandedProjectItems = [...projectFillers, ...projectItems]
+const expandedProjectFields = [
+  ...Array.from({ length: 31 }, (_, index) => ({
+    id: `PVTF_PUBLICATION_FILLER_${String(index).padStart(2, '0')}_${nonce}`,
+    name: `Filler ${index}`,
+    type: 'ProjectV2Field',
+  })),
+  {
+    id: prePublicationFakeState.project.status_field_id,
+    name: 'Status',
+    type: 'ProjectV2SingleSelectField',
+    options: prePublicationFakeState.project.status_options,
+  },
+]
 assert.ok(
   expandedProjectItems.findIndex(
     (item) => item.id === workItem.source_project_item_id,
   ) >= 1000,
 )
-await setFakeState({ items: expandedProjectItems })
+await setFakeState({
+  items: expandedProjectItems,
+  project_fields: expandedProjectFields,
+})
 const branch = `ecorp/issue-${issueNumber}-${source.head_commit.slice(0, 12)}`
 const body = `## ECorp verified factory deliverable
 
@@ -1162,23 +1440,29 @@ const publicationRequest = {
 const publicationPath =
   `/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication`
 
-const crossRoomStartRejected = await post(publicationPath, {
+const humanOnlyStartRejected = await post(publicationPath, {
+  ...publicationRequest,
+  idempotency_key: `${effectKey}:human-only-start-rejected`,
+})
+assert.equal(humanOnlyStartRejected.response.status, 403)
+assert.equal((await publicationContext(demo, workItem.id)).publication, null)
+
+const crossRoomStartRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   actor_id: crossRoomActorId,
   authorization_id: crypto.randomUUID(),
   idempotency_key: `${effectKey}:cross-room-start-rejected`,
-  publisher_id: 'cross-room-start-publisher-secret',
 })
 assert.equal(crossRoomStartRejected.response.status, 403)
 assert.match(crossRoomStartRejected.body.error, /not a member of this room/)
 
-const roleRejected = await post(publicationPath, {
+const roleRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   actor_id: demo.bob_actor_id,
   idempotency_key: `${effectKey}:member-rejected`,
 })
 assert.equal(roleRejected.response.status, 403)
-const corpRejected = await post(
+const corpRejected = await postPublicationStart(
   `/api/corps/${crypto.randomUUID()}/factory/work-items/${workItem.id}/publication`,
   {
     ...publicationRequest,
@@ -1190,7 +1474,7 @@ assert.equal(corpRejected.response.status, 403)
 await psql(
   `UPDATE factory_work_items SET policy = jsonb_set(policy, '{publication,allowed}', 'false'::jsonb) WHERE id = ${sqlLiteral(workItem.id)}::uuid;`,
 )
-const policyRejected = await post(publicationPath, {
+const policyRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:policy-rejected`,
 })
@@ -1210,7 +1494,7 @@ const breakerBefore = await psql(
 await psql(
   `UPDATE runs SET breaker_stage = 'suspend' WHERE id = ${sqlLiteral(run.id)}::uuid;`,
 )
-const breakerRejected = await post(publicationPath, {
+const breakerRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:breaker-rejected`,
 })
@@ -1230,7 +1514,7 @@ const usageBefore = (
 await psql(
   `UPDATE runs SET input_tokens = budget_tokens_limit, output_tokens = 0 WHERE id = ${sqlLiteral(run.id)}::uuid;`,
 )
-const budgetRejected = await post(publicationPath, {
+const budgetRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:budget-rejected`,
 })
@@ -1240,12 +1524,119 @@ await psql(
   `UPDATE runs SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]} WHERE id = ${sqlLiteral(run.id)}::uuid;`,
 )
 
-const initialAttempt = await postOk(publicationPath, {
+const initialAttempt = await postPublicationStartOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:initial-authority-attempt`,
   lease_seconds: 30,
 })
 assert.ok(initialAttempt.publisher_token)
+const humanOnlyRenewRejected = await post(
+  publicationRenewPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:human-only-renew-rejected`,
+    lease_seconds: 10,
+  },
+)
+assert.equal(humanOnlyRenewRejected.response.status, 403)
+const humanOnlyBranchCheckpointRejected = await post(
+  publicationCheckpointPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:human-only-branch-rejected`,
+    checkpoint: {
+      kind: 'branch_pushed',
+      commit_sha: source.head_commit,
+    },
+  },
+)
+assert.equal(humanOnlyBranchCheckpointRejected.response.status, 403)
+const humanOnlyFailureRejected = await post(
+  publicationCheckpointPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:human-only-failure-rejected`,
+    checkpoint: {
+      kind: 'failed',
+      failure_detail: 'A human credential alone must not fail publication.',
+    },
+  },
+)
+assert.equal(humanOnlyFailureRejected.response.status, 403)
+const humanOnlyCompletionRejected = await post(
+  publicationCheckpointPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:human-only-completion-rejected`,
+    checkpoint: {
+      kind: 'published',
+      project_status: 'In Review',
+      project_field_id: 'PVTSSF_PUBLICATION_STATUS',
+      project_option_id: 'in-review',
+    },
+  },
+)
+assert.equal(humanOnlyCompletionRejected.response.status, 403)
+const revokedCredentialRenewRejected = await postWithPublisherCredential(
+  publicationRenewPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:revoked-credential-renew-rejected`,
+    lease_seconds: 10,
+  },
+  revokedPublisherCredential.credential,
+)
+assert.equal(revokedCredentialRenewRejected.response.status, 403)
+const expiredCredentialRenewRejected = await postWithPublisherCredential(
+  publicationRenewPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:expired-credential-renew-rejected`,
+    lease_seconds: 10,
+  },
+  expiredPublisherCredential.credential,
+)
+assert.equal(expiredCredentialRenewRejected.response.status, 403)
+const crossCorpCredentialRenewRejected = await postWithPublisherCredential(
+  publicationRenewPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:cross-corp-credential-renew-rejected`,
+    lease_seconds: 10,
+  },
+  crossCorpPublisherCredential.credential,
+)
+assert.equal(crossCorpCredentialRenewRejected.response.status, 403)
+const mismatchedPublisherRenewRejected = await postPublisher(
+  publicationRenewPath(demo, initialAttempt.publication.id),
+  {
+    actor_id: demo.alice_actor_id,
+    publisher_token: initialAttempt.publisher_token,
+    expected_version: initialAttempt.publication.version,
+    idempotency_key: `${effectKey}:wrong-publisher-renew-rejected`,
+    lease_seconds: 10,
+  },
+  'trusted-publication-host-a',
+)
+assert.equal(mismatchedPublisherRenewRejected.response.status, 409)
+assert.match(
+  mismatchedPublisherRenewRejected.body.error,
+  /another trusted publisher/,
+)
 const publicationFailureCanary = `cross-room-failure-${nonce}`
 await psql(
   `UPDATE pull_request_publications SET failure_detail = ${sqlLiteral(publicationFailureCanary)} WHERE id = ${sqlLiteral(initialAttempt.publication.id)}::uuid;`,
@@ -1324,12 +1715,11 @@ await failPublicationAttempt(
   `${effectKey}:release-initial-authority-test`,
   'Release the authority-revocation test attempt.',
 )
-const crossRoomRecoveryRejected = await post(publicationPath, {
+const crossRoomRecoveryRejected = await postPublicationStart(publicationPath, {
   ...publicationRequest,
   actor_id: crossRoomActorId,
   authorization_id: crypto.randomUUID(),
   idempotency_key: `${effectKey}:cross-room-recovery-rejected`,
-  publisher_id: 'cross-room-recovery-publisher-secret',
   lease_seconds: 30,
 })
 assert.equal(crossRoomRecoveryRejected.response.status, 403)
@@ -1393,7 +1783,7 @@ assert.equal(
 )
 
 await waitForPublicationLeaseExpiry(demo, workItem.id)
-const pullRequestAuthorityAttempt = await postOk(publicationPath, {
+const pullRequestAuthorityAttempt = await postPublicationStartOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:pull-request-authority-attempt`,
   lease_seconds: 30,
@@ -1511,6 +1901,10 @@ const authorizedPullRequest = fakeState.pull_requests.find(
 assert.equal(authorizedPullRequest.number, 41)
 assert.equal(authorizedPullRequest.headRefOid, source.head_commit)
 assert.equal(authorizedPullRequest.headRepositoryOwner.login, 'shyamsridhar123')
+assert.equal(
+  authorizedPullRequest.url,
+  'https://github.com/ShyamSridhar123/ECorp/pull/41',
+)
 assert.notEqual(publicationSnapshot.publication.pull_request_number, forkPullRequest.number)
 assert.equal(
   fakeState.items.find((item) => item.id === workItem.source_project_item_id)
@@ -1519,7 +1913,7 @@ assert.equal(
 )
 
 await waitForPublicationLeaseExpiry(demo, workItem.id)
-const projectAuthorityAttempt = await postOk(publicationPath, {
+const projectAuthorityAttempt = await postPublicationStartOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:project-authority-attempt`,
   lease_seconds: 30,
@@ -1590,6 +1984,70 @@ await failPublicationAttempt(
   projectAuthorityAttempt.publisher_token,
   `${effectKey}:release-project-authority-test`,
   'Release the Project authority-revocation test attempt.',
+)
+
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+const projectEditsBeforePrMutation = fakeState.item_edits
+await setFakeState({
+  pr_list_mutation: {
+    call: (fakeState.pr_list_calls ?? 0) + 2,
+    number: 41,
+    patch: { state: 'CLOSED' },
+  },
+})
+await runPublisher(demo, workItem.id, {
+  expectFailure:
+    /persisted publication pull request no longer matches|authorized non-merging publication/,
+})
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.item_edits, projectEditsBeforePrMutation)
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+assert.equal(fakeState.pr_list_mutations_applied, 1)
+await setFakeState({
+  pull_requests: fakeState.pull_requests.map((pullRequest) =>
+    pullRequest.number === 41
+      ? { ...pullRequest, state: 'OPEN' }
+      : pullRequest,
+  ),
+  pr_list_mutation: null,
+})
+
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+const projectEditsBeforeStalePublisher = fakeState.item_edits
+const projectEffectPauseMarker = path.join(
+  root,
+  'output',
+  `publication-project-effect-pause-${nonce}`,
+)
+await rm(projectEffectPauseMarker, { force: true })
+const stalePublisherAttempt = runPublisher(demo, workItem.id, {
+  expectFailure: /not a member of this room/,
+  pauseAt: 'before_project_effect_renewal',
+  pauseMarker: projectEffectPauseMarker,
+  pauseMs: 5000,
+})
+let projectEffectMembershipRevoked = false
+try {
+  await waitForFile(projectEffectPauseMarker)
+  await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+  projectEffectMembershipRevoked = true
+  await stalePublisherAttempt
+} finally {
+  if (projectEffectMembershipRevoked) {
+    await restoreMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+  }
+  await rm(projectEffectPauseMarker, { force: true })
+}
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.item_edits, projectEditsBeforeStalePublisher)
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
 )
 
 await runPublisher(demo, workItem.id, {
@@ -1665,6 +2123,11 @@ assert.equal(
   projectItemListCallsBeforePublication,
 )
 assert.ok((fakeState.project_item_lookup_calls ?? 0) > 0)
+assert.equal(
+  fakeState.field_list_calls ?? 0,
+  projectFieldListCallsBeforePublication,
+)
+assert.ok((fakeState.project_field_lookup_calls ?? 0) > 0)
 const reviewEffectIndex = fakeState.effect_log.findIndex(
   (effect) => effect.kind === 'project_status' && effect.status === 'In Review',
 )
@@ -1748,12 +2211,24 @@ const durableText = [
     FROM pull_request_publications publication
     WHERE publication.corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
   ),
+  await psql(
+    `SELECT COALESCE(jsonb_agg(to_jsonb(credential)), '[]'::jsonb)::text
+     FROM publication_publisher_credentials credential
+     WHERE credential.corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
+  ),
 ].join('\n')
 assert.equal(
   durableText.includes(publisherToken),
   false,
   'trusted publisher credential leaked into durable or shared state',
 )
+for (const credential of publisherCredentialSecrets) {
+  assert.equal(
+    durableText.includes(credential),
+    false,
+    'publication publisher workload credential leaked into durable or shared state',
+  )
+}
 assert.equal(
   finalSnapshot.snapshot.events.some((event) =>
     JSON.stringify(event).includes(publisherToken),
@@ -1772,6 +2247,12 @@ const report = {
   checked_at: new Date().toISOString(),
   base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
   invalid_git_branches_rejected_before_start: true,
+  custom_title_normalized: collisionPublication.title === collisionCustomTitle,
+  mixed_case_repository_normalized:
+    collisionPublication.target_repository === 'shyamsridhar123/ecorp',
+  mixed_case_pull_request_url_accepted:
+    publication.pull_request_url ===
+    'https://github.com/ShyamSridhar123/ECorp/pull/41',
   implicit_authorization_retry_stable: true,
   cross_publisher_default_start_recovery:
     collisionPublication.publisher_id === 'trusted-publication-host-b' &&
@@ -1781,6 +2262,13 @@ const report = {
   actor_handoff_authorization_distinct: true,
   published_retry_after_base_move: true,
   exact_publication_context_lookup: true,
+  publisher_enrollment_manage_only:
+    memberPublisherEnrollment.response.status,
+  human_only_start_rejection: humanOnlyStartRejected.response.status,
+  missing_publisher_credential_no_start: true,
+  invalid_publisher_credential_no_start: true,
+  cross_room_publication_context_denial:
+    crossRoomPublicationContext.status,
   cross_room_publication_start_rejection:
     crossRoomStartRejected.response.status,
   cross_room_publication_recovery_rejection:
@@ -1792,12 +2280,20 @@ const report = {
     pullRequestMembershipRenewRejected.response.status,
   pre_project_room_membership_renewal_rejection:
     projectMembershipRenewRejected.response.status,
+  pr_revalidated_after_project_renewal:
+    fakeState.pr_list_mutations_applied === 1,
+  stale_publisher_blocked_before_project_effect: true,
   bounded_snapshot_work_item_and_deliverable_absent: true,
   published_retry_outside_bounded_snapshot: true,
   exact_project_item_lookup:
     (fakeState.project_item_lookup_calls ?? 0) > 0 &&
     (fakeState.item_list_calls ?? 0) === projectItemListCallsBeforePublication,
+  exact_project_field_lookup:
+    (fakeState.project_field_lookup_calls ?? 0) > 0 &&
+    (fakeState.field_list_calls ?? 0) ===
+      projectFieldListCallsBeforePublication,
   project_item_count_during_publication: expandedProjectItems.length,
+  project_field_count_during_publication: expandedProjectFields.length,
   unauthorized_pr_content_rejected: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
@@ -1834,7 +2330,27 @@ const report = {
     pullRequestBudgetRejected.response.status,
   pre_project_corp_budget_renewal_rejection:
     projectCorpBudgetRejected.response.status,
-  credential_non_disclosure: !durableText.includes(publisherToken),
+  human_only_renew_rejection: humanOnlyRenewRejected.response.status,
+  human_only_branch_checkpoint_rejection:
+    humanOnlyBranchCheckpointRejected.response.status,
+  human_only_failure_checkpoint_rejection:
+    humanOnlyFailureRejected.response.status,
+  human_only_completion_checkpoint_rejection:
+    humanOnlyCompletionRejected.response.status,
+  mismatched_publisher_identity_rejection:
+    mismatchedPublisherRenewRejected.response.status,
+  revoked_publisher_credential_rejection:
+    revokedCredentialRenewRejected.response.status,
+  expired_publisher_credential_rejection:
+    expiredCredentialRenewRejected.response.status,
+  cross_corp_publisher_credential_rejection:
+    crossCorpCredentialRenewRejected.response.status,
+  publisher_workload_auth_survived_restart: true,
+  credential_non_disclosure:
+    !durableText.includes(publisherToken) &&
+    publisherCredentialSecrets.every(
+      (credential) => !durableText.includes(credential),
+    ),
   auto_merge: publication.auto_merge_enabled,
   merge_authorized: publication.merge_authorized,
   deployment_authorized: publication.deployment_authorized,

@@ -9,7 +9,7 @@ use crony_domain::{
     NewEvent, PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
-    VerificationRequest,
+    VerificationRequest, write_scope_is_valid,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -164,6 +164,7 @@ pub struct StartPullRequestPublicationInput {
     pub effect_key: String,
     pub idempotency_key: String,
     pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub lease_seconds: i64,
 }
 
@@ -172,6 +173,8 @@ pub struct RenewPullRequestPublicationInput {
     pub corp_id: Uuid,
     pub publication_id: Uuid,
     pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub publisher_token: Uuid,
     pub expected_version: i64,
     pub idempotency_key: String,
@@ -213,6 +216,8 @@ pub struct RecordPullRequestPublicationCheckpointInput {
     pub corp_id: Uuid,
     pub publication_id: Uuid,
     pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub publisher_token: Uuid,
     pub expected_version: i64,
     pub idempotency_key: String,
@@ -233,6 +238,22 @@ pub struct FactoryPublicationContext {
     pub work_item: FactoryWorkItem,
     pub publication: Option<PullRequestPublication>,
     pub source_deliverables: Vec<SourceDeliverable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialRevocationOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub revoked: bool,
+    pub event: Option<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +295,7 @@ pub struct LaunchRecord {
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
     pub verification_policy: VerificationPolicy,
+    pub write_scope: Vec<String>,
     pub deliverable: Option<DeliverableSpec>,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -311,6 +333,7 @@ pub struct ResumeLaunchRecord {
     pub source_base_commit: Option<String>,
     pub workspace_base_commit: String,
     pub verification_policy: VerificationPolicy,
+    pub write_scope: Vec<String>,
     pub deliverable: Option<DeliverableSpec>,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -1809,6 +1832,196 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rooms)
+    }
+
+    pub async fn create_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        publisher_id: &str,
+        credential_hash: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<PublicationPublisherCredentialOutcome> {
+        let publisher_id = normalize_factory_identifier(publisher_id, "trusted publisher id", 160)?;
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "publication publisher credential hash must be a SHA-256 digest"
+            ));
+        }
+        if expires_at <= Utc::now() {
+            return Err(anyhow!(
+                "publication publisher credential expiry must be in the future"
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can enroll a publication publisher"
+            ));
+        }
+
+        let credential_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO publication_publisher_credentials
+                (id, corp_id, publisher_id, credential_hash, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .bind(&publisher_id)
+        .bind(&credential_hash)
+        .bind(actor_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "factory.publication_publisher_enrolled",
+                "publication_publisher",
+                credential_id,
+                format!("publication-publisher-enrolled:{credential_id}"),
+                json!({
+                    "publisher_id": publisher_id,
+                    "expires_at": expires_at
+                }),
+            ),
+        )
+        .await?
+        .context("publication publisher enrollment event was unexpectedly deduplicated")?;
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialOutcome {
+            credential_id,
+            publisher_id,
+            expires_at,
+            event,
+        })
+    }
+
+    pub async fn authenticate_publication_publisher(
+        &self,
+        corp_id: Uuid,
+        credential_hash: &str,
+    ) -> Result<String> {
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "forbidden: invalid publication publisher credential"
+            ));
+        }
+        let publisher_id = sqlx::query_scalar(
+            r#"
+            UPDATE publication_publisher_credentials
+            SET last_used_at = now()
+            WHERE id = (
+                SELECT id
+                FROM publication_publisher_credentials
+                WHERE corp_id = $1
+                  AND credential_hash = $2
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+                FOR UPDATE
+            )
+            RETURNING publisher_id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(&credential_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("forbidden: unknown, expired, or revoked publication publisher credential")?;
+        Ok(publisher_id)
+    }
+
+    pub async fn revoke_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        credential_id: Uuid,
+        reason: &str,
+    ) -> Result<PublicationPublisherCredentialRevocationOutcome> {
+        let reason =
+            normalize_factory_text(reason, "publisher credential revocation reason", 2_000)?;
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can revoke a publication publisher"
+            ));
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT publisher_id, revoked_at
+            FROM publication_publisher_credentials
+            WHERE id = $1 AND corp_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("publication publisher credential was not found")?;
+        let publisher_id: String = row.get("publisher_id");
+        let already_revoked = row
+            .get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
+            .is_some();
+        let event = if already_revoked {
+            None
+        } else {
+            sqlx::query(
+                "UPDATE publication_publisher_credentials SET revoked_at = now() WHERE id = $1",
+            )
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+            append_event_tx(
+                &mut tx,
+                NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "factory.publication_publisher_revoked",
+                    "publication_publisher",
+                    credential_id,
+                    format!("publication-publisher-revoked:{credential_id}"),
+                    json!({
+                        "publisher_id": publisher_id.clone(),
+                        "reason": reason
+                    }),
+                ),
+            )
+            .await?
+        };
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialRevocationOutcome {
+            credential_id,
+            publisher_id,
+            revoked: !already_revoked,
+            event,
+        })
     }
 
     pub async fn create_runner_enrollment(
@@ -3800,6 +4013,7 @@ impl PgStore {
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
                 verification_policy,
+                write_scope: contract.write_scope,
                 deliverable: contract.deliverable,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -4109,6 +4323,7 @@ impl PgStore {
                 source_base_commit: contract.source_base_commit.clone(),
                 workspace_base_commit,
                 verification_policy,
+                write_scope: contract.write_scope,
                 deliverable: contract.deliverable,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -8093,6 +8308,7 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
         || value.ends_with('.')
         || value.contains("..")
         || value.contains("@{")
+        || value.chars().any(char::is_control)
         || value
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
@@ -8100,6 +8316,27 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
         return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
     }
     Ok(())
+}
+
+fn validate_factory_publication_base_ref(value: &str) -> Result<()> {
+    validate_factory_base_ref(value)?;
+    if value == "HEAD" {
+        return Ok(());
+    }
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        if branch.is_empty() {
+            return Err(anyhow!(
+                "factory publication base ref must be HEAD or a branch ref"
+            ));
+        }
+        return validate_factory_branch_ref(branch);
+    }
+    if value.starts_with("refs/") {
+        return Err(anyhow!(
+            "factory publication base ref must be HEAD or a branch ref"
+        ));
+    }
+    validate_factory_branch_ref(value)
 }
 
 fn validate_factory_branch_ref(value: &str) -> Result<()> {
@@ -8237,6 +8474,24 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         .context("factory policy snapshot must be a JSON object")?;
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
+    if let Some(publication) = policy_object.get("publication") {
+        let publication = publication
+            .as_object()
+            .context("factory publication policy must be a JSON object")?;
+        if publication.get("allowed").and_then(Value::as_bool) == Some(true) {
+            let base_ref = factory_policy_required_string(publication, "base_ref", 240)?;
+            validate_factory_publication_base_ref(&base_ref)?;
+        }
+    }
+    if policy_object.contains_key("write_scope")
+        && let Some(scope) = factory_policy_string_array(policy_object, "write_scope")?
+            .iter()
+            .find(|scope| !write_scope_is_valid(scope))
+    {
+        return Err(anyhow!(
+            "factory policy contains invalid write scope {scope}"
+        ));
+    }
     let upgrade_required = match policy_object.get("source_commit_upgrade_required") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -10280,6 +10535,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be pinned and require a legacy upgrade")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "refs/tags/v1"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("HEAD or a branch ref")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "main\tbad"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("safe Git ref")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "write_scope": ["src/*.rs"]
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid write scope")
         );
     }
 

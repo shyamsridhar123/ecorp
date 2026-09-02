@@ -78,6 +78,14 @@ struct PublicationPrerequisiteRequest<'a> {
     body: &'a str,
 }
 
+struct ActivePublicationControl<'a> {
+    actor_id: Uuid,
+    publisher_id: &'a str,
+    presented_token: Uuid,
+    expected_version: i64,
+    now: chrono::DateTime<Utc>,
+}
+
 impl PgStore {
     pub async fn factory_publication_context(
         &self,
@@ -97,6 +105,15 @@ impl PgStore {
             FROM factory_work_items
             WHERE id = $1
               AND corp_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM missions mission
+                  JOIN room_memberships membership
+                    ON membership.room_id = mission.room_id
+                  WHERE mission.id = factory_work_items.mission_id
+                    AND mission.corp_id = factory_work_items.corp_id
+                    AND membership.actor_id = $3
+              )
               AND EXISTS (
                   SELECT 1
                   FROM actors viewer
@@ -192,6 +209,13 @@ impl PgStore {
         let operation_request = start_operation_request(&normalized);
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, normalized.corp_id, normalized.actor_id).await?;
+        revalidate_publication_publisher_credential_tx(
+            &mut tx,
+            normalized.corp_id,
+            &normalized.publisher_id,
+            &normalized.publisher_credential_hash,
+        )
+        .await?;
         ensure_actor_role_tx(
             &mut tx,
             normalized.corp_id,
@@ -634,9 +658,14 @@ impl PgStore {
             "publication idempotency key",
             500,
         )?;
+        let publisher_id =
+            normalize_factory_identifier(&input.publisher_id, "trusted publisher id", 160)?;
+        let publisher_credential_hash =
+            normalize_publication_publisher_credential_hash(&input.publisher_credential_hash)?;
         let lease_seconds = validate_publication_lease_seconds(input.lease_seconds)?;
         let operation_request = json!({
             "publication_id": input.publication_id,
+            "publisher_id": publisher_id,
             "expected_version": input.expected_version,
             "lease_seconds": lease_seconds
         });
@@ -644,6 +673,13 @@ impl PgStore {
         let lease_expires_at = now + Duration::seconds(lease_seconds);
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        revalidate_publication_publisher_credential_tx(
+            &mut tx,
+            input.corp_id,
+            &publisher_id,
+            &publisher_credential_hash,
+        )
+        .await?;
         lock_factory_keys_tx(
             &mut tx,
             &[
@@ -692,10 +728,13 @@ impl PgStore {
             &mut tx,
             &current,
             current_token,
-            input.actor_id,
-            input.publisher_token,
-            input.expected_version,
-            now,
+            ActivePublicationControl {
+                actor_id: input.actor_id,
+                publisher_id: &publisher_id,
+                presented_token: input.publisher_token,
+                expected_version: input.expected_version,
+                now,
+            },
         )
         .await?;
         revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
@@ -765,10 +804,25 @@ impl PgStore {
             "publication idempotency key",
             500,
         )?;
-        let (operation, checkpoint, operation_request) = normalize_checkpoint(input.checkpoint)?;
+        let publisher_id =
+            normalize_factory_identifier(&input.publisher_id, "trusted publisher id", 160)?;
+        let publisher_credential_hash =
+            normalize_publication_publisher_credential_hash(&input.publisher_credential_hash)?;
+        let (operation, checkpoint, checkpoint_request) = normalize_checkpoint(input.checkpoint)?;
+        let operation_request = json!({
+            "publisher_id": publisher_id,
+            "checkpoint": checkpoint_request
+        });
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        revalidate_publication_publisher_credential_tx(
+            &mut tx,
+            input.corp_id,
+            &publisher_id,
+            &publisher_credential_hash,
+        )
+        .await?;
         lock_factory_keys_tx(
             &mut tx,
             &[
@@ -818,10 +872,13 @@ impl PgStore {
             &mut tx,
             &current,
             current_token,
-            input.actor_id,
-            input.publisher_token,
-            input.expected_version,
-            now,
+            ActivePublicationControl {
+                actor_id: input.actor_id,
+                publisher_id: &publisher_id,
+                presented_token: input.publisher_token,
+                expected_version: input.expected_version,
+                now,
+            },
         )
         .await?;
 
@@ -1388,6 +1445,8 @@ fn normalize_start_input(
         normalize_factory_identifier(&input.idempotency_key, "publication idempotency key", 500)?;
     input.publisher_id =
         normalize_factory_identifier(&input.publisher_id, "trusted publisher id", 160)?;
+    input.publisher_credential_hash =
+        normalize_publication_publisher_credential_hash(&input.publisher_credential_hash)?;
     input.actor_role = normalize_factory_identifier(&input.actor_role, "actor role", 40)?;
     input.lease_seconds = validate_publication_lease_seconds(input.lease_seconds)?;
     Ok(input)
@@ -1412,6 +1471,16 @@ fn validate_publication_lease_seconds(value: i64) -> Result<i64> {
     if !(5..=3_600).contains(&value) {
         return Err(anyhow!(
             "publication lease must be between 5 and 3600 seconds"
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_publication_publisher_credential_hash(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "forbidden: invalid publication publisher credential"
         ));
     }
     Ok(value)
@@ -1626,7 +1695,7 @@ async fn validate_publication_prerequisites(
         .filter(|value| !value.trim().is_empty() && value.len() <= 240)
         .context("publication policy omitted base_ref")?
         .to_owned();
-    validate_factory_base_ref(&expected_base_ref)?;
+    validate_factory_publication_base_ref(&expected_base_ref)?;
     if request.base_ref != expected_base_ref {
         return Err(anyhow!(
             "publication base ref {} does not match factory policy {}",
@@ -2068,16 +2137,39 @@ fn validate_pull_request_identity(
             "pull request head repository or commit does not match the verified publication target"
         ));
     }
-    let expected_url = format!(
-        "https://github.com/{}/pull/{number}",
-        publication.target_repository
-    );
-    if url.trim_end_matches('/') != expected_url {
+    if !github_pull_request_url_matches(url, &publication.target_repository, number) {
         return Err(anyhow!(
             "pull request URL does not match the authorized repository and number"
         ));
     }
     Ok(())
+}
+
+fn github_pull_request_url_matches(url: &str, target_repository: &str, number: i64) -> bool {
+    let Some(path) = url
+        .trim_end_matches('/')
+        .strip_prefix("https://github.com/")
+    else {
+        return false;
+    };
+    let mut path_parts = path.split('/');
+    let Some(url_owner) = path_parts.next() else {
+        return false;
+    };
+    let Some(url_repository) = path_parts.next() else {
+        return false;
+    };
+    let expected_number = number.to_string();
+    if path_parts.next() != Some("pull")
+        || path_parts.next() != Some(expected_number.as_str())
+        || path_parts.next().is_some()
+    {
+        return false;
+    }
+    let Some((target_owner, target_name)) = target_repository.split_once('/') else {
+        return false;
+    };
+    url_owner.eq_ignore_ascii_case(target_owner) && url_repository.eq_ignore_ascii_case(target_name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2143,31 +2235,33 @@ async fn ensure_active_publication_control_tx(
     tx: &mut Transaction<'_, Postgres>,
     publication: &PullRequestPublication,
     current_token: Option<Uuid>,
-    actor_id: Uuid,
-    presented_token: Uuid,
-    expected_version: i64,
-    now: chrono::DateTime<Utc>,
+    control: ActivePublicationControl<'_>,
 ) -> Result<()> {
     if publication.state == PullRequestPublicationState::Published {
         return Err(anyhow!(
             "conflict: pull-request publication is already published"
         ));
     }
-    if current_token != Some(presented_token) {
+    if current_token != Some(control.presented_token) {
         return Err(anyhow!(
             "conflict: stale or unauthorized publication publisher token"
         ));
     }
-    if publication.version != expected_version {
+    if publication.publisher_id.as_deref() != Some(control.publisher_id) {
+        return Err(anyhow!(
+            "conflict: publication attempt belongs to another trusted publisher"
+        ));
+    }
+    if publication.version != control.expected_version {
         return Err(anyhow!(
             "conflict: publication version is {}, not {}",
             publication.version,
-            expected_version
+            control.expected_version
         ));
     }
     if publication
         .publisher_lease_expires_at
-        .is_none_or(|expiry| expiry <= now)
+        .is_none_or(|expiry| expiry <= control.now)
     {
         return Err(anyhow!("conflict: publication publisher lease has expired"));
     }
@@ -2186,11 +2280,42 @@ async fn ensure_active_publication_control_tx(
     .bind(publication.attempt_count)
     .fetch_optional(&mut **tx)
     .await?;
-    if current_actor != Some(actor_id) {
+    if current_actor != Some(control.actor_id) {
         return Err(anyhow!(
             "conflict: publication attempt belongs to another authorized actor"
         ));
     }
+    Ok(())
+}
+
+async fn revalidate_publication_publisher_credential_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    publisher_id: &str,
+    credential_hash: &str,
+) -> Result<()> {
+    let credential_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM publication_publisher_credentials
+        WHERE corp_id = $1
+          AND publisher_id = $2
+          AND credential_hash = $3
+          AND revoked_at IS NULL
+          AND expires_at > now()
+        FOR SHARE
+        "#,
+    )
+    .bind(corp_id)
+    .bind(publisher_id)
+    .bind(credential_hash)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("forbidden: publication publisher credential is no longer authorized")?;
+    sqlx::query("UPDATE publication_publisher_credentials SET last_used_at = now() WHERE id = $1")
+        .bind(credential_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -2478,5 +2603,29 @@ mod tests {
         assert!(validate_factory_branch_ref("ecorp/foo.lock/bar").is_err());
         assert!(validate_factory_branch_ref("ecorp/.hidden").is_err());
         assert!(validate_factory_branch_ref("HEAD").is_err());
+    }
+
+    #[test]
+    fn github_pull_request_urls_compare_repository_case_insensitively() {
+        assert!(github_pull_request_url_matches(
+            "https://github.com/Owner/MyRepo/pull/41",
+            "owner/myrepo",
+            41
+        ));
+        assert!(github_pull_request_url_matches(
+            "https://github.com/OWNER/MYREPO/pull/41/",
+            "owner/myrepo",
+            41
+        ));
+        assert!(!github_pull_request_url_matches(
+            "https://github.com/owner/other/pull/41",
+            "owner/myrepo",
+            41
+        ));
+        assert!(!github_pull_request_url_matches(
+            "https://github.com/owner/myrepo/pull/42",
+            "owner/myrepo",
+            41
+        ));
     }
 }

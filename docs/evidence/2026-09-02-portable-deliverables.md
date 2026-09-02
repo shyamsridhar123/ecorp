@@ -125,7 +125,172 @@ Screenshots:
 Cleanup stopped only the verified process tree rooted in this worktree. Ports `55433`, `8891`, and
 `5287` were closed, and container `ecorp-issue53-integration-live` was absent.
 
-The hosted CI run triggered by this dependency refresh was rejected before any step executed
-because the GitHub account has a payment or Actions spending-limit block. Landing remains paused
-until hosted CI can actually run; this is recorded as an external infrastructure failure rather
-than a passing or failing code gate.
+## Export-boundary review hardening — September 2, 2026
+
+Commit `cd016427685508b2dfdb5d1d37d6db2e4c4acce2` closes the three later review
+findings against the portable export boundary:
+
+- each start and resume assignment now carries the persisted task `write_scope` to the runner;
+- export rejects any selected changed path outside that scope, including the default
+  `deliverable.paths: []` case;
+- the temporary export index starts from the verified base commit rather than the current task
+  `HEAD`, so an existing agent commit cannot silently add unselected paths;
+- commit/branch exports create a bounded commit directly on the verified base, then atomically move
+  only the isolated task branch while preserving unselected work in the worktree index; and
+- sensitive runner and credential directories such as nested `.azure`, `.ssh`, and
+  `.config/gcloud` paths are rejected at every path depth.
+
+The focused runner suite passed `38/38`, including regressions for narrowed write scope, nested
+credential directories, unselected committed changes, selected-commit ancestry, and preservation
+of unrelated staged work.
+
+A fresh isolated stack used PostgreSQL `pr71review` on `55434`, server `8892`, runner
+`runner-pr71-review`, and Vite `5288`. `tools/e2e_portable_deliverables.mjs` passed twice and
+`tools/e2e_artifacts.mjs` passed between those runs. The final portable run recorded:
+
+- archive run `f651113a-0dbe-494b-a972-70170bfa1421`
+- archive artifact `4b35d49c-638f-4206-9914-2ebac5ae1af5`
+- archive SHA-256 `5fcc011dda886c4709f36e8a08a97d6c390711278290736e2935980b4ca8ac9e`
+- commit run `117a9cf7-30c7-4adf-a1c3-f8f90bf22c03`
+- commit artifact `096a9a35-e16e-477d-ab98-c4ff436c63d1`
+- bounded isolated commit `ef549f2b292b45a0c33996c8ad69c1746067f4bb`
+- reclaimed run `2e88ae33-8df2-4abc-b577-75ae10edd952`
+- retained-before-cleanup ordering `true`
+- unauthorized download HTTP `404`
+
+Headless Chromium loaded the resulting source-deliverable cards with zero console or page errors.
+Desktop had `scrollWidth == clientWidth == 1440`; mobile had
+`scrollWidth == clientWidth == 390`. Both displayed the source deliverable, download action, and
+`INTEGRATION · READY FOR REVIEW`.
+
+Screenshots:
+
+- `output/playwright/pr71-deliverable-desktop.png`
+- `output/playwright/pr71-deliverable-mobile.png`
+
+The exact code head `cd016427685508b2dfdb5d1d37d6db2e4c4acce2` passed all 23 immutable
+migration checks, formatting, warning-free workspace clippy, all 73 Rust tests, the production web
+build, web lint, and `git diff --check`. The test-owned process tree and container were removed;
+ports `55434`, `8892`, and `5288` were closed.
+
+GitHub Actions is unavailable because the account has exhausted its hosted-runner credits for the
+month. Those zero-step billing failures are not treated as product validation or as a landing
+blocker. Landing uses the complete local gate, focused E2Es, browser evidence, and clean review
+threads; auto-merge remains disabled.
+
+## Factory-default and path-grammar review closure — September 2, 2026
+
+Commit `5d6e9e14873b562848b0a2e159b9fc28bd85196a` closes four additional
+exact-head review findings:
+
+- governed factory materialization now requests a verified `commit_branch` deliverable by default,
+  including parallel synthesis and deterministic verification strategies;
+- one shared domain grammar validates repository-relative paths and write scopes in the factory
+  CLI, server planner, store policy boundary, and runner before dispatch or export;
+- Git commands set `GIT_LITERAL_PATHSPECS=1`, and colon pathspec magic such as
+  `:(exclude)secret.txt` is rejected before staging;
+- nested `.kube`, `.docker`, `.gnupg`, and `.password-store` directories join the existing
+  credential-directory denylist; and
+- temporary export paths are grouped so the warning-free clippy gate remains stable as the
+  commit/branch bundle path evolves.
+
+The fresh factory-controller E2E proved the primary governed path now creates exactly one portable
+source deliverable:
+
+- factory work item `94b56dee-80ec-42ea-b98f-a2c336a1aadf`
+- mission `4933f472-622a-4d19-838b-2d8ea1ce77ac`
+- run `ff547bd1-b940-42bb-a87a-ddb50cf34714`
+- source deliverable form `commit_branch`
+- integration state `ready_for_review`
+- factory state `verified`
+- mission and run status `completed`
+
+The same controller run retained its dry-run, fencing, replay, pagination, timeout, terminal
+failure, verifier failure, independent-review, repository-routing, and source-revalidation
+regressions. A subsequent portable-deliverable E2E recorded archive
+`de04311c-809c-418f-9703-4d345c96363e`, bounded commit
+`cf0038c8e671a151ccc59bf1aafac6e975d5bc95`, retained-before-cleanup ordering `true`, and
+unauthorized download HTTP `404`. The artifact regression also passed.
+
+The complete local repository gate passed with 23 immutable migrations, formatting, warning-free
+workspace clippy, all 75 Rust tests, production web build, web lint, Node syntax validation, and
+`git diff --check`. The isolated PostgreSQL/server/runner topology used ports `55435` and `8893`;
+its process tree and container were removed, and ports `55435`, `8893`, and `5289` were closed.
+
+## Literal reset and nested CLI-credential closure — September 2, 2026
+
+Commit `fc5982d54501bc7f690bea670767b265aded0962` closes two further export-edge
+findings:
+
+- the normal-index reset after a bounded commit now sets `GIT_LITERAL_PATHSPECS=1`, matching every
+  temporary-index Git operation; a wildcard-shaped literal selection such as `foo[bar]` cannot
+  unstage an unrelated staged path such as `foob`; and
+- nested credential-bearing config directories now include `.config/gh`, `.config/hub`,
+  `.config/glab`, `.config/doctl`, `.config/heroku`, `.config/op`, `.config/rclone`, and
+  `.config/containers`. Additional standalone credential filenames such as `.git-credentials`,
+  `.netrc`, `.vault-token`, application-default credentials, and kubeconfig are also rejected.
+
+Ten focused deliverable tests passed, including the wildcard-shaped post-commit reset regression
+and nested GitHub CLI/Rclone credential detection. A fresh isolated portable-deliverable E2E then
+recorded:
+
+- archive run `cc4ae5f8-a2d5-4418-b158-c17529d6b432`
+- archive artifact `e34f8037-39e3-497d-a97d-eb1e73de517f`
+- archive SHA-256 `cc216e92a8401bfd3da77c4e3ce690ded11fc8c3044ff32fd187e5926f99c23d`
+- commit run `8a175b89-8d5c-44d6-8c68-8bf6e6d9dfea`
+- bounded commit `35802869ddf7cebf0b43792bf03690e58fd13905`
+- retained-before-cleanup ordering `true`
+- unauthorized download HTTP `404`
+
+The exact code head passed all 23 migration checks, formatting, warning-free workspace clippy, all
+76 Rust tests, production web build, web lint, and `git diff --check`. The isolated process tree,
+PostgreSQL container, and ports `55437` and `8895` were cleaned up.
+
+## Copilot and adjacent credential-store closure — September 2, 2026
+
+Commit `8f73192b1e5ff91b1b09b15cf9bb5d4bcf4c0aea` rejects nested
+`.config/github-copilot` token stores before staging. The same component filter now covers adjacent
+AI/ML and infrastructure credential locations including OpenAI, Anthropic, Hugging Face, Kaggle,
+Weights & Biases, Poetry, Pulumi, OCI, Terraform, NuGet, Maven, Gradle, and RubyGems user stores.
+
+The focused nested-credential regression passed, and the exact code head passed all 23 migration
+checks, formatting, warning-free workspace clippy, all 76 Rust tests, production web build, web
+lint, and `git diff --check`. The immediately preceding fresh portable E2E remains representative
+because this change only expands the pre-export denylist.
+
+Commit `4e8069fde669fcc5df8565d87035d840a812d476` additionally rejects Cargo's
+`credentials.toml` while continuing to permit legitimate `.cargo/config.toml`. Composer, npm,
+yarn, pnpm, Bun, Deno, Vercel, Netlify, Cloudflare, Fly, and Azure DevOps user credential stores
+are covered at their standard hidden/config paths. The focused credential regression and the exact
+complete local gate again passed with 76 Rust tests.
+
+## Artifact filename header hardening — September 2, 2026
+
+Commit `51daba62eff3a00e79c40ad3bbe31b1bd5f93af0` closes the final PR #71
+Content-Disposition finding:
+
+- newly uploaded artifact filenames reject double quotes in addition to separators and control
+  characters;
+- downloads no longer interpolate persisted names into a quoted header parameter;
+- every response uses a conservative ASCII fallback plus a percent-encoded UTF-8 `filename*`
+  parameter, so legacy persisted names cannot inject additional disposition parameters; and
+- the artifact E2E asserts the exact attachment header through the real download route.
+
+Both malicious-name regressions passed. The complete local repository gate passed with 23
+immutable migrations, formatting, warning-free workspace clippy, all 78 Rust tests, production web
+build, web lint, and `git diff --check`.
+
+Fresh isolated browser-independent runtime evidence used Postgres, the exact-head server, an
+enrolled outbound runner, isolated Git worktrees, and the normal HTTP artifact API:
+
+- `tools/e2e_artifacts.mjs` passed at `2026-09-02T16:55:54.865Z` with run
+  `97b32ecc-4258-48b7-99d8-d1869b073a99`, verified artifact
+  `7b4569b4-aa32-4346-a587-6b66ab3178a4`, and unauthorized download HTTP `404`;
+- `tools/e2e_portable_deliverables.mjs` passed at `2026-09-02T16:57:08.257Z` with archive run
+  `93763a79-a3d2-49c0-aa26-c785d6a4ac86`, bounded commit
+  `9979867b540c69b7e5360c9ab1e7bc248b4a1e16`, retained-before-cleanup ordering `true`, and
+  unauthorized download HTTP `404`; and
+- the test-owned server, runner, and temporary database were removed after completion.
+
+GitHub-hosted checks remain unavailable because the account has exhausted its Actions credits.
+They were not used as evidence and are not treated as a repository failure.

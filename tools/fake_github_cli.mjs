@@ -52,6 +52,27 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   if (!itemId) {
     fail('exact Project item lookup omitted its node id')
   }
+  if (itemId === state.project.id) {
+    state.project_field_lookup_calls =
+      (state.project_field_lookup_calls ?? 0) + 1
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+    console.log(
+      JSON.stringify({
+        data: {
+          node: {
+            __typename: 'ProjectV2',
+            field: {
+              __typename: 'ProjectV2SingleSelectField',
+              id: state.project.status_field_id,
+              name: 'Status',
+              options: state.project.status_options,
+            },
+          },
+        },
+      }),
+    )
+    process.exit(0)
+  }
   const item = state.items.find((candidate) => candidate.id === itemId)
   const status = item
     ? state.project.status_options.find(
@@ -120,17 +141,21 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   console.log(JSON.stringify(state.project))
 } else if (args[0] === 'project' && args[1] === 'field-list') {
   assertProject()
+  state.field_list_calls = (state.field_list_calls ?? 0) + 1
+  const fields = state.project_fields ?? [
+    {
+      id: state.project.status_field_id,
+      name: 'Status',
+      type: 'ProjectV2SingleSelectField',
+      options: state.project.status_options,
+    },
+  ]
+  const requestedLimit = Number(option('--limit') ?? 30)
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   console.log(
     JSON.stringify({
-      fields: [
-        {
-          id: state.project.status_field_id,
-          name: 'Status',
-          type: 'ProjectV2SingleSelectField',
-          options: state.project.status_options,
-        },
-      ],
-      totalCount: 1,
+      fields: fields.slice(0, requestedLimit),
+      totalCount: fields.length,
     }),
   )
 } else if (args[0] === 'project' && args[1] === 'item-edit') {
@@ -198,6 +223,20 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   const head = option('--head')
   const base = option('--base')
   const requestedState = option('--state') ?? 'open'
+  state.pr_list_calls = (state.pr_list_calls ?? 0) + 1
+  const mutation = state.pr_list_mutation
+  if (mutation && mutation.call === state.pr_list_calls) {
+    const pullRequest = (state.pull_requests ?? []).find(
+      (candidate) => candidate.number === mutation.number,
+    )
+    if (!pullRequest) {
+      fail(`scheduled pr-list mutation references unknown PR ${mutation.number}`)
+    }
+    Object.assign(pullRequest, mutation.patch ?? {})
+    state.pr_list_mutations_applied =
+      (state.pr_list_mutations_applied ?? 0) + 1
+    state.pr_list_mutation = null
+  }
   const pullRequests = (state.pull_requests ?? []).filter(
     (pullRequest) =>
       (!head || pullRequest.headRefName === head) &&
@@ -206,7 +245,6 @@ if (args[0] === 'api' && args[1] === 'graphql') {
         (requestedState === 'open' && pullRequest.state === 'OPEN') ||
         (requestedState === 'closed' && pullRequest.state !== 'OPEN')),
   )
-  state.pr_list_calls = (state.pr_list_calls ?? 0) + 1
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   console.log(JSON.stringify(pullRequests))
 } else if (args[0] === 'pr' && args[1] === 'create') {
@@ -238,10 +276,11 @@ if (args[0] === 'api' && args[1] === 'graphql') {
     await new Promise((resolve) => setTimeout(resolve, state.pr_create_delay_ms))
   }
   const number = state.next_pr_number ?? 1
+  const canonicalRepository = state.canonical_repository ?? repository
   const pullRequest = {
     number,
     id: `PR_FAKE_${number}`,
-    url: `https://github.com/${repository}/pull/${number}`,
+    url: `https://github.com/${canonicalRepository}/pull/${number}`,
     state: 'OPEN',
     isDraft: false,
     headRefName: head,

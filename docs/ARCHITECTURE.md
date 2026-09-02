@@ -505,12 +505,20 @@ repository, base ref, branch, commit, pull-request title/body, source issue, exp
 authorization snapshot, and effect key. Attempts have independent publisher leases and fencing
 tokens; tokens never enter snapshots or events.
 
+Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
+Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
+expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
+require both current human authority and the independently authenticated publisher identity. The
+server derives the publisher ID from that workload credential and requires the request's publisher
+ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
+publication request header.
+
 Publisher planning does not use the bounded browser snapshot as an index. An exact Corp-authorized
 publication-context read loads the requested work item, its durable publication, and every source
 deliverable for the linked bounded mission. This keeps initial publication and restart recovery
 available after newer history has displaced any of those objects from shared snapshot limits. Both
 that context and the exact publication-status read join through the viewer's current mission-room
-membership.
+membership; an out-of-room actor receives no work-item source metadata or policy either.
 
 The trusted publisher downloads the signed deliverable and imports its embedded Git bundle into a
 temporary bare repository. It verifies the bundle digest, source branch provenance, exact commit,
@@ -518,14 +526,27 @@ authorized base ancestry, and current remote base before adopting or pushing the
 matching branches and pull requests are recovered; conflicting remote identities fail closed and
 branches are never force-pushed. The branch passes `git check-ref-format --branch` before durable
 start, with a defensive server-side branch-shape check as a second boundary.
+The runner bundles a short run-scoped ref pointing to the already validated workspace branch rather
+than the worktree's possibly detached `HEAD`; the publisher accepts exactly one matching legacy
+HEAD or run-scoped bundle head before import.
 
 An adopted pull request must report the exact verified `headRefOid`, the target repository owner,
 and `isCrossRepository = false`; a same-named branch from a fork is ignored and cannot advance
 durable publication state. A symbolic `HEAD` base is resolved without `--refs`, then cross-checked
 against its advertised explicit branch target. ECorp preserves `HEAD` as the authorized policy base
 but passes and persists the resolved branch name, such as `main`, as the actual GitHub PR base.
+Canonical GitHub pull-request URLs are matched by strict scheme/host/path/number while comparing
+repository owner/name components case-insensitively.
 Project status reads query the known Project item node ID directly and verify its Project and Status
 field identity; a bounded Project item listing is never used to prove that the item disappeared.
+The Status field and its options are queried directly by name from the known Project node, so
+field-list pagination cannot hide it.
+Factory policy accepts publication bases only as symbolic `HEAD`, a short branch name, or an
+explicit `refs/heads/*` branch. Tags, remote-tracking refs, and invalid Git branch names fail before
+the controller reads candidates or claims a work item, and the store repeats the policy check.
+Omitting the option derives it from the selected source base ref, so `HEAD` remains the ordinary
+default while an explicit source branch such as `release` also becomes the publication base unless
+the operator overrides it.
 
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed
@@ -539,9 +560,21 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
+For the Project effect, the publisher reads the exact Project and Status identities, renews
+authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
+state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a
+second authority renewal immediately before `item-edit`, so slow remote reads cannot leave a stale
+publisher mutating Project state. Before recording completion it refreshes Project status, repeats
+the PR validation, and renews authority again.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
-recovery key instead of conflicting with an earlier operation request.
+recovery key instead of conflicting with an earlier operation request. Custom pull-request titles
+and body files use the server's trim, size, control-character, and newline rules before that
+fingerprint or durable start is constructed. Target repository owner/name components are likewise
+validated and lowercased before plan construction.
+Recovery dry-runs and executions reuse the publication base persisted in an existing factory policy
+unless the operator supplies the exact same override; a newly derived source default cannot replace
+the durable publication target.
 
 ## Near-term architecture work
 

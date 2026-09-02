@@ -24,7 +24,7 @@ policy, merge a pull request, or deploy.
 
 ## Durable model and API
 
-Migration `0027_mission_budget_revisions.sql` adds:
+Migration `0028_mission_budget_revisions.sql` adds:
 
 - immutable `missions.original_budget_tokens` and
   `missions.original_budget_cost_microusd`;
