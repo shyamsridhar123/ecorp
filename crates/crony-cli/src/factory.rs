@@ -344,6 +344,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             ],
             "secret_ids": [],
             "verification_required": true,
+            "deliverable_form": "commit_branch",
             "budget_tokens": args.budget_tokens,
             "budget_cost_microusd": args.budget_cost_microusd,
             "auto_merge": false,
@@ -446,6 +447,11 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "strategy": args.strategy,
             "budget_tokens": args.budget_tokens,
             "budget_cost_microusd": args.budget_cost_microusd,
+            "deliverable": {
+                "form": "commit_branch",
+                "commit_after_verification": true,
+                "paths": []
+            },
             "contract": {
                 "objective": issue_objective(&refreshed.issue),
                 "expected_output": format!(

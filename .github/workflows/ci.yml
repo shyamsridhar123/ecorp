@@ -167,6 +167,12 @@ jobs:
         run: node tools/e2e_factory_claims.mjs
       - name: Verify Project eligibility, dry run, dispatch, status sync, and replay
         run: node tools/e2e_factory_controller.mjs
+      - name: Verify idempotent branch and pull-request publication with recovery
+        env:
+          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.pid
+          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
+          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
+        run: node tools/e2e_factory_publication.mjs
       - name: Verify OIDC, Corp RBAC, runner enrollment, rotation, replay defense, and revocation
         run: node tools/e2e_identity.mjs
       - name: Verify scoped secret brokering without plaintext leakage
@@ -215,7 +221,11 @@ jobs:
             output/e2e-idempotency.json
             output/e2e-factory-claims.json
             output/e2e-factory-controller.json
+            output/e2e-factory-publication.json
             output/fake-github-factory-state.json
+            output/fake-github-publication-*.json
+            output/publication-server-restart.stdout.log
+            output/publication-server-restart.stderr.log
             output/e2e-replay.json
             output/e2e-leases.json
             output/server-ci.log

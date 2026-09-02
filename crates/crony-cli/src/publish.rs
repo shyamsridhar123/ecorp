@@ -223,6 +223,14 @@ pub async fn run(client: &Client, server: &str, args: FactoryPublishArgs) -> Res
     if response.publisher_token.is_none() {
         response = wait_or_recover_publication(client, server, &args, &plan, response).await?;
     }
+    if response.publication.state == PullRequestPublicationState::Published {
+        return Ok(plan_json(
+            &args,
+            &plan,
+            "recovered",
+            Some(&response.publication),
+        ));
+    }
     let publisher_token = response
         .publisher_token
         .context("publication has no active trusted-publisher token")?;

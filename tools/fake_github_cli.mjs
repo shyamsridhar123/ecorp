@@ -27,6 +27,13 @@ function assertProject() {
   }
 }
 
+function assertPublisherCredential() {
+  const expected = process.env.ECORP_FAKE_GITHUB_EXPECT_TOKEN
+  if (expected && process.env.GH_TOKEN !== expected) {
+    fail('trusted publisher credential was not brokered to the fake GitHub boundary')
+  }
+}
+
 if (args[0] === 'project' && args[1] === 'item-list') {
   assertProject()
   state.item_list_calls = (state.item_list_calls ?? 0) + 1
@@ -100,6 +107,15 @@ if (args[0] === 'project' && args[1] === 'item-list') {
   }
   item.status = status.name
   state.item_edits = (state.item_edits ?? 0) + 1
+  state.effect_log = [
+    ...(state.effect_log ?? []),
+    {
+      kind: 'project_status',
+      item_id: item.id,
+      status: status.name,
+      pull_request_count: (state.pull_requests ?? []).length,
+    },
+  ]
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
 } else if (args[0] === 'issue' && args[1] === 'view') {
   const number = Number(args[2])
@@ -112,6 +128,86 @@ if (args[0] === 'project' && args[1] === 'item-list') {
     fail(`unknown issue ${number}`)
   }
   console.log(JSON.stringify(issue))
+} else if (args[0] === 'pr' && args[1] === 'list') {
+  assertPublisherCredential()
+  const repository = option('--repo')
+  if (repository !== state.repository) {
+    fail(`unknown repository ${repository}`)
+  }
+  const head = option('--head')
+  const base = option('--base')
+  const requestedState = option('--state') ?? 'open'
+  const pullRequests = (state.pull_requests ?? []).filter(
+    (pullRequest) =>
+      (!head || pullRequest.headRefName === head) &&
+      (!base || pullRequest.baseRefName === base) &&
+      (requestedState === 'all' ||
+        (requestedState === 'open' && pullRequest.state === 'OPEN') ||
+        (requestedState === 'closed' && pullRequest.state !== 'OPEN')),
+  )
+  state.pr_list_calls = (state.pr_list_calls ?? 0) + 1
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  console.log(JSON.stringify(pullRequests))
+} else if (args[0] === 'pr' && args[1] === 'create') {
+  assertPublisherCredential()
+  const repository = option('--repo')
+  if (repository !== state.repository) {
+    fail(`unknown repository ${repository}`)
+  }
+  const head = option('--head')
+  const base = option('--base')
+  const title = option('--title')
+  const bodyFile = option('--body-file')
+  if (!head || !base || !title || !bodyFile) {
+    fail('pull request creation omitted required fields')
+  }
+  const existing = (state.pull_requests ?? []).find(
+    (pullRequest) =>
+      pullRequest.headRefName === head &&
+      pullRequest.baseRefName === base &&
+      pullRequest.state === 'OPEN',
+  )
+  if (existing) {
+    fail(`a pull request already exists for ${head} -> ${base}`)
+  }
+  const body = await readFile(bodyFile, 'utf8')
+  if (state.pr_create_delay_ms) {
+    await new Promise((resolve) => setTimeout(resolve, state.pr_create_delay_ms))
+  }
+  const number = state.next_pr_number ?? 1
+  const pullRequest = {
+    number,
+    id: `PR_FAKE_${number}`,
+    url: `https://github.com/${repository}/pull/${number}`,
+    state: 'OPEN',
+    isDraft: false,
+    headRefName: head,
+    baseRefName: base,
+    autoMergeRequest: null,
+    title,
+    body,
+  }
+  state.next_pr_number = number + 1
+  state.pr_create_calls = (state.pr_create_calls ?? 0) + 1
+  state.pull_requests = [...(state.pull_requests ?? []), pullRequest]
+  state.effect_log = [
+    ...(state.effect_log ?? []),
+    {
+      kind: 'pull_request_created',
+      number,
+      head,
+      base,
+    },
+  ]
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  if (state.fail_pr_create_after_success) {
+    state.fail_pr_create_after_success = false
+    state.pr_create_external_success_failures =
+      (state.pr_create_external_success_failures ?? 0) + 1
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+    fail('injected local failure after remote pull request creation')
+  }
+  console.log(pullRequest.url)
 } else {
   fail(`unsupported fake gh command: ${args.join(' ')}`)
 }
