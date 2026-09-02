@@ -257,3 +257,9 @@ The focused nested-credential regression passed, and the exact code head passed 
 checks, formatting, warning-free workspace clippy, all 76 Rust tests, production web build, web
 lint, and `git diff --check`. The immediately preceding fresh portable E2E remains representative
 because this change only expands the pre-export denylist.
+
+Commit `4e8069fde669fcc5df8565d87035d840a812d476` additionally rejects Cargo's
+`credentials.toml` while continuing to permit legitimate `.cargo/config.toml`. Composer, npm,
+yarn, pnpm, Bun, Deno, Vercel, Netlify, Cloudflare, Fly, and Azure DevOps user credential stores
+are covered at their standard hidden/config paths. The focused credential regression and the exact
+complete local gate again passed with 76 Rust tests.
