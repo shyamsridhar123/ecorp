@@ -247,7 +247,7 @@ content-addressed storage, links them to the exact verification digest, supports
 download, denies a non-member, optionally creates a commit only on the isolated task branch, and
 receives durable storage acknowledgment before a clean worktree is reclaimed. Browser validation
 checks that provider evidence, verification evidence, source deliverables, and integration state
-are visibly distinct.
+are visibly distinct. See `docs/evidence/2026-09-02-portable-deliverables.md`.
 
 `tools/e2e_factory_publication.mjs` uses a real server, runner, isolated worktrees, portable Git
 bundle, bare Git remote, and deterministic fake GitHub API. It proves policy, role, Corp, budget,
