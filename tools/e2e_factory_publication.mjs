@@ -615,6 +615,15 @@ await runPublisher(demo, collisionWorkItem.id, {
   branch: 'main',
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  crashAfter: 'after_start',
+  expectCrash: true,
+})
+const collisionRestartedServerPid = await restartLocalServer()
+await waitForPublicationLeaseExpiry(demo, collisionWorkItem.id)
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: 'main',
+  bodyFile: collisionBodyPath,
+  omitAuthorizationId: true,
   expectFailure: collisionFailurePattern,
 })
 await runPublisher(demo, collisionWorkItem.id, {
@@ -1138,6 +1147,7 @@ const report = {
   base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
   implicit_authorization_retry_stable: true,
   body_file_crlf_normalized: true,
+  implicit_authorization_restart_pid: collisionRestartedServerPid,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
   source_deliverable_id: source.id,

@@ -98,11 +98,12 @@ start, changing the owner to another still-publish-capable role, raising a hard 
 the selected run budget, and exhausting the Corp aggregate budget each caused the next lease
 renewal to fail before branch, PR, or Project effects.
 
-A separate verified factory item explicitly allowed publication branch `main`. Two CLI invocations
-without `--authorization-id`, using a CRLF body file with a trailing newline, both reached the same
+A separate verified factory item explicitly allowed publication branch `main`. A CLI invocation
+without `--authorization-id` crashed immediately after durable start, the server restarted, and two
+later duplicate invocations using a CRLF body file with a trailing newline both reached the same
 resolved-base guard. The remote `main` object did not change, no pull request was created, the body
 canonicalized identically on client and server, and the generated authorization identity remained
-stable across retry.
+stable across crash, restart, and retry.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was
