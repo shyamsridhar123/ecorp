@@ -1158,6 +1158,28 @@ assert.deepEqual(remoteBranches, [
   `refs/heads/${branch}:${source.head_commit}`,
 ])
 
+const pullRequestCreatesBeforePublishedRetry = fakeState.pr_create_calls
+const itemEditsBeforePublishedRetry = fakeState.item_edits
+await execFile(
+  'git',
+  [
+    '--git-dir',
+    remotePath,
+    'update-ref',
+    'refs/heads/main',
+    source.head_commit,
+  ],
+  { cwd: root, windowsHide: true },
+)
+const publishedRetry = await runPublisher(demo, workItem.id, {
+  idempotencyKey: `${effectKey}:published-retry-after-base-move`,
+})
+assert.equal(publishedRetry.publication.id, publication.id)
+assert.equal(publishedRetry.publication.state, 'published')
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.pr_create_calls, pullRequestCreatesBeforePublishedRetry)
+assert.equal(fakeState.item_edits, itemEditsBeforePublishedRetry)
+
 const durableText = [
   JSON.stringify(finalSnapshot),
   JSON.stringify(fakeState),
@@ -1195,6 +1217,7 @@ const report = {
   body_file_crlf_normalized: true,
   implicit_authorization_restart_pid: collisionRestartedServerPid,
   actor_handoff_authorization_distinct: true,
+  published_retry_after_base_move: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
   source_deliverable_id: source.id,

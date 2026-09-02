@@ -223,11 +223,14 @@ pub async fn run(client: &Client, server: &str, args: FactoryPublishArgs) -> Res
         None,
     )
     .await?;
+    let publication_is_complete = published_publication_exists(&snapshot, args.work_item_id);
     let plan = publication_plan(&args, &snapshot)?;
     if args.dry_run {
         return Ok(plan_json(&args, &plan, "dry_run", None));
     }
-    preflight_publication_target(&plan)?;
+    if !publication_is_complete {
+        preflight_publication_target(&plan)?;
+    }
 
     let mut response =
         start_publication(client, server, &args, &plan, &plan.idempotency_key).await?;
@@ -1389,6 +1392,18 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
     })
 }
 
+fn published_publication_exists(snapshot: &Value, work_item_id: Uuid) -> bool {
+    snapshot
+        .pointer("/snapshot/pull_request_publications")
+        .and_then(Value::as_array)
+        .is_some_and(|publications| {
+            publications.iter().any(|publication| {
+                value_uuid(publication, "/factory_work_item_id").ok() == Some(work_item_id)
+                    && publication.get("state").and_then(Value::as_str) == Some("published")
+            })
+        })
+}
+
 fn normalize_publication_body(value: &str) -> Result<String> {
     let value = value.replace("\r\n", "\n").replace('\r', "\n");
     let value = value.trim();
@@ -1609,5 +1624,17 @@ mod tests {
         assert_eq!(first, stable_authorization_id(actor, "effect"));
         assert_ne!(first, stable_authorization_id(actor, "other-effect"));
         assert_ne!(first, stable_authorization_id(Uuid::new_v4(), "effect"));
+        let work_item_id = Uuid::new_v4();
+        assert!(published_publication_exists(
+            &json!({
+                "snapshot": {
+                    "pull_request_publications": [{
+                        "factory_work_item_id": work_item_id,
+                        "state": "published"
+                    }]
+                }
+            }),
+            work_item_id
+        ));
     }
 }
