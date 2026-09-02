@@ -577,6 +577,14 @@ async fn execute_publication(
             "project-review",
         )
         .await?;
+        let pull_request = find_pull_request(args, plan, &resolved_base.pull_request_base_ref)?
+            .context("persisted publication pull request no longer matches its durable identity")?;
+        ensure_remote_pull_request_matches(
+            &pull_request,
+            plan,
+            &resolved_base.pull_request_base_ref,
+        )?;
+        ensure_pull_request_matches_publication(&pull_request, &response.publication)?;
         let (_, refreshed_field_id, refreshed_option_id, refreshed_status) =
             project_status(args, plan)?;
         if refreshed_status == plan.project_status_before {
@@ -1173,6 +1181,33 @@ fn ensure_remote_pull_request_matches(
         || pull_request.auto_merge_request.is_some()
     {
         bail!("GitHub pull request does not match the authorized non-merging publication");
+    }
+    Ok(())
+}
+
+fn ensure_pull_request_matches_publication(
+    pull_request: &PullRequestView,
+    publication: &PullRequestPublication,
+) -> Result<()> {
+    if publication.pull_request_number != Some(pull_request.number)
+        || publication.pull_request_node_id.as_deref() != Some(pull_request.id.as_str())
+        || publication.pull_request_url.as_deref() != Some(pull_request.url.as_str())
+        || publication.pull_request_state.as_deref() != Some(pull_request.state.as_str())
+        || publication.pull_request_draft != Some(pull_request.is_draft)
+        || publication.pull_request_base_ref.as_deref() != Some(pull_request.base_ref_name.as_str())
+        || !publication
+            .pull_request_head_sha
+            .as_deref()
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(&pull_request.head_ref_oid))
+        || !publication
+            .pull_request_head_repository_owner
+            .as_deref()
+            .is_some_and(|owner| {
+                owner.eq_ignore_ascii_case(&pull_request.head_repository_owner.login)
+            })
+        || publication.pull_request_is_cross_repository != Some(pull_request.is_cross_repository)
+    {
+        bail!("GitHub pull request no longer matches the durable publication identity");
     }
     Ok(())
 }

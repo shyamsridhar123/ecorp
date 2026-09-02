@@ -49,7 +49,7 @@ pub struct FactoryArgs {
     #[arg(
         long,
         env = "ECORP_FACTORY_PUBLICATION_BASE_REF",
-        default_value = "main"
+        default_value = "HEAD"
     )]
     pub publication_base_ref: String,
 

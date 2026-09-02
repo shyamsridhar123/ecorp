@@ -223,6 +223,20 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   const head = option('--head')
   const base = option('--base')
   const requestedState = option('--state') ?? 'open'
+  state.pr_list_calls = (state.pr_list_calls ?? 0) + 1
+  const mutation = state.pr_list_mutation
+  if (mutation && mutation.call === state.pr_list_calls) {
+    const pullRequest = (state.pull_requests ?? []).find(
+      (candidate) => candidate.number === mutation.number,
+    )
+    if (!pullRequest) {
+      fail(`scheduled pr-list mutation references unknown PR ${mutation.number}`)
+    }
+    Object.assign(pullRequest, mutation.patch ?? {})
+    state.pr_list_mutations_applied =
+      (state.pr_list_mutations_applied ?? 0) + 1
+    state.pr_list_mutation = null
+  }
   const pullRequests = (state.pull_requests ?? []).filter(
     (pullRequest) =>
       (!head || pullRequest.headRefName === head) &&
@@ -231,7 +245,6 @@ if (args[0] === 'api' && args[1] === 'graphql') {
         (requestedState === 'open' && pullRequest.state === 'OPEN') ||
         (requestedState === 'closed' && pullRequest.state !== 'OPEN')),
   )
-  state.pr_list_calls = (state.pr_list_calls ?? 0) + 1
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   console.log(JSON.stringify(pullRequests))
 } else if (args[0] === 'pr' && args[1] === 'create') {

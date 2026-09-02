@@ -154,7 +154,7 @@ async function runController(
     strategy = 'single',
     githubTimeoutMs,
     sourceRepositoryPath = root,
-    publicationBaseRef = 'main',
+    publicationBaseRef,
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
     writeScope = ['**'],
@@ -172,8 +172,6 @@ async function runController(
     repository,
     '--source-repository-path',
     sourceRepositoryPath,
-    '--publication-base-ref',
-    publicationBaseRef,
     '--adapter',
     'fake-process',
     '--strategy',
@@ -187,6 +185,9 @@ async function runController(
     '--github-cli',
     process.execPath,
   ]
+  if (publicationBaseRef) {
+    args.push('--publication-base-ref', publicationBaseRef)
+  }
   for (const scope of writeScope) args.push('--write-scope', scope)
   if (issueNumber !== null) args.push('--issue', String(issueNumber))
   if (dryRun) args.push('--dry-run')
@@ -416,6 +417,7 @@ const factoryItems = finalState.snapshot.factory_work_items.filter(
 )
 assert.equal(factoryItems.length, 1)
 assert.equal(factoryItems[0].state, 'verified')
+assert.equal(factoryItems[0].policy.publication.base_ref, 'HEAD')
 assert.equal(Object.hasOwn(factoryItems[0], 'claim_token'), false)
 const missions = finalState.snapshot.missions.filter(
   (item) => item.id === first.mission_id,
@@ -1299,6 +1301,7 @@ const report = {
   mission_status: missions[0].status,
   run_status: runs[0].status,
   auto_merge: false,
+  default_publication_base_ref: factoryItems[0].policy.publication.base_ref,
   control_character_publication_base_policy_rejected:
     controlCharacterPolicyResponse.status,
   non_branch_publication_base_rejected_before_claim:

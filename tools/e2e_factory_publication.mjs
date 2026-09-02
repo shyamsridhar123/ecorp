@@ -1651,6 +1651,36 @@ await failPublicationAttempt(
   'Release the Project authority-revocation test attempt.',
 )
 
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+const projectEditsBeforePrMutation = fakeState.item_edits
+await setFakeState({
+  pr_list_mutation: {
+    call: (fakeState.pr_list_calls ?? 0) + 2,
+    number: 41,
+    patch: { state: 'CLOSED' },
+  },
+})
+await runPublisher(demo, workItem.id, {
+  expectFailure:
+    /persisted publication pull request no longer matches|authorized non-merging publication/,
+})
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.item_edits, projectEditsBeforePrMutation)
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+assert.equal(fakeState.pr_list_mutations_applied, 1)
+await setFakeState({
+  pull_requests: fakeState.pull_requests.map((pullRequest) =>
+    pullRequest.number === 41
+      ? { ...pullRequest, state: 'OPEN' }
+      : pullRequest,
+  ),
+  pr_list_mutation: null,
+})
+
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_project_remote',
   expectCrash: true,
@@ -1864,6 +1894,8 @@ const report = {
     pullRequestMembershipRenewRejected.response.status,
   pre_project_room_membership_renewal_rejection:
     projectMembershipRenewRejected.response.status,
+  pr_revalidated_after_project_renewal:
+    fakeState.pr_list_mutations_applied === 1,
   bounded_snapshot_work_item_and_deliverable_absent: true,
   published_retry_outside_bounded_snapshot: true,
   exact_project_item_lookup:
