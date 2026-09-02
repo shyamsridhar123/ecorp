@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use crony_domain::{DeliverableForm, DeliverableSpec};
+use crony_domain::{
+    DeliverableForm, DeliverableSpec, repository_relative_path_is_valid, write_scope_allows_path,
+    write_scope_is_valid,
+};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -42,6 +45,10 @@ struct ArchivedChange {
     content_base64: Option<String>,
 }
 
+struct TemporaryExportPaths<'a> {
+    index: &'a Path,
+}
+
 pub async fn export(
     run_id: Uuid,
     spec: &DeliverableSpec,
@@ -59,6 +66,9 @@ pub async fn export(
         .context("deliverable worktree has no managed parent")?
         .join(format!(".ecorp-deliverable-{}.index", run_id.simple()));
     let _ = tokio::fs::remove_file(&temporary_index).await;
+    let temporary_paths = TemporaryExportPaths {
+        index: &temporary_index,
+    };
 
     let result = export_with_index(
         spec,
@@ -67,7 +77,7 @@ pub async fn export(
         report,
         provider_artifacts,
         write_scope,
-        &temporary_index,
+        &temporary_paths,
     )
     .await;
     let _ = tokio::fs::remove_file(&temporary_index).await;
@@ -81,11 +91,11 @@ async fn export_with_index(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
-    temporary_index: &Path,
+    temporary_paths: &TemporaryExportPaths<'_>,
 ) -> Result<ExportedDeliverable> {
     git_success(
         workspace_root,
-        temporary_index,
+        temporary_paths.index,
         &[
             OsString::from("read-tree"),
             OsString::from(&workspace.base_commit),
@@ -106,7 +116,7 @@ async fn export_with_index(
             add_args.push(OsString::from(path));
         }
     }
-    git_success(workspace_root, temporary_index, &add_args).await?;
+    git_success(workspace_root, temporary_paths.index, &add_args).await?;
 
     for artifact in provider_artifacts {
         let Ok(artifact_path) = tokio::fs::canonicalize(&artifact.path).await else {
@@ -118,7 +128,7 @@ async fn export_with_index(
         let relative = portable_path(path)?;
         git_success(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             &[
                 OsString::from("reset"),
                 OsString::from("-q"),
@@ -130,9 +140,14 @@ async fn export_with_index(
         .await?;
     }
 
-    let changes = changed_paths(workspace_root, temporary_index, &workspace.base_commit).await?;
+    let changes = changed_paths(
+        workspace_root,
+        temporary_paths.index,
+        &workspace.base_commit,
+    )
+    .await?;
     reject_out_of_scope_changes(&changes, write_scope)?;
-    reject_unsafe_changes(workspace_root, temporary_index, &changes).await?;
+    reject_unsafe_changes(workspace_root, temporary_paths.index, &changes).await?;
     let verification_bytes =
         serde_json::to_vec(report).context("serialize verification report for linkage")?;
     let verification_sha256 = hex::encode(Sha256::digest(&verification_bytes));
@@ -142,7 +157,7 @@ async fn export_with_index(
     let head_commit = if should_commit {
         commit_index(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             workspace,
             &verification_sha256,
             &changes,
@@ -154,7 +169,7 @@ async fn export_with_index(
 
     let patch = git_output(
         workspace_root,
-        temporary_index,
+        temporary_paths.index,
         &[
             OsString::from("diff"),
             OsString::from("--cached"),
@@ -181,8 +196,13 @@ async fn export_with_index(
                     | DeliverableForm::TypedArtifactSet
                     | DeliverableForm::CommitBranch
             );
-            let archived =
-                archive_changes(workspace_root, temporary_index, &changes, include_content).await?;
+            let archived = archive_changes(
+                workspace_root,
+                temporary_paths.index,
+                &changes,
+                include_content,
+            )
+            .await?;
             let document = json!({
                 "schema_version": 1,
                 "form": form.as_str(),
@@ -442,14 +462,7 @@ async fn commit_index(
 }
 
 fn validate_relative(value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 500
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !repository_relative_path_is_valid(value) {
         return Err(anyhow!("deliverable path must stay inside the worktree"));
     }
     Ok(())
@@ -462,7 +475,11 @@ fn reject_out_of_scope_changes(changes: &[(String, String)], write_scope: &[Stri
         ));
     }
     for scope in write_scope {
-        validate_write_scope(scope)?;
+        if !write_scope_is_valid(scope) {
+            return Err(anyhow!(
+                "task write scope must be an exact relative path or end in /**"
+            ));
+        }
     }
     for (_, path) in changes {
         if !write_scope
@@ -475,42 +492,6 @@ fn reject_out_of_scope_changes(changes: &[(String, String)], write_scope: &[Stri
         }
     }
     Ok(())
-}
-
-fn validate_write_scope(scope: &str) -> Result<()> {
-    if scope == "**" {
-        return Ok(());
-    }
-    let path = scope.strip_suffix("/**").unwrap_or(scope);
-    if path.is_empty()
-        || scope.starts_with('/')
-        || scope.starts_with('\\')
-        || scope.contains('\\')
-        || scope.contains(':')
-        || scope.contains("//")
-        || path.contains('*')
-        || path
-            .split('/')
-            .any(|component| component.is_empty() || matches!(component, "." | ".."))
-    {
-        return Err(anyhow!(
-            "task write scope must be an exact relative path or end in /**"
-        ));
-    }
-    validate_relative(path)
-}
-
-fn write_scope_allows_path(scope: &str, path: &str) -> bool {
-    if scope == "**" || scope == path {
-        return true;
-    }
-    let Some(prefix) = scope.strip_suffix("/**") else {
-        return false;
-    };
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn portable_path(path: &Path) -> Result<String> {
@@ -535,7 +516,16 @@ fn sensitive_path(path: &str) -> bool {
     components.iter().any(|component| {
         matches!(
             *component,
-            ".git" | ".codex" | ".claude" | ".ssh" | ".aws" | ".azure"
+            ".git"
+                | ".codex"
+                | ".claude"
+                | ".ssh"
+                | ".aws"
+                | ".azure"
+                | ".kube"
+                | ".docker"
+                | ".gnupg"
+                | ".password-store"
         )
     }) || components
         .windows(2)
@@ -600,6 +590,7 @@ async fn git_text_with_env(
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -624,6 +615,7 @@ async fn git_output(workspace: &Path, index: &Path, args: &[OsString]) -> Result
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -810,7 +802,34 @@ mod tests {
         ));
         assert!(sensitive_path("packages/web/.azure/accessTokens.json"));
         assert!(sensitive_path("nested/.ssh/id_ed25519"));
+        assert!(sensitive_path("services/api/.kube/config"));
+        assert!(sensitive_path("nested/.docker/config.json"));
         assert!(!sensitive_path("docs/azure/accessTokens.json"));
+    }
+
+    #[tokio::test]
+    async fn git_pathspec_magic_is_rejected_before_staging() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"selected\n").expect("modify selected path");
+        fs::write(root.join("other.txt"), b"must remain unselected\n")
+            .expect("modify unselected path");
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::Archive,
+                commit_after_verification: false,
+                paths: vec![":(exclude)tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect_err("Git pathspec magic must fail");
+        assert!(error.to_string().contains("stay inside the worktree"));
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]
