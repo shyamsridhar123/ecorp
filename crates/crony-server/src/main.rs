@@ -41,13 +41,14 @@ use crony_protocol::{
     ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest,
-    TransitionFactoryWorkItemRequest, VerificationDecisionRequest, VerificationDecisionResponse,
+    TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
+    VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
     ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
     NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage,
     RenewFactoryWorkItemInput, RunClaim, RunnerConnectInput, RunnerEventInput,
-    TransitionFactoryWorkItemInput,
+    TransitionFactoryWorkItemInput, UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -410,6 +411,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/renew",
             post(renew_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/upgrade-source-commit",
+            post(upgrade_factory_source_commit),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
@@ -1476,6 +1481,43 @@ async fn renew_factory_work_item(
     }))
 }
 
+async fn upgrade_factory_source_commit(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpgradeFactorySourceCommitRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .upgrade_factory_source_commit(UpgradeFactorySourceCommitInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            source_base_commit: request.source_base_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
 async fn transition_factory_work_item(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1706,15 +1748,15 @@ async fn schedule_ready_tasks(
         ..ScheduleOutcome::default()
     };
     for candidate in candidates {
-        let Some((runner_id, runner_tx)) = select_runner(
-            state,
-            corp_id,
-            &candidate.required_adapter,
-            candidate.required_model.as_deref(),
-            candidate.required_reasoning_effort.as_deref(),
-            candidate.required_source_repository.as_deref(),
-            candidate.required_source_base_ref.as_deref(),
-        ) else {
+        let requirements = RunnerRequirements {
+            adapter: &candidate.required_adapter,
+            model: candidate.required_model.as_deref(),
+            reasoning_effort: candidate.required_reasoning_effort.as_deref(),
+            source_repository: candidate.required_source_repository.as_deref(),
+            source_base_ref: candidate.required_source_base_ref.as_deref(),
+            source_base_commit: candidate.required_source_base_commit.as_deref(),
+        };
+        let Some((runner_id, runner_tx)) = select_runner(state, corp_id, &requirements) else {
             outcome.failures.push(format!(
                 "task {} {}",
                 candidate.task_id,
@@ -1725,6 +1767,7 @@ async fn schedule_ready_tasks(
                     candidate.required_reasoning_effort.as_deref(),
                     candidate.required_source_repository.as_deref(),
                     candidate.required_source_base_ref.as_deref(),
+                    candidate.required_source_base_commit.as_deref(),
                 )
             ));
             continue;
@@ -1807,6 +1850,9 @@ async fn schedule_ready_tasks(
                 mission_title: record.mission_title.clone(),
                 model: record.model.clone(),
                 reasoning_effort: record.reasoning_effort.clone(),
+                source_repository: record.source_repository.clone(),
+                source_base_ref: record.source_base_ref.clone(),
+                source_base_commit: record.source_base_commit.clone(),
                 verification_policy: record.verification_policy.clone(),
                 deliverable: record.deliverable.clone(),
                 secrets,
@@ -2003,18 +2049,21 @@ fn runner_requirement_mismatch(
     required_reasoning_effort: Option<&str>,
     required_source_repository: Option<&str>,
     required_source_base_ref: Option<&str>,
+    required_source_base_commit: Option<&str>,
 ) -> String {
     if required_source_repository.is_some()
         && !runner_workspace_satisfies_requirement(
             capabilities,
             required_source_repository,
             required_source_base_ref,
+            required_source_base_commit,
         )
     {
         return format!(
-            "requires source repository {} at {}, but no connected runner advertises that checkout",
+            "requires source repository {} at {} ({}) but no connected runner advertises that immutable checkout",
             required_source_repository.unwrap_or("unknown"),
-            required_source_base_ref.unwrap_or("unknown")
+            required_source_base_ref.unwrap_or("unknown"),
+            required_source_base_commit.unwrap_or("unknown")
         );
     }
     let adapter_capabilities = capabilities
@@ -2076,14 +2125,19 @@ fn runner_requirement_mismatch(
     format!("requires {required_adapter}/{model_id}, but no matching runner was selectable")
 }
 
+struct RunnerRequirements<'a> {
+    adapter: &'a str,
+    model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    source_repository: Option<&'a str>,
+    source_base_ref: Option<&'a str>,
+    source_base_commit: Option<&'a str>,
+}
+
 fn select_runner(
     state: &AppState,
     corp_id: Uuid,
-    required_adapter: &str,
-    required_model: Option<&str>,
-    required_reasoning_effort: Option<&str>,
-    required_source_repository: Option<&str>,
-    required_source_base_ref: Option<&str>,
+    requirements: &RunnerRequirements<'_>,
 ) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
     let mut runners = state
         .runners
@@ -2092,15 +2146,16 @@ fn select_runner(
             entry.corp_id == corp_id
                 && runner_workspace_satisfies_requirement(
                     &entry.capabilities,
-                    required_source_repository,
-                    required_source_base_ref,
+                    requirements.source_repository,
+                    requirements.source_base_ref,
+                    requirements.source_base_commit,
                 )
                 && entry.capabilities.iter().any(|capability| {
                     capability_satisfies_requirement(
                         capability,
-                        required_adapter,
-                        required_model,
-                        required_reasoning_effort,
+                        requirements.adapter,
+                        requirements.model,
+                        requirements.reasoning_effort,
                     )
                 })
         })
@@ -2114,29 +2169,29 @@ fn runner_workspace_satisfies_requirement(
     capabilities: &[RunnerCapability],
     required_repository: Option<&str>,
     required_base_ref: Option<&str>,
+    required_base_commit: Option<&str>,
 ) -> bool {
     let Some(required_repository) = required_repository else {
-        return required_base_ref.is_none();
+        return required_base_ref.is_none() && required_base_commit.is_none();
     };
-    let Some(required_base_ref) = required_base_ref else {
+    let (Some(required_base_ref), Some(required_base_commit)) =
+        (required_base_ref, required_base_commit)
+    else {
         return false;
     };
     capabilities.iter().any(|capability| {
         capability.name == "workspace-isolation"
             && capability.available
-            && capability_detail_value(capability.detail.as_deref(), "remote")
+            && capability
+                .source_repository
+                .as_deref()
                 .is_some_and(|repository| repository.eq_ignore_ascii_case(required_repository))
-            && capability_detail_value(capability.detail.as_deref(), "base")
-                == Some(required_base_ref)
+            && capability.source_base_ref.as_deref() == Some(required_base_ref)
+            && capability
+                .source_base_commit
+                .as_deref()
+                .is_some_and(|commit| commit.eq_ignore_ascii_case(required_base_commit))
     })
-}
-
-fn capability_detail_value<'a>(detail: Option<&'a str>, key: &str) -> Option<&'a str> {
-    detail?
-        .split([';', ','])
-        .map(str::trim)
-        .find_map(|entry| entry.strip_prefix(&format!("{key}=")))
-        .map(str::trim)
 }
 
 fn validate_requested_model(
@@ -2248,6 +2303,7 @@ async fn resume_run(
         &runner.capabilities,
         record.source_repository.as_deref(),
         record.source_base_ref.as_deref(),
+        record.source_base_commit.as_deref(),
     ) {
         drop(runner);
         let failure = state
@@ -2281,6 +2337,7 @@ async fn resume_run(
         reasoning_effort: record.reasoning_effort.clone(),
         source_repository: record.source_repository.clone(),
         source_base_ref: record.source_base_ref.clone(),
+        source_base_commit: record.source_base_commit.clone(),
         verification_policy: record.verification_policy.clone(),
         deliverable: record.deliverable.clone(),
         secret_refs: record.secret_refs.clone(),
@@ -2321,6 +2378,10 @@ async fn resume_run(
             prompt: resume_prompt,
             model: record.model,
             reasoning_effort: record.reasoning_effort,
+            source_repository: record.source_repository,
+            source_base_ref: record.source_base_ref,
+            source_base_commit: record.source_base_commit,
+            workspace_base_commit: Some(record.workspace_base_commit),
             verification_policy: record.verification_policy,
             deliverable: record.deliverable,
             secrets,
@@ -3761,6 +3822,9 @@ mod tests {
             available: true,
             detail: None,
             models: Vec::new(),
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
         }];
         assert_eq!(
             runner_requirement_mismatch(
@@ -3768,6 +3832,7 @@ mod tests {
                 "fake-process",
                 Some("gpt-5.6-sol"),
                 Some("max"),
+                None,
                 None,
                 None,
             ),
@@ -3782,6 +3847,9 @@ mod tests {
             available: true,
             detail: None,
             models: vec![model("gpt-5.6-sol", &["high", "max"])],
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
         };
         assert!(capability_satisfies_requirement(
             &capability,
@@ -3803,25 +3871,39 @@ mod tests {
             name: "workspace-isolation".to_owned(),
             available: true,
             detail: Some(
-                "root=/tmp/runner; repository=/src/ecorp; remote=shyamsridhar123/ecorp; base=HEAD"
+                "root=/tmp/runner; repository=/src/ecorp; remote=shyamsridhar123/ecorp; base=HEAD; commit=1111111111111111111111111111111111111111"
                     .to_owned(),
             ),
             models: Vec::new(),
+            source_repository: Some("shyamsridhar123/ecorp".to_owned()),
+            source_base_ref: Some("HEAD".to_owned()),
+            source_base_commit: Some(
+                "1111111111111111111111111111111111111111".to_owned(),
+            ),
         }];
         assert!(super::runner_workspace_satisfies_requirement(
             &capabilities,
             Some("shyamsridhar123/ecorp"),
             Some("HEAD"),
+            Some("1111111111111111111111111111111111111111"),
         ));
         assert!(!super::runner_workspace_satisfies_requirement(
             &capabilities,
             Some("acme/widget"),
             Some("HEAD"),
+            Some("1111111111111111111111111111111111111111"),
         ));
         assert!(!super::runner_workspace_satisfies_requirement(
             &capabilities,
             Some("shyamsridhar123/ecorp"),
             Some("main"),
+            Some("1111111111111111111111111111111111111111"),
+        ));
+        assert!(!super::runner_workspace_satisfies_requirement(
+            &capabilities,
+            Some("shyamsridhar123/ecorp"),
+            Some("HEAD"),
+            Some("2222222222222222222222222222222222222222"),
         ));
     }
 
@@ -3841,6 +3923,7 @@ mod tests {
                     "expected_output": "A verified change",
                     "source_repository": null,
                     "source_base_ref": null,
+                    "source_base_commit": null,
                     "acceptance_tests": ["tests pass"],
                     "allowed_tools": ["filesystem", "shell"],
                     "prohibited_actions": ["do not merge"],
