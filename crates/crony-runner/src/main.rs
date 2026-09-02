@@ -159,6 +159,7 @@ struct Assignment {
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    resume_workspace_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
     secrets: Vec<ResolvedSecret>,
 }
@@ -586,6 +587,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    resume_workspace_base_commit: None,
                     verification_policy,
                     secrets,
                 };
@@ -682,6 +684,7 @@ async fn run_connection(
                 source_repository,
                 source_base_ref,
                 source_base_commit,
+                workspace_base_commit,
                 verification_policy,
                 secrets,
             } => {
@@ -702,6 +705,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    resume_workspace_base_commit: workspace_base_commit,
                     verification_policy,
                     secrets,
                 };
@@ -1146,7 +1150,12 @@ async fn execute_assignment(
 ) -> Result<()> {
     validate_assignment_source(&workspaces, &assignment)?;
     let workspace = workspaces
-        .prepare(assignment.task_id, assignment.workspace_run_id)
+        .prepare(
+            assignment.task_id,
+            assignment.workspace_run_id,
+            assignment.source_base_commit.as_deref(),
+            assignment.resume_workspace_base_commit.as_deref(),
+        )
         .await
         .context("prepare isolated task worktree")?;
     let request = AdapterRunRequest {

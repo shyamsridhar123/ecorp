@@ -91,6 +91,17 @@ pub struct RenewFactoryWorkItemInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpgradeFactorySourceCommitInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_base_commit: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct TransitionFactoryWorkItemInput {
     pub corp_id: Uuid,
     pub work_item_id: Uuid,
@@ -204,6 +215,7 @@ pub struct ResumeLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_base_commit: String,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -2474,6 +2486,252 @@ impl PgStore {
         })
     }
 
+    pub async fn upgrade_factory_source_commit(
+        &self,
+        input: UpgradeFactorySourceCommitInput,
+    ) -> Result<FactoryWorkItemOutcome> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let source_base_commit = input.source_base_commit.trim().to_ascii_lowercase();
+        validate_factory_base_commit(&source_base_commit)?;
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let operation_request = json!({
+            "work_item_id": input.work_item_id,
+            "expected_version": input.expected_version,
+            "source_base_commit": source_base_commit
+        });
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "upgrade_source_commit",
+                input.actor_id,
+                Some(input.work_item_id),
+                Some(input.claim_token),
+                &operation_request,
+            )?;
+            let (work_item, current_token) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                    .await?
+                    .context("idempotent source upgrade references a missing work item")?;
+            let claim_token =
+                replayable_factory_claim_token(&work_item, current_token, &operation, now);
+            tx.commit().await?;
+            return Ok(FactoryWorkItemOutcome {
+                work_item,
+                claim_token,
+                event: None,
+                replayed: true,
+            });
+        }
+
+        let (current, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_active_factory_control(
+            &current,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_version,
+            now,
+        )?;
+        let mut policy = current
+            .policy
+            .as_object()
+            .cloned()
+            .context("factory policy snapshot must be a JSON object")?;
+        if policy
+            .get("source_base_commit")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            return Err(anyhow!(
+                "factory source policy already has an immutable base commit"
+            ));
+        }
+        if policy
+            .get("source_commit_upgrade_required")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(anyhow!(
+                "factory source policy is not marked for an authorized legacy upgrade"
+            ));
+        }
+        let source_base_ref = factory_policy_required_string(&policy, "source_base_ref", 240)?;
+        validate_factory_base_ref(&source_base_ref)?;
+        let source_repository = format!(
+            "{}/{}",
+            current.source_repository_owner, current.source_repository_name
+        );
+
+        if let Some(mission_id) = current.mission_id {
+            let has_run: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM runs r
+                    JOIN tasks t ON t.id = r.task_id
+                    WHERE t.corp_id = $1 AND t.mission_id = $2
+                )
+                "#,
+            )
+            .bind(input.corp_id)
+            .bind(mission_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_run {
+                return Err(anyhow!(
+                    "legacy source commit cannot be freshly pinned after a run exists"
+                ));
+            }
+            let incompatible_task: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM tasks
+                    WHERE corp_id = $1 AND mission_id = $2
+                      AND (
+                        contract->>'source_repository' IS DISTINCT FROM $3
+                        OR contract->>'source_base_ref' IS DISTINCT FROM $4
+                        OR (
+                            contract ? 'source_base_commit'
+                            AND contract->>'source_base_commit' IS NOT NULL
+                        )
+                      )
+                )
+                "#,
+            )
+            .bind(input.corp_id)
+            .bind(mission_id)
+            .bind(&source_repository)
+            .bind(&source_base_ref)
+            .fetch_one(&mut *tx)
+            .await?;
+            if incompatible_task {
+                return Err(anyhow!(
+                    "legacy mission tasks do not preserve the claimed repository and base ref"
+                ));
+            }
+            sqlx::query(
+                r#"
+                UPDATE tasks
+                SET contract = jsonb_set(
+                        contract,
+                        '{source_base_commit}',
+                        to_jsonb($1::text),
+                        true
+                    ),
+                    updated_at = now()
+                WHERE corp_id = $2 AND mission_id = $3
+                "#,
+            )
+            .bind(&source_base_commit)
+            .bind(input.corp_id)
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        policy.insert(
+            "source_base_commit".to_owned(),
+            Value::String(source_base_commit.clone()),
+        );
+        policy.insert(
+            "source_commit_upgrade_required".to_owned(),
+            Value::Bool(false),
+        );
+        let row = sqlx::query(
+            r#"
+            UPDATE factory_work_items
+            SET policy = $1,
+                version = version + 1,
+                failure_detail = NULL,
+                updated_at = now()
+            WHERE id = $2 AND corp_id = $3
+            RETURNING id, corp_id, source_kind, source_project_owner,
+                      source_project_number, source_project_item_id,
+                      source_repository_owner, source_repository_name,
+                      source_issue_number, source_issue_node_id, source_issue_url,
+                      source_title, source_revision, state, version, claim_owner_id,
+                      lease_expires_at, policy, mission_id, failure_detail,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(Value::Object(policy))
+        .bind(input.work_item_id)
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let work_item = map_factory_work_item(row)?;
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "upgrade_source_commit",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let event_room_id =
+            factory_event_room_id_tx(&mut tx, input.corp_id, work_item.mission_id).await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: event_room_id,
+                aggregate_version: work_item.version,
+                correlation_id: work_item.mission_id,
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.source_commit_pinned",
+                    "factory_work_item",
+                    work_item.id,
+                    format!(
+                        "factory:{}:source-commit:{}",
+                        work_item.id, work_item.version
+                    ),
+                    json!({
+                        "state": work_item.state.as_str(),
+                        "legacy_upgrade": true
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory source upgrade event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(FactoryWorkItemOutcome {
+            work_item,
+            claim_token: Some(input.claim_token),
+            event: Some(event),
+            replayed: false,
+        })
+    }
+
     pub async fn transition_factory_work_item(
         &self,
         input: TransitionFactoryWorkItemInput,
@@ -3227,7 +3485,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
-                   r.workspace_run_id, r.workspace_disposition,
+                   r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
                    t.mission_id, t.contract, t.verification_policy, m.room_id, a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -3249,6 +3507,9 @@ impl PgStore {
             .try_get::<Option<String>, _>("provider_session_id")?
             .context("source run has no resumable provider session")?;
         let workspace_run_id: Uuid = row.get("workspace_run_id");
+        let workspace_base_commit: String = row
+            .try_get::<Option<String>, _>("workspace_base_commit")?
+            .context("source run has no persisted workspace base commit")?;
         let workspace_disposition: Option<String> = row.get("workspace_disposition");
         if workspace_disposition.as_deref() != Some("preserved") {
             return Err(anyhow!(
@@ -3381,6 +3642,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
+                workspace_base_commit,
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,

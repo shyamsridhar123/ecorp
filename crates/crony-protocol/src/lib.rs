@@ -127,6 +127,7 @@ pub enum ServerToRunner {
         source_repository: Option<String>,
         source_base_ref: Option<String>,
         source_base_commit: Option<String>,
+        workspace_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -380,6 +381,15 @@ pub struct RenewFactoryWorkItemRequest {
     pub idempotency_key: String,
     #[serde(default = "default_factory_lease_seconds")]
     pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeFactorySourceCommitRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_base_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

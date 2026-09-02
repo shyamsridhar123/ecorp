@@ -32,24 +32,55 @@ Both connected runners advertised:
 They intentionally resolved that ref differently:
 
 - authorized runner `runner-local`:
-  `e2f3115d3dd5edffbc421929182fdb185f42b00f`
+  `a159184f3d9f76209c4bc48b7291b8fe27e7ea2d`
 - wrong runner `aaa-wrong-commit`:
-  `d968a5c3d4f5244284530045943299cc78dd7918`
+  `e2f3115d3dd5edffbc421929182fdb185f42b00f`
 
 The wrong runner sorted before `runner-local`, so ref-only routing would have selected it. Commit
 matching instead selected `runner-local`. The factory mission completed and verified with:
 
 - task source commit:
-  `e2f3115d3dd5edffbc421929182fdb185f42b00f`
+  `a159184f3d9f76209c4bc48b7291b8fe27e7ea2d`
 - persisted run source commit:
-  `e2f3115d3dd5edffbc421929182fdb185f42b00f`
+  `a159184f3d9f76209c4bc48b7291b8fe27e7ea2d`
 - runner-emitted workspace base commit:
-  `e2f3115d3dd5edffbc421929182fdb185f42b00f`
+  `a159184f3d9f76209c4bc48b7291b8fe27e7ea2d`
 - wrong-runner run count: `0`
 - wrong-runner managed worktree file count: `0`
 
 The fixture runner was stopped and its disposable repository and workspace were removed after the
 assertions.
+
+## Review remediation evidence
+
+The live-ref regression
+`workspace::tests::unpinned_worktrees_follow_the_live_ref_while_pinned_and_resumed_work_stays_fixed`
+passed. It kept one `WorkspaceManager` alive, advanced the configured `HEAD`, and proved:
+
+- a later unpinned worktree started from the advanced commit
+- a pinned worktree still started from its assigned immutable commit
+- pinned and unpinned resumes reused the original persisted workspace base identity
+
+`node tools/e2e_factory_legacy_source_upgrade.mjs` passed with source commit
+`a159184f3d9f76209c4bc48b7291b8fe27e7ea2d`.
+
+Derivable legacy run:
+
+- work item `3585bb07-31a3-4d9d-a997-5350cddc35f5`
+- mission `5a5af86e-e4d1-4bb0-b09b-0a20875197e5`
+- run `550a28f6-78a2-44bd-ae19-ddde81ae1660`
+- policy, task contract, and run source tuple were backfilled from the one authoritative
+  `workspace_base_commit`
+
+Unmaterialized legacy claim:
+
+- work item `2e7b916b-aaaf-4e19-ae29-c8318e6adeee`
+- migration marked `source_commit_upgrade_required=true`
+- the controller used the active claim fence to persist one fresh resolved commit
+- exactly one `factory.source_commit_pinned` audit event was emitted
+- mission `dde4a382-eb71-4889-af45-e618536f8468`
+- run `ddd0dbbf-d6bd-4a4d-ad7d-a2fbf3bbefe3`
+- final factory state `verified`
 
 ## Factory regression evidence
 

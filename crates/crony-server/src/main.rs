@@ -41,13 +41,14 @@ use crony_protocol::{
     ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest,
-    TransitionFactoryWorkItemRequest, VerificationDecisionRequest, VerificationDecisionResponse,
+    TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
+    VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
     ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
     NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage,
     RenewFactoryWorkItemInput, RunClaim, RunnerConnectInput, RunnerEventInput,
-    TransitionFactoryWorkItemInput,
+    TransitionFactoryWorkItemInput, UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -410,6 +411,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/renew",
             post(renew_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/upgrade-source-commit",
+            post(upgrade_factory_source_commit),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
@@ -1472,6 +1477,43 @@ async fn renew_factory_work_item(
     }))
 }
 
+async fn upgrade_factory_source_commit(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpgradeFactorySourceCommitRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .upgrade_factory_source_commit(UpgradeFactorySourceCommitInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            source_base_commit: request.source_base_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
 async fn transition_factory_work_item(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2331,6 +2373,7 @@ async fn resume_run(
             source_repository: record.source_repository,
             source_base_ref: record.source_base_ref,
             source_base_commit: record.source_base_commit,
+            workspace_base_commit: Some(record.workspace_base_commit),
             verification_policy: record.verification_policy,
             secrets,
         })

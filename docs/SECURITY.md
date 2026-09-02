@@ -79,7 +79,16 @@ GitHub remote matches the claimed repository, then persists the full 40- or 64-h
 Factory tasks and run launch records carry repository, ref, and commit as one all-or-nothing source
 identity. The scheduler accepts only a runner advertising the same structured tuple, and the runner
 independently rejects both start and resume commands before worktree access if any element differs.
-Symbolic refs alone are never sufficient authority for write-capable routing.
+Symbolic refs alone are never sufficient authority for factory write-capable routing. Unpinned
+ordinary tasks continue to resolve the configured ref for each new worktree, while resume is fenced
+to the source run's persisted workspace base commit.
+
+Pre-commit factory records are migrated only from unambiguous persisted workspace evidence.
+Underivable legacy claims are not guessed or silently widened: migration marks them as requiring an
+upgrade, and only the active fenced operator may resolve and persist a new commit before any run
+exists. That dedicated idempotent operation is stored in `factory_operations` and emits
+`factory.source_commit_pinned`; it rejects stale tokens, stale versions, already-pinned policies,
+incompatible task contracts, and any mission that has already produced a run.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

@@ -170,12 +170,18 @@ struct ProjectFieldOption {
 
 #[derive(Debug, Clone)]
 struct ExistingFactoryItem {
+    version: i64,
     source_revision: String,
     claim_owner_id: Uuid,
     state: String,
     mission_id: Option<Uuid>,
     policy: Value,
     lease_expires_at: DateTime<Utc>,
+}
+
+struct ResolvedSourceCommit {
+    commit: String,
+    legacy_upgrade_required: bool,
 }
 
 #[derive(Debug)]
@@ -243,9 +249,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     let selected_source_base_commit = selected_index
         .map(|index| {
             if evaluated[index].recovery {
-                persisted_source_base_commit(&evaluated[index], &existing)
+                resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)
             } else {
-                resolve_source_base_commit(&args)
+                resolve_source_base_commit(&args).map(|commit| ResolvedSourceCommit {
+                    commit,
+                    legacy_upgrade_required: false,
+                })
             }
         })
         .transpose()?;
@@ -262,7 +271,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "project_number": args.project_number,
             "repository": args.repository,
             "source_base_ref": args.source_base_ref,
-            "source_base_commit": selected_source_base_commit,
+            "source_base_commit": selected_source_base_commit
+                .as_ref()
+                .map(|resolved| resolved.commit.as_str()),
+            "legacy_source_upgrade_required": selected_source_base_commit
+                .as_ref()
+                .is_some_and(|resolved| resolved.legacy_upgrade_required),
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
             "mutations": [],
@@ -276,8 +290,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     })?;
     let selected = evaluated.swap_remove(selected_index);
-    let source_base_commit = selected_source_base_commit
+    let source_resolution = selected_source_base_commit
         .context("selected factory issue did not resolve an immutable source commit")?;
+    let ResolvedSourceCommit {
+        commit: source_base_commit,
+        legacy_upgrade_required,
+    } = source_resolution;
     let refreshed = refresh_selected(&args, &existing, &selected)?;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let stable_prefix = format!(
@@ -305,6 +323,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "repository_allowlist": [args.repository],
             "source_base_ref": args.source_base_ref,
             "source_base_commit": source_base_commit,
+            "source_commit_upgrade_required": false,
             "adapter_allowlist": adapter_allowlist,
             "strategy_allowlist": [args.strategy],
             "model": args.model,
@@ -323,6 +342,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "auto_merge": false,
         })
     };
+    let claim_generation = existing
+        .get(&refreshed.project_item.id)
+        .map(|item| item.version)
+        .unwrap_or(0);
     let claim_body = json!({
         "actor_id": args.actor_id,
         "source_project_owner": args.owner,
@@ -337,7 +360,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_revision": refreshed.issue.updated_at,
         "source_base_ref": args.source_base_ref,
         "source_base_commit": source_base_commit,
-        "idempotency_key": format!("{stable_prefix}:claim:{}", args.actor_id),
+        "idempotency_key": format!(
+            "{stable_prefix}:claim:{}:{claim_generation}",
+            args.actor_id
+        ),
         "lease_seconds": args.lease_seconds,
         "policy": policy,
     });
@@ -363,6 +389,31 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     let control_token = value_uuid(&claim, "/claim_token")
         .context("factory work item has no usable controller fencing token")?;
     let mut work_item_version = value_i64(&claim, "/work_item/version")?;
+    let mut source_commit_upgraded = false;
+    if legacy_upgrade_required {
+        let upgrade = server_json(
+            client,
+            Method::POST,
+            format!(
+                "{server}/api/corps/{}/factory/work-items/{work_item_id}/upgrade-source-commit",
+                args.corp_id
+            ),
+            Some(json!({
+                "actor_id": args.actor_id,
+                "claim_token": control_token,
+                "expected_version": work_item_version,
+                "idempotency_key": format!("{stable_prefix}:upgrade-source-commit"),
+                "source_base_commit": source_base_commit,
+            })),
+        )
+        .await?;
+        work_item_version = value_i64(&upgrade, "/work_item/version")?;
+        mission_id = value_optional_uuid(&upgrade, "/work_item/mission_id")?;
+        source_commit_upgraded = !upgrade
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
     let mut materialized = false;
     if mission_id.is_none() {
         let materialize_body = json!({
@@ -695,6 +746,9 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "issue_number": refreshed.issue.number,
         "issue_url": refreshed.issue.url,
         "source_revision": refreshed.issue.updated_at,
+        "source_base_ref": args.source_base_ref,
+        "source_base_commit": source_base_commit,
+        "legacy_source_commit_upgraded": source_commit_upgraded,
         "factory_work_item_id": work_item_id,
         "factory_state": work_item_state,
         "factory_version": work_item_version,
@@ -791,23 +845,36 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn persisted_source_base_commit(
+fn resolve_recovery_source_base_commit(
+    args: &FactoryArgs,
     selected: &EvaluatedItem,
     existing: &HashMap<String, ExistingFactoryItem>,
-) -> Result<String> {
+) -> Result<ResolvedSourceCommit> {
     let policy = existing
         .get(&selected.project_item.id)
         .context("recoverable factory item disappeared from the ECorp snapshot")?
         .policy
         .as_object()
         .context("persisted factory policy is not a JSON object")?;
-    let commit = policy
-        .get("source_base_commit")
-        .and_then(Value::as_str)
-        .context("persisted factory policy has no immutable source_base_commit")?
-        .to_ascii_lowercase();
-    validate_source_base_commit(&commit)?;
-    Ok(commit)
+    if let Some(commit) = policy.get("source_base_commit").and_then(Value::as_str) {
+        let commit = commit.to_ascii_lowercase();
+        validate_source_base_commit(&commit)?;
+        return Ok(ResolvedSourceCommit {
+            commit,
+            legacy_upgrade_required: false,
+        });
+    }
+    if policy
+        .get("source_commit_upgrade_required")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("persisted factory policy has no immutable source_base_commit");
+    }
+    Ok(ResolvedSourceCommit {
+        commit: resolve_source_base_commit(args)?,
+        legacy_upgrade_required: true,
+    })
 }
 
 fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
@@ -1260,6 +1327,7 @@ fn existing_factory_items(snapshot: &Value) -> Result<HashMap<String, ExistingFa
             Ok((
                 project_item_id,
                 ExistingFactoryItem {
+                    version: value_i64(item, "/version")?,
                     source_revision: value_string(item, "/source_revision")?,
                     claim_owner_id: value_uuid(item, "/claim_owner_id")?,
                     state: value_string(item, "/state")?,
@@ -2069,6 +2137,7 @@ Blocked by #999 outside the section.
         let owner = Uuid::new_v4();
         let replacement = Uuid::new_v4();
         let mut item = ExistingFactoryItem {
+            version: 1,
             source_revision: "2026-09-01T14:00:00Z".to_owned(),
             claim_owner_id: owner,
             state: "running".to_owned(),
