@@ -378,6 +378,26 @@ function sqlLiteral(value) {
   return `'${String(value).replaceAll("'", "''")}'`
 }
 
+async function revokeMissionRoomMembership(missionId, actorId) {
+  await psql(`
+    DELETE FROM room_memberships
+    WHERE room_id = (
+      SELECT room_id FROM missions WHERE id = ${sqlLiteral(missionId)}::uuid
+    )
+      AND actor_id = ${sqlLiteral(actorId)}::uuid;
+  `)
+}
+
+async function restoreMissionRoomMembership(missionId, actorId) {
+  await psql(`
+    INSERT INTO room_memberships (room_id, actor_id, role)
+    SELECT room_id, ${sqlLiteral(actorId)}::uuid, 'member'
+    FROM missions
+    WHERE id = ${sqlLiteral(missionId)}::uuid
+    ON CONFLICT (room_id, actor_id) DO NOTHING;
+  `)
+}
+
 async function seedNewerPublicationContextRows(
   workItem,
   source,
@@ -850,6 +870,31 @@ await writeFile(
 )
 
 const demo = await postOk('/api/demo/reset', {})
+const crossRoomActorId = crypto.randomUUID()
+const crossRoomId = crypto.randomUUID()
+await psql(`
+  INSERT INTO actors (id, corp_id, name, kind, role)
+  VALUES (
+    ${sqlLiteral(crossRoomActorId)}::uuid,
+    ${sqlLiteral(demo.corp_id)}::uuid,
+    'Cross-room publication manager',
+    'human',
+    'manager'
+  );
+  INSERT INTO rooms (id, corp_id, name, purpose)
+  VALUES (
+    ${sqlLiteral(crossRoomId)}::uuid,
+    ${sqlLiteral(demo.corp_id)}::uuid,
+    ${sqlLiteral(`Cross-room publication ${nonce}`)},
+    'Prove publication data and effects remain mission-room scoped.'
+  );
+  INSERT INTO room_memberships (room_id, actor_id, role)
+  VALUES (
+    ${sqlLiteral(crossRoomId)}::uuid,
+    ${sqlLiteral(crossRoomActorId)}::uuid,
+    'member'
+  );
+`)
 const collisionFirstController = await runController(demo, collisionIssueNumber)
 assert.equal(collisionFirstController.factory_state, 'running')
 const collisionCompleted = await waitForMission(
@@ -1117,6 +1162,16 @@ const publicationRequest = {
 const publicationPath =
   `/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication`
 
+const crossRoomStartRejected = await post(publicationPath, {
+  ...publicationRequest,
+  actor_id: crossRoomActorId,
+  authorization_id: crypto.randomUUID(),
+  idempotency_key: `${effectKey}:cross-room-start-rejected`,
+  publisher_id: 'cross-room-start-publisher-secret',
+})
+assert.equal(crossRoomStartRejected.response.status, 403)
+assert.match(crossRoomStartRejected.body.error, /not a member of this room/)
+
 const roleRejected = await post(publicationPath, {
   ...publicationRequest,
   actor_id: demo.bob_actor_id,
@@ -1191,6 +1246,47 @@ const initialAttempt = await postOk(publicationPath, {
   lease_seconds: 30,
 })
 assert.ok(initialAttempt.publisher_token)
+const publicationFailureCanary = `cross-room-failure-${nonce}`
+await psql(
+  `UPDATE pull_request_publications SET failure_detail = ${sqlLiteral(publicationFailureCanary)} WHERE id = ${sqlLiteral(initialAttempt.publication.id)}::uuid;`,
+)
+const crossRoomStatus = await request(
+  `${publicationPath}?actor_id=${crossRoomActorId}`,
+)
+assert.equal(crossRoomStatus.response.status, 404)
+const crossRoomStatusText = JSON.stringify(crossRoomStatus.body)
+for (const secret of [
+  body,
+  publicationRequest.authorization_reason,
+  publicationRequest.publisher_id,
+  publicationRequest.authorization_id,
+  publicationFailureCanary,
+]) {
+  assert.equal(
+    crossRoomStatusText.includes(secret),
+    false,
+    `cross-room publication status leaked ${secret}`,
+  )
+}
+await psql(
+  `UPDATE pull_request_publications SET failure_detail = NULL WHERE id = ${sqlLiteral(initialAttempt.publication.id)}::uuid;`,
+)
+
+await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+const branchMembershipRenewRejected = await renewPublicationAttempt(
+  demo,
+  initialAttempt.publication,
+  initialAttempt.publisher_token,
+  `${effectKey}:renew-branch-membership-rejected`,
+)
+assert.equal(branchMembershipRenewRejected.response.status, 403)
+assert.match(
+  branchMembershipRenewRejected.body.error,
+  /not a member of this room/,
+)
+assert.equal(await remoteBranchExists(branch), false)
+await restoreMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+
 await psql(
   `UPDATE actors SET role = 'admin' WHERE id = ${sqlLiteral(demo.alice_actor_id)}::uuid;`,
 )
@@ -1228,6 +1324,16 @@ await failPublicationAttempt(
   `${effectKey}:release-initial-authority-test`,
   'Release the authority-revocation test attempt.',
 )
+const crossRoomRecoveryRejected = await post(publicationPath, {
+  ...publicationRequest,
+  actor_id: crossRoomActorId,
+  authorization_id: crypto.randomUUID(),
+  idempotency_key: `${effectKey}:cross-room-recovery-rejected`,
+  publisher_id: 'cross-room-recovery-publisher-secret',
+  lease_seconds: 30,
+})
+assert.equal(crossRoomRecoveryRejected.response.status, 403)
+assert.match(crossRoomRecoveryRejected.body.error, /not a member of this room/)
 
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_branch_remote',
@@ -1293,6 +1399,26 @@ const pullRequestAuthorityAttempt = await postOk(publicationPath, {
   lease_seconds: 30,
 })
 assert.ok(pullRequestAuthorityAttempt.publisher_token)
+await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+const pullRequestMembershipRenewRejected = await renewPublicationAttempt(
+  demo,
+  pullRequestAuthorityAttempt.publication,
+  pullRequestAuthorityAttempt.publisher_token,
+  `${effectKey}:pull-request-membership-rejected`,
+)
+assert.equal(pullRequestMembershipRenewRejected.response.status, 403)
+assert.match(
+  pullRequestMembershipRenewRejected.body.error,
+  /not a member of this room/,
+)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.pull_requests.filter(
+    (pullRequest) => pullRequest.isCrossRepository === false,
+  ).length,
+  0,
+)
+await restoreMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
 await psql(
   `UPDATE runs SET input_tokens = budget_tokens_limit, output_tokens = 0 WHERE id = ${sqlLiteral(run.id)}::uuid;`,
 )
@@ -1399,6 +1525,25 @@ const projectAuthorityAttempt = await postOk(publicationPath, {
   lease_seconds: 30,
 })
 assert.ok(projectAuthorityAttempt.publisher_token)
+await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+const projectMembershipRenewRejected = await renewPublicationAttempt(
+  demo,
+  projectAuthorityAttempt.publication,
+  projectAuthorityAttempt.publisher_token,
+  `${effectKey}:project-membership-rejected`,
+)
+assert.equal(projectMembershipRenewRejected.response.status, 403)
+assert.match(
+  projectMembershipRenewRejected.body.error,
+  /not a member of this room/,
+)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+await restoreMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
 assert.equal(
   Number(
     await psql(
@@ -1636,6 +1781,17 @@ const report = {
   actor_handoff_authorization_distinct: true,
   published_retry_after_base_move: true,
   exact_publication_context_lookup: true,
+  cross_room_publication_start_rejection:
+    crossRoomStartRejected.response.status,
+  cross_room_publication_recovery_rejection:
+    crossRoomRecoveryRejected.response.status,
+  cross_room_publication_status_denial: crossRoomStatus.response.status,
+  pre_branch_room_membership_renewal_rejection:
+    branchMembershipRenewRejected.response.status,
+  pre_pull_request_room_membership_renewal_rejection:
+    pullRequestMembershipRenewRejected.response.status,
+  pre_project_room_membership_renewal_rejection:
+    projectMembershipRenewRejected.response.status,
   bounded_snapshot_work_item_and_deliverable_absent: true,
   published_retry_outside_bounded_snapshot: true,
   exact_project_item_lookup:

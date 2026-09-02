@@ -157,7 +157,9 @@ pull requests, and records the pull-request identity before changing Project sta
 restart, timeout, and external-success/local-failure recovery adopt only matching remote effects.
 The database constrains auto-merge, merge authorization, and deployment authorization to false.
 The publisher reads its requested work item, publication, and mission deliverables through an exact
-Corp-authorized context endpoint rather than trusting bounded shared snapshots.
+Corp-authorized context endpoint rather than trusting bounded shared snapshots. Exact publication
+status reads apply the same mission-room join; knowing a work-item UUID does not expose pull-request
+body, authorization reason/snapshot, publisher identity, or failure detail to another-room members.
 
 Before every branch push, pull-request creation, and Project mutation, lease renewal transactionally
 rechecks the current attempt actor against its persisted role snapshot and reruns current run,
@@ -166,6 +168,9 @@ mission, requester, Corp-budget, and hard-breaker authority. Pull-request adopti
 `HEAD` is accepted only when its symbolic branch target exists and advertises the same object ID.
 GitHub PR commands receive that verified branch name rather than the literal `HEAD`, and the
 resolved PR base is retained separately from the authorized symbolic base.
+The publisher's mission-room membership is rechecked in the same transaction on new start,
+idempotent replay, expired-lease recovery, and every renewal. Removing a still-manager actor from
+the room therefore blocks branch, pull-request, and Project effects.
 
 PR adoption also requires the exact authorized title and body. A collaborator-created PR with the
 right branch and SHA but altered content is ignored and cannot advance Project state. Publication
