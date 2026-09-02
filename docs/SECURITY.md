@@ -198,9 +198,10 @@ trailing newline.
 
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.
-For an unfinished publication, the exact checkpointed PR is re-fetched after the final authority
-renewal and immediately before Project mutation, preventing a closed, retargeted, edited, or
-auto-merge-enabled PR from advancing review state.
+For an unfinished publication, Project state is refreshed after the final authority renewal, then
+the exact checkpointed PR is re-fetched immediately before mutation. A second check precedes
+completion, preventing a closed, retargeted, edited, or auto-merge-enabled PR from advancing or
+being recorded as reviewed.
 
 ## Required production boundaries
 

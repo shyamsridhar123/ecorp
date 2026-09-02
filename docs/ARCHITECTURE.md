@@ -521,9 +521,10 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
-After the Project-stage renewal and immediately before Project mutation, the publisher re-fetches
-the exact durable PR and revalidates its open state, base/head, content, repository/SHA, URL, draft,
-and auto-merge identity.
+After the Project-stage renewal, the publisher first refreshes the Project field/item state, then
+immediately before Project mutation re-fetches the exact durable PR and revalidates its open state,
+base/head, content, repository/SHA, URL, draft, and auto-merge identity. It repeats the PR check
+before recording completion.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
 recovery key instead of conflicting with an earlier operation request. Custom pull-request titles

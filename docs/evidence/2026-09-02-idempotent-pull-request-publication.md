@@ -15,9 +15,9 @@
 **Context and base-ref closure head:** `7e8f13f24e5a3f4e923695b2ac00d369a99e15f7`
 **Metadata lookup closure head:** `75bfc0de71233d1c79363c2d2c642304bda0b960`
 **URL identity closure head:** `70b287478d060fc08bafee4f33f28c393fb7c5dd`
-**Final ordering/default head:** `a49705e9550dd758e855a7407f35c68407742608`
-**Integrated gate head:** `926fa7705f43f512c0aba75bd2f0042065fc03d4`
-**Stacked base:** `4ad38c5f0f6c99bad9807cc487859af0cebd3c3b`
+**Final ordering/default head:** `6acf3ed019b2ea6e1952828d7f6cae2976e52076`
+**Integrated gate head:** `6acf3ed019b2ea6e1952828d7f6cae2976e52076`
+**Stacked base:** `0be72d458e5afd35b7309786bf662486727b8d2b`
 
 ## Scope
 
@@ -89,7 +89,7 @@ The final exact-head run recorded:
   "project_field_count_during_publication": 32,
   "publication_attempts": 10,
   "pull_request_number": 41,
-  "pull_request_head_sha": "ab6117ba0c702053641ab34ca34fa5e74aa88ccb",
+  "pull_request_head_sha": "95bc94527f01a706f8851605b12b3e233a41dfec",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -296,12 +296,11 @@ portable Git bundle path grouping. URL identity commit
 `70b287478d060fc08bafee4f33f28c393fb7c5dd` then passed all repository gates and fresh isolated
 controller/publication E2Es on the merged tree.
 
-The final base `4ad38c5f0f6c99bad9807cc487859af0cebd3c3b` was then merged normally.
-For final ordering coverage, the fake GitHub API closed PR #41 on the second PR lookup: the first
-lookup occurred before Project-stage renewal and the second immediately afterward. Publication
-rejected the changed durable PR, made no Project edit, restored the fixture, and then completed
-normally. Commit `a49705e9550dd758e855a7407f35c68407742608` and merged head
-`926fa7705f43f512c0aba75bd2f0042065fc03d4` passed all gates and both focused E2Es.
+The final base `0be72d458e5afd35b7309786bf662486727b8d2b` was then merged normally.
+For final ordering coverage, the fake GitHub API closed PR #41 on the PR lookup immediately after
+the refreshed Project field/item reads. Publication rejected the changed durable PR, made no Project
+edit, restored the fixture, and then completed normally. Commit
+`6acf3ed019b2ea6e1952828d7f6cae2976e52076` passed all gates and both focused E2Es.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not
