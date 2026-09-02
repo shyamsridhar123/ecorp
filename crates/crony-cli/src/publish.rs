@@ -172,16 +172,49 @@ struct ProjectFieldOption {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectItemsEnvelope {
-    #[serde(default)]
-    items: Vec<ProjectItem>,
+struct GraphQlProjectItemEnvelope {
+    data: GraphQlProjectItemData,
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectItem {
+struct GraphQlProjectItemData {
+    node: Option<GraphQlProjectItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectItem {
+    #[serde(rename = "__typename")]
+    kind: String,
     id: String,
-    #[serde(default)]
-    status: String,
+    project: GraphQlProject,
+    #[serde(rename = "fieldValueByName")]
+    status: Option<GraphQlProjectStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProject {
+    id: String,
+    number: i64,
+    owner: GraphQlProjectOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectStatus {
+    #[serde(rename = "__typename")]
+    kind: String,
+    name: String,
+    field: GraphQlProjectStatusField,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectStatusField {
+    id: String,
+    name: String,
 }
 
 struct TemporaryPublisherWorkspace {
@@ -215,18 +248,19 @@ impl Drop for TemporaryPublisherWorkspace {
 
 pub async fn run(client: &Client, server: &str, args: FactoryPublishArgs) -> Result<Value> {
     validate_args(&args)?;
-    let snapshot = server_json(
+    let context = server_json(
         client,
         Method::GET,
         format!(
-            "{server}/api/corps/{}/snapshot?actor_id={}",
-            args.corp_id, args.actor_id
+            "{server}/api/corps/{}/factory/work-items/{}/publication-context?actor_id={}",
+            args.corp_id, args.work_item_id, args.actor_id
         ),
         None,
     )
     .await?;
-    let publication_is_complete = published_publication_exists(&snapshot, args.work_item_id);
-    let plan = publication_plan(&args, &snapshot)?;
+    let publication_is_complete = published_publication_exists(&context, args.work_item_id);
+    let plan = publication_plan(&args, &context)?;
+    validate_publication_branch(&plan.branch)?;
     if args.dry_run {
         return Ok(plan_json(&args, &plan, "dry_run", None));
     }
@@ -344,9 +378,11 @@ async fn wait_or_recover_publication(
                 .unwrap_or_else(|| "an unknown time".to_owned())
         );
     }
-    let recovery_key = format!(
-        "{}:recover:{}:{}",
-        plan.effect_key, response.publication.version, response.publication.attempt_count
+    let recovery_key = stable_recovery_idempotency_key(
+        args.actor_id,
+        &plan.idempotency_key,
+        response.publication.version,
+        response.publication.attempt_count,
     );
     start_publication(client, server, args, plan, &recovery_key).await
 }
@@ -1171,61 +1207,68 @@ fn project_status(
                 plan.project_review_status
             )
         })?;
-    let items: ProjectItemsEnvelope = serde_json::from_value(gh_json(
-        &args.github_cli,
-        &[
-            "project",
-            "item-list",
-            &plan.project_number.to_string(),
-            "--owner",
-            &plan.project_owner,
-            "--format",
-            "json",
-            "--limit",
-            "1000",
-        ],
-    )?)
-    .context("decode GitHub Project items")?;
-    let status = items
-        .items
-        .iter()
-        .find(|item| item.id == plan.project_item_id)
-        .map(|item| item.status.clone())
-        .context("GitHub Project item disappeared during publication")?;
+    let item = load_project_item(args, plan)?;
+    if item.kind != "ProjectV2Item"
+        || item.id != plan.project_item_id
+        || item.project.id != project.id
+        || item.project.number != plan.project_number
+        || !item
+            .project
+            .owner
+            .login
+            .eq_ignore_ascii_case(&plan.project_owner)
+    {
+        bail!("GitHub Project item does not match the authorized publication Project");
+    }
+    let status = item
+        .status
+        .context("GitHub Project item has no Status value")?;
+    if status.kind != "ProjectV2ItemFieldSingleSelectValue"
+        || status.field.id != status_field.id
+        || status.field.name != "Status"
+    {
+        bail!("GitHub Project item Status value does not match the Project Status field");
+    }
     Ok((
         project.id,
         status_field.id.clone(),
         review_option.id.clone(),
-        status,
+        status.name,
     ))
 }
 
-fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<PublicationPlan> {
-    let work_item = snapshot
-        .pointer("/snapshot/factory_work_items")
-        .and_then(Value::as_array)
-        .context("ECorp snapshot omitted factory work items")?
-        .iter()
-        .find(|item| value_uuid(item, "/id").ok() == Some(args.work_item_id))
-        .context("factory work item was not found in the authorized snapshot")?;
-    let existing_publication = snapshot
-        .pointer("/snapshot/pull_request_publications")
-        .and_then(Value::as_array)
-        .context("ECorp snapshot omitted pull-request publications")?
-        .iter()
-        .find(|publication| {
-            value_uuid(publication, "/factory_work_item_id").ok() == Some(args.work_item_id)
-        });
+fn load_project_item(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+) -> Result<GraphQlProjectItem> {
+    const QUERY: &str = r#"query($id:ID!){node(id:$id){__typename ... on ProjectV2Item{id project{id number owner{__typename ... on User{login} ... on Organization{login}}} fieldValueByName(name:"Status"){__typename ... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{id name}}}}}}}"#;
+    let id = format!("id={}", plan.project_item_id);
+    let envelope: GraphQlProjectItemEnvelope = serde_json::from_value(gh_json(
+        &args.github_cli,
+        &["api", "graphql", "-f", &format!("query={QUERY}"), "-F", &id],
+    )?)
+    .context("decode exact GitHub Project item")?;
+    envelope
+        .data
+        .node
+        .context("GitHub Project item disappeared during publication")
+}
+
+fn publication_plan(args: &FactoryPublishArgs, context: &Value) -> Result<PublicationPlan> {
+    let work_item = context
+        .get("work_item")
+        .context("ECorp publication context omitted the factory work item")?;
+    if value_uuid(work_item, "/id")? != args.work_item_id {
+        bail!("ECorp publication context returned a different factory work item");
+    }
+    let existing_publication = context.get("publication").filter(|value| !value.is_null());
+    if existing_publication.is_some_and(|publication| {
+        value_uuid(publication, "/factory_work_item_id").ok() != Some(args.work_item_id)
+    }) {
+        bail!("ECorp publication context returned a publication for another work item");
+    }
     let mission_id =
         value_uuid(work_item, "/mission_id").context("factory work item has no mission")?;
-    let task_ids = snapshot
-        .pointer("/snapshot/tasks")
-        .and_then(Value::as_array)
-        .context("ECorp snapshot omitted tasks")?
-        .iter()
-        .filter(|task| value_uuid(task, "/mission_id").ok() == Some(mission_id))
-        .filter_map(|task| value_uuid(task, "/id").ok())
-        .collect::<Vec<_>>();
     let persisted_deliverable_id = existing_publication
         .and_then(|publication| publication.get("source_deliverable_id"))
         .and_then(Value::as_str)
@@ -1234,16 +1277,13 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         .context("persisted publication deliverable id is invalid")?;
     let selected_deliverable_id =
         publication_deliverable_selection(args.source_deliverable_id, persisted_deliverable_id)?;
-    let deliverables = snapshot
-        .pointer("/snapshot/source_deliverables")
+    let deliverables = context
+        .get("source_deliverables")
         .and_then(Value::as_array)
-        .context("ECorp snapshot omitted source deliverables")?
+        .context("ECorp publication context omitted source deliverables")?
         .iter()
         .filter(|deliverable| {
-            value_uuid(deliverable, "/task_id")
-                .ok()
-                .is_some_and(|task_id| task_ids.contains(&task_id))
-                && deliverable.get("form").and_then(Value::as_str) == Some("commit_branch")
+            deliverable.get("form").and_then(Value::as_str) == Some("commit_branch")
                 && match deliverable.get("integration_state").and_then(Value::as_str) {
                     Some("ready_for_review") => true,
                     Some("published") => existing_publication.is_some(),
@@ -1365,15 +1405,11 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         (None, Some(persisted)) => persisted,
         (None, None) => stable_authorization_id(args.actor_id, &effect_key),
     };
-    let idempotency_key = args
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| format!("{effect_key}:start:{}", args.actor_id));
     let publisher_id = args
         .publisher_id
         .clone()
         .unwrap_or_else(default_publisher_id);
-    Ok(PublicationPlan {
+    let mut plan = PublicationPlan {
         source_deliverable_id: value_uuid(deliverable, "/id")?,
         artifact_id: value_uuid(deliverable, "/artifact_id")?,
         target_repository,
@@ -1386,7 +1422,7 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         authorization_id,
         authorization_reason: args.authorization_reason.trim().to_owned(),
         effect_key,
-        idempotency_key,
+        idempotency_key: String::new(),
         publisher_id,
         issue_number,
         issue_url,
@@ -1403,7 +1439,12 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
             .and_then(Value::as_str)
             .context("publication policy omitted review_status")?
             .to_owned(),
-    })
+    };
+    plan.idempotency_key = match args.idempotency_key.clone() {
+        Some(key) => key,
+        None => stable_start_idempotency_key(args, &plan)?,
+    };
+    Ok(plan)
 }
 
 fn publication_deliverable_selection(
@@ -1422,15 +1463,13 @@ fn publication_deliverable_selection(
     }
 }
 
-fn published_publication_exists(snapshot: &Value, work_item_id: Uuid) -> bool {
-    snapshot
-        .pointer("/snapshot/pull_request_publications")
-        .and_then(Value::as_array)
-        .is_some_and(|publications| {
-            publications.iter().any(|publication| {
-                value_uuid(publication, "/factory_work_item_id").ok() == Some(work_item_id)
-                    && publication.get("state").and_then(Value::as_str) == Some("published")
-            })
+fn published_publication_exists(context: &Value, work_item_id: Uuid) -> bool {
+    context
+        .get("publication")
+        .filter(|publication| !publication.is_null())
+        .is_some_and(|publication| {
+            value_uuid(publication, "/factory_work_item_id").ok() == Some(work_item_id)
+                && publication.get("state").and_then(Value::as_str) == Some("published")
         })
 }
 
@@ -1449,6 +1488,12 @@ fn normalize_publication_body(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn validate_publication_branch(branch: &str) -> Result<()> {
+    source_git_output(Path::new("."), &["check-ref-format", "--branch", branch])
+        .map(|_| ())
+        .with_context(|| format!("publication branch {branch} is not a valid Git branch name"))
+}
+
 fn stable_authorization_id(actor_id: Uuid, effect_key: &str) -> Uuid {
     let mut digest = Sha256::new();
     digest.update(b"ecorp-publication-authorization-v1\0");
@@ -1460,6 +1505,50 @@ fn stable_authorization_id(actor_id: Uuid, effect_key: &str) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+fn stable_start_idempotency_key(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+) -> Result<String> {
+    let request = json!({
+        "actor_id": args.actor_id,
+        "work_item_id": args.work_item_id,
+        "source_deliverable_id": plan.source_deliverable_id,
+        "target_repository": plan.target_repository,
+        "base_ref": plan.base_ref,
+        "branch": plan.branch,
+        "title": plan.title,
+        "body": plan.body,
+        "authorization_id": plan.authorization_id,
+        "authorization_reason": plan.authorization_reason,
+        "effect_key": plan.effect_key,
+        "publisher_id": plan.publisher_id,
+        "lease_seconds": args.lease_seconds,
+    });
+    stable_start_idempotency_key_for_request(args.actor_id, &request)
+}
+
+fn stable_start_idempotency_key_for_request(actor_id: Uuid, request: &Value) -> Result<String> {
+    let encoded = serde_json::to_vec(&request).context("encode publication start identity")?;
+    let digest = format!("{:x}", Sha256::digest(encoded));
+    Ok(format!("publication-start:{actor_id}:{}", &digest[..32]))
+}
+
+fn stable_recovery_idempotency_key(
+    actor_id: Uuid,
+    start_idempotency_key: &str,
+    version: i64,
+    attempt: i32,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ecorp-publication-recovery-v1\0");
+    digest.update(start_idempotency_key.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    format!(
+        "publication-recover:{actor_id}:{version}:{attempt}:{}",
+        &digest[..16]
+    )
 }
 
 fn ensure_publication_matches_plan(
@@ -1657,11 +1746,9 @@ mod tests {
         let work_item_id = Uuid::new_v4();
         assert!(published_publication_exists(
             &json!({
-                "snapshot": {
-                    "pull_request_publications": [{
-                        "factory_work_item_id": work_item_id,
-                        "state": "published"
-                    }]
+                "publication": {
+                    "factory_work_item_id": work_item_id,
+                    "state": "published"
                 }
             }),
             work_item_id
@@ -1676,5 +1763,68 @@ mod tests {
             publication_deliverable_selection(Some(Uuid::new_v4()), Some(persisted_deliverable))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn publication_start_and_recovery_keys_track_the_exact_invocation() {
+        let actor = Uuid::new_v4();
+        let request = json!({
+            "publisher_id": "publisher-a",
+            "authorization_reason": "reason-a",
+            "lease_seconds": 30
+        });
+        let first = stable_start_idempotency_key_for_request(actor, &request).expect("start key");
+        assert_eq!(
+            first,
+            stable_start_idempotency_key_for_request(actor, &request).expect("repeat start key")
+        );
+        for changed in [
+            json!({
+                "publisher_id": "publisher-b",
+                "authorization_reason": "reason-a",
+                "lease_seconds": 30
+            }),
+            json!({
+                "publisher_id": "publisher-a",
+                "authorization_reason": "reason-b",
+                "lease_seconds": 30
+            }),
+            json!({
+                "publisher_id": "publisher-a",
+                "authorization_reason": "reason-a",
+                "lease_seconds": 60
+            }),
+        ] {
+            assert_ne!(
+                first,
+                stable_start_idempotency_key_for_request(actor, &changed).expect("changed key")
+            );
+        }
+        assert_ne!(
+            first,
+            stable_start_idempotency_key_for_request(Uuid::new_v4(), &request)
+                .expect("other actor key")
+        );
+
+        let recovery = stable_recovery_idempotency_key(actor, &first, 4, 2);
+        assert_eq!(
+            recovery,
+            stable_recovery_idempotency_key(actor, &first, 4, 2)
+        );
+        assert_ne!(
+            recovery,
+            stable_recovery_idempotency_key(actor, &first, 5, 2)
+        );
+        assert_ne!(
+            recovery,
+            stable_recovery_idempotency_key(Uuid::new_v4(), &first, 4, 2)
+        );
+    }
+
+    #[test]
+    fn publication_branch_uses_git_branch_rules() {
+        assert!(validate_publication_branch("ecorp/issue-61-safe").is_ok());
+        assert!(validate_publication_branch("ecorp/foo//bar").is_err());
+        assert!(validate_publication_branch("ecorp/foo.lock").is_err());
     }
 }

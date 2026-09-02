@@ -228,6 +228,13 @@ pub struct PullRequestPublicationOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct FactoryPublicationContext {
+    pub work_item: FactoryWorkItem,
+    pub publication: Option<PullRequestPublication>,
+    pub source_deliverables: Vec<SourceDeliverable>,
+}
+
+#[derive(Debug, Clone)]
 struct FactoryOperation {
     work_item_id: Uuid,
     actor_id: Uuid,
@@ -7884,6 +7891,19 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
     {
         return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
+    }
+    Ok(())
+}
+
+fn validate_factory_branch_ref(value: &str) -> Result<()> {
+    validate_factory_base_ref(value)?;
+    if value == "HEAD"
+        || value.contains("//")
+        || value
+            .split('/')
+            .any(|component| component.starts_with('.') || component.ends_with(".lock"))
+    {
+        return Err(anyhow!("publication branch is not a valid Git branch name"));
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 use crony_domain::{
     CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    PullRequestPublication, TaskSecretReference, VerificationPolicy,
+    PullRequestPublication, SourceDeliverable, TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -481,6 +481,13 @@ pub struct MaterializeFactoryMissionResponse {
     pub task_ids: Vec<Uuid>,
     pub strategy: String,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryPublicationContextResponse {
+    pub work_item: FactoryWorkItem,
+    pub publication: Option<PullRequestPublication>,
+    pub source_deliverables: Vec<SourceDeliverable>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

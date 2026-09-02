@@ -83,6 +83,12 @@ function snapshot(demo, actorId = demo.alice_actor_id) {
   )
 }
 
+function publicationContext(demo, workItemId, actorId = demo.alice_actor_id) {
+  return requestOk(
+    `/api/corps/${demo.corp_id}/factory/work-items/${workItemId}/publication-context?actor_id=${actorId}`,
+  )
+}
+
 async function waitForMission(demo, missionId, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -156,6 +162,11 @@ async function runPublisher(
     bodyFile,
     omitAuthorizationId = false,
     actorId = demo.alice_actor_id,
+    sourceDeliverableId,
+    publisherId = 'trusted-publication-e2e',
+    authorizationReason =
+      'Publication E2E authorizes review-only branch and pull request creation.',
+    leaseSeconds = 5,
   } = {},
 ) {
   const args = [
@@ -164,11 +175,11 @@ async function runPublisher(
     actorId,
     workItemId,
     '--authorization-reason',
-    'Publication E2E authorizes review-only branch and pull request creation.',
+    authorizationReason,
     '--publisher-id',
-    'trusted-publication-e2e',
+    publisherId,
     '--lease-seconds',
-    '5',
+    String(leaseSeconds),
     '--wait-seconds',
     '60',
     '--github-cli',
@@ -176,6 +187,9 @@ async function runPublisher(
   ]
   if (!omitAuthorizationId) {
     args.push('--authorization-id', authorizationId)
+  }
+  if (sourceDeliverableId) {
+    args.push('--source-deliverable-id', sourceDeliverableId)
   }
   if (idempotencyKey) args.push('--idempotency-key', idempotencyKey)
   if (branch) args.push('--branch', branch)
@@ -337,14 +351,288 @@ async function psqlInvocation() {
       'psql is unavailable and ECORP_TEST_POSTGRES_CONTAINER was not provided',
     )
   }
+  const parsedDatabaseUrl = new URL(databaseUrl)
+  const databaseName = decodeURIComponent(
+    parsedDatabaseUrl.pathname.replace(/^\/+/, ''),
+  )
+  const databaseUser = decodeURIComponent(parsedDatabaseUrl.username || 'crony')
+  if (!databaseName) {
+    throw new Error('DATABASE_URL omitted its PostgreSQL database name')
+  }
   return {
     command: 'docker',
-    args: ['exec', '-i', container, 'psql', '-U', 'crony', '-d', 'crony'],
+    args: [
+      'exec',
+      '-i',
+      container,
+      'psql',
+      '-U',
+      databaseUser,
+      '-d',
+      databaseName,
+    ],
   }
 }
 
 function sqlLiteral(value) {
   return `'${String(value).replaceAll("'", "''")}'`
+}
+
+async function seedNewerPublicationContextRows(
+  workItem,
+  source,
+  count = 501,
+) {
+  const seed = `publication-context-${nonce}`
+  const missionPrefix = `${seed}:mission:`
+  const taskPrefix = `${seed}:task:`
+  const runPrefix = `${seed}:run:`
+  const assignmentPrefix = `${seed}:assignment:`
+  const artifactPrefix = `${seed}:artifact:`
+  const deliverablePrefix = `${seed}:deliverable:`
+  const workItemPrefix = `${seed}:work-item:`
+  const claimPrefix = `${seed}:claim:`
+  await psql(`
+    BEGIN;
+
+    WITH template AS (
+      SELECT * FROM missions WHERE id = ${sqlLiteral(workItem.mission_id)}::uuid
+    )
+    INSERT INTO missions
+    SELECT (
+      jsonb_populate_record(
+        NULL::missions,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(missionPrefix)} || generated.sequence::text)::uuid,
+          'title', 'Publication context history ' || generated.sequence::text,
+          'status', 'completed',
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'updated_at', clock_timestamp() + generated.sequence * interval '1 millisecond'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    WITH template AS (
+      SELECT * FROM tasks WHERE id = ${sqlLiteral(source.task_id)}::uuid
+    )
+    INSERT INTO tasks
+    SELECT (
+      jsonb_populate_record(
+        NULL::tasks,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
+          'mission_id', md5(${sqlLiteral(missionPrefix)} || generated.sequence::text)::uuid,
+          'plan_key', 'publication-context-' || generated.sequence::text,
+          'title', 'Publication context task ' || generated.sequence::text,
+          'status', 'completed',
+          'verification_status', 'passed',
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'updated_at', clock_timestamp() + generated.sequence * interval '1 millisecond'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    WITH template AS (
+      SELECT * FROM runs WHERE id = ${sqlLiteral(source.run_id)}::uuid
+    )
+    INSERT INTO runs
+    SELECT (
+      jsonb_populate_record(
+        NULL::runs,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
+          'task_id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
+          'assignment_token', md5(${sqlLiteral(assignmentPrefix)} || generated.sequence::text)::uuid,
+          'workspace_run_id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
+          'resumed_from_run_id', NULL,
+          'provider_session_id', NULL,
+          'artifact_id', NULL,
+          'artifact_path', NULL,
+          'artifact_uri', NULL,
+          'artifact_media_type', NULL,
+          'artifact_signature', NULL,
+          'input_tokens', 0,
+          'output_tokens', 0,
+          'cost_microusd', 0,
+          'status', 'completed',
+          'verification_status', 'passed',
+          'breaker_stage', 'healthy',
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'updated_at', clock_timestamp() + generated.sequence * interval '1 millisecond'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    WITH template AS (
+      SELECT * FROM artifacts WHERE id = ${sqlLiteral(source.artifact_id)}::uuid
+    )
+    INSERT INTO artifacts
+    SELECT (
+      jsonb_populate_record(
+        NULL::artifacts,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(artifactPrefix)} || generated.sequence::text)::uuid,
+          'task_id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
+          'run_id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
+          'object_key', ${sqlLiteral(`${seed}/artifact/`)} || generated.sequence::text,
+          'uri', ${sqlLiteral(`memory://${seed}/artifact/`)} || generated.sequence::text,
+          'status', 'ready',
+          'staging_key', NULL,
+          'rejection_reason', NULL,
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'finalized_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'retention_until', clock_timestamp() + interval '30 days'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    UPDATE runs
+    SET artifact_id = md5(${sqlLiteral(artifactPrefix)} || generated.sequence::text)::uuid
+    FROM generate_series(1, ${count}) AS generated(sequence)
+    WHERE runs.id = md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid;
+
+    WITH template AS (
+      SELECT * FROM source_deliverables WHERE id = ${sqlLiteral(source.id)}::uuid
+    )
+    INSERT INTO source_deliverables
+    SELECT (
+      jsonb_populate_record(
+        NULL::source_deliverables,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(deliverablePrefix)} || generated.sequence::text)::uuid,
+          'task_id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
+          'run_id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
+          'artifact_id', md5(${sqlLiteral(artifactPrefix)} || generated.sequence::text)::uuid,
+          'branch', 'ecorp/publication-context-' || generated.sequence::text,
+          'integration_state', 'ready_for_review',
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    WITH template AS (
+      SELECT * FROM factory_work_items WHERE id = ${sqlLiteral(workItem.id)}::uuid
+    )
+    INSERT INTO factory_work_items
+    SELECT (
+      jsonb_populate_record(
+        NULL::factory_work_items,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(workItemPrefix)} || generated.sequence::text)::uuid,
+          'source_project_item_id', 'PVTI_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
+          'source_issue_number', 50000 + generated.sequence,
+          'source_issue_node_id', 'I_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
+          'source_issue_url', 'https://github.com/shyamsridhar123/ecorp/issues/' || (50000 + generated.sequence)::text,
+          'source_title', 'Publication context history ' || generated.sequence::text,
+          'source_revision', (clock_timestamp() + generated.sequence * interval '1 millisecond')::text,
+          'state', 'verified',
+          'version', 1,
+          'claim_token', md5(${sqlLiteral(claimPrefix)} || generated.sequence::text)::uuid,
+          'lease_expires_at', clock_timestamp() + interval '1 day',
+          'mission_id', md5(${sqlLiteral(missionPrefix)} || generated.sequence::text)::uuid,
+          'failure_detail', NULL,
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'updated_at', clock_timestamp() + generated.sequence * interval '1 millisecond'
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    COMMIT;
+  `)
+  return { count, seed }
+}
+
+async function seedNewerPublications(publication, seed, count = 501) {
+  const missionPrefix = `${seed}:mission:`
+  const taskPrefix = `${seed}:task:`
+  const runPrefix = `${seed}:run:`
+  const artifactPrefix = `${seed}:artifact:`
+  const deliverablePrefix = `${seed}:deliverable:`
+  const workItemPrefix = `${seed}:work-item:`
+  const publicationPrefix = `${seed}:publication:`
+  const authorizationPrefix = `${seed}:authorization:`
+  await psql(`
+    BEGIN;
+
+    WITH template AS (
+      SELECT * FROM pull_request_publications
+      WHERE id = ${sqlLiteral(publication.id)}::uuid
+    )
+    INSERT INTO pull_request_publications
+    SELECT (
+      jsonb_populate_record(
+        NULL::pull_request_publications,
+        to_jsonb(template) || jsonb_build_object(
+          'id', md5(${sqlLiteral(publicationPrefix)} || generated.sequence::text)::uuid,
+          'factory_work_item_id', md5(${sqlLiteral(workItemPrefix)} || generated.sequence::text)::uuid,
+          'mission_id', md5(${sqlLiteral(missionPrefix)} || generated.sequence::text)::uuid,
+          'source_deliverable_id', md5(${sqlLiteral(deliverablePrefix)} || generated.sequence::text)::uuid,
+          'artifact_id', md5(${sqlLiteral(artifactPrefix)} || generated.sequence::text)::uuid,
+          'task_id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
+          'run_id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
+          'source_issue_number', 50000 + generated.sequence,
+          'source_issue_url', 'https://github.com/shyamsridhar123/ecorp/issues/' || (50000 + generated.sequence)::text,
+          'branch', 'ecorp/publication-history-' || generated.sequence::text || '-${nonce}',
+          'authorization_id', md5(${sqlLiteral(authorizationPrefix)} || generated.sequence::text)::uuid,
+          'effect_key', 'publication-context-effect-' || generated.sequence::text || '-${nonce}',
+          'idempotency_key', 'publication-context-start-' || generated.sequence::text || '-${nonce}',
+          'state', 'published',
+          'version', 5,
+          'attempt_count', 1,
+          'publisher_id', NULL,
+          'publisher_token', NULL,
+          'publisher_lease_expires_at', NULL,
+          'failure_detail', NULL,
+          'branch_pushed_at', clock_timestamp(),
+          'pull_request_number', 50000 + generated.sequence,
+          'pull_request_node_id', 'PR_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
+          'pull_request_url', 'https://github.com/shyamsridhar123/ecorp/pull/' || (50000 + generated.sequence)::text,
+          'pull_request_state', 'OPEN',
+          'pull_request_draft', false,
+          'project_item_id', 'PVTI_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
+          'project_status_after', 'In Review',
+          'project_status_updated_at', clock_timestamp(),
+          'auto_merge_enabled', false,
+          'merge_authorized', false,
+          'deployment_authorized', false,
+          'created_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'updated_at', clock_timestamp() + generated.sequence * interval '1 millisecond',
+          'provenance', template.provenance || jsonb_build_object(
+            'factory_work_item_id', md5(${sqlLiteral(workItemPrefix)} || generated.sequence::text)::uuid,
+            'mission_id', md5(${sqlLiteral(missionPrefix)} || generated.sequence::text)::uuid
+          )
+        )
+      )
+    ).*
+    FROM template
+    CROSS JOIN generate_series(1, ${count}) AS generated(sequence);
+
+    UPDATE factory_work_items
+    SET state = 'published', updated_at = clock_timestamp()
+    FROM generate_series(1, ${count}) AS generated(sequence)
+    WHERE factory_work_items.id =
+      md5(${sqlLiteral(workItemPrefix)} || generated.sequence::text)::uuid;
+
+    UPDATE source_deliverables
+    SET integration_state = 'published'
+    FROM generate_series(1, ${count}) AS generated(sequence)
+    WHERE source_deliverables.id =
+      md5(${sqlLiteral(deliverablePrefix)} || generated.sequence::text)::uuid;
+
+    COMMIT;
+  `)
 }
 
 async function setFakeState(patch) {
@@ -591,6 +879,17 @@ const collisionSource = collisionSnapshot.snapshot.source_deliverables.find(
     deliverable.integration_state === 'ready_for_review',
 )
 assert.ok(collisionSource)
+for (const invalidBranch of ['ecorp/foo//bar', 'ecorp/foo.lock']) {
+  await runPublisher(demo, collisionWorkItem.id, {
+    branch: invalidBranch,
+    sourceDeliverableId: collisionSource.id,
+    expectFailure: /not a valid Git branch name/,
+  })
+}
+assert.equal(
+  (await publicationContext(demo, collisionWorkItem.id)).publication,
+  null,
+)
 await psql(
   `UPDATE factory_work_items SET policy = jsonb_set(policy, '{publication,branch_prefix}', '\"main\"'::jsonb) WHERE id = ${sqlLiteral(collisionWorkItem.id)}::uuid;`,
 )
@@ -637,6 +936,9 @@ await runPublisher(demo, collisionWorkItem.id, {
   branch: collisionRecoveryBranch,
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  publisherId: 'trusted-publication-host-a',
+  authorizationReason: 'Host A authorizes the first recoverable publication attempt.',
+  leaseSeconds: 5,
   crashAfter: 'after_start',
   expectCrash: true,
 })
@@ -646,6 +948,9 @@ await runPublisher(demo, collisionWorkItem.id, {
   branch: collisionRecoveryBranch,
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  publisherId: 'trusted-publication-host-b',
+  authorizationReason: 'Host B authorizes recovery after the first publisher stopped.',
+  leaseSeconds: 7,
   crashAfter: 'after_start',
   expectCrash: true,
 })
@@ -664,6 +969,8 @@ const collisionPublication = (await snapshot(demo)).snapshot.pull_request_public
   (publication) => publication.factory_work_item_id === collisionWorkItem.id,
 )
 assert.equal(collisionPublication.branch, collisionRecoveryBranch)
+assert.equal(collisionPublication.publisher_id, 'trusted-publication-host-b')
+assert.equal(collisionPublication.attempt_count, 2)
 assert.equal(
   collisionFakeState.items.find(
     (item) => item.id === collisionWorkItem.source_project_item_id,
@@ -701,6 +1008,63 @@ const source = verifiedSnapshot.snapshot.source_deliverables.find(
 )
 assert.ok(source)
 assert.ok(source.head_commit)
+const contextSeed = await seedNewerPublicationContextRows(
+  workItem,
+  source,
+)
+const boundedPublicationSnapshot = await snapshot(demo)
+assert.equal(
+  boundedPublicationSnapshot.snapshot.factory_work_items.some(
+    (item) => item.id === workItem.id,
+  ),
+  false,
+)
+assert.equal(
+  boundedPublicationSnapshot.snapshot.source_deliverables.some(
+    (item) => item.id === source.id,
+  ),
+  false,
+)
+const exactPublicationContext = await publicationContext(demo, workItem.id)
+assert.equal(exactPublicationContext.work_item.id, workItem.id)
+assert.equal(exactPublicationContext.publication, null)
+assert.equal(
+  exactPublicationContext.source_deliverables.some(
+    (deliverable) => deliverable.id === source.id,
+  ),
+  true,
+)
+const guestPublicationContext = await fetch(
+  `${server}/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication-context?actor_id=${demo.eve_actor_id}`,
+)
+const guestPublicationContextBody = await guestPublicationContext.text()
+assert.equal(guestPublicationContext.status, 403)
+assert.equal(guestPublicationContextBody.includes(workItem.id), false)
+assert.equal(guestPublicationContextBody.includes(source.id), false)
+
+const prePublicationFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+const projectItemListCallsBeforePublication =
+  prePublicationFakeState.item_list_calls ?? 0
+const projectItems = prePublicationFakeState.items
+const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
+  id: `PVTI_PUBLICATION_FILLER_${String(index).padStart(4, '0')}_${nonce}`,
+  status: 'Done',
+  content: {
+    body: '',
+    number: 60000 + index,
+    repository: 'shyamsridhar123/ecorp',
+    title: `Publication filler ${index}`,
+    type: 'Issue',
+    url: `https://github.com/shyamsridhar123/ecorp/issues/${60000 + index}`,
+  },
+}))
+const expandedProjectItems = [...projectFillers, ...projectItems]
+assert.ok(
+  expandedProjectItems.findIndex(
+    (item) => item.id === workItem.source_project_item_id,
+  ) >= 1000,
+)
+await setFakeState({ items: expandedProjectItems })
 const branch = `ecorp/issue-${issueNumber}-${source.head_commit.slice(0, 12)}`
 const body = `## ECorp verified factory deliverable
 
@@ -1110,27 +1474,21 @@ assert.equal(concurrent[1].publication.pull_request_number, 41)
 assert.equal(concurrent[0].publication.id, concurrent[1].publication.id)
 
 const finalSnapshot = await snapshot(demo)
-const publication = finalSnapshot.snapshot.pull_request_publications.find(
-  (item) => item.factory_work_item_id === workItem.id,
-)
-  assert.equal(publication.state, 'published')
-  assert.equal(publication.pull_request_number, 41)
-  assert.equal(publication.pull_request_url, authorizedPullRequest.url)
-  assert.equal(publication.pull_request_head_sha, source.head_commit)
-  assert.equal(publication.pull_request_head_repository_owner, 'shyamsridhar123')
-  assert.equal(publication.pull_request_is_cross_repository, false)
+const finalPublicationContext = await publicationContext(demo, workItem.id)
+const publication = finalPublicationContext.publication
+assert.equal(publication.state, 'published')
+assert.equal(publication.pull_request_number, 41)
+assert.equal(publication.pull_request_url, authorizedPullRequest.url)
+assert.equal(publication.pull_request_head_sha, source.head_commit)
+assert.equal(publication.pull_request_head_repository_owner, 'shyamsridhar123')
+assert.equal(publication.pull_request_is_cross_repository, false)
 assert.equal(publication.project_status_after, 'In Review')
 assert.equal(publication.auto_merge_enabled, false)
 assert.equal(publication.merge_authorized, false)
 assert.equal(publication.deployment_authorized, false)
+assert.equal(finalPublicationContext.work_item.state, 'published')
 assert.equal(
-  finalSnapshot.snapshot.factory_work_items.find(
-    (item) => item.id === workItem.id,
-  ).state,
-  'published',
-)
-assert.equal(
-  finalSnapshot.snapshot.source_deliverables.find(
+  finalPublicationContext.source_deliverables.find(
     (item) => item.id === source.id,
   ).integration_state,
   'published',
@@ -1157,6 +1515,11 @@ assert.equal(
   1,
 )
 assert.equal(fakeState.pr_create_calls, 1)
+assert.equal(
+  fakeState.item_list_calls ?? 0,
+  projectItemListCallsBeforePublication,
+)
+assert.ok((fakeState.project_item_lookup_calls ?? 0) > 0)
 const reviewEffectIndex = fakeState.effect_log.findIndex(
   (effect) => effect.kind === 'project_status' && effect.status === 'In Review',
 )
@@ -1192,6 +1555,21 @@ assert.deepEqual(remoteBranches, [
 
 const pullRequestCreatesBeforePublishedRetry = fakeState.pr_create_calls
 const itemEditsBeforePublishedRetry = fakeState.item_edits
+await seedNewerPublications(
+  publication,
+  contextSeed.seed,
+  contextSeed.count,
+)
+const boundedPublishedSnapshot = await snapshot(demo)
+assert.equal(
+  boundedPublishedSnapshot.snapshot.pull_request_publications.some(
+    (item) => item.id === publication.id,
+  ),
+  false,
+)
+const exactPublishedContext = await publicationContext(demo, workItem.id)
+assert.equal(exactPublishedContext.publication.id, publication.id)
+assert.equal(exactPublishedContext.publication.state, 'published')
 await execFile(
   'git',
   [
@@ -1204,7 +1582,10 @@ await execFile(
   { cwd: root, windowsHide: true },
 )
 const publishedRetry = await runPublisher(demo, workItem.id, {
-  idempotencyKey: `${effectKey}:published-retry-after-base-move`,
+  publisherId: 'trusted-publication-host-c',
+  authorizationReason:
+    'Host C verifies published recovery after context pagination and base movement.',
+  leaseSeconds: 9,
 })
 assert.equal(publishedRetry.publication.id, publication.id)
 assert.equal(publishedRetry.publication.state, 'published')
@@ -1245,11 +1626,22 @@ assert.ok(
 const report = {
   checked_at: new Date().toISOString(),
   base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
+  invalid_git_branches_rejected_before_start: true,
   implicit_authorization_retry_stable: true,
+  cross_publisher_default_start_recovery:
+    collisionPublication.publisher_id === 'trusted-publication-host-b' &&
+    collisionPublication.attempt_count === 2,
   body_file_crlf_normalized: true,
   implicit_authorization_restart_pid: collisionRestartedServerPid,
   actor_handoff_authorization_distinct: true,
   published_retry_after_base_move: true,
+  exact_publication_context_lookup: true,
+  bounded_snapshot_work_item_and_deliverable_absent: true,
+  published_retry_outside_bounded_snapshot: true,
+  exact_project_item_lookup:
+    (fakeState.project_item_lookup_calls ?? 0) > 0 &&
+    (fakeState.item_list_calls ?? 0) === projectItemListCallsBeforePublication,
+  project_item_count_during_publication: expandedProjectItems.length,
   unauthorized_pr_content_rejected: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,

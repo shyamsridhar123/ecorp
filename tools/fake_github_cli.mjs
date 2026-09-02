@@ -14,6 +14,18 @@ function option(name) {
   return index >= 0 ? args[index + 1] : undefined
 }
 
+function formValue(name) {
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (
+      (args[index] === '-F' || args[index] === '-f') &&
+      args[index + 1].startsWith(`${name}=`)
+    ) {
+      return args[index + 1].slice(name.length + 1)
+    }
+  }
+  return undefined
+}
+
 function fail(message) {
   console.error(message)
   process.exit(1)
@@ -34,7 +46,52 @@ function assertPublisherCredential() {
   }
 }
 
-if (args[0] === 'project' && args[1] === 'item-list') {
+if (args[0] === 'api' && args[1] === 'graphql') {
+  assertPublisherCredential()
+  const itemId = formValue('id')
+  if (!itemId) {
+    fail('exact Project item lookup omitted its node id')
+  }
+  const item = state.items.find((candidate) => candidate.id === itemId)
+  const status = item
+    ? state.project.status_options.find(
+        (candidate) => candidate.name === item.status,
+      )
+    : undefined
+  state.project_item_lookup_calls = (state.project_item_lookup_calls ?? 0) + 1
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  console.log(
+    JSON.stringify({
+      data: {
+        node: item
+          ? {
+              __typename: 'ProjectV2Item',
+              id: item.id,
+              project: {
+                id: state.project.id,
+                number: state.project.number,
+                owner: {
+                  __typename: 'Organization',
+                  login: state.project.owner,
+                },
+              },
+              fieldValueByName: status
+                ? {
+                    __typename: 'ProjectV2ItemFieldSingleSelectValue',
+                    name: status.name,
+                    optionId: status.id,
+                    field: {
+                      id: state.project.status_field_id,
+                      name: 'Status',
+                    },
+                  }
+                : null,
+            }
+          : null,
+      },
+    }),
+  )
+} else if (args[0] === 'project' && args[1] === 'item-list') {
   assertProject()
   state.item_list_calls = (state.item_list_calls ?? 0) + 1
   const mutation = state.item_list_mutation
@@ -51,9 +108,10 @@ if (args[0] === 'project' && args[1] === 'item-list') {
     state.item_list_mutation = null
   }
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  const requestedLimit = Number(option('--limit') ?? state.items.length)
   console.log(
     JSON.stringify({
-      items: state.items,
+      items: state.items.slice(0, requestedLimit),
       totalCount: state.items.length,
     }),
   )
