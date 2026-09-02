@@ -86,3 +86,46 @@ secret-like path rejection, scoped commit behavior, and preservation of unrelate
 
 Only issue-scoped processes and infrastructure were stopped. Ports `55433`, `8891`, and `5287`
 were confirmed free, and container `ecorp-issue53-pg` was confirmed absent.
+
+## Dependency integration rerun — September 2, 2026
+
+PR #71 integrated PR #70 head `797bdea1b5a0f46c47585b5ecf0d5dc74379af0c` at merge commit
+`7e26948`. Migration validation still reported 23 immutable migrations with portable deliverables
+at version 23. The four focused `crony-runner` deliverable tests passed.
+
+The complete isolated path then passed again with PostgreSQL on `55433`, server `8891`, runner
+`runner-issue53-integration`, and Vite on `5287`:
+
+- `tools/e2e_portable_deliverables.mjs`
+  - archive run `4ff724c4-774a-47be-9615-19c906127ce8`
+  - archive artifact `3a0bd962-9d73-46ea-abfb-98e2ca9132fe`
+  - archive SHA-256 `d69592ca4cad82446f3b399ad5626cf645535168fa24bdb13c8527efcbb9d70e`
+  - commit run `256807d8-7fed-424e-b71b-905970478953`
+  - commit artifact `7cfa764c-707b-49df-89b2-4dacd0ad0b8e`
+  - isolated commit `06f15822dab4cc7368c43be33cc95b20675f7362`
+  - reclaimed run `54fb99f5-fdb8-482e-8a23-5368398df445`
+  - retained-before-cleanup ordering remained true
+  - unauthorized download remained HTTP `404`
+- `tools/e2e_artifacts.mjs`
+  - provider artifact run `50a52c39-fb9f-40c5-8104-04bb2bf65410`
+  - provider artifact `273b5896-9e6b-4d8f-84ad-6fd1ee41d898`
+  - runner-local path exposure remained false
+
+Real Chromium loaded the integrated UI with zero console or page errors. Each of the three
+completed mission cards rendered provider evidence, verification linkage, one source deliverable,
+one integration state, and the separate publication/merge authorization boundary. Desktop width
+had `scrollWidth == clientWidth == 1265`; the responsive check had
+`scrollWidth == clientWidth == 390`.
+
+Screenshots:
+
+- `output/playwright/issue53-integration-desktop.png`
+- `output/playwright/issue53-integration-mobile.png`
+
+Cleanup stopped only the verified process tree rooted in this worktree. Ports `55433`, `8891`, and
+`5287` were closed, and container `ecorp-issue53-integration-live` was absent.
+
+The hosted CI run triggered by this dependency refresh was rejected before any step executed
+because the GitHub account has a payment or Actions spending-limit block. Landing remains paused
+until hosted CI can actually run; this is recorded as an external infrastructure failure rather
+than a passing or failing code gate.
