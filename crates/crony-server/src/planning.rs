@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Component, Path},
     sync::Arc,
 };
 
@@ -8,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use crony_domain::{
     Agent, AgentStatus, DeliverableSpec, ManualVerificationGate, PlannedTask, TaskContract,
     TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
+    repository_relative_path_is_valid, write_scope_is_valid,
 };
 
 pub const MAX_GRAPH_NODES: usize = 8;
@@ -420,6 +420,7 @@ fn verification_plan(
     );
     task_contract.budget_cost_microusd = budget_cost_microusd;
     task_contract.normalize_for_adapter(&agent.adapter);
+    task_contract.deliverable = request.deliverable.cloned();
     Ok(TaskGraphPlan {
         strategy: strategy.to_owned(),
         max_nodes: 1,
@@ -676,6 +677,15 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
             ));
         }
     }
+    if let Some(scope) = contract
+        .write_scope
+        .iter()
+        .find(|scope| !write_scope_is_valid(scope))
+    {
+        return Err(anyhow!(
+            "task {task_key} contains invalid write scope {scope}"
+        ));
+    }
     let mut environment_names = HashSet::new();
     for secret in &contract.secret_refs {
         if secret.env_name.is_empty()
@@ -717,7 +727,11 @@ fn validate_deliverable(task_key: &str, deliverable: &DeliverableSpec) -> Result
         ));
     }
     for path in &deliverable.paths {
-        validate_relative_path(task_key, path)?;
+        if !repository_relative_path_is_valid(path) {
+            return Err(anyhow!(
+                "task {task_key} deliverable path must be a literal repository-relative path"
+            ));
+        }
     }
     Ok(())
 }
@@ -847,14 +861,7 @@ fn validate_verification_policy(task_key: &str, policy: &VerificationPolicy) -> 
 }
 
 fn validate_relative_path(task_key: &str, value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 500
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !repository_relative_path_is_valid(value) {
         return Err(anyhow!(
             "task {task_key} verifier path must stay inside the worktree"
         ));
@@ -1125,6 +1132,33 @@ mod tests {
                 )
                 .is_err()
         );
+
+        let magic_requested = DeliverableSpec {
+            paths: vec![":(exclude)secret.txt".to_owned()],
+            ..DeliverableSpec::default()
+        };
+        assert!(
+            registry
+                .plan(
+                    "single",
+                    &PlanningRequest {
+                        mission_title: "reject Git pathspec magic",
+                        preferred_adapter: Some("fake-process"),
+                        preferred_model: None,
+                        reasoning_effort: None,
+                        secret_refs: &[],
+                        budget_tokens: None,
+                        budget_cost_microusd: None,
+                        deliverable: Some(&magic_requested),
+                    },
+                    &agents,
+                )
+                .is_err()
+        );
+
+        let mut invalid_scope_plan = plan;
+        invalid_scope_plan.tasks[0].contract.write_scope = vec!["src/*.rs".to_owned()];
+        assert!(validate_plan(&invalid_scope_plan, &agents).is_err());
     }
 
     #[test]

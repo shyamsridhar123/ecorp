@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::Args;
+use crony_domain::write_scope_is_valid;
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -455,7 +456,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "deliverable": {
                 "form": "commit_branch",
                 "commit_after_verification": true,
-                "paths": []
+                "paths": [],
             },
             "contract": {
                 "objective": issue_objective(&refreshed.issue),
@@ -812,7 +813,7 @@ fn validate_args(args: &FactoryArgs) -> Result<()> {
         || args
             .write_scope
             .iter()
-            .any(|scope| scope.trim().is_empty() || scope.len() > 500)
+            .any(|scope| !write_scope_is_valid(scope))
     {
         bail!("factory write scope is invalid");
     }

@@ -9,7 +9,7 @@ use crony_domain::{
     PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
-    VerificationRequest,
+    VerificationRequest, write_scope_is_valid,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -8065,6 +8065,15 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
             validate_factory_publication_base_ref(&base_ref)?;
         }
     }
+    if policy_object.contains_key("write_scope")
+        && let Some(scope) = factory_policy_string_array(policy_object, "write_scope")?
+            .iter()
+            .find(|scope| !write_scope_is_valid(scope))
+    {
+        return Err(anyhow!(
+            "factory policy contains invalid write scope {scope}"
+        ));
+    }
     let upgrade_required = match policy_object.get("source_commit_upgrade_required") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -9935,6 +9944,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("safe Git ref")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "write_scope": ["src/*.rs"]
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid write scope")
         );
     }
 

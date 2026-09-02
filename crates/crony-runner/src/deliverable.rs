@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use crony_domain::{DeliverableForm, DeliverableSpec};
+use crony_domain::{
+    DeliverableForm, DeliverableSpec, repository_relative_path_is_valid, write_scope_allows_path,
+    write_scope_is_valid,
+};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -550,14 +553,7 @@ async fn commit_index(
 }
 
 fn validate_relative(value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 500
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !repository_relative_path_is_valid(value) {
         return Err(anyhow!("deliverable path must stay inside the worktree"));
     }
     Ok(())
@@ -570,7 +566,11 @@ fn reject_out_of_scope_changes(changes: &[(String, String)], write_scope: &[Stri
         ));
     }
     for scope in write_scope {
-        validate_write_scope(scope)?;
+        if !write_scope_is_valid(scope) {
+            return Err(anyhow!(
+                "task write scope must be an exact relative path or end in /**"
+            ));
+        }
     }
     for (_, path) in changes {
         if !write_scope
@@ -583,42 +583,6 @@ fn reject_out_of_scope_changes(changes: &[(String, String)], write_scope: &[Stri
         }
     }
     Ok(())
-}
-
-fn validate_write_scope(scope: &str) -> Result<()> {
-    if scope == "**" {
-        return Ok(());
-    }
-    let path = scope.strip_suffix("/**").unwrap_or(scope);
-    if path.is_empty()
-        || scope.starts_with('/')
-        || scope.starts_with('\\')
-        || scope.contains('\\')
-        || scope.contains(':')
-        || scope.contains("//")
-        || path.contains('*')
-        || path
-            .split('/')
-            .any(|component| component.is_empty() || matches!(component, "." | ".."))
-    {
-        return Err(anyhow!(
-            "task write scope must be an exact relative path or end in /**"
-        ));
-    }
-    validate_relative(path)
-}
-
-fn write_scope_allows_path(scope: &str, path: &str) -> bool {
-    if scope == "**" || scope == path {
-        return true;
-    }
-    let Some(prefix) = scope.strip_suffix("/**") else {
-        return false;
-    };
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn portable_path(path: &Path) -> Result<String> {
@@ -643,7 +607,16 @@ fn sensitive_path(path: &str) -> bool {
     components.iter().any(|component| {
         matches!(
             *component,
-            ".git" | ".codex" | ".claude" | ".ssh" | ".aws" | ".azure"
+            ".git"
+                | ".codex"
+                | ".claude"
+                | ".ssh"
+                | ".aws"
+                | ".azure"
+                | ".kube"
+                | ".docker"
+                | ".gnupg"
+                | ".password-store"
         )
     }) || components
         .windows(2)
@@ -708,6 +681,7 @@ async fn git_text_with_env(
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -732,6 +706,7 @@ async fn git_output(workspace: &Path, index: &Path, args: &[OsString]) -> Result
         .args(args)
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -918,7 +893,34 @@ mod tests {
         ));
         assert!(sensitive_path("packages/web/.azure/accessTokens.json"));
         assert!(sensitive_path("nested/.ssh/id_ed25519"));
+        assert!(sensitive_path("services/api/.kube/config"));
+        assert!(sensitive_path("nested/.docker/config.json"));
         assert!(!sensitive_path("docs/azure/accessTokens.json"));
+    }
+
+    #[tokio::test]
+    async fn git_pathspec_magic_is_rejected_before_staging() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"selected\n").expect("modify selected path");
+        fs::write(root.join("other.txt"), b"must remain unselected\n")
+            .expect("modify unselected path");
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::Archive,
+                commit_after_verification: false,
+                paths: vec![":(exclude)tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect_err("Git pathspec magic must fail");
+        assert!(error.to_string().contains("stay inside the worktree"));
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]

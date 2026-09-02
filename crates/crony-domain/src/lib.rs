@@ -338,6 +338,45 @@ pub struct DeliverableSpec {
     pub paths: Vec<String>,
 }
 
+pub fn repository_relative_path_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 500
+        && value == value.trim()
+        && !value.starts_with('/')
+        && !value.starts_with('\\')
+        && !value.contains('\\')
+        && !value.contains(':')
+        && !value.contains("//")
+        && !value.chars().any(char::is_control)
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
+pub fn write_scope_is_valid(value: &str) -> bool {
+    if value == "**" {
+        return true;
+    }
+    let path = value.strip_suffix("/**").unwrap_or(value);
+    repository_relative_path_is_valid(path)
+        && !path
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+}
+
+pub fn write_scope_allows_path(scope: &str, path: &str) -> bool {
+    if scope == "**" || scope == path {
+        return true;
+    }
+    let Some(prefix) = scope.strip_suffix("/**") else {
+        return false;
+    };
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSecretReference {
     pub secret_id: Uuid,
@@ -823,5 +862,26 @@ mod tests {
                 .expect("serialize publication state"),
             "\"pull_request_created\""
         );
+    }
+
+    #[test]
+    fn portable_paths_and_write_scopes_have_one_shared_grammar() {
+        assert!(repository_relative_path_is_valid("src/main.rs"));
+        assert!(repository_relative_path_is_valid(
+            "folder with spaces/file.txt"
+        ));
+        assert!(!repository_relative_path_is_valid("../escape"));
+        assert!(!repository_relative_path_is_valid(":(exclude)secret.txt"));
+        assert!(!repository_relative_path_is_valid("C:/outside.txt"));
+        assert!(!repository_relative_path_is_valid("src\\outside.txt"));
+
+        assert!(write_scope_is_valid("**"));
+        assert!(write_scope_is_valid("src/**"));
+        assert!(write_scope_is_valid("README.md"));
+        assert!(!write_scope_is_valid("src/*.rs"));
+        assert!(!write_scope_is_valid("src/[ab].rs"));
+        assert!(!write_scope_is_valid("src/../secret/**"));
+        assert!(write_scope_allows_path("src/**", "src/lib.rs"));
+        assert!(!write_scope_allows_path("src/**", "src2/lib.rs"));
     }
 }
