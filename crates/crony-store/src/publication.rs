@@ -1374,7 +1374,13 @@ async fn validate_publication_prerequisites(
             "publication target repository must match the claimed source repository"
         ));
     }
-    let expected_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    let expected_base_ref = publication_policy
+        .get("base_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 240)
+        .context("publication policy omitted base_ref")?
+        .to_owned();
+    validate_factory_base_ref(&expected_base_ref)?;
     if input.base_ref != expected_base_ref {
         return Err(anyhow!(
             "publication base ref {} does not match factory policy {}",

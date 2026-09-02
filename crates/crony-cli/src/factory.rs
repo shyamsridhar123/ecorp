@@ -47,6 +47,13 @@ pub struct FactoryArgs {
 
     #[arg(
         long,
+        env = "ECORP_FACTORY_PUBLICATION_BASE_REF",
+        default_value = "main"
+    )]
+    pub publication_base_ref: String,
+
+    #[arg(
+        long,
         env = "ECORP_FACTORY_SOURCE_REPOSITORY_PATH",
         default_value = "."
     )]
@@ -340,6 +347,16 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "budget_tokens": args.budget_tokens,
             "budget_cost_microusd": args.budget_cost_microusd,
             "auto_merge": false,
+            "publication": {
+                "allowed": true,
+                "repository_allowlist": [args.repository],
+                "base_ref": args.publication_base_ref,
+                "branch_prefix": "ecorp/",
+                "review_status": "In Review",
+                "auto_merge": false,
+                "merge": false,
+                "deploy": false
+            },
         })
     };
     let claim_generation = existing
@@ -360,6 +377,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_revision": refreshed.issue.updated_at,
         "source_base_ref": args.source_base_ref,
         "source_base_commit": source_base_commit,
+        "publication_base_ref": args.publication_base_ref,
         "idempotency_key": format!(
             "{stable_prefix}:claim:{}:{claim_generation}",
             args.actor_id
@@ -762,6 +780,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
     validate_source_base_ref(&args.source_base_ref)?;
+    validate_source_base_ref(&args.publication_base_ref)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
         bail!("GitHub Project owner is invalid");
     }
@@ -799,6 +818,7 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
         normalize_github_component(repository_name, "repository name")?
     );
     args.source_base_ref = args.source_base_ref.trim().to_owned();
+    args.publication_base_ref = args.publication_base_ref.trim().to_owned();
     args.adapter = args.adapter.trim().to_owned();
     args.strategy = args.strategy.trim().to_owned();
     args.allowed_adapters = args
@@ -1787,7 +1807,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn sanitize_failure_detail(value: &str) -> String {
+pub(crate) fn sanitize_failure_detail(value: &str) -> String {
     let normalized = value
         .chars()
         .map(|character| {
@@ -1807,7 +1827,7 @@ fn sanitize_failure_detail(value: &str) -> String {
     truncate_utf8(collapsed, 2_000)
 }
 
-fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
+pub(crate) fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
     let output = gh_output(github_cli, args)?;
     serde_json::from_slice(&output).with_context(|| {
         format!(
@@ -1818,11 +1838,11 @@ fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
     })
 }
 
-fn gh_run(github_cli: &Path, args: &[&str]) -> Result<()> {
+pub(crate) fn gh_run(github_cli: &Path, args: &[&str]) -> Result<()> {
     gh_output(github_cli, args).map(|_| ())
 }
 
-fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let prefix_args = env::var("ECORP_GITHUB_CLI_PREFIX_ARGS_JSON")
         .ok()
         .map(|value| {
@@ -1884,7 +1904,7 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(stdout)
 }
 
-fn source_git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn source_git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repository)
@@ -1970,7 +1990,7 @@ fn join_process_output(
         .with_context(|| format!("read {stream}"))
 }
 
-async fn server_json(
+pub(crate) async fn server_json(
     client: &Client,
     method: Method,
     url: String,

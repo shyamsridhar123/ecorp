@@ -451,6 +451,7 @@ name = "crony-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "crony-domain",
@@ -458,6 +459,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "url",
  "uuid",
