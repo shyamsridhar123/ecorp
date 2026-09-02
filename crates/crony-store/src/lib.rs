@@ -188,6 +188,8 @@ pub enum PullRequestPublicationCheckpointInput {
         url: String,
         state: String,
         draft: bool,
+        title: String,
+        body: String,
         head_ref: String,
         base_ref: String,
         head_sha: String,

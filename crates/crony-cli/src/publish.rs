@@ -129,6 +129,8 @@ struct PullRequestView {
     head_repository_owner: PullRequestRepositoryOwner,
     #[serde(rename = "isCrossRepository")]
     is_cross_repository: bool,
+    title: String,
+    body: String,
     #[serde(rename = "autoMergeRequest")]
     auto_merge_request: Option<Value>,
 }
@@ -483,6 +485,8 @@ async fn execute_publication(
                 "url": pull_request.url,
                 "state": pull_request.state,
                 "draft": pull_request.is_draft,
+                "title": pull_request.title,
+                "body": pull_request.body,
                 "head_ref": pull_request.head_ref_name,
                 "base_ref": pull_request.base_ref_name,
                 "head_sha": pull_request.head_ref_oid,
@@ -1062,7 +1066,7 @@ fn find_pull_request(
             "--limit",
             "100",
             "--json",
-            "number,id,url,state,isDraft,headRefName,baseRefName,headRefOid,headRepositoryOwner,isCrossRepository,autoMergeRequest",
+            "number,id,url,state,isDraft,title,body,headRefName,baseRefName,headRefOid,headRepositoryOwner,isCrossRepository,autoMergeRequest",
         ],
     )?;
     let pull_requests: Vec<PullRequestView> =
@@ -1102,6 +1106,8 @@ fn pull_request_matches_verified_head(
         && pull_request
             .head_ref_oid
             .eq_ignore_ascii_case(&plan.commit_sha)
+        && pull_request.title == plan.title
+        && pull_request.body == plan.body
 }
 
 fn ensure_remote_pull_request_matches(
@@ -1220,6 +1226,14 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         .filter(|task| value_uuid(task, "/mission_id").ok() == Some(mission_id))
         .filter_map(|task| value_uuid(task, "/id").ok())
         .collect::<Vec<_>>();
+    let persisted_deliverable_id = existing_publication
+        .and_then(|publication| publication.get("source_deliverable_id"))
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .context("persisted publication deliverable id is invalid")?;
+    let selected_deliverable_id =
+        publication_deliverable_selection(args.source_deliverable_id, persisted_deliverable_id)?;
     let deliverables = snapshot
         .pointer("/snapshot/source_deliverables")
         .and_then(Value::as_array)
@@ -1238,7 +1252,7 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
                 && deliverable.get("head_commit").is_some_and(Value::is_string)
         })
         .filter(|deliverable| {
-            args.source_deliverable_id
+            selected_deliverable_id
                 .is_none_or(|expected| value_uuid(deliverable, "/id").ok() == Some(expected))
         })
         .collect::<Vec<_>>();
@@ -1390,6 +1404,22 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
             .context("publication policy omitted review_status")?
             .to_owned(),
     })
+}
+
+fn publication_deliverable_selection(
+    requested: Option<Uuid>,
+    persisted: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    match (requested, persisted) {
+        (Some(requested), Some(persisted)) if requested != persisted => {
+            bail!(
+                "requested source deliverable does not match the persisted publication deliverable"
+            )
+        }
+        (Some(requested), _) => Ok(Some(requested)),
+        (None, Some(persisted)) => Ok(Some(persisted)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn published_publication_exists(snapshot: &Value, work_item_id: Uuid) -> bool {
@@ -1636,5 +1666,15 @@ mod tests {
             }),
             work_item_id
         ));
+        let persisted_deliverable = Uuid::new_v4();
+        assert_eq!(
+            publication_deliverable_selection(None, Some(persisted_deliverable))
+                .expect("persisted deliverable"),
+            Some(persisted_deliverable)
+        );
+        assert!(
+            publication_deliverable_selection(Some(Uuid::new_v4()), Some(persisted_deliverable))
+                .is_err()
+        );
     }
 }

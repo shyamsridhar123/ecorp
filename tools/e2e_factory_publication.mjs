@@ -958,6 +958,38 @@ await failPublicationAttempt(
   'Release the pull-request authority-revocation test attempt.',
 )
 
+const unauthorizedContentPullRequest = {
+  number: 8,
+  id: 'PR_FAKE_UNAUTHORIZED_CONTENT_8',
+  url: 'https://github.com/shyamsridhar123/ecorp/pull/8',
+  state: 'OPEN',
+  isDraft: false,
+  headRefName: branch,
+  baseRefName: resolvedPublicationBase,
+  headRefOid: source.head_commit,
+  headRepositoryOwner: { login: 'shyamsridhar123' },
+  isCrossRepository: false,
+  autoMergeRequest: null,
+  title: 'Unauthorized replacement title',
+  body: 'Unauthorized replacement body.',
+}
+await setFakeState({
+  pull_requests: [forkPullRequest, unauthorizedContentPullRequest],
+})
+await runPublisher(demo, workItem.id, {
+  expectFailure: /create GitHub pull request|already exists/,
+})
+publicationSnapshot = await publicationState(demo, workItem.id)
+assert.equal(publicationSnapshot.publication.state, 'branch_pushed')
+assert.equal(publicationSnapshot.publication.pull_request_number, null)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+await setFakeState({ pull_requests: [forkPullRequest] })
+
 await setFakeState({ fail_pr_create_after_success: true })
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_pull_request_checkpoint',
@@ -1218,6 +1250,7 @@ const report = {
   implicit_authorization_restart_pid: collisionRestartedServerPid,
   actor_handoff_authorization_distinct: true,
   published_retry_after_base_move: true,
+  unauthorized_pr_content_rejected: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
   source_deliverable_id: source.id,

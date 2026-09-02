@@ -814,6 +814,8 @@ impl PgStore {
                 url,
                 state,
                 draft,
+                title,
+                body,
                 head_ref,
                 base_ref,
                 head_sha,
@@ -827,6 +829,8 @@ impl PgStore {
                     &node_id,
                     &url,
                     &state,
+                    &title,
+                    &body,
                     &head_ref,
                     &base_ref,
                     &head_sha,
@@ -877,6 +881,8 @@ impl PgStore {
                         "url": url,
                         "state": state,
                         "draft": draft,
+                        "title": title,
+                        "body": body,
                         "base_ref": base_ref,
                         "head_sha": head_sha,
                         "head_repository_owner": head_repository_owner,
@@ -1784,6 +1790,8 @@ fn normalize_checkpoint(
             url,
             state,
             draft,
+            title,
+            body,
             head_ref,
             base_ref,
             head_sha,
@@ -1798,6 +1806,8 @@ fn normalize_checkpoint(
             let url = normalize_factory_text(&url, "pull request URL", 500)?;
             let state = normalize_factory_identifier(&state, "pull request state", 40)?
                 .to_ascii_uppercase();
+            let title = normalize_factory_text(&title, "pull request title", 256)?;
+            let body = normalize_publication_body(&body)?;
             let head_ref = normalize_factory_identifier(&head_ref, "pull request head ref", 500)?;
             let base_ref = normalize_factory_identifier(&base_ref, "pull request base ref", 500)?;
             validate_factory_base_ref(&base_ref)?;
@@ -1814,6 +1824,8 @@ fn normalize_checkpoint(
                 url: url.clone(),
                 state: state.clone(),
                 draft,
+                title: title.clone(),
+                body: body.clone(),
                 head_ref: head_ref.clone(),
                 base_ref: base_ref.clone(),
                 head_sha: head_sha.clone(),
@@ -1831,6 +1843,8 @@ fn normalize_checkpoint(
                     "url": url,
                     "state": state,
                     "draft": draft,
+                    "title": title,
+                    "body": body,
                     "head_ref": head_ref,
                     "base_ref": base_ref,
                     "head_sha": head_sha,
@@ -1893,6 +1907,8 @@ fn validate_pull_request_identity(
     _node_id: &str,
     url: &str,
     state: &str,
+    title: &str,
+    body: &str,
     head_ref: &str,
     base_ref: &str,
     head_sha: &str,
@@ -1908,6 +1924,11 @@ fn validate_pull_request_identity(
     if state != "OPEN" {
         return Err(anyhow!(
             "factory publication requires an open pull request, not {state}"
+        ));
+    }
+    if title != publication.title || body != publication.body {
+        return Err(anyhow!(
+            "pull request title or body does not match the authorized publication content"
         ));
     }
     if head_ref != publication.branch {
