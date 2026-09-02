@@ -224,17 +224,6 @@ impl EvaluatedItem {
 pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
     normalize_args(&mut args)?;
     validate_args(&args)?;
-    let snapshot = server_json(
-        client,
-        Method::GET,
-        format!(
-            "{server}/api/corps/{}/snapshot?actor_id={}",
-            args.corp_id, args.actor_id
-        ),
-        None,
-    )
-    .await?;
-    let existing = existing_factory_items(&snapshot)?;
     let project_items = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project_items.items.len() < project_items.total_count {
         bail!(
@@ -243,6 +232,13 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             project_items.total_count
         );
     }
+    let candidate_ids = project_items
+        .items
+        .iter()
+        .filter(|item| project_item_is_candidate(&args, item))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let existing = lookup_factory_work_items(client, server, &args, &candidate_ids).await?;
     let mut issue_cache = HashMap::new();
     let mut evaluated = evaluate_items(&args, project_items.items, &existing, &mut issue_cache)?;
     evaluated.sort_by(|left, right| {
@@ -297,13 +293,24 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     })?;
     let selected = evaluated.swap_remove(selected_index);
-    let source_resolution = selected_source_base_commit
-        .context("selected factory issue did not resolve an immutable source commit")?;
+    let (refreshed, persisted) = refresh_selected(client, server, &args, &selected).await?;
+    let source_resolution = if refreshed.recovery {
+        resolve_recovery_source_base_commit_from_item(
+            &args,
+            persisted
+                .as_ref()
+                .context("recoverable factory item disappeared from the selected-item lookup")?,
+        )?
+    } else {
+        ResolvedSourceCommit {
+            commit: resolve_source_base_commit(&args)?,
+            legacy_upgrade_required: false,
+        }
+    };
     let ResolvedSourceCommit {
         commit: source_base_commit,
         legacy_upgrade_required,
     } = source_resolution;
-    let refreshed = refresh_selected(&args, &existing, &selected)?;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let stable_prefix = format!(
         "github-project:{}:{}:{}:{}",
@@ -314,10 +321,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         args.corp_id
     );
     let policy = if refreshed.recovery {
-        existing
-            .get(&refreshed.project_item.id)
+        persisted
+            .as_ref()
             .map(|item| item.policy.clone())
-            .context("recoverable factory item disappeared from the ECorp snapshot")?
+            .context("recoverable factory item disappeared from the selected-item lookup")?
     } else {
         json!({
             "schema_version": 1,
@@ -361,10 +368,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             },
         })
     };
-    let claim_generation = existing
-        .get(&refreshed.project_item.id)
-        .map(|item| item.version)
-        .unwrap_or(0);
+    let claim_generation = persisted.as_ref().map(|item| item.version).unwrap_or(0);
     let claim_body = json!({
         "actor_id": args.actor_id,
         "source_project_owner": args.owner,
@@ -381,8 +385,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_base_commit": source_base_commit,
         "publication_base_ref": args.publication_base_ref,
         "idempotency_key": format!(
-            "{stable_prefix}:claim:{}:{claim_generation}",
-            args.actor_id
+            "{stable_prefix}:claim:{}:{claim_generation}:lease:{}",
+            args.actor_id, args.lease_seconds
         ),
         "lease_seconds": args.lease_seconds,
         "policy": policy,
@@ -398,8 +402,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         let replay_version = value_i64(&claim, "/work_item/version")?;
         let mut reclaim_body = claim_body;
         reclaim_body["idempotency_key"] = Value::String(format!(
-            "{stable_prefix}:reclaim:{}:{replay_version}",
-            args.actor_id
+            "{stable_prefix}:reclaim:{}:{replay_version}:lease:{}",
+            args.actor_id, args.lease_seconds
         ));
         claim = server_json(client, Method::POST, claim_path, Some(reclaim_body)).await?;
     }
@@ -877,12 +881,32 @@ fn resolve_recovery_source_base_commit(
     selected: &EvaluatedItem,
     existing: &HashMap<String, ExistingFactoryItem>,
 ) -> Result<ResolvedSourceCommit> {
-    let policy = existing
+    let item = existing
         .get(&selected.project_item.id)
-        .context("recoverable factory item disappeared from the ECorp snapshot")?
+        .context("recoverable factory item disappeared from the selected-item lookup")?;
+    resolve_recovery_source_base_commit_from_item(args, item)
+}
+
+fn resolve_recovery_source_base_commit_from_item(
+    args: &FactoryArgs,
+    item: &ExistingFactoryItem,
+) -> Result<ResolvedSourceCommit> {
+    let policy = item
         .policy
         .as_object()
         .context("persisted factory policy is not a JSON object")?;
+    let source_base_ref = policy
+        .get("source_base_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("persisted factory policy has no source_base_ref")?;
+    validate_source_base_ref(source_base_ref)?;
+    if source_base_ref != args.source_base_ref {
+        bail!(
+            "factory recovery source base ref mismatch: persisted policy requires {source_base_ref}, controller requested {}",
+            args.source_base_ref
+        );
+    }
     if let Some(commit) = policy.get("source_base_commit").and_then(Value::as_str) {
         let commit = commit.to_ascii_lowercase();
         validate_source_base_commit(&commit)?;
@@ -899,12 +923,16 @@ fn resolve_recovery_source_base_commit(
         bail!("persisted factory policy has no immutable source_base_commit");
     }
     Ok(ResolvedSourceCommit {
-        commit: resolve_source_base_commit(args)?,
+        commit: resolve_source_base_commit_at_ref(args, source_base_ref)?,
         legacy_upgrade_required: true,
     })
 }
 
 fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
+    resolve_source_base_commit_at_ref(args, &args.source_base_ref)
+}
+
+fn resolve_source_base_commit_at_ref(args: &FactoryArgs, source_base_ref: &str) -> Result<String> {
     let remote = source_git_output(
         &args.source_repository_path,
         &["config", "--get", "remote.origin.url"],
@@ -920,7 +948,7 @@ fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
             args.repository
         );
     }
-    let revision = format!("{}^{{commit}}", args.source_base_ref);
+    let revision = format!("{source_base_ref}^{{commit}}");
     let commit = source_git_output(
         &args.source_repository_path,
         &["rev-parse", "--verify", &revision],
@@ -928,7 +956,7 @@ fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
     .with_context(|| {
         format!(
             "resolve factory source base ref {} in {}",
-            args.source_base_ref,
+            source_base_ref,
             args.source_repository_path.display()
         )
     })?;
@@ -1067,16 +1095,7 @@ fn evaluate_items(
     let mut evaluated = Vec::new();
     let now = Utc::now();
     for item in items {
-        if item.content.kind != "Issue"
-            || !item
-                .content
-                .repository
-                .eq_ignore_ascii_case(&args.repository)
-            || (args.issue.is_none() && !matches!(item.status.as_str(), "Todo" | "In Progress"))
-            || args
-                .issue
-                .is_some_and(|number| number != item.content.number)
-        {
+        if !project_item_is_candidate(args, &item) {
             continue;
         }
         let issue = cached_issue(
@@ -1169,6 +1188,18 @@ fn evaluate_items(
     Ok(evaluated)
 }
 
+fn project_item_is_candidate(args: &FactoryArgs, item: &ProjectItem) -> bool {
+    item.content.kind == "Issue"
+        && item
+            .content
+            .repository
+            .eq_ignore_ascii_case(&args.repository)
+        && (args.issue.is_some() || matches!(item.status.as_str(), "Todo" | "In Progress"))
+        && args
+            .issue
+            .is_none_or(|number| number == item.content.number)
+}
+
 fn factory_state_is_recoverable(state: &str) -> bool {
     matches!(
         state,
@@ -1192,11 +1223,12 @@ fn factory_item_recoverable_by(
         && (item.claim_owner_id == actor_id || item.lease_expires_at <= now)
 }
 
-fn refresh_selected(
+async fn refresh_selected(
+    client: &Client,
+    server: &str,
     args: &FactoryArgs,
-    existing: &HashMap<String, ExistingFactoryItem>,
     selected: &EvaluatedItem,
-) -> Result<EvaluatedItem> {
+) -> Result<(EvaluatedItem, Option<ExistingFactoryItem>)> {
     let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project.items.len() < project.total_count {
         bail!(
@@ -1210,8 +1242,10 @@ fn refresh_selected(
         .into_iter()
         .find(|item| item.id == selected.project_item.id)
         .context("selected GitHub Project item disappeared before claim")?;
+    let existing =
+        lookup_factory_work_items(client, server, args, std::slice::from_ref(&item.id)).await?;
     let mut cache = HashMap::new();
-    let refreshed = evaluate_items(args, vec![item], existing, &mut cache)?
+    let refreshed = evaluate_items(args, vec![item], &existing, &mut cache)?
         .into_iter()
         .next()
         .context("selected GitHub Project item is no longer in the repository allowlist")?;
@@ -1221,7 +1255,8 @@ fn refresh_selected(
             refreshed.reasons.join("; ")
         );
     }
-    Ok(refreshed)
+    let persisted = existing.get(&refreshed.project_item.id).cloned();
+    Ok((refreshed, persisted))
 }
 
 fn revalidate_selected_for_effect(
@@ -1343,11 +1378,57 @@ fn cached_issue(
     Ok(issue)
 }
 
-fn existing_factory_items(snapshot: &Value) -> Result<HashMap<String, ExistingFactoryItem>> {
-    snapshot
-        .pointer("/snapshot/factory_work_items")
+async fn lookup_factory_work_items(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    source_project_item_ids: &[String],
+) -> Result<HashMap<String, ExistingFactoryItem>> {
+    if source_project_item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let response = server_json(
+        client,
+        Method::POST,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/lookup",
+            args.corp_id
+        ),
+        Some(json!({
+            "actor_id": args.actor_id,
+            "source_project_owner": args.owner,
+            "source_project_number": args.project_number,
+            "source_project_item_ids": source_project_item_ids,
+        })),
+    )
+    .await?;
+    let items = response
+        .get("items")
         .and_then(Value::as_array)
-        .context("ECorp snapshot omitted factory_work_items")?
+        .context("factory work-item lookup omitted items")?;
+    let total_count = response
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .context("factory work-item lookup omitted total_count")?;
+    if total_count != items.len() as u64 {
+        bail!(
+            "factory work-item lookup returned {} of {} items",
+            items.len(),
+            total_count
+        );
+    }
+    for item in items {
+        if value_string(item, "/source_project_owner")? != args.owner
+            || value_i64(item, "/source_project_number")? != i64::from(args.project_number)
+        {
+            bail!("factory work-item lookup returned an item from another GitHub Project");
+        }
+    }
+    existing_factory_items(items)
+}
+
+fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFactoryItem>> {
+    items
         .iter()
         .map(|item| {
             let project_item_id = value_string(item, "/source_project_item_id")?;

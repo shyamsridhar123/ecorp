@@ -36,6 +36,7 @@ use crony_protocol::{
     CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
     FactoryMissionContract, FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse,
     LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
     MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
@@ -408,6 +409,10 @@ async fn main() -> anyhow::Result<()> {
             get(download_artifact),
         )
         .route("/api/corps/{corp_id}/missions", post(create_mission))
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/lookup",
+            post(lookup_factory_work_items),
+        )
         .route(
             "/api/corps/{corp_id}/factory/work-items/claim",
             post(claim_factory_work_item),
@@ -1458,6 +1463,35 @@ async fn claim_factory_work_item(
         claim_token: outcome.claim_token,
         replayed: outcome.replayed,
     }))
+}
+
+async fn lookup_factory_work_items(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<LookupFactoryWorkItemsRequest>,
+) -> Result<Json<LookupFactoryWorkItemsResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let items = state
+        .store
+        .factory_work_items_by_project_item_ids(
+            corp_id,
+            actor_id,
+            &request.source_project_owner,
+            request.source_project_number,
+            &request.source_project_item_ids,
+        )
+        .await
+        .map_err(map_store_error)?;
+    let total_count = items.len();
+    Ok(Json(LookupFactoryWorkItemsResponse { items, total_count }))
 }
 
 async fn renew_factory_work_item(

@@ -69,6 +69,14 @@ Publication states cannot be asserted through the generic factory transition end
 Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
 events omit GitHub source metadata; once a mission exists, factory events inherit its room
 visibility.
+The controller's selected-Project-item lookup requires Corp `Operate` authorization and repeats the
+store-side human operator-role check before returning source or policy metadata. Requests are
+bounded to 1,000 Project item IDs of at most 160 characters and are deduplicated before the query.
+The normalized Project owner, positive Project number, source kind, Corp, and item IDs all scope
+the lookup, preventing an equal item ID in another Project from substituting its state or policy.
+Guests and spectators receive no lookup results, and claim tokens remain excluded from lookup
+responses. Claim and reclaim idempotency keys include the validated lease duration so a recovery
+request with a changed lease cannot collide with a persisted request containing another duration.
 
 Controllers renew their fenced lease immediately before a GitHub mutation and again before launch.
 After each renewal they re-fetch and compare the Project item, issue revision, state, required
@@ -88,7 +96,10 @@ Underivable legacy claims are not guessed or silently widened: migration marks t
 upgrade, and only the active fenced operator may resolve and persist a new commit before any run
 exists. That dedicated idempotent operation is stored in `factory_operations` and emits
 `factory.source_commit_pinned`; it rejects stale tokens, stale versions, already-pinned policies,
-incompatible task contracts, and any mission that has already produced a run.
+incompatible task contracts, and any mission that has already produced a run. New claim intake
+requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
+Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
+match the persisted policy ref before resolving or storing a commit.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
