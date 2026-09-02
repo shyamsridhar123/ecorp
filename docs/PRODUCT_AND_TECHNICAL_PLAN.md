@@ -41,6 +41,9 @@
   before final publication. Staged, finalized, rejected, and orphaned states recover after restart
   or a periodic reconciliation pass. Signed provenance and authorized download replace runner-local
   artifact paths in shared state.
+- Governed factory routing now pins the authorized GitHub repository and symbolic ref to an
+  immutable commit across policy, tasks, runs, scheduling, runner admission, worktree creation, and
+  resume.
 
 ---
 

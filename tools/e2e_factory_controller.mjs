@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
-import { readFile, writeFile } from 'node:fs/promises'
+import { rm, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const execFile = promisify(execFileCallback)
@@ -17,6 +17,24 @@ const binary =
   )
 const statePath = path.join(root, 'output', 'fake-github-factory-state.json')
 const fakeGithub = path.join(root, 'tools', 'fake_github_cli.mjs')
+const sourceBaseCommit = (
+  await execFile('git', ['rev-parse', 'HEAD'], { cwd: root, windowsHide: true })
+).stdout.trim()
+
+async function createSourceFixture(repository) {
+  const fixture = path.join(root, 'output', `factory-source-${repository.replace('/', '-')}`)
+  await rm(fixture, { recursive: true, force: true })
+  await execFile('git', ['clone', '--quiet', '--no-hardlinks', root, fixture], {
+    cwd: root,
+    windowsHide: true,
+  })
+  await execFile(
+    'git',
+    ['remote', 'set-url', 'origin', `https://github.com/${repository}.git`],
+    { cwd: fixture, windowsHide: true },
+  )
+  return fixture
+}
 
 async function request(url, init) {
   const response = await fetch(`${server}${url}`, init)
@@ -51,6 +69,7 @@ async function runController(
     repository = 'ShyamSridhar123/ECorp',
     strategy = 'single',
     githubTimeoutMs,
+    sourceRepositoryPath = root,
   } = {},
 ) {
   const args = [
@@ -63,6 +82,8 @@ async function runController(
     '7',
     '--repository',
     repository,
+    '--source-repository-path',
+    sourceRepositoryPath,
     '--adapter',
     'fake-process',
     '--strategy',
@@ -224,6 +245,7 @@ const fencedTask = fencedState.snapshot.tasks.find(
 )
 assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
 assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
+assert.equal(fencedTask.contract.source_base_commit, sourceBaseCommit)
 
 const completed = await waitForMission(demo, first.mission_id)
 assert.equal(completed.mission.status, 'completed')
@@ -253,6 +275,9 @@ const taskIds = new Set(
 const runs = finalState.snapshot.runs.filter((run) => taskIds.has(run.task_id))
 assert.equal(runs.length, 1)
 assert.equal(runs[0].status, 'completed')
+assert.equal(runs[0].source_repository, 'shyamsridhar123/ecorp')
+assert.equal(runs[0].source_base_ref, 'HEAD')
+assert.equal(runs[0].source_base_commit, sourceBaseCommit)
 const fakeState = JSON.parse(await readFile(statePath, 'utf8'))
 assert.equal(fakeState.items[0].status, 'In Progress')
 assert.ok(fakeState.item_edits >= 1)
@@ -619,6 +644,7 @@ const approvedFactory = await runController(approvalDemo, 9012, false, {
 assert.equal(approvedFactory.factory_state, 'verified')
 
 const mismatchDemo = await post('/api/demo/reset', {})
+const mismatchSourceRepository = await createSourceFixture('acme/widget')
 const mismatchIssue = {
   ...issue,
   id: 'I_FAKE_FACTORY_9006',
@@ -650,6 +676,7 @@ let repositoryMismatch
 try {
   await runController(mismatchDemo, 9006, false, {
     repository: 'acme/widget',
+    sourceRepositoryPath: mismatchSourceRepository,
   })
 } catch (error) {
   repositoryMismatch = error
@@ -669,7 +696,8 @@ assert.ok(
   mismatchTasks.every(
     (task) =>
       task.contract.source_repository === 'acme/widget' &&
-      task.contract.source_base_ref === 'HEAD',
+      task.contract.source_base_ref === 'HEAD' &&
+      task.contract.source_base_commit === sourceBaseCommit,
   ),
 )
 const mismatchTaskIds = new Set(mismatchTasks.map((task) => task.id))
@@ -851,6 +879,7 @@ const report = {
   replay_recovered_existing_mission: true,
   external_effect_lease_revalidated: true,
   claimed_repository_persisted_to_task: true,
+  claimed_commit_persisted_to_task_and_run: true,
   factory_state: factoryItems[0].state,
   claim_token_absent_from_snapshot: true,
   mission_status: missions[0].status,
@@ -913,6 +942,7 @@ const report = {
     mission_id: mismatchItem.mission_id,
     required_repository: 'acme/widget',
     required_base_ref: 'HEAD',
+    required_base_commit: sourceBaseCommit,
     mismatched_runner_rejected: true,
     run_count: 0,
     factory_state: mismatchItem.state,

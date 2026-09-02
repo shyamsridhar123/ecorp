@@ -191,6 +191,14 @@ controller E2E proves an independent reviewer, not the requester, advances
 dependency and acceptance parsing. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
 
+`tools/e2e_factory_commit_routing.mjs` connects two runners that advertise the same GitHub
+repository and symbolic `HEAD` ref but resolve to different commits. It proves factory policy,
+task contracts, and the persisted run retain the authorized full commit, the scheduler selects only
+the matching runner, and the wrong runner receives no run or worktree files. Runner and server unit
+coverage separately proves malformed object IDs, partial source tuples, mismatched starts, and
+mismatched resumes fail closed. See
+`docs/evidence/2026-09-01-factory-immutable-source-routing.md`.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before

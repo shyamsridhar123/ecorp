@@ -20,6 +20,7 @@ pub struct WorkspaceManager {
     repository: PathBuf,
     repository_identity: Option<String>,
     base_ref: String,
+    base_commit: String,
     git_lock: Arc<Mutex<()>>,
 }
 
@@ -73,13 +74,14 @@ impl WorkspaceManager {
             repository,
             repository_identity: None,
             base_ref,
+            base_commit: String::new(),
             git_lock: Arc::new(Mutex::new(())),
         };
         manager
             .git_success(&manager.repository, &["rev-parse", "--git-dir"])
             .await
             .context("configured source path is not a Git repository")?;
-        manager.resolve_base_commit().await?;
+        manager.base_commit = manager.resolve_base_commit().await?;
         manager.repository_identity = manager
             .git_text(
                 &manager.repository,
@@ -107,6 +109,49 @@ impl WorkspaceManager {
         &self.base_ref
     }
 
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub fn verify_source_identity(
+        &self,
+        repository: Option<&str>,
+        base_ref: Option<&str>,
+        base_commit: Option<&str>,
+    ) -> Result<()> {
+        let (Some(repository), Some(base_ref), Some(base_commit)) =
+            (repository, base_ref, base_commit)
+        else {
+            if repository.is_none() && base_ref.is_none() && base_commit.is_none() {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "source assignment must include repository, base ref, and immutable base commit"
+            ));
+        };
+        let configured_repository = self
+            .repository_identity()
+            .context("runner source repository has no resolved GitHub identity")?;
+        if !configured_repository.eq_ignore_ascii_case(repository) {
+            return Err(anyhow!(
+                "source repository mismatch: assignment requires {repository}, runner is configured for {configured_repository}"
+            ));
+        }
+        if self.base_ref != base_ref {
+            return Err(anyhow!(
+                "source base ref mismatch: assignment requires {base_ref}, runner is configured for {}",
+                self.base_ref
+            ));
+        }
+        if !self.base_commit.eq_ignore_ascii_case(base_commit) {
+            return Err(anyhow!(
+                "source base commit mismatch: assignment requires {base_commit}, runner is pinned to {}",
+                self.base_commit
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn prepare(&self, task_id: Uuid, workspace_run_id: Uuid) -> Result<WorkspaceLease> {
         let _guard = self.git_lock.lock().await;
         let branch = branch_name(task_id, workspace_run_id);
@@ -132,24 +177,6 @@ impl WorkspaceManager {
                 ],
             )
             .await?;
-        let base_commit = if branch_exists {
-            match self
-                .git_text(&self.repository, &["merge-base", &branch, &self.base_ref])
-                .await
-            {
-                Ok(value) => value,
-                Err(_) => {
-                    self.git_text(
-                        &self.repository,
-                        &["rev-parse", &format!("{branch}^{{commit}}")],
-                    )
-                    .await?
-                }
-            }
-        } else {
-            self.resolve_base_commit_locked().await?
-        };
-
         let mut args = vec![OsString::from("worktree"), OsString::from("add")];
         if branch_exists {
             args.push(path.as_os_str().to_owned());
@@ -158,7 +185,7 @@ impl WorkspaceManager {
             args.push(OsString::from("-b"));
             args.push(OsString::from(&branch));
             args.push(path.as_os_str().to_owned());
-            args.push(OsString::from(&base_commit));
+            args.push(OsString::from(&self.base_commit));
         }
         self.git_success_os(&self.repository, &args)
             .await
@@ -391,32 +418,28 @@ impl WorkspaceManager {
                 current_branch.trim()
             ));
         }
-        let current_base_commit = self.resolve_base_commit_locked().await?;
-        let base_commit = match self
-            .git_text_os(
+        let pinned_base_is_ancestor = self
+            .git_exit_success(
                 &canonical_path,
                 &[
                     OsString::from("merge-base"),
+                    OsString::from("--is-ancestor"),
+                    OsString::from(&self.base_commit),
                     OsString::from("HEAD"),
-                    OsString::from(&current_base_commit),
                 ],
             )
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => {
-                self.git_text_os(
-                    &canonical_path,
-                    &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
-                )
-                .await?
-            }
-        };
+            .await?;
+        if !pinned_base_is_ancestor {
+            return Err(anyhow!(
+                "worktree does not descend from pinned base commit {}",
+                self.base_commit
+            ));
+        }
         Ok(WorkspaceLease {
             path: canonical_path,
             branch,
             base_ref: self.base_ref.clone(),
-            base_commit: base_commit.trim().to_owned(),
+            base_commit: self.base_commit.clone(),
         })
     }
 
@@ -691,6 +714,15 @@ mod tests {
                 OsStr::new("init"),
             ],
         );
+        command(
+            &repository,
+            &[
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                OsStr::new("https://github.com/shyamsridhar123/ecorp.git"),
+            ],
+        );
         (root, repository, managed)
     }
 
@@ -910,6 +942,37 @@ mod tests {
             "sentinel\n"
         );
         assert!(!repository.join("not-a-worktree.txt").exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn source_identity_requires_the_exact_resolved_commit() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let commit = manager.base_commit().to_owned();
+        manager
+            .verify_source_identity(Some("SHYAMSRIDHAR123/ECORP"), Some("HEAD"), Some(&commit))
+            .expect("matching immutable source identity");
+        assert!(
+            manager
+                .verify_source_identity(
+                    Some("shyamsridhar123/ecorp"),
+                    Some("HEAD"),
+                    Some("1111111111111111111111111111111111111111"),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("commit mismatch")
+        );
+        assert!(
+            manager
+                .verify_source_identity(Some("shyamsridhar123/ecorp"), Some("HEAD"), None,)
+                .unwrap_err()
+                .to_string()
+                .contains("must include")
+        );
         cleanup_fixture(&root, &repository);
     }
 

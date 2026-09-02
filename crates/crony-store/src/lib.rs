@@ -168,6 +168,7 @@ pub struct LaunchRecord {
     pub reasoning_effort: Option<String>,
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
+    pub source_base_commit: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -181,6 +182,7 @@ pub struct SchedulableTask {
     pub required_reasoning_effort: Option<String>,
     pub required_source_repository: Option<String>,
     pub required_source_base_ref: Option<String>,
+    pub required_source_base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +203,7 @@ pub struct ResumeLaunchRecord {
     pub reasoning_effort: Option<String>,
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
+    pub source_base_commit: Option<String>,
     pub verification_policy: VerificationPolicy,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
@@ -1158,6 +1161,7 @@ impl PgStore {
                    r.input_tokens, r.output_tokens, r.cost_microusd,
                    r.budget_tokens_limit, r.budget_cost_microusd_limit, r.breaker_stage,
                    r.no_progress_events, r.repeated_tool_count,
+                   r.source_repository, r.source_base_ref, r.source_base_commit,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
                    r.verification_status, r.verification_summary, r.status,
@@ -2937,7 +2941,8 @@ impl PgStore {
                    t.contract->>'model' AS required_model,
                    t.contract->>'reasoning_effort' AS required_reasoning_effort,
                    t.contract->>'source_repository' AS required_source_repository,
-                   t.contract->>'source_base_ref' AS required_source_base_ref
+                   t.contract->>'source_base_ref' AS required_source_base_ref,
+                   t.contract->>'source_base_commit' AS required_source_base_commit
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -2980,6 +2985,7 @@ impl PgStore {
                 required_reasoning_effort: row.get("required_reasoning_effort"),
                 required_source_repository: row.get("required_source_repository"),
                 required_source_base_ref: row.get("required_source_base_ref"),
+                required_source_base_commit: row.get("required_source_base_commit"),
             })
         })
         .collect()
@@ -3112,8 +3118,10 @@ impl PgStore {
             INSERT INTO runs
                 (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
                  workspace_run_id, budget_tokens_limit, budget_cost_microusd_limit,
-                 model, reasoning_effort)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $1, $7, $8, $9, $10)
+                 model, reasoning_effort, source_repository, source_base_ref,
+                 source_base_commit)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $1, $7, $8, $9, $10,
+                    $11, $12, $13)
             "#,
         )
         .bind(run_id)
@@ -3126,6 +3134,9 @@ impl PgStore {
         .bind(contract.budget_cost_microusd)
         .bind(&model)
         .bind(&reasoning_effort)
+        .bind(&contract.source_repository)
+        .bind(&contract.source_base_ref)
+        .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
         let queued_messages =
@@ -3197,6 +3208,7 @@ impl PgStore {
                 reasoning_effort,
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
+                source_base_commit: contract.source_base_commit.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -3279,8 +3291,10 @@ impl PgStore {
             INSERT INTO runs
                 (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
                  provider_session_id, resumed_from_run_id, workspace_run_id,
-                 budget_tokens_limit, budget_cost_microusd_limit, model, reasoning_effort)
-            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9, $10, $11, $12, $13)
+                 budget_tokens_limit, budget_cost_microusd_limit, model, reasoning_effort,
+                 source_repository, source_base_ref, source_base_commit)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16)
             "#,
         )
         .bind(run_id)
@@ -3296,6 +3310,9 @@ impl PgStore {
         .bind(contract.budget_cost_microusd)
         .bind(&model)
         .bind(&reasoning_effort)
+        .bind(&contract.source_repository)
+        .bind(&contract.source_base_ref)
+        .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
         let queued_messages =
@@ -3363,6 +3380,7 @@ impl PgStore {
                 reasoning_effort,
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
+                source_base_commit: contract.source_base_commit.clone(),
                 verification_policy,
                 secret_refs: contract.secret_refs,
                 queued_messages,
@@ -6394,6 +6412,7 @@ fn format_task_prompt(
          ATTEMPT: {attempt}\n\
          SOURCE REPOSITORY: {}\n\
          SOURCE BASE REF: {}\n\
+         SOURCE BASE COMMIT: {}\n\
          OBJECTIVE: {}\n\
          EXPECTED OUTPUT: {}\n\
          ACCEPTANCE TESTS:\n{}\n\
@@ -6414,6 +6433,10 @@ fn format_task_prompt(
             .unwrap_or("runner default"),
         contract
             .source_base_ref
+            .as_deref()
+            .unwrap_or("runner default"),
+        contract
+            .source_base_commit
             .as_deref()
             .unwrap_or("runner default"),
         contract.objective,
@@ -6859,9 +6882,13 @@ fn apply_factory_source_constraints(
     );
     let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
+    let source_base_commit =
+        factory_policy_required_string(policy, "source_base_commit", 64)?.to_ascii_lowercase();
+    validate_factory_base_commit(&source_base_commit)?;
     for task in &mut plan.tasks {
         task.contract.source_repository = Some(source_repository.clone());
         task.contract.source_base_ref = Some(source_base_ref.clone());
+        task.contract.source_base_commit = Some(source_base_commit.clone());
     }
     Ok(())
 }
@@ -6896,12 +6923,16 @@ fn validate_factory_plan_against_policy(
         ));
     }
     let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    let source_base_commit =
+        factory_policy_required_string(policy, "source_base_commit", 64)?.to_ascii_lowercase();
+    validate_factory_base_commit(&source_base_commit)?;
     if let Some(task) = plan.tasks.iter().find(|task| {
         task.contract.source_repository.as_deref() != Some(source_repository.as_str())
             || task.contract.source_base_ref.as_deref() != Some(source_base_ref.as_str())
+            || task.contract.source_base_commit.as_deref() != Some(source_base_commit.as_str())
     }) {
         return Err(anyhow!(
-            "factory task {} does not preserve the claimed repository and base ref",
+            "factory task {} does not preserve the claimed repository, base ref, and immutable base commit",
             task.key
         ));
     }
@@ -7141,6 +7172,15 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
     {
         return Err(anyhow!("factory source_base_ref is not a safe Git ref"));
+    }
+    Ok(())
+}
+
+fn validate_factory_base_commit(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "factory source_base_commit must be a full 40- or 64-character hexadecimal Git object id"
+        ));
     }
     Ok(())
 }
@@ -8123,6 +8163,9 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         breaker_stage: row.get("breaker_stage"),
         no_progress_events: row.get("no_progress_events"),
         repeated_tool_count: row.get("repeated_tool_count"),
+        source_repository: row.get("source_repository"),
+        source_base_ref: row.get("source_base_ref"),
+        source_base_commit: row.get("source_base_commit"),
         workspace_path: row.get("workspace_path"),
         workspace_branch: row.get("workspace_branch"),
         workspace_base_ref: row.get("workspace_base_ref"),
@@ -8745,6 +8788,7 @@ mod tests {
             "auto_merge": false,
             "repository_allowlist": ["owner/repo"],
             "source_base_ref": "HEAD",
+            "source_base_commit": "1111111111111111111111111111111111111111",
             "adapter_allowlist": ["codex"],
             "strategy_allowlist": ["single"],
             "model": model,
@@ -8771,6 +8815,7 @@ mod tests {
                     expected_output: "A verified change".to_owned(),
                     source_repository: Some("owner/repo".to_owned()),
                     source_base_ref: Some("HEAD".to_owned()),
+                    source_base_commit: Some("1111111111111111111111111111111111111111".to_owned()),
                     acceptance_tests: vec!["tests pass".to_owned()],
                     allowed_tools: vec!["filesystem".to_owned()],
                     prohibited_actions: vec!["merge requires separate authorization".to_owned()],

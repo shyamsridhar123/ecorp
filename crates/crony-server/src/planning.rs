@@ -478,6 +478,7 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         expected_output: expected_output.to_owned(),
         source_repository: None,
         source_base_ref: None,
+        source_base_commit: None,
         acceptance_tests: vec![
             "the declared artifact exists".to_owned(),
             "the task reports concrete verification evidence".to_owned(),
@@ -633,6 +634,7 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
         task_key,
         contract.source_repository.as_deref(),
         contract.source_base_ref.as_deref(),
+        contract.source_base_commit.as_deref(),
     )?;
     if contract
         .model
@@ -701,11 +703,13 @@ fn validate_source_requirement(
     task_key: &str,
     repository: Option<&str>,
     base_ref: Option<&str>,
+    base_commit: Option<&str>,
 ) -> Result<()> {
-    let (Some(repository), Some(base_ref)) = (repository, base_ref) else {
-        if repository.is_some() || base_ref.is_some() {
+    let (Some(repository), Some(base_ref), Some(base_commit)) = (repository, base_ref, base_commit)
+    else {
+        if repository.is_some() || base_ref.is_some() || base_commit.is_some() {
             return Err(anyhow!(
-                "task {task_key} must specify source repository and base ref together"
+                "task {task_key} must specify source repository, base ref, and immutable base commit together"
             ));
         }
         return Ok(());
@@ -734,6 +738,8 @@ fn validate_source_requirement(
         || base_ref
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
+        || !matches!(base_commit.len(), 40 | 64)
+        || !base_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(anyhow!(
             "task {task_key} contains an invalid source repository requirement"

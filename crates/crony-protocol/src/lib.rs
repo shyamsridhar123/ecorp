@@ -13,6 +13,12 @@ pub struct RunnerCapability {
     pub detail: Option<String>,
     #[serde(default)]
     pub models: Vec<RunnerModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +104,9 @@ pub enum ServerToRunner {
         mission_title: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -115,6 +124,9 @@ pub enum ServerToRunner {
         prompt: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },

@@ -42,7 +42,7 @@ enum Command {
     },
     Factory {
         #[command(flatten)]
-        args: factory::FactoryArgs,
+        args: Box<factory::FactoryArgs>,
     },
     Mission {
         corp_id: Uuid,
@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Factory { args: factory_args } => {
-            factory::run(&client, &args.server, factory_args).await?
+            factory::run(&client, &args.server, *factory_args).await?
         }
         Command::Mission {
             corp_id,

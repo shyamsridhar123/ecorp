@@ -156,6 +156,9 @@ struct Assignment {
     mission_title: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
     secrets: Vec<ResolvedSecret>,
 }
@@ -443,19 +446,26 @@ async fn run_connection(
             available,
             detail: Some(detail),
             models,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
         });
     }
     capabilities.push(RunnerCapability {
         name: "workspace-isolation".to_owned(),
         available: true,
         detail: Some(format!(
-            "root={}; repository={}; remote={}; base={}",
+            "root={}; repository={}; remote={}; base={}; commit={}",
             workspaces.root().display(),
             workspaces.repository().display(),
             workspaces.repository_identity().unwrap_or("unidentified"),
-            workspaces.base_ref()
+            workspaces.base_ref(),
+            workspaces.base_commit()
         )),
         models: Vec::new(),
+        source_repository: workspaces.repository_identity().map(str::to_owned),
+        source_base_ref: Some(workspaces.base_ref().to_owned()),
+        source_base_commit: Some(workspaces.base_commit().to_owned()),
     });
     capabilities.push(RunnerCapability {
         name: "secret-delivery".to_owned(),
@@ -465,6 +475,9 @@ async fn run_connection(
                 .to_owned(),
         ),
         models: Vec::new(),
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
     });
     out_tx
         .send(RunnerToServer::Register {
@@ -550,6 +563,9 @@ async fn run_connection(
                 mission_title,
                 model,
                 reasoning_effort,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
                 verification_policy,
                 secrets,
             } => {
@@ -567,9 +583,22 @@ async fn run_connection(
                     mission_title,
                     model,
                     reasoning_effort,
+                    source_repository,
+                    source_base_ref,
+                    source_base_commit,
                     verification_policy,
                     secrets,
                 };
+                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({"error": error.to_string()}),
+                    );
+                    continue;
+                }
                 let secret_ttl = match secret_expiry_delay(&assignment.secrets) {
                     Ok(ttl) => ttl,
                     Err(error) => {
@@ -650,6 +679,9 @@ async fn run_connection(
                 prompt,
                 model,
                 reasoning_effort,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
                 verification_policy,
                 secrets,
             } => {
@@ -667,9 +699,22 @@ async fn run_connection(
                     mission_title: prompt,
                     model,
                     reasoning_effort,
+                    source_repository,
+                    source_base_ref,
+                    source_base_commit,
                     verification_policy,
                     secrets,
                 };
+                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({"error": error.to_string()}),
+                    );
+                    continue;
+                }
                 let secret_ttl = match secret_expiry_delay(&assignment.secrets) {
                     Ok(ttl) => ttl,
                     Err(error) => {
@@ -1099,6 +1144,7 @@ async fn execute_assignment(
     controls: mpsc::UnboundedReceiver<AdapterControl>,
     resume_session_id: Option<String>,
 ) -> Result<()> {
+    validate_assignment_source(&workspaces, &assignment)?;
     let workspace = workspaces
         .prepare(assignment.task_id, assignment.workspace_run_id)
         .await
@@ -1197,6 +1243,19 @@ async fn execute_assignment(
     send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
     execution?;
     Ok(())
+}
+
+fn validate_assignment_source(
+    workspaces: &WorkspaceManager,
+    assignment: &Assignment,
+) -> Result<()> {
+    workspaces
+        .verify_source_identity(
+            assignment.source_repository.as_deref(),
+            assignment.source_base_ref.as_deref(),
+            assignment.source_base_commit.as_deref(),
+        )
+        .context("reject source assignment")
 }
 
 async fn send_verification_events(
