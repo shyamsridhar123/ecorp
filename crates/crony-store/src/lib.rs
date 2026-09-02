@@ -2325,6 +2325,7 @@ impl PgStore {
             };
             (map_factory_work_item(row)?, "factory.work_item_reclaimed")
         } else {
+            ensure_new_factory_policy_is_pinned(&policy)?;
             let work_item_id = Uuid::new_v4();
             let row = sqlx::query(
                 r#"
@@ -7624,35 +7625,63 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         .context("factory policy snapshot must be a JSON object")?;
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
-    let source_base_commit =
-        factory_policy_required_string(policy_object, "source_base_commit", 64)?
-            .to_ascii_lowercase();
-    validate_factory_base_commit(&source_base_commit)?;
-    match policy_object.get("source_commit_upgrade_required") {
-        None | Some(Value::Bool(false)) => {}
-        Some(Value::Bool(true)) => {
-            return Err(anyhow!(
-                "factory source_commit_upgrade_required is reserved for migrated legacy records"
-            ));
-        }
+    let upgrade_required = match policy_object.get("source_commit_upgrade_required") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
         Some(_) => {
             return Err(anyhow!(
                 "factory source_commit_upgrade_required must be a boolean"
             ));
         }
+    };
+    match policy_object.get("source_base_commit") {
+        Some(Value::String(source_base_commit)) if !source_base_commit.trim().is_empty() => {
+            if upgrade_required {
+                return Err(anyhow!(
+                    "factory source policy cannot be pinned and require a legacy upgrade"
+                ));
+            }
+            let source_base_commit = source_base_commit.to_ascii_lowercase();
+            validate_factory_base_commit(&source_base_commit)?;
+            policy_object.insert(
+                "source_base_commit".to_owned(),
+                Value::String(source_base_commit),
+            );
+            policy_object.insert(
+                "source_commit_upgrade_required".to_owned(),
+                Value::Bool(false),
+            );
+        }
+        None if upgrade_required => {}
+        _ => {
+            return Err(anyhow!(
+                "factory policy source_base_commit must be a non-empty string"
+            ));
+        }
     }
-    policy_object.insert(
-        "source_base_commit".to_owned(),
-        Value::String(source_base_commit),
-    );
-    policy_object.insert(
-        "source_commit_upgrade_required".to_owned(),
-        Value::Bool(false),
-    );
     if serde_json::to_vec(&policy)?.len() > 65_536 {
         return Err(anyhow!("factory policy snapshot cannot exceed 65536 bytes"));
     }
     Ok(policy)
+}
+
+fn ensure_new_factory_policy_is_pinned(policy: &Value) -> Result<()> {
+    let policy = policy
+        .as_object()
+        .context("factory policy snapshot must be a JSON object")?;
+    let source_base_commit =
+        factory_policy_required_string(policy, "source_base_commit", 64)?.to_ascii_lowercase();
+    validate_factory_base_commit(&source_base_commit)?;
+    if policy
+        .get("source_commit_upgrade_required")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(anyhow!(
+            "new factory claims cannot require a legacy source upgrade"
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_factory_operation_request(request: Value) -> Result<Value> {
@@ -9044,9 +9073,9 @@ mod tests {
 
     use super::{
         FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
-        ensure_breaker_allows_human_progress, factory_transition_allowed,
-        normalize_artifact_rejection_reason, normalize_factory_policy, normalize_factory_source,
-        should_retry_runner_failure, validate_factory_lease_seconds,
+        ensure_breaker_allows_human_progress, ensure_new_factory_policy_is_pinned,
+        factory_transition_allowed, normalize_artifact_rejection_reason, normalize_factory_policy,
+        normalize_factory_source, should_retry_runner_failure, validate_factory_lease_seconds,
         validate_factory_plan_against_policy,
     };
 
@@ -9289,6 +9318,17 @@ mod tests {
                 .to_string()
                 .contains("source_base_commit")
         );
+        let migrated = normalize_factory_policy(json!({
+            "source_base_ref": "HEAD",
+            "source_commit_upgrade_required": true
+        }))
+        .expect("marked migrated legacy policy");
+        assert!(
+            ensure_new_factory_policy_is_pinned(&migrated)
+                .unwrap_err()
+                .to_string()
+                .contains("source_base_commit")
+        );
         assert!(
             normalize_factory_policy(json!({
                 "source_base_ref": "HEAD",
@@ -9297,7 +9337,7 @@ mod tests {
             }))
             .unwrap_err()
             .to_string()
-            .contains("reserved for migrated legacy records")
+            .contains("cannot be pinned and require a legacy upgrade")
         );
     }
 
