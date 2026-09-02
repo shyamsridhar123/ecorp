@@ -133,6 +133,9 @@ storage acknowledgment before worktree cleanup.
 
 Post-verification commit creation is fixed runner behavior on the isolated task branch. It does not
 authorize credential use, branch publication, pull-request creation, auto-merge, merge, or deploy.
+Commit/branch bundles use a unique temporary ref created only after the workspace branch is verified
+against the generated head, then delete it after bundle creation. A detached worktree `HEAD` cannot
+redirect or empty the bundle.
 
 Pull-request publication runs only in the trusted publisher CLI after a dedicated server
 authorization check. GitHub credentials stay in the publisher's keyring or process environment;
@@ -186,7 +189,8 @@ The Status field definition and option IDs come from an exact GraphQL lookup on 
 node rather than the first page of `field-list`.
 Publication base policy is branch-only: the controller and store accept `HEAD`, short branch names,
 or `refs/heads/*`, while rejecting tags, remote-tracking refs, invalid branch shapes, and control
-characters before durable claim. The default is symbolic `HEAD`, not an assumed branch name.
+characters before durable claim. When omitted, it derives from the selected source base ref rather
+than independently assuming `HEAD` or `main`.
 
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before

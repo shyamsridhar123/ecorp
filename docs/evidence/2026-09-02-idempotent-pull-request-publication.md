@@ -15,9 +15,9 @@
 **Context and base-ref closure head:** `7e8f13f24e5a3f4e923695b2ac00d369a99e15f7`
 **Metadata lookup closure head:** `75bfc0de71233d1c79363c2d2c642304bda0b960`
 **URL identity closure head:** `70b287478d060fc08bafee4f33f28c393fb7c5dd`
-**Final ordering/default head:** `6acf3ed019b2ea6e1952828d7f6cae2976e52076`
-**Integrated gate head:** `6acf3ed019b2ea6e1952828d7f6cae2976e52076`
-**Stacked base:** `0be72d458e5afd35b7309786bf662486727b8d2b`
+**Source-base and bundle head:** `e17ef45`
+**Integrated gate head:** `31acd7c4a469f3b012d22024b59c8b1ae4b48c28`
+**Stacked base:** `f7801b08b05a99e54ac8bfd7d0e650541ea2e776`
 
 ## Scope
 
@@ -51,7 +51,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 87 non-documentation unit tests with no failures.
+The Rust workspace ran 90 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -89,7 +89,7 @@ The final exact-head run recorded:
   "project_field_count_during_publication": 32,
   "publication_attempts": 10,
   "pull_request_number": 41,
-  "pull_request_head_sha": "95bc94527f01a706f8851605b12b3e233a41dfec",
+  "pull_request_head_sha": "893864d95384007577109f13316f2b08d1480911",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -199,8 +199,9 @@ The fake GitHub API returned the canonical pull-request URL
 scheme/host, pull path, and number while comparing owner/repository components
 case-insensitively. The URL was accepted, persisted, and recovered.
 
-The controller was also invoked without `--publication-base-ref`. Its persisted policy base was
-`HEAD`, matching the source revision selection instead of assuming `main`.
+The controller was invoked without `--publication-base-ref` for both source `HEAD` and a local
+`release` source ref. Its effective publication bases were respectively `HEAD` and `release`,
+proving the default derives from the selected source revision.
 
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
@@ -296,11 +297,16 @@ portable Git bundle path grouping. URL identity commit
 `70b287478d060fc08bafee4f33f28c393fb7c5dd` then passed all repository gates and fresh isolated
 controller/publication E2Es on the merged tree.
 
-The final base `0be72d458e5afd35b7309786bf662486727b8d2b` was then merged normally.
+The final base `f7801b08b05a99e54ac8bfd7d0e650541ea2e776` was then merged normally.
 For final ordering coverage, the fake GitHub API closed PR #41 on the PR lookup immediately after
 the refreshed Project field/item reads. Publication rejected the changed durable PR, made no Project
-edit, restored the fixture, and then completed normally. Commit
-`6acf3ed019b2ea6e1952828d7f6cae2976e52076` passed all gates and both focused E2Es.
+edit, restored the fixture, and then completed normally.
+
+Runner coverage detached worktree `HEAD` at the verified base, generated the commit on the validated
+workspace branch, bundled a unique `refs/ecorp/deliverables/*` ref, and proved the temporary ref was
+removed. The publisher validates and imports that sole bundle head while retaining compatibility
+with earlier HEAD-labeled bundles. Integrated head
+`31acd7c4a469f3b012d22024b59c8b1ae4b48c28` passed all gates and both focused E2Es.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not

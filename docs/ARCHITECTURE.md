@@ -491,6 +491,9 @@ authorized base ancestry, and current remote base before adopting or pushing the
 matching branches and pull requests are recovered; conflicting remote identities fail closed and
 branches are never force-pushed. The branch passes `git check-ref-format --branch` before durable
 start, with a defensive server-side branch-shape check as a second boundary.
+The runner bundles a short run-scoped ref pointing to the already validated workspace branch rather
+than the worktree's possibly detached `HEAD`; the publisher accepts exactly one matching legacy
+HEAD or run-scoped bundle head before import.
 
 An adopted pull request must report the exact verified `headRefOid`, the target repository owner,
 and `isCrossRepository = false`; a same-named branch from a fork is ignored and cannot advance
@@ -506,8 +509,9 @@ field-list pagination cannot hide it.
 Factory policy accepts publication bases only as symbolic `HEAD`, a short branch name, or an
 explicit `refs/heads/*` branch. Tags, remote-tracking refs, and invalid Git branch names fail before
 the controller reads candidates or claims a work item, and the store repeats the policy check.
-Omitting the option defaults to symbolic `HEAD`, matching the source revision selected for the
-factory claim instead of assuming a `main` branch exists.
+Omitting the option derives it from the selected source base ref, so `HEAD` remains the ordinary
+default while an explicit source branch such as `release` also becomes the publication base unless
+the operator overrides it.
 
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed
