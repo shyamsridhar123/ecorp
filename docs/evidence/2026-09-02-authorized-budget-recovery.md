@@ -6,6 +6,7 @@
 **Operator UI:** `c4ce25e`
 **Integrated publication base:** `bef6774851c79a1cd8a773883b9c5b090318b673`
 **Cross-scenario reset isolation:** `3a3702e`
+**Full repository gate head:** `70b615e416add32ca64da9107983bd4a8caef707`
 
 ## Scope
 
@@ -132,4 +133,18 @@ tools/e2e_budget_revision.mjs
 tools/e2e_factory_publication.mjs
 ```
 
-The full repository gate is recorded on the final evidence commit.
+The exact committed head `70b615e416add32ca64da9107983bd4a8caef707` then passed the complete
+repository-required sequence:
+
+```text
+node tools/check_migrations.mjs
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+pnpm build:web
+pnpm lint:web
+```
+
+Migration validation reported 27 immutable migrations. The Rust workspace ran 80
+non-documentation tests with zero failures. The web production build and lint completed without
+errors.
