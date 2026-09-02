@@ -72,6 +72,17 @@ const completed = await waitForRun(demo, launch.run_id)
 assert.equal(completed.run.status, 'completed', completed.run.summary)
 const bytes = await downloadVerifiedArtifact(server, demo, completed.run)
 assert.ok(bytes.length > 0)
+const authorizedDownload = await fetchArtifact(
+  server,
+  demo.corp_id,
+  demo.alice_actor_id,
+  completed.run.artifact_uri,
+)
+assert.equal(authorizedDownload.status, 200)
+assert.equal(
+  authorizedDownload.headers.get('content-disposition'),
+  'attachment; filename="result.md"; filename*=UTF-8\'\'result.md',
+)
 
 const artifactEvent = completed.state.snapshot.events.find(
   (event) =>

@@ -228,11 +228,7 @@ impl ArtifactStore {
             .get("file_name")
             .and_then(Value::as_str)
             .unwrap_or("artifact.bin");
-        if file_name.is_empty()
-            || file_name.len() > 255
-            || file_name.contains(['/', '\\'])
-            || file_name.chars().any(char::is_control)
-        {
+        if !valid_artifact_file_name(file_name) {
             return Err(anyhow!("artifact file name is invalid"));
         }
         let metadata = if artifact_role == "source_deliverable" {
@@ -586,6 +582,13 @@ fn is_zip_container(media_type: &str) -> bool {
         || media_type.starts_with("application/vnd.oasis.opendocument.")
 }
 
+fn valid_artifact_file_name(file_name: &str) -> bool {
+    !file_name.is_empty()
+        && file_name.len() <= 255
+        && !file_name.contains(['/', '\\', '"'])
+        && !file_name.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +805,14 @@ mod tests {
         assert!(normalize_and_verify_media_type("application/json", br#"{"ok":true}"#).is_ok());
         assert!(normalize_and_verify_media_type("application/json", b"not json").is_err());
         assert!(normalize_and_verify_media_type("image/png", b"not png").is_err());
+    }
+
+    #[test]
+    fn artifact_file_names_reject_content_disposition_injection() {
+        assert!(valid_artifact_file_name("report 2026.txt"));
+        assert!(!valid_artifact_file_name(
+            "safe.txt\"; filename=\"payload.html"
+        ));
     }
 
     #[test]
