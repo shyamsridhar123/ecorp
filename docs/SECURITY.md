@@ -82,8 +82,24 @@ Controllers renew their fenced lease immediately before a GitHub mutation and ag
 After each renewal they re-fetch and compare the Project item, issue revision, state, required
 label, and dependency eligibility. A changed or newly blocked source is durably blocked before the
 next effect. A final renewal follows each revalidation, and GitHub CLI subprocesses are killed on a
-bounded timeout below the effect lease. Factory tasks carry the claimed repository and base ref,
-and the scheduler accepts only a runner advertising the same normalized checkout.
+bounded timeout below the effect lease. The controller resolves the source ref in a checkout whose
+GitHub remote matches the claimed repository, then persists the full 40- or 64-hex commit in policy.
+Factory tasks and run launch records carry repository, ref, and commit as one all-or-nothing source
+identity. The scheduler accepts only a runner advertising the same structured tuple, and the runner
+independently rejects both start and resume commands before worktree access if any element differs.
+Symbolic refs alone are never sufficient authority for factory write-capable routing. Unpinned
+ordinary tasks continue to resolve the configured ref for each new worktree, while resume is fenced
+to the source run's persisted workspace base commit.
+
+Pre-commit factory records are migrated only from unambiguous persisted workspace evidence.
+Underivable legacy claims are not guessed or silently widened: migration marks them as requiring an
+upgrade, and only the active fenced operator may resolve and persist a new commit before any run
+exists. That dedicated idempotent operation is stored in `factory_operations` and emits
+`factory.source_commit_pinned`; it rejects stale tokens, stale versions, already-pinned policies,
+incompatible task contracts, and any mission that has already produced a run. New claim intake
+requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
+Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
+match the persisted policy ref before resolving or storing a commit.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

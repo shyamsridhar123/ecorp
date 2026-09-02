@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import {
   existsSync,
   openSync,
@@ -13,6 +13,10 @@ const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
+const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+  cwd: root,
+  encoding: 'utf8',
+}).trim()
 
 async function request(url, init) {
   const response = await fetch(`${server}${url}`, init)
@@ -153,6 +157,7 @@ const claimRequest = {
     project_status: 'Todo',
     repository_allowlist: ['shyamsridhar123/ecorp'],
     source_base_ref: 'HEAD',
+    source_base_commit: sourceBaseCommit,
     adapter_allowlist: ['fake-process'],
     strategy_allowlist: ['single'],
     model: null,
@@ -379,6 +384,7 @@ const linkedTask = afterMaterialize.snapshot.tasks.find(
 assert.match(linkedTask.contract.objective, /linked GitHub issue/)
 assert.equal(linkedTask.contract.source_repository, 'shyamsridhar123/ecorp')
 assert.equal(linkedTask.contract.source_base_ref, 'HEAD')
+assert.equal(linkedTask.contract.source_base_commit, sourceBaseCommit)
 assert.deepEqual(linkedTask.contract.write_scope, materializeRequest.contract.write_scope)
 assert.ok(
   linkedTask.contract.references.includes(

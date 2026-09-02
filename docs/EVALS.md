@@ -200,6 +200,25 @@ verifies Markdown section boundaries for dependency and acceptance parsing. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
 `docs/evidence/2026-09-01-factory-pagination-safety.md`.
 
+`tools/e2e_factory_commit_routing.mjs` connects two runners that advertise the same GitHub
+repository and symbolic `HEAD` ref but resolve to different commits. It proves factory policy,
+task contracts, and the persisted run retain the authorized full commit, the scheduler selects only
+the matching runner, and the wrong runner receives no run or worktree files. Runner and server unit
+coverage separately proves malformed object IDs, partial source tuples, mismatched starts, and
+mismatched resumes fail closed. See
+`docs/evidence/2026-09-01-factory-immutable-source-routing.md`.
+
+`tools/e2e_factory_legacy_source_upgrade.mjs` rewrites one completed factory run into its pre-0022
+shape, reapplies migration 0022, and proves policy, task, and run source commits are recovered from
+the persisted workspace base commit. It also creates an unmaterialized legacy claim with no
+derivable commit, proves migration marks an upgrade requirement, then runs the controller through
+one fenced and audited source-pin operation before materialization and verified execution. The
+same test proves new commit-less claims are rejected without creating a work item and that a
+recovery invocation naming a different symbolic ref cannot mutate the migration-marked record. The
+workspace unit regression advances `HEAD` while one manager remains alive and proves a later
+unpinned worktree follows the new commit while pinned and resumed work remains on the original
+identity.
+
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and
 resumed in the same provider thread and repository, and a third run was emergency-stopped before

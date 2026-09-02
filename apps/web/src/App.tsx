@@ -38,6 +38,7 @@ type TaskContract = {
   expected_output: string
   source_repository: string | null
   source_base_ref: string | null
+  source_base_commit: string | null
   acceptance_tests: string[]
   allowed_tools: string[]
   prohibited_actions: string[]
@@ -79,6 +80,9 @@ type Run = {
   input_tokens: number
   output_tokens: number
   cost_microusd: number
+  source_repository: string | null
+  source_base_ref: string | null
+  source_base_commit: string | null
   workspace_path: string | null
   workspace_branch: string | null
   workspace_base_ref: string | null
@@ -962,6 +966,9 @@ function MissionCard({
                       {task.contract.source_repository ?? 'Runner default'}
                       {task.contract.source_base_ref
                         ? ` @ ${task.contract.source_base_ref}`
+                        : ''}
+                      {task.contract.source_base_commit
+                        ? ` (${task.contract.source_base_commit.slice(0, 12)})`
                         : ''}
                     </dd>
                   </div>

@@ -13,6 +13,12 @@ pub struct RunnerCapability {
     pub detail: Option<String>,
     #[serde(default)]
     pub models: Vec<RunnerModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +104,9 @@ pub enum ServerToRunner {
         mission_title: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -115,6 +124,10 @@ pub enum ServerToRunner {
         prompt: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
+        workspace_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
         secrets: Vec<ResolvedSecret>,
     },
@@ -383,6 +396,15 @@ pub struct RenewFactoryWorkItemRequest {
     pub idempotency_key: String,
     #[serde(default = "default_factory_lease_seconds")]
     pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeFactorySourceCommitRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_base_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
