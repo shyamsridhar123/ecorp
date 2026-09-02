@@ -28,7 +28,10 @@ type Mission = {
   strategy: string
   max_nodes: number
   max_depth: number
+  original_budget_tokens: number
+  original_budget_cost_microusd: number
   budget_tokens: number
+  budget_cost_microusd: number
   status: 'draft' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
   created_at: string
 }
@@ -45,6 +48,7 @@ type TaskContract = {
   references: string[]
   write_scope: string[]
   budget_tokens: number
+  budget_cost_microusd: number
   deadline_at: string | null
   escalation: string
   deliverable: {
@@ -85,6 +89,9 @@ type Run = {
   input_tokens: number
   output_tokens: number
   cost_microusd: number
+  budget_tokens_limit: number
+  budget_cost_microusd_limit: number
+  breaker_stage: 'steer' | 'constrain' | 'suspend' | 'stop' | null
   source_repository: string | null
   source_base_ref: string | null
   source_base_commit: string | null
@@ -255,6 +262,49 @@ type CircuitBreakerIncident = {
   created_at: string
 }
 
+type MissionBudgetRevision = {
+  id: string
+  mission_id: string
+  proposed_by: string
+  status: 'pending' | 'approved' | 'rejected'
+  version: number
+  current_budget_tokens: number
+  current_budget_cost_microusd: number
+  proposed_budget_tokens: number
+  proposed_budget_cost_microusd: number
+  consumed_tokens_at_proposal: number
+  consumed_cost_microusd_at_proposal: number
+  rationale: string
+  replacement_task_id: string | null
+  previous_contract: TaskContract | null
+  replacement_contract: TaskContract | null
+  previous_verification_policy: Record<string, unknown> | null
+  replacement_verification_policy: Record<string, unknown> | null
+  decided_by: string | null
+  decision_note: string | null
+  created_at: string
+  decided_at: string | null
+  updated_at: string
+}
+
+type MissionFinishScopeInput = {
+  task_id: string
+  objective: string
+  expected_output: string
+  acceptance_tests: string[]
+  write_scope: string[]
+  budget_tokens: number
+  budget_cost_microusd: number
+  verification_policy: Record<string, unknown>
+}
+
+type MissionBudgetRevisionInput = {
+  proposed_budget_tokens: number
+  proposed_budget_cost_microusd: number
+  rationale: string
+  finish_scope: MissionFinishScopeInput | null
+}
+
 type FactoryWorkItem = {
   id: string
   source_project_owner: string
@@ -358,6 +408,7 @@ type SnapshotResponse = {
     rooms: { id: string; name: string; purpose: string }[]
     agents: Agent[]
     missions: Mission[]
+    mission_budget_revisions: MissionBudgetRevision[]
     tasks: Task[]
     runs: Run[]
     room_messages: RoomMessage[]
@@ -566,6 +617,30 @@ function time(value: string): string {
     hour: '2-digit',
     minute: '2-digit',
   }).format(new Date(value))
+}
+
+function formatUsd(microusd: number): string {
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(microusd / 1_000_000)
+}
+
+function budgetRemainingLabel(value: number, unit: 'tokens' | 'cost'): string {
+  const amount =
+    unit === 'tokens'
+      ? Math.abs(value).toLocaleString()
+      : formatUsd(Math.abs(value))
+  return value >= 0 ? `${amount} left` : `${amount} over`
+}
+
+function nonEmptyLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
 }
 
 function leaseTokenKey(actorId: string, agentId: string): string {
@@ -1055,6 +1130,645 @@ function AgentDesk({
   )
 }
 
+function BudgetRevisionPanel({
+  mission,
+  tasks,
+  runs,
+  revisions,
+  actors,
+  actorRole,
+  busy,
+  resumableRun,
+  onPropose,
+  onDecision,
+}: {
+  mission: Mission
+  tasks: Task[]
+  runs: Run[]
+  revisions: MissionBudgetRevision[]
+  actors: Actor[]
+  actorRole: string
+  busy: boolean
+  resumableRun: Run | undefined
+  onPropose: (mission: Mission, input: MissionBudgetRevisionInput) => Promise<boolean>
+  onDecision: (
+    mission: Mission,
+    revision: MissionBudgetRevision,
+    approved: boolean,
+  ) => Promise<void>
+}) {
+  const [proposalOpen, setProposalOpen] = useState(false)
+  const [proposedTokens, setProposedTokens] = useState(mission.budget_tokens)
+  const [proposedCostUsd, setProposedCostUsd] = useState(
+    mission.budget_cost_microusd / 1_000_000,
+  )
+  const [rationale, setRationale] = useState('')
+  const [replaceFinishScope, setReplaceFinishScope] = useState(false)
+  const [finishTaskId, setFinishTaskId] = useState('')
+  const [finishObjective, setFinishObjective] = useState('')
+  const [finishExpectedOutput, setFinishExpectedOutput] = useState('')
+  const [finishAcceptanceTests, setFinishAcceptanceTests] = useState('')
+  const [finishWriteScope, setFinishWriteScope] = useState('')
+  const [finishBudgetTokens, setFinishBudgetTokens] = useState(1)
+  const [finishBudgetCostUsd, setFinishBudgetCostUsd] = useState(0.01)
+
+  const consumedTokens = runs.reduce(
+    (total, run) => total + run.input_tokens + run.output_tokens,
+    0,
+  )
+  const consumedCostMicrousd = runs.reduce(
+    (total, run) => total + run.cost_microusd,
+    0,
+  )
+  const remainingTokens = mission.budget_tokens - consumedTokens
+  const remainingCostMicrousd =
+    mission.budget_cost_microusd - consumedCostMicrousd
+  const budgetExhausted = remainingTokens <= 0 || remainingCostMicrousd <= 0
+  const activeRun = runs.some((run) => !terminalRun(run.status))
+  const orderedRevisions = revisions.toSorted(
+    (left, right) =>
+      new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+  )
+  const pendingRevision = orderedRevisions.find(
+    (revision) => revision.status === 'pending',
+  )
+  const latestApprovedRevision = orderedRevisions.find(
+    (revision) => revision.status === 'approved',
+  )
+  const finishTasks = tasks.filter((task) => task.status !== 'completed')
+  const selectedFinishTask = finishTasks.find(
+    (task) => task.id === finishTaskId,
+  )
+  const canManageBudget = ['owner', 'admin'].includes(actorRole)
+  const canReviseNow =
+    Boolean(resumableRun) &&
+    resumableRun?.breaker_stage === 'suspend' &&
+    !activeRun &&
+    mission.status !== 'completed' &&
+    mission.status !== 'cancelled'
+  const proposedCostMicrousd = Math.round(proposedCostUsd * 1_000_000)
+  const finishCostMicrousd = Math.round(finishBudgetCostUsd * 1_000_000)
+  const proposedRemainingTokens = proposedTokens - consumedTokens
+  const proposedRemainingCostMicrousd =
+    proposedCostMicrousd - consumedCostMicrousd
+  const actorName = (actorId: string | null) =>
+    actors.find((actor) => actor.id === actorId)?.name ??
+    (actorId ? `Actor ${shortId(actorId)}` : 'Not decided')
+
+  const seedFinishTask = (
+    task: Task | undefined,
+    missionTokenCeiling: number,
+    missionCostCeiling: number,
+  ) => {
+    if (!task) {
+      setFinishTaskId('')
+      setFinishObjective('')
+      setFinishExpectedOutput('')
+      setFinishAcceptanceTests('')
+      setFinishWriteScope('')
+      setFinishBudgetTokens(1)
+      setFinishBudgetCostUsd(0.01)
+      return
+    }
+    const availableTokens = Math.max(
+      1,
+      missionTokenCeiling - consumedTokens,
+    )
+    const availableCostMicrousd = Math.max(
+      1,
+      missionCostCeiling - consumedCostMicrousd,
+    )
+    setFinishTaskId(task.id)
+    setFinishObjective(task.objective)
+    setFinishExpectedOutput(task.contract.expected_output)
+    setFinishAcceptanceTests(task.contract.acceptance_tests.join('\n'))
+    setFinishWriteScope(task.contract.write_scope.join('\n'))
+    setFinishBudgetTokens(
+      Math.min(task.contract.budget_tokens, availableTokens, 2_000_000),
+    )
+    const finishCostMicrousd = Math.min(
+      task.contract.budget_cost_microusd,
+      availableCostMicrousd,
+      10_000_000,
+    )
+    setFinishBudgetCostUsd(
+      Math.max(10_000, Math.floor(finishCostMicrousd / 10_000) * 10_000) /
+        1_000_000,
+    )
+  }
+
+  const openProposal = () => {
+    const nextTokens = Math.min(
+      20_000_000,
+      Math.max(
+        mission.budget_tokens +
+          Math.max(50_000, Math.ceil(mission.budget_tokens * 0.25)),
+        consumedTokens + 50_000,
+      ),
+    )
+    const nextCostMicrousd = Math.min(
+      100_000_000,
+      Math.ceil(
+        Math.max(
+        mission.budget_cost_microusd +
+          Math.max(500_000, Math.ceil(mission.budget_cost_microusd * 0.25)),
+        consumedCostMicrousd + 500_000,
+        ) / 10_000,
+      ) * 10_000,
+    )
+    const defaultTask =
+      finishTasks.find((task) => task.id === resumableRun?.task_id) ??
+      finishTasks[0]
+    setProposedTokens(nextTokens)
+    setProposedCostUsd(nextCostMicrousd / 1_000_000)
+    setRationale('')
+    setReplaceFinishScope(false)
+    seedFinishTask(defaultTask, nextTokens, nextCostMicrousd)
+    setProposalOpen(true)
+  }
+
+  const acceptanceTests = nonEmptyLines(finishAcceptanceTests)
+  const writeScope = nonEmptyLines(finishWriteScope)
+  const proposalErrors: string[] = []
+  if (
+    proposedTokens < mission.budget_tokens ||
+    proposedCostMicrousd < mission.budget_cost_microusd ||
+    (proposedTokens === mission.budget_tokens &&
+      proposedCostMicrousd === mission.budget_cost_microusd)
+  ) {
+    proposalErrors.push(
+      'Raise at least one current mission limit without reducing the other.',
+    )
+  }
+  if (proposedTokens <= consumedTokens) {
+    proposalErrors.push('The token ceiling must exceed consumed usage.')
+  }
+  if (proposedCostMicrousd <= consumedCostMicrousd) {
+    proposalErrors.push('The cost ceiling must exceed consumed spend.')
+  }
+  if (
+    proposedTokens > 20_000_000 ||
+    proposedCostMicrousd > 100_000_000
+  ) {
+    proposalErrors.push('The proposed mission ceiling exceeds policy bounds.')
+  }
+  if (!rationale.trim()) {
+    proposalErrors.push('Record why this additional budget is authorized.')
+  }
+  if (replaceFinishScope) {
+    if (!selectedFinishTask) {
+      proposalErrors.push('Choose the unfinished task to narrow.')
+    } else {
+      if (!finishObjective.trim() || !finishExpectedOutput.trim()) {
+        proposalErrors.push('The bounded finish objective and output are required.')
+      }
+      if (!acceptanceTests.length || !writeScope.length) {
+        proposalErrors.push(
+          'Keep at least one acceptance test and one authorized write path.',
+        )
+      }
+      if (
+        finishBudgetTokens < 1 ||
+        finishBudgetTokens > selectedFinishTask.contract.budget_tokens ||
+        finishBudgetTokens > proposedRemainingTokens ||
+        finishBudgetTokens > 2_000_000
+      ) {
+        proposalErrors.push(
+          'The finish token budget must fit both the prior task and proposed remaining budget.',
+        )
+      }
+      if (
+        finishCostMicrousd < 1 ||
+        finishCostMicrousd >
+          selectedFinishTask.contract.budget_cost_microusd ||
+        finishCostMicrousd > proposedRemainingCostMicrousd ||
+        finishCostMicrousd > 10_000_000
+      ) {
+        proposalErrors.push(
+          'The finish cost budget must fit both the prior task and proposed remaining budget.',
+        )
+      }
+    }
+  }
+
+  const submitProposal = async (event: FormEvent) => {
+    event.preventDefault()
+    if (proposalErrors.length) return
+    const finishScope =
+      replaceFinishScope && selectedFinishTask
+        ? {
+            task_id: selectedFinishTask.id,
+            objective: finishObjective.trim(),
+            expected_output: finishExpectedOutput.trim(),
+            acceptance_tests: acceptanceTests,
+            write_scope: writeScope,
+            budget_tokens: finishBudgetTokens,
+            budget_cost_microusd: finishCostMicrousd,
+            verification_policy: selectedFinishTask.verification_policy,
+          }
+        : null
+    const accepted = await onPropose(mission, {
+      proposed_budget_tokens: proposedTokens,
+      proposed_budget_cost_microusd: proposedCostMicrousd,
+      rationale: rationale.trim(),
+      finish_scope: finishScope,
+    })
+    if (accepted) setProposalOpen(false)
+  }
+
+  const tokenPercent =
+    mission.budget_tokens > 0
+      ? Math.min(100, Math.max(0, (consumedTokens / mission.budget_tokens) * 100))
+      : 100
+  const costPercent =
+    mission.budget_cost_microusd > 0
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            (consumedCostMicrousd / mission.budget_cost_microusd) * 100,
+          ),
+        )
+      : 100
+
+  return (
+    <section
+      className={`budget-ledger${budgetExhausted ? ' budget-ledger-exhausted' : ''}`}
+      data-testid="mission-budget-ledger"
+      data-budget-exhausted={budgetExhausted}
+    >
+      <div className="budget-ledger-heading">
+        <div>
+          <span>Mission budget authority</span>
+          <strong>
+            {budgetExhausted
+              ? 'Recovery authorization required'
+              : pendingRevision
+                ? 'Revision awaiting decision'
+                : 'Authorized capacity'}
+          </strong>
+        </div>
+        <span className={`budget-state budget-state-${budgetExhausted ? 'exhausted' : 'available'}`}>
+          {budgetExhausted ? 'Exhausted' : 'Available'}
+        </span>
+      </div>
+
+      <div className="budget-meters" aria-label="Mission budget use">
+        <div>
+          <span>Tokens</span>
+          <div className="budget-meter" aria-hidden="true">
+            <span style={{ width: `${tokenPercent}%` }} />
+          </div>
+        </div>
+        <div>
+          <span>Cost</span>
+          <div className="budget-meter budget-meter-cost" aria-hidden="true">
+            <span style={{ width: `${costPercent}%` }} />
+          </div>
+        </div>
+      </div>
+
+      <div className="budget-metrics">
+        <div>
+          <span>Consumed</span>
+          <strong>{consumedTokens.toLocaleString()} tokens</strong>
+          <small>{formatUsd(consumedCostMicrousd)}</small>
+        </div>
+        <div>
+          <span>Original</span>
+          <strong>{mission.original_budget_tokens.toLocaleString()} tokens</strong>
+          <small>{formatUsd(mission.original_budget_cost_microusd)}</small>
+        </div>
+        <div>
+          <span>Current</span>
+          <strong>{mission.budget_tokens.toLocaleString()} tokens</strong>
+          <small>{formatUsd(mission.budget_cost_microusd)}</small>
+        </div>
+        <div>
+          <span>Remaining</span>
+          <strong>{budgetRemainingLabel(remainingTokens, 'tokens')}</strong>
+          <small>{budgetRemainingLabel(remainingCostMicrousd, 'cost')}</small>
+        </div>
+      </div>
+
+      {latestApprovedRevision ? (
+        <div className="budget-approval-proof" data-testid="budget-approval-proof">
+          <span>Current ceiling approved by</span>
+          <strong>{actorName(latestApprovedRevision.decided_by)}</strong>
+          <small>
+            {latestApprovedRevision.decided_at
+              ? time(latestApprovedRevision.decided_at)
+              : 'Decision time unavailable'}
+            {' · '}
+            {latestApprovedRevision.decision_note}
+          </small>
+        </div>
+      ) : (
+        <div className="budget-approval-proof">
+          <span>Current ceiling</span>
+          <strong>Original mission authorization</strong>
+        </div>
+      )}
+
+      {pendingRevision ? (
+        <div className="budget-pending" data-testid="budget-revision-pending">
+          <div>
+            <span>Pending change order · v{pendingRevision.version}</span>
+            <strong>
+              {pendingRevision.current_budget_tokens.toLocaleString()} →{' '}
+              {pendingRevision.proposed_budget_tokens.toLocaleString()} tokens
+            </strong>
+            <small>
+              {formatUsd(pendingRevision.current_budget_cost_microusd)} →{' '}
+              {formatUsd(pendingRevision.proposed_budget_cost_microusd)}
+              {' · proposed by '}
+              {actorName(pendingRevision.proposed_by)}
+            </small>
+            <p>{pendingRevision.rationale}</p>
+            {pendingRevision.replacement_task_id ? (
+              <small>
+                Also narrows task {shortId(pendingRevision.replacement_task_id)} without changing
+                its verifier policy.
+              </small>
+            ) : null}
+          </div>
+          <div className="budget-decision-actions">
+            <button
+              className="button button-primary"
+              type="button"
+              disabled={busy || !canManageBudget}
+              onClick={() => void onDecision(mission, pendingRevision, true)}
+            >
+              Approve revision
+            </button>
+            <button
+              className="button button-danger"
+              type="button"
+              disabled={busy || !canManageBudget}
+              onClick={() => void onDecision(mission, pendingRevision, false)}
+            >
+              Reject revision
+            </button>
+          </div>
+          {!canManageBudget ? (
+            <small className="budget-guidance">
+              Switch to an owner or admin to decide this revision.
+            </small>
+          ) : null}
+        </div>
+      ) : null}
+
+      {budgetExhausted && !pendingRevision && canManageBudget && canReviseNow ? (
+        proposalOpen ? (
+          <form
+            className="budget-proposal"
+            data-testid="budget-revision-form"
+            onSubmit={submitProposal}
+          >
+            <div className="budget-proposal-heading">
+              <div>
+                <span>Authorized recovery</span>
+                <strong>Propose a new mission ceiling</strong>
+              </div>
+              <button
+                type="button"
+                onClick={() => setProposalOpen(false)}
+                aria-label="Close budget revision form"
+              >
+                ×
+              </button>
+            </div>
+            <div className="budget-proposal-grid">
+              <label>
+                Token ceiling
+                <input
+                  type="number"
+                  min={Math.max(mission.budget_tokens, consumedTokens + 1)}
+                  max={20_000_000}
+                  step={1}
+                  value={proposedTokens}
+                  onChange={(event) => setProposedTokens(Number(event.target.value))}
+                />
+              </label>
+              <label>
+                Cost ceiling · USD
+                <input
+                  type="number"
+                  min={
+                    Math.ceil(
+                      Math.max(
+                        mission.budget_cost_microusd,
+                        consumedCostMicrousd + 1,
+                      ) / 10_000,
+                    ) / 100
+                  }
+                  max={100}
+                  step={0.01}
+                  value={proposedCostUsd}
+                  onChange={(event) => setProposedCostUsd(Number(event.target.value))}
+                />
+              </label>
+            </div>
+            <label>
+              Authorization rationale
+              <textarea
+                rows={3}
+                maxLength={4_000}
+                value={rationale}
+                onChange={(event) => setRationale(event.target.value)}
+                placeholder="Why is more budget justified, and what must finish?"
+              />
+            </label>
+            <label className="mission-run-toggle budget-scope-toggle">
+              <input
+                type="checkbox"
+                checked={replaceFinishScope}
+                disabled={!finishTasks.length}
+                onChange={(event) => setReplaceFinishScope(event.target.checked)}
+              />
+              <span>
+                <strong>Narrow the remaining task</strong>
+                <small>
+                  Replace its objective, output, write paths, and budget while retaining the
+                  existing verification policy.
+                </small>
+              </span>
+            </label>
+            {replaceFinishScope ? (
+              <div className="finish-scope-fields" data-testid="finish-scope-fields">
+                <label>
+                  Task
+                  <select
+                    value={finishTaskId}
+                    onChange={(event) => {
+                      const task = finishTasks.find(
+                        (candidate) => candidate.id === event.target.value,
+                      )
+                      seedFinishTask(task, proposedTokens, proposedCostMicrousd)
+                    }}
+                  >
+                    {finishTasks.map((task) => (
+                      <option key={task.id} value={task.id}>
+                        {task.plan_key} · {statusLabel(task.status)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Bounded finish objective
+                  <textarea
+                    rows={3}
+                    value={finishObjective}
+                    onChange={(event) => setFinishObjective(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Expected output
+                  <textarea
+                    rows={2}
+                    maxLength={10_000}
+                    value={finishExpectedOutput}
+                    onChange={(event) => setFinishExpectedOutput(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Acceptance tests · one per line
+                  <textarea
+                    rows={3}
+                    value={finishAcceptanceTests}
+                    onChange={(event) => setFinishAcceptanceTests(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Authorized write paths · one per line
+                  <textarea
+                    rows={3}
+                    value={finishWriteScope}
+                    onChange={(event) => setFinishWriteScope(event.target.value)}
+                  />
+                </label>
+                <div className="budget-proposal-grid">
+                  <label>
+                    Finish token budget
+                    <input
+                      type="number"
+                      min={1}
+                      max={Math.min(
+                        selectedFinishTask?.contract.budget_tokens ?? 2_000_000,
+                        Math.max(1, proposedRemainingTokens),
+                      )}
+                      step={1}
+                      value={finishBudgetTokens}
+                      onChange={(event) =>
+                        setFinishBudgetTokens(Number(event.target.value))
+                      }
+                    />
+                  </label>
+                  <label>
+                    Finish cost budget · USD
+                    <input
+                      type="number"
+                      min={0.01}
+                      max={
+                        Math.min(
+                          selectedFinishTask?.contract.budget_cost_microusd ??
+                            10_000_000,
+                          Math.max(1, proposedRemainingCostMicrousd),
+                        ) / 1_000_000
+                      }
+                      step={0.01}
+                      value={finishBudgetCostUsd}
+                      onChange={(event) =>
+                        setFinishBudgetCostUsd(Number(event.target.value))
+                      }
+                    />
+                  </label>
+                </div>
+                <small>
+                  The server rejects wider write paths, larger task budgets, or any verifier-policy
+                  change.
+                </small>
+              </div>
+            ) : null}
+            <div className="budget-proposal-footer">
+              <small className={proposalErrors.length ? 'budget-error' : ''}>
+                {proposalErrors[0] ??
+                  `${proposedRemainingTokens.toLocaleString()} tokens and ${formatUsd(proposedRemainingCostMicrousd)} would remain after recorded usage.`}
+              </small>
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={busy || proposalErrors.length > 0}
+              >
+                Propose revision
+              </button>
+            </div>
+          </form>
+        ) : (
+          <button
+            className="button button-secondary budget-revision-open"
+            type="button"
+            disabled={busy}
+            onClick={openProposal}
+          >
+            Authorize recovery budget
+          </button>
+        )
+      ) : null}
+
+      {budgetExhausted && !canManageBudget ? (
+        <p className="budget-guidance">
+          {resumableRun?.breaker_stage === 'stop'
+            ? 'A stop-stage breaker is terminal and cannot be overridden. Create a new bounded mission from the preserved evidence.'
+            : 'Resume is locked. An owner or admin must approve a higher mission ceiling before another provider session starts.'}
+        </p>
+      ) : null}
+      {budgetExhausted && canManageBudget && !canReviseNow && !pendingRevision ? (
+        <p className="budget-guidance">
+          {resumableRun?.breaker_stage === 'stop'
+            ? 'A stop-stage breaker is terminal and cannot be overridden. Create a new bounded mission from the preserved evidence.'
+            : 'Recovery becomes available after the active run stops at a resumable budget suspension.'}
+        </p>
+      ) : null}
+
+      {orderedRevisions.length ? (
+        <details className="budget-history">
+          <summary>{orderedRevisions.length} recorded budget revision{orderedRevisions.length === 1 ? '' : 's'}</summary>
+          <ol>
+            {orderedRevisions.map((revision) => (
+              <li key={revision.id}>
+                <div>
+                  <span className={`budget-history-status budget-history-${revision.status}`}>
+                    {statusLabel(revision.status)}
+                  </span>
+                  <strong>
+                    {revision.proposed_budget_tokens.toLocaleString()} tokens ·{' '}
+                    {formatUsd(revision.proposed_budget_cost_microusd)}
+                  </strong>
+                </div>
+                <p>{revision.rationale}</p>
+                <small>
+                  Proposed by {actorName(revision.proposed_by)} at {time(revision.created_at)}
+                  {' · consumed '}
+                  {revision.consumed_tokens_at_proposal.toLocaleString()} tokens /{' '}
+                  {formatUsd(revision.consumed_cost_microusd_at_proposal)}
+                </small>
+                {revision.decided_by ? (
+                  <small>
+                    Decided by {actorName(revision.decided_by)}
+                    {revision.decided_at ? ` at ${time(revision.decided_at)}` : ''}
+                    {revision.decision_note ? ` · ${revision.decision_note}` : ''}
+                  </small>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
+    </section>
+  )
+}
+
 function MissionCard({
   mission,
   tasks,
@@ -1062,6 +1776,8 @@ function MissionCard({
   agents,
   evidence,
   deliverables,
+  revisions,
+  actors,
   verificationRequests,
   actionApprovals,
   actorId,
@@ -1071,6 +1787,8 @@ function MissionCard({
   onResume,
   onDownloadArtifact,
   onDownloadDeliverable,
+  onProposeBudgetRevision,
+  onBudgetRevisionDecision,
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
@@ -1080,6 +1798,8 @@ function MissionCard({
   agents: Agent[]
   evidence: VerificationEvidence[]
   deliverables: SourceDeliverable[]
+  revisions: MissionBudgetRevision[]
+  actors: Actor[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
   actorId: string
@@ -1089,6 +1809,15 @@ function MissionCard({
   onResume: (run: Run) => Promise<void>
   onDownloadArtifact: (run: Run) => Promise<void>
   onDownloadDeliverable: (deliverable: SourceDeliverable) => Promise<void>
+  onProposeBudgetRevision: (
+    mission: Mission,
+    input: MissionBudgetRevisionInput,
+  ) => Promise<boolean>
+  onBudgetRevisionDecision: (
+    mission: Mission,
+    revision: MissionBudgetRevision,
+    approved: boolean,
+  ) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
@@ -1101,6 +1830,20 @@ function MissionCard({
   const activeRuns = runs.filter((run) =>
     ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
   ).length
+  const consumedTokens = runs.reduce(
+    (total, run) => total + run.input_tokens + run.output_tokens,
+    0,
+  )
+  const consumedCostMicrousd = runs.reduce(
+    (total, run) => total + run.cost_microusd,
+    0,
+  )
+  const resumeBudgetBlocked =
+    consumedTokens >= mission.budget_tokens ||
+    consumedCostMicrousd >= mission.budget_cost_microusd
+  const pendingBudgetRevision = revisions.find(
+    (revision) => revision.status === 'pending',
+  )
   const resumableRun = runs.find(
     (run) =>
       run.provider_session_id &&
@@ -1108,6 +1851,7 @@ function MissionCard({
       terminalRun(run.status),
   )
   const pendingRun = runs.find((run) => run.status === 'waiting_for_approval')
+  const resumeStopBlocked = resumableRun?.breaker_stage === 'stop'
   const pendingRequest = pendingRun
     ? verificationRequests.find(
         (request) => request.run_id === pendingRun.id && request.status === 'pending',
@@ -1153,6 +1897,18 @@ function MissionCard({
           <dd>{activeRuns ? `${activeRuns} active` : `${runs.length} attempts`}</dd>
         </div>
       </dl>
+      <BudgetRevisionPanel
+        mission={mission}
+        tasks={tasks}
+        runs={runs}
+        revisions={revisions}
+        actors={actors}
+        actorRole={actorRole}
+        busy={busy}
+        resumableRun={resumableRun}
+        onPropose={onProposeBudgetRevision}
+        onDecision={onBudgetRevisionDecision}
+      />
       <div className="task-graph-list">
         {orderedTasks.map((task) => {
           const assignedAgent = agents.find((agent) => agent.id === task.assigned_agent_id)
@@ -1342,9 +2098,42 @@ function MissionCard({
         </div>
       ) : null}
       {resumableRun && activeRuns === 0 ? (
-        <button className="button button-secondary mission-launch" type="button" disabled={busy} onClick={() => onResume(resumableRun)}>
-          Resume agent session
-        </button>
+        <>
+          <button
+            className="button button-secondary mission-launch"
+            type="button"
+            disabled={
+              busy ||
+              resumeStopBlocked ||
+              resumeBudgetBlocked ||
+              Boolean(pendingBudgetRevision)
+            }
+            onClick={() => onResume(resumableRun)}
+          >
+            {resumeStopBlocked
+              ? 'Stop-stage run cannot resume'
+              : pendingBudgetRevision
+                ? 'Budget decision required'
+                : resumeBudgetBlocked
+                  ? 'Budget revision required'
+                : 'Resume agent session'}
+          </button>
+          {resumeStopBlocked ? (
+            <p className="budget-resume-guidance" data-testid="budget-resume-guidance">
+              This run crossed a stop-stage safety boundary. Start a new bounded mission from its
+              preserved evidence instead of resuming the provider session.
+            </p>
+          ) : pendingBudgetRevision ? (
+            <p className="budget-resume-guidance" data-testid="budget-resume-guidance">
+              Decide the pending budget revision before starting another provider run.
+            </p>
+          ) : resumeBudgetBlocked ? (
+            <p className="budget-resume-guidance" data-testid="budget-resume-guidance">
+              This mission has no authorized budget remaining. Approve a revision above, then resume
+              the preserved provider session and worktree.
+            </p>
+          ) : null}
+        </>
       ) : null}
       {pendingRun && pendingRequest ? (
         <div className="verification-actions">
@@ -1950,6 +2739,81 @@ function App() {
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const proposeBudgetRevision = async (
+    mission: Mission,
+    input: MissionBudgetRevisionInput,
+  ): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/missions/${mission.id}/budget-revisions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            expected_budget_tokens: mission.budget_tokens,
+            expected_budget_cost_microusd: mission.budget_cost_microusd,
+            proposed_budget_tokens: input.proposed_budget_tokens,
+            proposed_budget_cost_microusd:
+              input.proposed_budget_cost_microusd,
+            rationale: input.rationale,
+            idempotency_key: crypto.randomUUID(),
+            finish_scope: input.finish_scope,
+          }),
+        },
+      )
+      await refresh(bootstrap.corp_id, selectedActor.id)
+      setAnnouncement(
+        'Budget revision proposed. An owner or admin must record the decision before resume.',
+      )
+      return true
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const decideBudgetRevision = async (
+    mission: Mission,
+    revision: MissionBudgetRevision,
+    approved: boolean,
+  ) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/missions/${mission.id}/budget-revisions/${revision.id}/decision`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            expected_version: revision.version,
+            approved,
+            note: approved
+              ? `${selectedActor.name} authorized the revised mission ceiling.`
+              : `${selectedActor.name} rejected the proposed mission ceiling.`,
+            decision_key: crypto.randomUUID(),
+          }),
+        },
+      )
+      await refresh(bootstrap.corp_id, selectedActor.id)
+      setAnnouncement(
+        approved
+          ? 'Budget revision approved. The preserved run can resume within the revised ceiling.'
+          : 'Budget revision rejected. The prior mission ceiling remains authoritative.',
+      )
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -2877,6 +3741,10 @@ function App() {
                     agents={data.snapshot.agents}
                     evidence={data.snapshot.verification_evidence}
                     deliverables={data.snapshot.source_deliverables}
+                    revisions={data.snapshot.mission_budget_revisions.filter(
+                      (revision) => revision.mission_id === mission.id,
+                    )}
+                    actors={data.snapshot.actors}
                     verificationRequests={data.snapshot.verification_requests}
                     actionApprovals={data.snapshot.action_approvals}
                     actorId={selectedActor.id}
@@ -2886,6 +3754,8 @@ function App() {
                     onResume={resumeAgentRun}
                     onDownloadArtifact={downloadArtifact}
                     onDownloadDeliverable={downloadDeliverable}
+                    onProposeBudgetRevision={proposeBudgetRevision}
+                    onBudgetRevisionDecision={decideBudgetRevision}
                     onVerificationDecision={decideVerification}
                     onActionApprovalDecision={decideActionApproval}
                   />

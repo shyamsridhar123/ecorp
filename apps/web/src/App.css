@@ -933,6 +933,379 @@ select:focus-visible {
   font: 700 12px/1 var(--mono);
 }
 
+.budget-ledger {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 2px solid var(--ink);
+  border-top: 8px solid var(--cobalt);
+  background:
+    linear-gradient(90deg, rgb(23 39 45 / 5%) 1px, transparent 1px),
+    #eef2ed;
+  background-size: 18px 18px;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 65%);
+}
+
+.budget-ledger-exhausted {
+  border-top-color: var(--signal);
+  background:
+    linear-gradient(135deg, rgb(200 32 39 / 8%) 25%, transparent 25%) 0 0 / 16px 16px,
+    #f5e4dc;
+}
+
+.budget-ledger-heading,
+.budget-proposal-heading,
+.budget-pending > div:first-child > div,
+.budget-history li > div {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.budget-ledger-heading > div,
+.budget-proposal-heading > div {
+  min-width: 0;
+}
+
+.budget-ledger-heading span,
+.budget-proposal-heading span,
+.budget-pending span,
+.budget-metrics span,
+.budget-approval-proof span {
+  display: block;
+  color: var(--ink-soft);
+  font: 700 9px/1.2 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.budget-ledger-heading strong,
+.budget-proposal-heading strong {
+  display: block;
+  margin-top: 4px;
+  font: 700 15px/1.1 var(--sans);
+  text-transform: uppercase;
+}
+
+.budget-state {
+  flex: 0 0 auto;
+  padding: 5px 7px;
+  color: var(--paper-light);
+  font: 700 9px/1 var(--mono);
+  border: 1px solid var(--ink);
+  background: var(--mint);
+  text-transform: uppercase;
+}
+
+.budget-state-exhausted {
+  background: var(--signal);
+}
+
+.budget-meters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.budget-meters > div {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-meters > div > span {
+  color: var(--ink-soft);
+  font: 700 8px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.budget-meter {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--ink);
+  background: var(--paper-light);
+}
+
+.budget-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--cobalt);
+}
+
+.budget-meter-cost > span {
+  background: var(--marigold);
+}
+
+.budget-ledger-exhausted .budget-meter > span {
+  background: var(--signal);
+}
+
+.budget-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.budget-metrics > div {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: rgb(248 244 232 / 88%);
+}
+
+.budget-metrics strong,
+.budget-metrics small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.budget-metrics strong {
+  margin-top: 5px;
+  font: 700 11px/1.25 var(--mono);
+}
+
+.budget-metrics small {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font: 9px/1.2 var(--mono);
+}
+
+.budget-approval-proof {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  padding: 8px;
+  border-left: 4px solid var(--mint);
+  background: var(--paper-light);
+}
+
+.budget-approval-proof strong {
+  font: 700 10px/1.2 var(--mono);
+  text-align: right;
+}
+
+.budget-approval-proof small {
+  grid-column: 1 / -1;
+  color: var(--ink-soft);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.budget-pending {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 2px solid #8b6315;
+  background: #f6e4b7;
+}
+
+.budget-pending strong,
+.budget-pending small,
+.budget-pending p {
+  display: block;
+}
+
+.budget-pending strong {
+  margin-top: 5px;
+  font: 700 12px/1.25 var(--mono);
+}
+
+.budget-pending small {
+  margin-top: 4px;
+  color: #6b4810;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.budget-pending p {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.budget-decision-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.budget-revision-open {
+  width: 100%;
+}
+
+.budget-proposal {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 2px solid var(--signal);
+  background: var(--paper-light);
+}
+
+.budget-proposal-heading > button {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  color: var(--ink);
+  font-size: 23px;
+  line-height: 1;
+  border: 1px solid var(--ink);
+  background: transparent;
+}
+
+.budget-proposal label,
+.finish-scope-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--ink);
+  font: 700 9px/1.2 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.budget-proposal input,
+.budget-proposal textarea,
+.budget-proposal select {
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 8px 9px;
+  color: var(--ink);
+  font: 12px/1.35 var(--mono);
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  background: var(--paper);
+}
+
+.budget-proposal textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.budget-proposal-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.budget-scope-toggle {
+  margin: 0;
+}
+
+.finish-scope-fields {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px dashed var(--cobalt);
+  background: #e5ece8;
+}
+
+.finish-scope-fields > small {
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.budget-proposal-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.budget-proposal-footer small,
+.budget-guidance,
+.budget-resume-guidance {
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.budget-error {
+  color: #6f1c15 !important;
+  font-weight: 700;
+}
+
+.budget-guidance,
+.budget-resume-guidance {
+  margin: 0;
+  padding: 8px;
+  border-left: 4px solid var(--signal);
+  background: #f0d4c7;
+}
+
+.budget-resume-guidance {
+  margin-top: 7px;
+}
+
+.budget-history {
+  border-top: 1px solid var(--line);
+}
+
+.budget-history summary {
+  min-height: 40px;
+  padding: 10px 0 0;
+  color: var(--cobalt-dark);
+  font: 700 9px/1.2 var(--mono);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+
+.budget-history ol {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 7px 0 0;
+  list-style: none;
+}
+
+.budget-history li {
+  display: grid;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--paper-light);
+}
+
+.budget-history li strong {
+  font: 700 10px/1.2 var(--mono);
+  text-align: right;
+}
+
+.budget-history li p,
+.budget-history li small {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.budget-history li p {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.budget-history li small {
+  color: var(--ink-soft);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.budget-history-status {
+  flex: 0 0 auto;
+  padding: 3px 5px;
+  color: var(--paper-light);
+  font: 700 8px/1 var(--mono);
+  background: var(--marigold);
+  text-transform: uppercase;
+}
+
+.budget-history-approved {
+  background: var(--mint);
+}
+
+.budget-history-rejected {
+  background: var(--signal);
+}
+
 .task-graph-list {
   display: grid;
   gap: 5px;
@@ -3153,5 +3526,36 @@ summary:focus-visible {
 
   .transfer-row .transfer-control {
     width: 100%;
+  }
+
+  .budget-metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .budget-proposal-grid,
+  .budget-decision-actions,
+  .budget-proposal-footer {
+    grid-template-columns: 1fr;
+  }
+
+  .budget-proposal-footer .button {
+    width: 100%;
+  }
+
+  .budget-approval-proof {
+    grid-template-columns: 1fr;
+  }
+
+  .budget-approval-proof strong {
+    text-align: left;
+  }
+
+  .budget-history li > div {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .budget-history li strong {
+    text-align: left;
   }
 }
