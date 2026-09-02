@@ -2077,16 +2077,39 @@ fn validate_pull_request_identity(
             "pull request head repository or commit does not match the verified publication target"
         ));
     }
-    let expected_url = format!(
-        "https://github.com/{}/pull/{number}",
-        publication.target_repository
-    );
-    if url.trim_end_matches('/') != expected_url {
+    if !github_pull_request_url_matches(url, &publication.target_repository, number) {
         return Err(anyhow!(
             "pull request URL does not match the authorized repository and number"
         ));
     }
     Ok(())
+}
+
+fn github_pull_request_url_matches(url: &str, target_repository: &str, number: i64) -> bool {
+    let Some(path) = url
+        .trim_end_matches('/')
+        .strip_prefix("https://github.com/")
+    else {
+        return false;
+    };
+    let mut path_parts = path.split('/');
+    let Some(url_owner) = path_parts.next() else {
+        return false;
+    };
+    let Some(url_repository) = path_parts.next() else {
+        return false;
+    };
+    let expected_number = number.to_string();
+    if path_parts.next() != Some("pull")
+        || path_parts.next() != Some(expected_number.as_str())
+        || path_parts.next().is_some()
+    {
+        return false;
+    }
+    let Some((target_owner, target_name)) = target_repository.split_once('/') else {
+        return false;
+    };
+    url_owner.eq_ignore_ascii_case(target_owner) && url_repository.eq_ignore_ascii_case(target_name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2487,5 +2510,29 @@ mod tests {
         assert!(validate_factory_branch_ref("ecorp/foo.lock/bar").is_err());
         assert!(validate_factory_branch_ref("ecorp/.hidden").is_err());
         assert!(validate_factory_branch_ref("HEAD").is_err());
+    }
+
+    #[test]
+    fn github_pull_request_urls_compare_repository_case_insensitively() {
+        assert!(github_pull_request_url_matches(
+            "https://github.com/Owner/MyRepo/pull/41",
+            "owner/myrepo",
+            41
+        ));
+        assert!(github_pull_request_url_matches(
+            "https://github.com/OWNER/MYREPO/pull/41/",
+            "owner/myrepo",
+            41
+        ));
+        assert!(!github_pull_request_url_matches(
+            "https://github.com/owner/other/pull/41",
+            "owner/myrepo",
+            41
+        ));
+        assert!(!github_pull_request_url_matches(
+            "https://github.com/owner/myrepo/pull/42",
+            "owner/myrepo",
+            41
+        ));
     }
 }

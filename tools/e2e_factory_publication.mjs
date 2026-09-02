@@ -818,6 +818,7 @@ await writeFile(
   `${JSON.stringify(
     {
       repository: 'shyamsridhar123/ecorp',
+      canonical_repository: 'ShyamSridhar123/ECorp',
       project: {
         id: 'PVT_PUBLICATION',
         number: 7,
@@ -1565,6 +1566,10 @@ const authorizedPullRequest = fakeState.pull_requests.find(
 assert.equal(authorizedPullRequest.number, 41)
 assert.equal(authorizedPullRequest.headRefOid, source.head_commit)
 assert.equal(authorizedPullRequest.headRepositoryOwner.login, 'shyamsridhar123')
+assert.equal(
+  authorizedPullRequest.url,
+  'https://github.com/ShyamSridhar123/ECorp/pull/41',
+)
 assert.notEqual(publicationSnapshot.publication.pull_request_number, forkPullRequest.number)
 assert.equal(
   fakeState.items.find((item) => item.id === workItem.source_project_item_id)
@@ -1834,6 +1839,9 @@ const report = {
   custom_title_normalized: collisionPublication.title === collisionCustomTitle,
   mixed_case_repository_normalized:
     collisionPublication.target_repository === 'shyamsridhar123/ecorp',
+  mixed_case_pull_request_url_accepted:
+    publication.pull_request_url ===
+    'https://github.com/ShyamSridhar123/ECorp/pull/41',
   implicit_authorization_retry_stable: true,
   cross_publisher_default_start_recovery:
     collisionPublication.publisher_id === 'trusted-publication-host-b' &&

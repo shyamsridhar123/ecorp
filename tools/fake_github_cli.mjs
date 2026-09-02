@@ -263,10 +263,11 @@ if (args[0] === 'api' && args[1] === 'graphql') {
     await new Promise((resolve) => setTimeout(resolve, state.pr_create_delay_ms))
   }
   const number = state.next_pr_number ?? 1
+  const canonicalRepository = state.canonical_repository ?? repository
   const pullRequest = {
     number,
     id: `PR_FAKE_${number}`,
-    url: `https://github.com/${repository}/pull/${number}`,
+    url: `https://github.com/${canonicalRepository}/pull/${number}`,
     state: 'OPEN',
     isDraft: false,
     headRefName: head,
