@@ -96,7 +96,10 @@ Underivable legacy claims are not guessed or silently widened: migration marks t
 upgrade, and only the active fenced operator may resolve and persist a new commit before any run
 exists. That dedicated idempotent operation is stored in `factory_operations` and emits
 `factory.source_commit_pinned`; it rejects stale tokens, stale versions, already-pinned policies,
-incompatible task contracts, and any mission that has already produced a run.
+incompatible task contracts, and any mission that has already produced a run. New claim intake
+requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
+Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
+match the persisted policy ref before resolving or storing a commit.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

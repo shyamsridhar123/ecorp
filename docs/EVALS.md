@@ -213,6 +213,8 @@ shape, reapplies migration 0022, and proves policy, task, and run source commits
 the persisted workspace base commit. It also creates an unmaterialized legacy claim with no
 derivable commit, proves migration marks an upgrade requirement, then runs the controller through
 one fenced and audited source-pin operation before materialization and verified execution. The
+same test proves new commit-less claims are rejected without creating a work item and that a
+recovery invocation naming a different symbolic ref cannot mutate the migration-marked record. The
 workspace unit regression advances `HEAD` while one manager remains alive and proves a later
 unpinned worktree follows the new commit while pinned and resumed work remains on the original
 identity.
