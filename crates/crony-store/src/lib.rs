@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+mod budget_revision;
 mod publication;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -3799,7 +3800,11 @@ impl PgStore {
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
-                   t.mission_id, t.contract, t.verification_policy, m.room_id, a.adapter
+                   r.breaker_stage AS source_breaker_stage,
+                   t.mission_id, t.contract, t.verification_policy, m.room_id,
+                   m.budget_tokens AS mission_budget_tokens,
+                   m.budget_cost_microusd AS mission_budget_cost_microusd,
+                   a.adapter
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -3834,6 +3839,12 @@ impl PgStore {
                 .context("decode verification policy")?;
         let contract: TaskContract =
             serde_json::from_value(row.get("contract")).context("decode task contract")?;
+        let source_breaker_stage: String = row.get("source_breaker_stage");
+        if source_breaker_stage == "stop" {
+            return Err(anyhow!(
+                "source run reached a stop-stage breaker and cannot be resumed"
+            ));
+        }
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let adapter: String = row.get("adapter");
@@ -3858,6 +3869,22 @@ impl PgStore {
             return Err(anyhow!("task already has an active run"));
         }
 
+        let (mission_tokens_used, mission_cost_used) =
+            budget_revision::mission_usage_tx(&mut tx, corp_id, mission_id).await?;
+        let mission_budget_tokens: i64 = row.get("mission_budget_tokens");
+        let mission_budget_cost_microusd: i64 = row.get("mission_budget_cost_microusd");
+        let remaining_mission_tokens = mission_budget_tokens - mission_tokens_used;
+        let remaining_mission_cost_microusd = mission_budget_cost_microusd - mission_cost_used;
+        if remaining_mission_tokens <= 0 || remaining_mission_cost_microusd <= 0 {
+            return Err(anyhow!(
+                "mission has no remaining authorized budget; an owner or admin must approve a budget revision before resume"
+            ));
+        }
+        let resume_budget_tokens = contract.budget_tokens.min(remaining_mission_tokens);
+        let resume_budget_cost_microusd = contract
+            .budget_cost_microusd
+            .min(remaining_mission_cost_microusd);
+
         let run_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
         sqlx::query(
@@ -3880,8 +3907,8 @@ impl PgStore {
         .bind(&provider_session_id)
         .bind(source_run_id)
         .bind(workspace_run_id)
-        .bind(contract.budget_tokens)
-        .bind(contract.budget_cost_microusd)
+        .bind(resume_budget_tokens)
+        .bind(resume_budget_cost_microusd)
         .bind(&model)
         .bind(&reasoning_effort)
         .bind(&contract.source_repository)
@@ -3928,7 +3955,13 @@ impl PgStore {
                         "agent_id": agent_id,
                         "runner_id": runner_id,
                         "model": model,
-                        "reasoning_effort": reasoning_effort
+                        "reasoning_effort": reasoning_effort,
+                        "mission_tokens_used": mission_tokens_used,
+                        "mission_cost_microusd_used": mission_cost_used,
+                        "remaining_mission_tokens": remaining_mission_tokens,
+                        "remaining_mission_cost_microusd": remaining_mission_cost_microusd,
+                        "resume_budget_tokens": resume_budget_tokens,
+                        "resume_budget_cost_microusd": resume_budget_cost_microusd,
                     }),
                 )
             },
@@ -8900,6 +8933,51 @@ fn map_mission(row: sqlx::postgres::PgRow) -> Result<Mission> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct MissionFinishScopeInput {
+    pub task_id: Uuid,
+    pub objective: String,
+    pub expected_output: String,
+    pub acceptance_tests: Vec<String>,
+    pub write_scope: Vec<String>,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub verification_policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposeMissionBudgetRevisionInput {
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub actor_id: Uuid,
+    pub expected_budget_tokens: i64,
+    pub expected_budget_cost_microusd: i64,
+    pub proposed_budget_tokens: i64,
+    pub proposed_budget_cost_microusd: i64,
+    pub rationale: String,
+    pub idempotency_key: Uuid,
+    pub finish_scope: Option<MissionFinishScopeInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecideMissionBudgetRevisionInput {
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub revision_id: Uuid,
+    pub actor_id: Uuid,
+    pub expected_version: i64,
+    pub approved: bool,
+    pub note: String,
+    pub decision_key: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct MissionBudgetRevisionOutcome {
+    pub revision: MissionBudgetRevision,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
 }
 
 fn map_mission_budget_revision(row: sqlx::postgres::PgRow) -> Result<MissionBudgetRevision> {
