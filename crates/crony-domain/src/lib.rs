@@ -657,6 +657,8 @@ pub struct PullRequestPublicationAttempt {
     pub publication_id: Uuid,
     pub attempt: i32,
     pub actor_id: Uuid,
+    pub authorization_id: Uuid,
+    pub authorization: Value,
     pub publisher_id: String,
     pub state: String,
     pub failure_detail: Option<String>,

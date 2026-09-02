@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+mod publication;
+
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
 const DEMO_BOB_ID: &str = "00000000-0000-4000-8000-000000000012";
@@ -238,27 +240,6 @@ struct NewFactoryOperation<'a> {
     operation: &'a str,
     resulting_version: i64,
     claim_token: Option<Uuid>,
-    request: &'a Value,
-}
-
-#[derive(Debug, Clone)]
-struct PullRequestPublicationOperation {
-    publication_id: Uuid,
-    actor_id: Uuid,
-    operation: String,
-    resulting_version: i64,
-    publisher_token: Option<Uuid>,
-    request: Value,
-}
-
-struct NewPullRequestPublicationOperation<'a> {
-    corp_id: Uuid,
-    idempotency_key: &'a str,
-    publication_id: Uuid,
-    actor_id: Uuid,
-    operation: &'a str,
-    resulting_version: i64,
-    publisher_token: Option<Uuid>,
     request: &'a Value,
 }
 
@@ -1484,8 +1465,9 @@ impl PgStore {
         let pull_request_publication_attempts = sqlx::query(
             r#"
             SELECT attempt.id, attempt.corp_id, attempt.publication_id, attempt.attempt,
-                   attempt.actor_id, attempt.publisher_id, attempt.state,
-                   attempt.failure_detail, attempt.started_at, attempt.finished_at
+                   attempt.actor_id, attempt.authorization_id, attempt.authorization,
+                   attempt.publisher_id, attempt.state, attempt.failure_detail,
+                   attempt.started_at, attempt.finished_at
             FROM pull_request_publication_attempts attempt
             JOIN pull_request_publications publication ON publication.id = attempt.publication_id
             JOIN missions mission ON mission.id = publication.mission_id
@@ -9009,9 +8991,7 @@ fn map_source_deliverable(row: sqlx::postgres::PgRow) -> Result<SourceDeliverabl
     })
 }
 
-fn map_pull_request_publication(
-    row: sqlx::postgres::PgRow,
-) -> Result<PullRequestPublication> {
+fn map_pull_request_publication(row: sqlx::postgres::PgRow) -> Result<PullRequestPublication> {
     Ok(PullRequestPublication {
         id: row.get("id"),
         corp_id: row.get("corp_id"),
@@ -9070,6 +9050,8 @@ fn map_pull_request_publication_attempt(
         publication_id: row.get("publication_id"),
         attempt: row.get("attempt"),
         actor_id: row.get("actor_id"),
+        authorization_id: row.get("authorization_id"),
+        authorization: row.get("authorization"),
         publisher_id: row.get("publisher_id"),
         state: row.get("state"),
         failure_detail: row.get("failure_detail"),

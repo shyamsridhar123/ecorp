@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS pull_request_publication_attempts (
     publication_id UUID NOT NULL REFERENCES pull_request_publications(id) ON DELETE CASCADE,
     attempt INTEGER NOT NULL CHECK (attempt > 0),
     actor_id UUID NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+    authorization_id UUID NOT NULL,
+    authorization JSONB NOT NULL,
     publisher_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('running', 'failed', 'abandoned', 'published')),
     failure_detail TEXT,
