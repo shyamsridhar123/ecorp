@@ -216,3 +216,32 @@ The complete local repository gate passed with 23 immutable migrations, formatti
 workspace clippy, all 75 Rust tests, production web build, web lint, Node syntax validation, and
 `git diff --check`. The isolated PostgreSQL/server/runner topology used ports `55435` and `8893`;
 its process tree and container were removed, and ports `55435`, `8893`, and `5289` were closed.
+
+## Literal reset and nested CLI-credential closure — September 2, 2026
+
+Commit `fc5982d54501bc7f690bea670767b265aded0962` closes two further export-edge
+findings:
+
+- the normal-index reset after a bounded commit now sets `GIT_LITERAL_PATHSPECS=1`, matching every
+  temporary-index Git operation; a wildcard-shaped literal selection such as `foo[bar]` cannot
+  unstage an unrelated staged path such as `foob`; and
+- nested credential-bearing config directories now include `.config/gh`, `.config/hub`,
+  `.config/glab`, `.config/doctl`, `.config/heroku`, `.config/op`, `.config/rclone`, and
+  `.config/containers`. Additional standalone credential filenames such as `.git-credentials`,
+  `.netrc`, `.vault-token`, application-default credentials, and kubeconfig are also rejected.
+
+Ten focused deliverable tests passed, including the wildcard-shaped post-commit reset regression
+and nested GitHub CLI/Rclone credential detection. A fresh isolated portable-deliverable E2E then
+recorded:
+
+- archive run `cc4ae5f8-a2d5-4418-b158-c17529d6b432`
+- archive artifact `e34f8037-39e3-497d-a97d-eb1e73de517f`
+- archive SHA-256 `cc216e92a8401bfd3da77c4e3ce690ded11fc8c3044ff32fd187e5926f99c23d`
+- commit run `8a175b89-8d5c-44d6-8c68-8bf6e6d9dfea`
+- bounded commit `35802869ddf7cebf0b43792bf03690e58fd13905`
+- retained-before-cleanup ordering `true`
+- unauthorized download HTTP `404`
+
+The exact code head passed all 23 migration checks, formatting, warning-free workspace clippy, all
+76 Rust tests, production web build, web lint, and `git diff --check`. The isolated process tree,
+PostgreSQL container, and ports `55437` and `8895` were cleaned up.

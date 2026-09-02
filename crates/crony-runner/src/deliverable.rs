@@ -537,6 +537,7 @@ async fn commit_index(
             .args(["reset", "--mixed", "HEAD", "--"])
             .args(changes.iter().map(|(_, path)| path))
             .current_dir(workspace)
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -618,16 +619,34 @@ fn sensitive_path(path: &str) -> bool {
                 | ".gnupg"
                 | ".password-store"
         )
-    }) || components
-        .windows(2)
-        .any(|pair| pair == [".config", "gcloud"])
-        || file_name.starts_with(".env")
+    }) || components.windows(2).any(|pair| {
+        pair[0] == ".config"
+            && matches!(
+                pair[1],
+                "gcloud"
+                    | "gh"
+                    | "hub"
+                    | "glab"
+                    | "doctl"
+                    | "heroku"
+                    | "op"
+                    | "rclone"
+                    | "containers"
+            )
+    }) || file_name.starts_with(".env")
         || matches!(
             file_name,
             ".npmrc"
                 | ".pypirc"
+                | ".netrc"
+                | "_netrc"
+                | ".git-credentials"
+                | ".vault-token"
                 | "id_rsa"
                 | "id_ed25519"
+                | "application_default_credentials.json"
+                | "accesstokens.json"
+                | "kubeconfig"
                 | "credentials"
                 | "credentials.json"
                 | "secrets.json"
@@ -895,7 +914,10 @@ mod tests {
         assert!(sensitive_path("nested/.ssh/id_ed25519"));
         assert!(sensitive_path("services/api/.kube/config"));
         assert!(sensitive_path("nested/.docker/config.json"));
-        assert!(!sensitive_path("docs/azure/accessTokens.json"));
+        assert!(sensitive_path("services/api/.config/gh/hosts.yml"));
+        assert!(sensitive_path("nested/.config/rclone/rclone.conf"));
+        assert!(sensitive_path("nested/.git-credentials"));
+        assert!(!sensitive_path("docs/azure/guide.json"));
     }
 
     #[tokio::test]
@@ -1035,6 +1057,41 @@ mod tests {
         assert_eq!(
             git(&root, &["show", "--format=", "--name-only", "HEAD"]),
             "tracked.txt"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn scoped_commit_reset_treats_selected_paths_literally() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("foo[bar]"), b"before selected\n").expect("write selected base");
+        fs::write(root.join("foob"), b"before staged\n").expect("write staged base");
+        git(&root, &["add", "foo[bar]", "foob"]);
+        git(&root, &["commit", "-m", "add wildcard-shaped paths"]);
+
+        fs::write(root.join("foo[bar]"), b"after selected\n").expect("modify selected path");
+        fs::write(root.join("foob"), b"after staged\n").expect("modify staged path");
+        git(&root, &["add", "foob"]);
+
+        export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: vec!["foo[bar]".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+        )
+        .await
+        .expect("literal scoped commit export");
+
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "foob");
+        assert_eq!(
+            git(&root, &["show", "--format=", "--name-only", "HEAD"]),
+            "foo[bar]"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
