@@ -3,6 +3,7 @@
 **Date:** September 2, 2026  
 **Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`
 **Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
+**Final local validation head:** `02a8baa8d63279e3f1f02c96025bf2fc596c5d4d`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -36,7 +37,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 72 non-documentation unit tests with no failures.
+The Rust workspace ran 73 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -49,7 +50,7 @@ The final exact-head run recorded:
 {
   "publication_attempts": 8,
   "pull_request_number": 41,
-  "pull_request_head_sha": "d1f389edee02e9f009b6a3c24c9d975efd9da1d2",
+  "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "pull_request_create_calls": 1,
@@ -111,16 +112,17 @@ the bundle, and the publisher separately verifies the document's source branch p
 The React console loaded against the final isolated stack in the Codex in-app browser with no
 console errors. The visible publication card showed:
 
-- target `shyamsridhar123/ecorp` and base `main`;
+- target `shyamsridhar123/ecorp` and verified symbolic base `HEAD`;
 - exact branch and commit;
-- owner authorization and four attempts;
+- owner authorization and eight retained attempts;
 - pull request #41 open for review;
+- verified head owner `shyamsridhar123`, exact head SHA, and same-repository identity;
 - Project `In Progress -> In Review`; and
 - `auto-merge off` plus merge/deploy unauthorized.
 
 Screenshot:
 
-`output/playwright/factory-publication-exact-head.png`
+`output/playwright/factory-publication-review-hardened.png`
 
 All test-owned processes, ports, and containers were stopped after validation. Failed-run worktrees
 were preserved according to the repository safety contract.
