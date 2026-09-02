@@ -845,7 +845,7 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
     Ok(())
 }
 
-fn normalize_github_component(value: &str, field: &str) -> Result<String> {
+pub(crate) fn normalize_github_component(value: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 100
@@ -867,6 +867,7 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
         || value.ends_with('.')
         || value.contains("..")
         || value.contains("@{")
+        || value.chars().any(char::is_control)
         || value
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
@@ -2284,6 +2285,7 @@ Blocked by #999 outside the section.
         assert!(publication_base_branch("refs/tags/v1").is_err());
         assert!(publication_base_branch("refs/remotes/origin/main").is_err());
         assert!(publication_base_branch("refs/heads/").is_err());
+        assert!(publication_base_branch("main\tbad").is_err());
     }
 
     #[test]

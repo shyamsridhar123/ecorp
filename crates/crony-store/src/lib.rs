@@ -7886,6 +7886,7 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
         || value.ends_with('.')
         || value.contains("..")
         || value.contains("@{")
+        || value.chars().any(char::is_control)
         || value
             .chars()
             .any(|character| matches!(character, '\\' | ' ' | '~' | '^' | ':' | '?' | '*' | '['))
@@ -9917,6 +9918,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("HEAD or a branch ref")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "main\tbad"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("safe Git ref")
         );
     }
 

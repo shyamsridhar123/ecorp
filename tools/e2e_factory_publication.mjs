@@ -164,6 +164,7 @@ async function runPublisher(
     actorId = demo.alice_actor_id,
     sourceDeliverableId,
     title,
+    repository,
     publisherId = 'trusted-publication-e2e',
     authorizationReason =
       'Publication E2E authorizes review-only branch and pull request creation.',
@@ -193,6 +194,7 @@ async function runPublisher(
     args.push('--source-deliverable-id', sourceDeliverableId)
   }
   if (title) args.push('--title', title)
+  if (repository) args.push('--repository', repository)
   if (idempotencyKey) args.push('--idempotency-key', idempotencyKey)
   if (branch) args.push('--branch', branch)
   if (bodyFile) args.push('--body-file', bodyFile)
@@ -985,6 +987,7 @@ await runPublisher(demo, collisionWorkItem.id, {
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
   title: `  ${collisionCustomTitle}  `,
+  repository: 'ShyamSridhar123/ECorp',
   publisherId: 'trusted-publication-host-a',
   authorizationReason: 'Host A authorizes the first recoverable publication attempt.',
   leaseSeconds: 5,
@@ -1019,6 +1022,7 @@ const collisionPublication = (await snapshot(demo)).snapshot.pull_request_public
 )
 assert.equal(collisionPublication.branch, collisionRecoveryBranch)
 assert.equal(collisionPublication.title, collisionCustomTitle)
+assert.equal(collisionPublication.target_repository, 'shyamsridhar123/ecorp')
 assert.equal(collisionPublication.publisher_id, 'trusted-publication-host-b')
 assert.equal(collisionPublication.attempt_count, 2)
 assert.equal(
@@ -1122,6 +1126,8 @@ assert.equal(guestPublicationContextBody.includes(source.id), false)
 const prePublicationFakeState = JSON.parse(await readFile(statePath, 'utf8'))
 const projectItemListCallsBeforePublication =
   prePublicationFakeState.item_list_calls ?? 0
+const projectFieldListCallsBeforePublication =
+  prePublicationFakeState.field_list_calls ?? 0
 const projectItems = prePublicationFakeState.items
 const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
   id: `PVTI_PUBLICATION_FILLER_${String(index).padStart(4, '0')}_${nonce}`,
@@ -1136,12 +1142,28 @@ const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
   },
 }))
 const expandedProjectItems = [...projectFillers, ...projectItems]
+const expandedProjectFields = [
+  ...Array.from({ length: 31 }, (_, index) => ({
+    id: `PVTF_PUBLICATION_FILLER_${String(index).padStart(2, '0')}_${nonce}`,
+    name: `Filler ${index}`,
+    type: 'ProjectV2Field',
+  })),
+  {
+    id: prePublicationFakeState.project.status_field_id,
+    name: 'Status',
+    type: 'ProjectV2SingleSelectField',
+    options: prePublicationFakeState.project.status_options,
+  },
+]
 assert.ok(
   expandedProjectItems.findIndex(
     (item) => item.id === workItem.source_project_item_id,
   ) >= 1000,
 )
-await setFakeState({ items: expandedProjectItems })
+await setFakeState({
+  items: expandedProjectItems,
+  project_fields: expandedProjectFields,
+})
 const branch = `ecorp/issue-${issueNumber}-${source.head_commit.slice(0, 12)}`
 const body = `## ECorp verified factory deliverable
 
@@ -1697,6 +1719,11 @@ assert.equal(
   projectItemListCallsBeforePublication,
 )
 assert.ok((fakeState.project_item_lookup_calls ?? 0) > 0)
+assert.equal(
+  fakeState.field_list_calls ?? 0,
+  projectFieldListCallsBeforePublication,
+)
+assert.ok((fakeState.project_field_lookup_calls ?? 0) > 0)
 const reviewEffectIndex = fakeState.effect_log.findIndex(
   (effect) => effect.kind === 'project_status' && effect.status === 'In Review',
 )
@@ -1805,6 +1832,8 @@ const report = {
   base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
   invalid_git_branches_rejected_before_start: true,
   custom_title_normalized: collisionPublication.title === collisionCustomTitle,
+  mixed_case_repository_normalized:
+    collisionPublication.target_repository === 'shyamsridhar123/ecorp',
   implicit_authorization_retry_stable: true,
   cross_publisher_default_start_recovery:
     collisionPublication.publisher_id === 'trusted-publication-host-b' &&
@@ -1832,7 +1861,12 @@ const report = {
   exact_project_item_lookup:
     (fakeState.project_item_lookup_calls ?? 0) > 0 &&
     (fakeState.item_list_calls ?? 0) === projectItemListCallsBeforePublication,
+  exact_project_field_lookup:
+    (fakeState.project_field_lookup_calls ?? 0) > 0 &&
+    (fakeState.field_list_calls ?? 0) ===
+      projectFieldListCallsBeforePublication,
   project_item_count_during_publication: expandedProjectItems.length,
+  project_field_count_during_publication: expandedProjectFields.length,
   unauthorized_pr_content_rejected: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,

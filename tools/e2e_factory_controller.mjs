@@ -306,6 +306,41 @@ await writeFile(
   )}\n`,
 )
 
+const controlCharacterPolicyRejected = await post(
+  `/api/corps/${demo.corp_id}/factory/work-items/claim`,
+  {
+    actor_id: demo.alice_actor_id,
+    source_project_owner: 'acme',
+    source_project_number: 7,
+    source_project_item_id: 'PVTI_FAKE_FACTORY_CONTROL_REF',
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    source_issue_number: 9098,
+    source_issue_node_id: 'I_FAKE_FACTORY_CONTROL_REF',
+    source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/9098',
+    source_title: 'Reject control characters in publication base policy',
+    source_revision: '2026-09-02T00:00:00Z',
+    idempotency_key: 'factory-control-ref-rejected',
+    lease_seconds: 300,
+    policy: {
+      ...factoryPolicy(),
+      publication: {
+        allowed: true,
+        repository_allowlist: ['shyamsridhar123/ecorp'],
+        base_ref: 'main\tbad',
+        branch_prefix: 'ecorp/',
+        status_before: 'In Progress',
+        review_status: 'In Review',
+        auto_merge: false,
+        merge: false,
+        deploy: false,
+      },
+    },
+  },
+)
+assert.equal(controlCharacterPolicyRejected.response.status, 400)
+assert.match(controlCharacterPolicyRejected.body.error, /safe Git ref/)
+
 let invalidPublicationBaseRejected = false
 try {
   await runController(demo, 9001, true, {
@@ -1237,6 +1272,8 @@ const report = {
   mission_status: missions[0].status,
   run_status: runs[0].status,
   auto_merge: false,
+  control_character_publication_base_policy_rejected:
+    controlCharacterPolicyRejected.response.status,
   non_branch_publication_base_rejected_before_claim:
     invalidPublicationBaseRejected,
   queue_progression: {

@@ -52,6 +52,27 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   if (!itemId) {
     fail('exact Project item lookup omitted its node id')
   }
+  if (itemId === state.project.id) {
+    state.project_field_lookup_calls =
+      (state.project_field_lookup_calls ?? 0) + 1
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+    console.log(
+      JSON.stringify({
+        data: {
+          node: {
+            __typename: 'ProjectV2',
+            field: {
+              __typename: 'ProjectV2SingleSelectField',
+              id: state.project.status_field_id,
+              name: 'Status',
+              options: state.project.status_options,
+            },
+          },
+        },
+      }),
+    )
+    process.exit(0)
+  }
   const item = state.items.find((candidate) => candidate.id === itemId)
   const status = item
     ? state.project.status_options.find(
@@ -120,17 +141,21 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   console.log(JSON.stringify(state.project))
 } else if (args[0] === 'project' && args[1] === 'field-list') {
   assertProject()
+  state.field_list_calls = (state.field_list_calls ?? 0) + 1
+  const fields = state.project_fields ?? [
+    {
+      id: state.project.status_field_id,
+      name: 'Status',
+      type: 'ProjectV2SingleSelectField',
+      options: state.project.status_options,
+    },
+  ]
+  const requestedLimit = Number(option('--limit') ?? 30)
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   console.log(
     JSON.stringify({
-      fields: [
-        {
-          id: state.project.status_field_id,
-          name: 'Status',
-          type: 'ProjectV2SingleSelectField',
-          options: state.project.status_options,
-        },
-      ],
-      totalCount: 1,
+      fields: fields.slice(0, requestedLimit),
+      totalCount: fields.length,
     }),
   )
 } else if (args[0] === 'project' && args[1] === 'item-edit') {

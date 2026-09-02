@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::factory::{
-    gh_json, gh_output, gh_run, sanitize_failure_detail, server_json, source_git_output,
+    gh_json, gh_output, gh_run, normalize_github_component, sanitize_failure_detail, server_json,
+    source_git_output,
 };
 
 #[derive(Debug, Args)]
@@ -152,13 +153,26 @@ struct ProjectView {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectFields {
-    #[serde(default)]
-    fields: Vec<ProjectField>,
+struct GraphQlProjectFieldEnvelope {
+    data: GraphQlProjectFieldData,
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectField {
+struct GraphQlProjectFieldData {
+    node: Option<GraphQlProjectFieldNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectFieldNode {
+    #[serde(rename = "__typename")]
+    kind: String,
+    field: Option<GraphQlProjectField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlProjectField {
+    #[serde(rename = "__typename")]
+    kind: String,
     id: String,
     name: String,
     #[serde(default)]
@@ -1180,24 +1194,7 @@ fn project_status(
         ],
     )?)
     .context("decode GitHub Project")?;
-    let fields: ProjectFields = serde_json::from_value(gh_json(
-        &args.github_cli,
-        &[
-            "project",
-            "field-list",
-            &plan.project_number.to_string(),
-            "--owner",
-            &plan.project_owner,
-            "--format",
-            "json",
-        ],
-    )?)
-    .context("decode GitHub Project fields")?;
-    let status_field = fields
-        .fields
-        .iter()
-        .find(|field| field.name == "Status")
-        .context("GitHub Project has no Status field")?;
+    let status_field = load_project_status_field(args, &project.id)?;
     let review_option = status_field
         .options
         .iter()
@@ -1236,6 +1233,32 @@ fn project_status(
         review_option.id.clone(),
         status.name,
     ))
+}
+
+fn load_project_status_field(
+    args: &FactoryPublishArgs,
+    project_id: &str,
+) -> Result<GraphQlProjectField> {
+    const QUERY: &str = r#"query($id:ID!){node(id:$id){__typename ... on ProjectV2{field(name:"Status"){__typename ... on ProjectV2SingleSelectField{id name options{id name}}}}}}"#;
+    let id = format!("id={project_id}");
+    let query = format!("query={QUERY}");
+    let envelope: GraphQlProjectFieldEnvelope = serde_json::from_value(gh_json(
+        &args.github_cli,
+        &["api", "graphql", "-f", &query, "-F", &id],
+    )?)
+    .context("decode exact GitHub Project Status field")?;
+    let node = envelope
+        .data
+        .node
+        .context("GitHub Project disappeared during publication")?;
+    let field = node.field.context("GitHub Project has no Status field")?;
+    if node.kind != "ProjectV2"
+        || field.kind != "ProjectV2SingleSelectField"
+        || field.name != "Status"
+    {
+        bail!("GitHub Project Status field has an unexpected identity");
+    }
+    Ok(field)
 }
 
 fn load_project_item(
@@ -1318,6 +1341,7 @@ fn publication_plan(args: &FactoryPublishArgs, context: &Value) -> Result<Public
         .map(str::to_owned)
         .or_else(|| args.repository.clone())
         .unwrap_or_else(|| format!("{source_owner}/{source_name}"));
+    let target_repository = normalize_publication_repository(&target_repository)?;
     let base_ref = existing_publication
         .and_then(|publication| publication.get("base_ref"))
         .and_then(Value::as_str)
@@ -1488,6 +1512,25 @@ fn normalize_publication_body(value: &str) -> Result<String> {
         bail!("pull request body cannot contain NUL bytes");
     }
     Ok(value.to_owned())
+}
+
+fn normalize_publication_repository(value: &str) -> Result<String> {
+    let repository = value.trim();
+    let mut parts = repository.split('/');
+    let owner = parts
+        .next()
+        .context("publication target repository omitted owner")?;
+    let name = parts
+        .next()
+        .context("publication target repository omitted name")?;
+    if parts.next().is_some() {
+        bail!("publication target repository must use owner/name form");
+    }
+    Ok(format!(
+        "{}/{}",
+        normalize_github_component(owner, "publication repository owner")?,
+        normalize_github_component(name, "publication repository name")?
+    ))
 }
 
 fn normalize_publication_title(value: &str) -> Result<String> {
@@ -1758,6 +1801,12 @@ mod tests {
             normalize_publication_title("  Review title  ").expect("normalize title"),
             "Review title"
         );
+        assert_eq!(
+            normalize_publication_repository(" ShyamSridhar123 / ECorp ")
+                .expect("normalize repository"),
+            "shyamsridhar123/ecorp"
+        );
+        assert!(normalize_publication_repository("owner/repo/extra").is_err());
         assert!(normalize_publication_title("   ").is_err());
         assert!(normalize_publication_title("bad\ntitle").is_err());
         assert!(normalize_publication_title(&"x".repeat(257)).is_err());
