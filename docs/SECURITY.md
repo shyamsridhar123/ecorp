@@ -144,11 +144,13 @@ mission, requester, Corp-budget, and hard-breaker authority. Pull-request adopti
 GitHub PR commands receive that verified branch name rather than the literal `HEAD`, and the
 resolved PR base is retained separately from the authorized symbolic base.
 
-The resolved PR base can never also be the publication head branch; this guard runs before push so
-publication cannot mutate the default branch as a substitute for merge authorization. Generated
-authorization IDs remain stable across restart and duplicate invocation, and local body-file
-normalization matches server canonicalization so idempotency cannot fail on CRLF or a trailing
-newline.
+The resolved PR base can never also be the publication head branch. A read-only remote preflight
+rejects that configuration before the server persists a publication, and the guard repeats before
+push, so publication cannot mutate the default branch as a substitute for merge authorization.
+Generated authorization IDs remain stable across restart and duplicate invocation. A different
+recovery actor receives a new actor-bound ID rather than inheriting the first actor's grant. Local
+body-file normalization matches server canonicalization so idempotency cannot fail on CRLF or a
+trailing newline.
 
 ## Required production boundaries
 

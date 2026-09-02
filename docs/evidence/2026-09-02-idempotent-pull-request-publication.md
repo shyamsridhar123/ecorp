@@ -6,6 +6,7 @@
 **Final local validation head:** `ae2df7c50d778f0de56fcb694711044d7cfc9bec`
 **Resolved-base fix head:** `59638db`
 **Retry and base-branch guard head:** `aa55790`
+**Preflight and actor-handoff head:** `6f4c57c`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -54,6 +55,7 @@ The final exact-head run recorded:
   "base_branch_collision_rejected": true,
   "implicit_authorization_retry_stable": true,
   "body_file_crlf_normalized": true,
+  "actor_handoff_authorization_distinct": true,
   "publication_attempts": 8,
   "pull_request_number": 41,
   "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
@@ -98,12 +100,17 @@ start, changing the owner to another still-publish-capable role, raising a hard 
 the selected run budget, and exhausting the Corp aggregate budget each caused the next lease
 renewal to fail before branch, PR, or Project effects.
 
-A separate verified factory item explicitly allowed publication branch `main`. A CLI invocation
-without `--authorization-id` crashed immediately after durable start, the server restarted, and two
-later duplicate invocations using a CRLF body file with a trailing newline both reached the same
-resolved-base guard. The remote `main` object did not change, no pull request was created, the body
-canonicalized identically on client and server, and the generated authorization identity remained
-stable across crash, restart, and retry.
+A separate verified factory item explicitly allowed publication branch `main`. The read-only
+preflight rejected it before creating any publication row and left the factory item verified, so a
+corrected branch remained usable. A later CLI invocation on that corrected branch omitted
+`--authorization-id`, crashed immediately after durable start, restarted the server, and recovered
+through a duplicate invocation using a CRLF body file with a trailing newline. The remote `main`
+object did not change, no pull request was created, the body canonicalized identically on client and
+server, and the generated authorization identity remained stable across crash, restart, and retry.
+
+The main publication then expired an Alice-owned attempt, promoted Bob to manager for recovery, and
+proved Bob's attempt received a different authorization ID whose snapshot named Bob. Bob was
+returned to member afterward and Alice completed the remaining recovery path.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was
