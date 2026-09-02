@@ -202,17 +202,6 @@ impl EvaluatedItem {
 pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
     normalize_args(&mut args)?;
     validate_args(&args)?;
-    let snapshot = server_json(
-        client,
-        Method::GET,
-        format!(
-            "{server}/api/corps/{}/snapshot?actor_id={}",
-            args.corp_id, args.actor_id
-        ),
-        None,
-    )
-    .await?;
-    let existing = existing_factory_items(&snapshot)?;
     let project_items = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project_items.items.len() < project_items.total_count {
         bail!(
@@ -221,6 +210,13 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             project_items.total_count
         );
     }
+    let candidate_ids = project_items
+        .items
+        .iter()
+        .filter(|item| project_item_is_candidate(&args, item))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let existing = lookup_factory_work_items(client, server, &args, &candidate_ids).await?;
     let mut issue_cache = HashMap::new();
     let mut evaluated = evaluate_items(&args, project_items.items, &existing, &mut issue_cache)?;
     evaluated.sort_by(|left, right| {
@@ -256,7 +252,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     })?;
     let selected = evaluated.swap_remove(selected_index);
-    let refreshed = refresh_selected(&args, &existing, &selected)?;
+    let (refreshed, persisted) = refresh_selected(client, server, &args, &selected).await?;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let stable_prefix = format!(
         "github-project:{}:{}:{}:{}",
@@ -267,10 +263,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         args.corp_id
     );
     let policy = if refreshed.recovery {
-        existing
-            .get(&refreshed.project_item.id)
+        persisted
+            .as_ref()
             .map(|item| item.policy.clone())
-            .context("recoverable factory item disappeared from the ECorp snapshot")?
+            .context("recoverable factory item disappeared from the selected-item lookup")?
     } else {
         json!({
             "schema_version": 1,
@@ -312,7 +308,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_issue_url": refreshed.issue.url,
         "source_title": refreshed.issue.title,
         "source_revision": refreshed.issue.updated_at,
-        "idempotency_key": format!("{stable_prefix}:claim:{}", args.actor_id),
+        "idempotency_key": format!(
+            "{stable_prefix}:claim:{}:lease:{}",
+            args.actor_id, args.lease_seconds
+        ),
         "lease_seconds": args.lease_seconds,
         "policy": policy,
     });
@@ -327,8 +326,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         let replay_version = value_i64(&claim, "/work_item/version")?;
         let mut reclaim_body = claim_body;
         reclaim_body["idempotency_key"] = Value::String(format!(
-            "{stable_prefix}:reclaim:{}:{replay_version}",
-            args.actor_id
+            "{stable_prefix}:reclaim:{}:{replay_version}:lease:{}",
+            args.actor_id, args.lease_seconds
         ));
         claim = server_json(client, Method::POST, claim_path, Some(reclaim_body)).await?;
     }
@@ -854,16 +853,7 @@ fn evaluate_items(
     let mut evaluated = Vec::new();
     let now = Utc::now();
     for item in items {
-        if item.content.kind != "Issue"
-            || !item
-                .content
-                .repository
-                .eq_ignore_ascii_case(&args.repository)
-            || (args.issue.is_none() && !matches!(item.status.as_str(), "Todo" | "In Progress"))
-            || args
-                .issue
-                .is_some_and(|number| number != item.content.number)
-        {
+        if !project_item_is_candidate(args, &item) {
             continue;
         }
         let issue = cached_issue(
@@ -956,6 +946,18 @@ fn evaluate_items(
     Ok(evaluated)
 }
 
+fn project_item_is_candidate(args: &FactoryArgs, item: &ProjectItem) -> bool {
+    item.content.kind == "Issue"
+        && item
+            .content
+            .repository
+            .eq_ignore_ascii_case(&args.repository)
+        && (args.issue.is_some() || matches!(item.status.as_str(), "Todo" | "In Progress"))
+        && args
+            .issue
+            .is_none_or(|number| number == item.content.number)
+}
+
 fn factory_state_is_recoverable(state: &str) -> bool {
     matches!(
         state,
@@ -979,11 +981,12 @@ fn factory_item_recoverable_by(
         && (item.claim_owner_id == actor_id || item.lease_expires_at <= now)
 }
 
-fn refresh_selected(
+async fn refresh_selected(
+    client: &Client,
+    server: &str,
     args: &FactoryArgs,
-    existing: &HashMap<String, ExistingFactoryItem>,
     selected: &EvaluatedItem,
-) -> Result<EvaluatedItem> {
+) -> Result<(EvaluatedItem, Option<ExistingFactoryItem>)> {
     let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project.items.len() < project.total_count {
         bail!(
@@ -997,8 +1000,10 @@ fn refresh_selected(
         .into_iter()
         .find(|item| item.id == selected.project_item.id)
         .context("selected GitHub Project item disappeared before claim")?;
+    let existing =
+        lookup_factory_work_items(client, server, args, std::slice::from_ref(&item.id)).await?;
     let mut cache = HashMap::new();
-    let refreshed = evaluate_items(args, vec![item], existing, &mut cache)?
+    let refreshed = evaluate_items(args, vec![item], &existing, &mut cache)?
         .into_iter()
         .next()
         .context("selected GitHub Project item is no longer in the repository allowlist")?;
@@ -1008,7 +1013,8 @@ fn refresh_selected(
             refreshed.reasons.join("; ")
         );
     }
-    Ok(refreshed)
+    let persisted = existing.get(&refreshed.project_item.id).cloned();
+    Ok((refreshed, persisted))
 }
 
 fn revalidate_selected_for_effect(
@@ -1130,11 +1136,57 @@ fn cached_issue(
     Ok(issue)
 }
 
-fn existing_factory_items(snapshot: &Value) -> Result<HashMap<String, ExistingFactoryItem>> {
-    snapshot
-        .pointer("/snapshot/factory_work_items")
+async fn lookup_factory_work_items(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    source_project_item_ids: &[String],
+) -> Result<HashMap<String, ExistingFactoryItem>> {
+    if source_project_item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let response = server_json(
+        client,
+        Method::POST,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/lookup",
+            args.corp_id
+        ),
+        Some(json!({
+            "actor_id": args.actor_id,
+            "source_project_owner": args.owner,
+            "source_project_number": args.project_number,
+            "source_project_item_ids": source_project_item_ids,
+        })),
+    )
+    .await?;
+    let items = response
+        .get("items")
         .and_then(Value::as_array)
-        .context("ECorp snapshot omitted factory_work_items")?
+        .context("factory work-item lookup omitted items")?;
+    let total_count = response
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .context("factory work-item lookup omitted total_count")?;
+    if total_count != items.len() as u64 {
+        bail!(
+            "factory work-item lookup returned {} of {} items",
+            items.len(),
+            total_count
+        );
+    }
+    for item in items {
+        if value_string(item, "/source_project_owner")? != args.owner
+            || value_i64(item, "/source_project_number")? != i64::from(args.project_number)
+        {
+            bail!("factory work-item lookup returned an item from another GitHub Project");
+        }
+    }
+    existing_factory_items(items)
+}
+
+fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFactoryItem>> {
+    items
         .iter()
         .map(|item| {
             let project_item_id = value_string(item, "/source_project_item_id")?;
