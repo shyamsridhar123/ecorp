@@ -1,8 +1,8 @@
 # Idempotent pull-request publication validation
 
 **Date:** September 2, 2026  
-**Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`  
-**Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`  
+**Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`
+**Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
