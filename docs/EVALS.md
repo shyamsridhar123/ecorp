@@ -110,9 +110,20 @@ acknowledgment, and verifies that an expired approval cancels coherently. `tools
 proves spend, repeated-tool, rolling requester/Corp budget evaluation, suspend and stop
 transitions, non-retryable rejection of a misbehaving provider's late completion after a stop-stage
 breaker, rejection of a pending action approval after the hard limit, and the healthy-conversation
-exemption. Authorized recovery after suspension remains open in #50, and cross-run fan-out for
-aggregate limits remains open in #56. See
-`docs/evidence/2026-08-30-approval-and-budget-validation.md`.
+exemption. `tools/e2e_budget_revision.mjs` proves owner/admin proposal and decision, unauthorized
+member rejection, exact proposal/decision replay, rejected recovery, one-pending-revision
+enforcement, bounded finish-scope replacement, pre-dispatch exhausted-budget rejection,
+same-session/worktree resume under the remaining authorized ceiling, and a second overrun that
+reaches terminal `stop` without artifact or accepted completion. Its review-hardening cases also
+  prove actor and Corp rolling ceilings reject resume before run creation, a stopped descendant
+  fences resume through an older suspended ancestor, room removal blocks proposal/decision replay, a
+  changed task contract blocks stale approval, unsafe finish-scope paths fail closed, and a
+  retryable pre-dispatch failure cannot displace the preserved source run from its resumable
+  provider/workspace lineage. Chromium also proves cancelled+suspended missions retain recovery
+  controls and that the same control remains available after a `dispatch_not_started` failure.
+Cross-run fan-out for already active runs remains open in #56. See
+`docs/evidence/2026-08-30-approval-and-budget-validation.md` and
+`docs/evidence/2026-09-02-authorized-budget-recovery.md`.
 
 `tests/scenarios/v1.jsonl` is a versioned 100-scenario corpus. `tools/run_evals.mjs` keeps
 deterministic and real-provider lanes separate. Deterministic rows must reference fresh, hashed

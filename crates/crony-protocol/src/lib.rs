@@ -1,6 +1,7 @@
 use crony_domain::{
     CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    PullRequestPublication, SourceDeliverable, TaskSecretReference, VerificationPolicy,
+    MissionBudgetRevision, PullRequestPublication, SourceDeliverable, TaskSecretReference,
+    VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -631,6 +632,45 @@ pub struct ResumeRunResponse {
     pub run_id: Uuid,
     pub runner_id: String,
     pub provider_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionFinishScopeRevision {
+    pub task_id: Uuid,
+    pub objective: String,
+    pub expected_output: String,
+    pub acceptance_tests: Vec<String>,
+    pub write_scope: Vec<String>,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub verification_policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposeMissionBudgetRevisionRequest {
+    pub actor_id: Uuid,
+    pub expected_budget_tokens: i64,
+    pub expected_budget_cost_microusd: i64,
+    pub proposed_budget_tokens: i64,
+    pub proposed_budget_cost_microusd: i64,
+    pub rationale: String,
+    pub idempotency_key: Uuid,
+    pub finish_scope: Option<MissionFinishScopeRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideMissionBudgetRevisionRequest {
+    pub actor_id: Uuid,
+    pub expected_version: i64,
+    pub approved: bool,
+    pub note: String,
+    pub decision_key: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionBudgetRevisionResponse {
+    pub revision: MissionBudgetRevision,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -135,6 +135,11 @@
       "version": 27,
       "file": "0027_publication_publisher_credentials.sql",
       "sha384": "dd1c995e46beecc20dedd9c032edf05713f6f7eaa288d290a91bdf6e3a2cfb8127c5c696dceb5f1896a6aa913d67cde3"
+    },
+    {
+      "version": 28,
+      "file": "0028_mission_budget_revisions.sql",
+      "sha384": "e49e0dfc0ad4abe44513e7d8900f9a147fe49abaa9d1bb966b2e5a0835fc83e4a33ade6cdcf4b74be478f8d3490f8e6b"
     }
   ]
 }

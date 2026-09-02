@@ -34,14 +34,15 @@ use crony_protocol::{
     CreateMissionResponse, CreatePublicationPublisherCredentialRequest,
     CreatePublicationPublisherCredentialResponse, CreateRoomMessageRequest,
     CreateRoomMessageResponse, CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse,
-    CreateSecretRequest, CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest,
-    EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
-    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
-    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
-    MaterializeFactoryMissionResponse, PullRequestPublicationCheckpoint,
-    PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
-    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
+    CreateSecretRequest, CreateSecretResponse, DecideMissionBudgetRevisionRequest,
+    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, FactoryMissionContract,
+    FactoryPublicationContextResponse, FactoryWorkItemResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    MissionBudgetRevisionResponse, ProposeMissionBudgetRevisionRequest,
+    PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
+    QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
     RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
@@ -51,11 +52,13 @@ use crony_protocol::{
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
-    NewRoomMessageInput, PendingRunnerCommand, PgStore, PullRequestPublicationCheckpointInput,
-    PullRequestPublicationOutcome, QueuedRunMessage, RecordPullRequestPublicationCheckpointInput,
-    RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
-    RunnerEventInput, StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
+    ClaimFactoryWorkItemInput, DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
+    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
+    PendingRunnerCommand, PgStore, ProposeMissionBudgetRevisionInput,
+    PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
+    RecordPullRequestPublicationCheckpointInput, RenewFactoryWorkItemInput,
+    RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput, RunnerEventInput,
+    StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
     UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
@@ -483,6 +486,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/missions/{mission_id}/launch",
             post(launch_mission),
+        )
+        .route(
+            "/api/corps/{corp_id}/missions/{mission_id}/budget-revisions",
+            post(propose_mission_budget_revision),
+        )
+        .route(
+            "/api/corps/{corp_id}/missions/{mission_id}/budget-revisions/{revision_id}/decision",
+            post(decide_mission_budget_revision),
         )
         .route(
             "/api/corps/{corp_id}/runs/{run_id}/resume",
@@ -1078,6 +1089,91 @@ async fn set_budget_policy(
         .map_err(map_store_error)?;
     publish(&state, event);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn propose_mission_budget_revision(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ProposeMissionBudgetRevisionRequest>,
+) -> Result<Json<MissionBudgetRevisionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .propose_mission_budget_revision(ProposeMissionBudgetRevisionInput {
+            corp_id,
+            mission_id,
+            actor_id,
+            expected_budget_tokens: request.expected_budget_tokens,
+            expected_budget_cost_microusd: request.expected_budget_cost_microusd,
+            proposed_budget_tokens: request.proposed_budget_tokens,
+            proposed_budget_cost_microusd: request.proposed_budget_cost_microusd,
+            rationale: request.rationale,
+            idempotency_key: request.idempotency_key,
+            finish_scope: request.finish_scope.map(|scope| MissionFinishScopeInput {
+                task_id: scope.task_id,
+                objective: scope.objective,
+                expected_output: scope.expected_output,
+                acceptance_tests: scope.acceptance_tests,
+                write_scope: scope.write_scope,
+                budget_tokens: scope.budget_tokens,
+                budget_cost_microusd: scope.budget_cost_microusd,
+                verification_policy: scope.verification_policy,
+            }),
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(MissionBudgetRevisionResponse {
+        revision: outcome.revision,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn decide_mission_budget_revision(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, mission_id, revision_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(request): Json<DecideMissionBudgetRevisionRequest>,
+) -> Result<Json<MissionBudgetRevisionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .decide_mission_budget_revision(DecideMissionBudgetRevisionInput {
+            corp_id,
+            mission_id,
+            revision_id,
+            actor_id,
+            expected_version: request.expected_version,
+            approved: request.approved,
+            note: request.note,
+            decision_key: request.decision_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(MissionBudgetRevisionResponse {
+        revision: outcome.revision,
+        replayed: outcome.replayed,
+    }))
 }
 
 fn valid_scope_component(value: &str) -> bool {

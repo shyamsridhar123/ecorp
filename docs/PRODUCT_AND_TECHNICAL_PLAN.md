@@ -33,6 +33,10 @@
 - OIDC-backed production authentication, Corp-scoped RBAC, rotating runner workload identity,
   scoped encrypted secret delivery, durable action approvals, and budget circuit breakers are
   implemented.
+- Budget-suspended missions can now recover through a durable owner/admin revision. Original spend
+  remains immutable, current and remaining authority are explicit, optional finish scope can only
+  narrow task budget and write boundaries while preserving verifier policy, and stop-stage runs
+  remain terminal.
 - The versioned 100-scenario deterministic evaluation lane, consolidated chaos evidence, and
   hosted Windows/macOS/Linux runner matrix are implemented. Real-provider and real-team evidence
   remain explicitly separate.
