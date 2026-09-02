@@ -168,6 +168,8 @@ PR adoption also requires the exact authorized title and body. A collaborator-cr
 right branch and SHA but altered content is ignored and cannot advance Project state. Publication
 retries remain pinned to the persisted deliverable ID even when the mission contains other
 merge-ready outputs.
+Pull-request URL validation requires canonical GitHub scheme, host, path shape, and number, while
+owner/repository path components compare case-insensitively to GitHub's canonical casing.
 
 Publication branches pass `git check-ref-format --branch` before the durable start request; the
 server independently rejects invalid path components such as doubled separators and `.lock`

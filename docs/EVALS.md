@@ -296,5 +296,6 @@ title. The cross-room context read also returns `404` without work-item source/p
 and the controller rejects `refs/tags/v1` as a publication base before Project reads or durable
 claim. A direct control-character base policy returns `400`; a mixed-case target repository
 canonicalizes before plan validation; and a Project with 32 fields, with Status after the default
-30-field page, completes through exact Status-field GraphQL lookup. See
+30-field page, completes through exact Status-field GraphQL lookup. A canonical PR URL retaining
+mixed-case owner/repository components is accepted and persisted. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

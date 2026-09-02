@@ -14,8 +14,9 @@
 **Title-normalization closure head:** `ba20a8347a67c1e1ab6e4b188ad3602b131654c1`
 **Context and base-ref closure head:** `7e8f13f24e5a3f4e923695b2ac00d369a99e15f7`
 **Metadata lookup closure head:** `75bfc0de71233d1c79363c2d2c642304bda0b960`
-**Integrated gate head:** `41b6fc568a3112bda8115fc22c37b5dd63b91f99`
-**Stacked base:** `7d151e1914d522a2c691e320f6b909918b3ad731`
+**URL identity closure head:** `70b287478d060fc08bafee4f33f28c393fb7c5dd`
+**Integrated gate head:** `70b287478d060fc08bafee4f33f28c393fb7c5dd`
+**Stacked base:** `95c8ff94cf3227448353e6dfb0b72d13a2b1a677`
 
 ## Scope
 
@@ -49,7 +50,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 83 non-documentation unit tests with no failures.
+The Rust workspace ran 86 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -64,6 +65,7 @@ The final exact-head run recorded:
   "invalid_git_branches_rejected_before_start": true,
   "custom_title_normalized": true,
   "mixed_case_repository_normalized": true,
+  "mixed_case_pull_request_url_accepted": true,
   "implicit_authorization_retry_stable": true,
   "cross_publisher_default_start_recovery": true,
   "body_file_crlf_normalized": true,
@@ -85,7 +87,7 @@ The final exact-head run recorded:
   "project_field_count_during_publication": 32,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "54734ce96b23904216d8053d619f690ebc0c3cb8",
+  "pull_request_head_sha": "93f1657a80faf7f4392c48f79ddef990515d77ad",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -190,6 +192,11 @@ trimmed title and created no remote pull request or Project mutation for that fi
 invocation supplied `ShyamSridhar123/ECorp`; the plan and durable publication both retained the
 canonical `shyamsridhar123/ecorp`.
 
+The fake GitHub API returned the canonical pull-request URL
+`https://github.com/ShyamSridhar123/ECorp/pull/41`. URL validation required the exact GitHub
+scheme/host, pull path, and number while comparing owner/repository components
+case-insensitively. The URL was accepted, persisted, and recovered.
+
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
 GitHub create operation refused the duplicate head, and ECorp retained `branch_pushed` without a PR
@@ -277,6 +284,12 @@ After normally merging stacked base `7d151e1914d522a2c691e320f6b909918b3ad731`,
 clippy exposed the new deliverable helper's eighth argument. Commit
 `41b6fc568a3112bda8115fc22c37b5dd63b91f99` grouped its temporary paths without changing
 behavior. Full gates and fresh exact-head controller/publication E2Es then passed.
+
+The final dependency head `95c8ff94cf3227448353e6dfb0b72d13a2b1a677` was merged normally.
+The conflict resolution retained both its shared path/write-scope safety grammar and publication's
+portable Git bundle path grouping. URL identity commit
+`70b287478d060fc08bafee4f33f28c393fb7c5dd` then passed all repository gates and fresh isolated
+controller/publication E2Es on the merged tree.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not

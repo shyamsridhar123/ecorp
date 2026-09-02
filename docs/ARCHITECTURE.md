@@ -497,6 +497,8 @@ and `isCrossRepository = false`; a same-named branch from a fork is ignored and 
 durable publication state. A symbolic `HEAD` base is resolved without `--refs`, then cross-checked
 against its advertised explicit branch target. ECorp preserves `HEAD` as the authorized policy base
 but passes and persists the resolved branch name, such as `main`, as the actual GitHub PR base.
+Canonical GitHub pull-request URLs are matched by strict scheme/host/path/number while comparing
+repository owner/name components case-insensitively.
 Project status reads query the known Project item node ID directly and verify its Project and Status
 field identity; a bounded Project item listing is never used to prove that the item disappeared.
 The Status field and its options are queried directly by name from the known Project node, so
