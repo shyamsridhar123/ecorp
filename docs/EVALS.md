@@ -187,9 +187,18 @@ requirement, and rejection of a runner checked out to another repository before 
 `crony-store` unit coverage separately proves exact retention of policy-pinned model and reasoning
 settings on every materialized task and rejects provider-backed tasks without a manual gate. The
 controller E2E proves an independent reviewer, not the requester, advances
-`awaiting_approval -> verified`. CLI unit coverage verifies Markdown section boundaries for
-dependency and acceptance parsing. See
-`docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
+`awaiting_approval -> verified`. The same E2E creates 501 newer historical factory items, proves
+the recoverable target is absent from the legacy 500-item snapshot, then recovers the exact work
+item, mission, persisted policy, and single run through the selected-Project-item lookup. It also
+proves explicit lookup counts, identifier and request-count bounds, guest denial, isolation from an
+equal item ID with a conflicting policy in another Project, and recovery after the lease duration
+changes. A fresh post-replay lookup and snapshot count every matching work item, mission, task, and
+run to prove there is exactly one of each. Mission discovery uses the deterministic GitHub issue
+title and persisted source marker from the fresh snapshot rather than following the work item's
+mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
+verifies Markdown section boundaries for dependency and acceptance parsing. See
+`docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
+`docs/evidence/2026-09-01-factory-pagination-safety.md`.
 
 `tools/e2e_factory_commit_routing.mjs` connects two runners that advertise the same GitHub
 repository and symbolic `HEAD` ref but resolve to different commits. It proves factory policy,

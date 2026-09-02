@@ -1415,6 +1415,70 @@ impl PgStore {
         Ok(snapshot)
     }
 
+    pub async fn factory_work_items_by_project_item_ids(
+        &self,
+        corp_id: Uuid,
+        viewer_actor_id: Uuid,
+        source_project_owner: &str,
+        source_project_number: i64,
+        source_project_item_ids: &[String],
+    ) -> Result<Vec<FactoryWorkItem>> {
+        if source_project_number <= 0 {
+            return Err(anyhow!("factory source project number must be positive"));
+        }
+        let source_project_owner =
+            normalize_github_component(source_project_owner, "source project owner", 100)?;
+        if source_project_item_ids.len() > 1_000 {
+            return Err(anyhow!(
+                "factory work-item lookup cannot exceed 1,000 Project item ids"
+            ));
+        }
+        let mut normalized_ids = source_project_item_ids
+            .iter()
+            .map(|value| normalize_factory_identifier(value, "source Project item id", 160))
+            .collect::<Result<Vec<_>>>()?;
+        normalized_ids.sort();
+        normalized_ids.dedup();
+        if normalized_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query(
+            r#"
+            SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+                   source_project_item_id, source_repository_owner, source_repository_name,
+                   source_issue_number, source_issue_node_id, source_issue_url, source_title,
+                   source_revision, state, version, claim_owner_id, lease_expires_at, policy,
+                   mission_id, failure_detail, created_at, updated_at
+            FROM factory_work_items
+            WHERE corp_id = $1
+              AND source_kind = 'github_project_issue'
+              AND source_project_owner = $3
+              AND source_project_number = $4
+              AND source_project_item_id = ANY($5)
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = factory_work_items.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .bind(source_project_owner)
+        .bind(source_project_number)
+        .bind(&normalized_ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_factory_work_item)
+        .collect()
+    }
+
     pub async fn events_after(
         &self,
         corp_id: Uuid,
