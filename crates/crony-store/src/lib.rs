@@ -5,8 +5,8 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
     Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
-    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent,
-    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    FactoryWorkItemState, ManualVerificationGate, Mission, MissionBudgetRevision, MissionStatus,
+    NewEvent, PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
     VerificationRequest,
@@ -1111,6 +1111,10 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM mission_budget_revisions WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM runs WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1199,8 +1203,9 @@ impl PgStore {
         let missions = sqlx::query(
             r#"
             SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title, m.strategy,
-                   m.max_nodes, m.max_depth, m.budget_tokens, m.budget_cost_microusd, m.status,
-                   m.created_at, m.updated_at
+                   m.max_nodes, m.max_depth, m.original_budget_tokens,
+                   m.original_budget_cost_microusd, m.budget_tokens,
+                   m.budget_cost_microusd, m.status, m.created_at, m.updated_at
             FROM missions m
             JOIN room_memberships rm ON rm.room_id = m.room_id
             WHERE m.corp_id = $1 AND rm.actor_id = $2
@@ -1213,6 +1218,34 @@ impl PgStore {
         .await?
         .into_iter()
         .map(map_mission)
+        .collect::<Result<Vec<_>>>()?;
+
+        let mission_budget_revisions = sqlx::query(
+            r#"
+            SELECT revision.id, revision.corp_id, revision.mission_id,
+                   revision.proposed_by, revision.status, revision.version,
+                   revision.current_budget_tokens, revision.current_budget_cost_microusd,
+                   revision.proposed_budget_tokens, revision.proposed_budget_cost_microusd,
+                   revision.consumed_tokens_at_proposal,
+                   revision.consumed_cost_microusd_at_proposal, revision.rationale,
+                   revision.replacement_task_id, revision.previous_contract,
+                   revision.replacement_contract, revision.previous_verification_policy,
+                   revision.replacement_verification_policy, revision.decided_by,
+                   revision.decision_note, revision.created_at, revision.decided_at,
+                   revision.updated_at
+            FROM mission_budget_revisions revision
+            JOIN missions mission ON mission.id = revision.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE revision.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY revision.created_at DESC
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_mission_budget_revision)
         .collect::<Result<Vec<_>>>()?;
 
         let mut tasks = sqlx::query(
@@ -1609,6 +1642,7 @@ impl PgStore {
             rooms,
             agents,
             missions,
+            mission_budget_revisions,
             tasks,
             runs,
             room_messages,
@@ -7380,8 +7414,9 @@ async fn create_mission_tx(
         r#"
         INSERT INTO missions
             (id, corp_id, room_id, requested_by, title, strategy,
-             max_nodes, max_depth, budget_tokens, budget_cost_microusd, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ready')
+             max_nodes, max_depth, original_budget_tokens,
+             original_budget_cost_microusd, budget_tokens, budget_cost_microusd, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, $10, 'ready')
         "#,
     )
     .bind(mission_id)
@@ -8857,10 +8892,60 @@ fn map_mission(row: sqlx::postgres::PgRow) -> Result<Mission> {
         strategy: row.get("strategy"),
         max_nodes: row.get("max_nodes"),
         max_depth: row.get("max_depth"),
+        original_budget_tokens: row.get("original_budget_tokens"),
+        original_budget_cost_microusd: row.get("original_budget_cost_microusd"),
         budget_tokens: row.get("budget_tokens"),
         budget_cost_microusd: row.get("budget_cost_microusd"),
         status: parse_mission_status(row.get::<String, _>("status").as_str())?,
         created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_mission_budget_revision(row: sqlx::postgres::PgRow) -> Result<MissionBudgetRevision> {
+    let previous_contract = row
+        .try_get::<Option<Value>, _>("previous_contract")?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode previous mission budget revision contract")?;
+    let replacement_contract = row
+        .try_get::<Option<Value>, _>("replacement_contract")?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode replacement mission budget revision contract")?;
+    let previous_verification_policy = row
+        .try_get::<Option<Value>, _>("previous_verification_policy")?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode previous mission budget revision verifier policy")?;
+    let replacement_verification_policy = row
+        .try_get::<Option<Value>, _>("replacement_verification_policy")?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode replacement mission budget revision verifier policy")?;
+    Ok(MissionBudgetRevision {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        mission_id: row.get("mission_id"),
+        proposed_by: row.get("proposed_by"),
+        status: row.get("status"),
+        version: row.get("version"),
+        current_budget_tokens: row.get("current_budget_tokens"),
+        current_budget_cost_microusd: row.get("current_budget_cost_microusd"),
+        proposed_budget_tokens: row.get("proposed_budget_tokens"),
+        proposed_budget_cost_microusd: row.get("proposed_budget_cost_microusd"),
+        consumed_tokens_at_proposal: row.get("consumed_tokens_at_proposal"),
+        consumed_cost_microusd_at_proposal: row.get("consumed_cost_microusd_at_proposal"),
+        rationale: row.get("rationale"),
+        replacement_task_id: row.get("replacement_task_id"),
+        previous_contract,
+        replacement_contract,
+        previous_verification_policy,
+        replacement_verification_policy,
+        decided_by: row.get("decided_by"),
+        decision_note: row.get("decision_note"),
+        created_at: row.get("created_at"),
+        decided_at: row.get("decided_at"),
         updated_at: row.get("updated_at"),
     })
 }

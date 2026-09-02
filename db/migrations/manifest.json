@@ -130,6 +130,11 @@
       "version": 26,
       "file": "0026_pull_request_resolved_base.sql",
       "sha384": "fffa900b0287178d67be3a4a86ce8b9a588c59c52006a753d293b3895a05d61b3f6ea59e904a0d3cbf723716499286d0"
+    },
+    {
+      "version": 27,
+      "file": "0027_mission_budget_revisions.sql",
+      "sha384": "e49e0dfc0ad4abe44513e7d8900f9a147fe49abaa9d1bb966b2e5a0835fc83e4a33ade6cdcf4b74be478f8d3490f8e6b"
     }
   ]
 }
