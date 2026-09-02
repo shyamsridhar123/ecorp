@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
+import { execFile as execFileCallback } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
+const execFile = promisify(execFileCallback)
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
+const databaseUrl =
+  process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
 const root = path.resolve(import.meta.dirname, '..')
+const proposalRationale =
+  'Authorize a bounded finish after reviewing already consumed usage.'
+let psqlMode
 
 async function request(url, init) {
   const response = await fetch(`${server}${url}`, init)
@@ -36,6 +44,72 @@ function postRaw(url, body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+async function psql(sql) {
+  const invocation = await psqlInvocation()
+  const { stdout } = await execFile(
+    invocation.command,
+    [
+      ...invocation.args,
+      '-v',
+      'ON_ERROR_STOP=1',
+      '-At',
+      '-c',
+      sql,
+    ],
+    {
+      cwd: root,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  )
+  return stdout.trim()
+}
+
+async function psqlInvocation() {
+  if (!psqlMode) {
+    try {
+      await execFile('psql', ['--version'], { cwd: root, windowsHide: true })
+      psqlMode = 'direct'
+    } catch {
+      psqlMode = 'docker'
+    }
+  }
+  if (psqlMode === 'direct') {
+    return { command: 'psql', args: [databaseUrl] }
+  }
+  const container = process.env.ECORP_TEST_POSTGRES_CONTAINER
+  if (!container) {
+    throw new Error(
+      'psql is unavailable and ECORP_TEST_POSTGRES_CONTAINER was not provided',
+    )
+  }
+  const parsedDatabaseUrl = new URL(databaseUrl)
+  const databaseName = decodeURIComponent(
+    parsedDatabaseUrl.pathname.replace(/^\/+/, ''),
+  )
+  const databaseUser = decodeURIComponent(parsedDatabaseUrl.username || 'crony')
+  if (!databaseName) {
+    throw new Error('DATABASE_URL omitted its PostgreSQL database name')
+  }
+  return {
+    command: 'docker',
+    args: [
+      'exec',
+      '-i',
+      container,
+      'psql',
+      '-U',
+      databaseUser,
+      '-d',
+      databaseName,
+    ],
+  }
+}
+
+function sqlLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`
 }
 
 async function snapshot(demo) {
@@ -126,7 +200,7 @@ async function propose(
       expected_budget_cost_microusd: 10_000_000,
       proposed_budget_tokens: proposedTokens,
       proposed_budget_cost_microusd: 10_000_000,
-      rationale: 'Authorize a bounded finish after reviewing already consumed usage.',
+      rationale: proposalRationale,
       idempotency_key: idempotencyKey,
       finish_scope: scope,
     },
@@ -153,6 +227,94 @@ async function decide(
       decision_key: decisionKey,
     },
   )
+}
+
+async function authorizationRevalidationScenario() {
+  const demo = await post('/api/demo/reset', {})
+  await setPolicy(demo)
+  const suspended = await createSuspendedMission(
+    demo,
+    'authorization-revalidation',
+  )
+  const task = suspended.terminal.state.snapshot.tasks.find(
+    (candidate) => candidate.id === suspended.mission.task_id,
+  )
+  const mission = suspended.terminal.state.snapshot.missions.find(
+    (candidate) => candidate.id === suspended.mission.mission_id,
+  )
+  const scope = finishScope(task)
+  const proposalKey = randomUUID()
+  const proposal = await propose(
+    demo,
+    suspended.mission.mission_id,
+    demo.alice_actor_id,
+    20_000,
+    proposalKey,
+    scope,
+  )
+
+  await psql(`
+    UPDATE tasks
+    SET contract = jsonb_set(
+      contract,
+      '{objective}',
+      to_jsonb('intervening contract change'::text),
+      false
+    )
+    WHERE id = ${sqlLiteral(task.id)}::uuid;
+  `)
+  const staleApproval = await postRaw(
+    `/api/corps/${demo.corp_id}/missions/${suspended.mission.mission_id}/budget-revisions/${proposal.revision.id}/decision`,
+    {
+      actor_id: demo.alice_actor_id,
+      expected_version: proposal.revision.version,
+      approved: true,
+      note: 'This stale approval must not overwrite the intervening contract.',
+      decision_key: randomUUID(),
+    },
+  )
+  assert.equal(staleApproval.response.status, 409)
+  assert.match(JSON.stringify(staleApproval.body), /changed after proposal/)
+
+  await psql(`
+    DELETE FROM room_memberships
+    WHERE room_id = ${sqlLiteral(mission.room_id)}::uuid
+      AND actor_id = ${sqlLiteral(demo.alice_actor_id)}::uuid;
+  `)
+  const replayWithoutMembership = await postRaw(
+    `/api/corps/${demo.corp_id}/missions/${suspended.mission.mission_id}/budget-revisions`,
+    {
+      actor_id: demo.alice_actor_id,
+      expected_budget_tokens: 6_000,
+      expected_budget_cost_microusd: 10_000_000,
+      proposed_budget_tokens: 20_000,
+      proposed_budget_cost_microusd: 10_000_000,
+      rationale: proposalRationale,
+      idempotency_key: proposalKey,
+      finish_scope: scope,
+    },
+  )
+  assert.equal(replayWithoutMembership.response.status, 403)
+  assert.match(JSON.stringify(replayWithoutMembership.body), /not a member/)
+
+  const decisionWithoutMembership = await postRaw(
+    `/api/corps/${demo.corp_id}/missions/${suspended.mission.mission_id}/budget-revisions/${proposal.revision.id}/decision`,
+    {
+      actor_id: demo.alice_actor_id,
+      expected_version: proposal.revision.version,
+      approved: false,
+      note: 'Removed room members cannot decide revisions.',
+      decision_key: randomUUID(),
+    },
+  )
+  assert.equal(decisionWithoutMembership.response.status, 403)
+  assert.match(JSON.stringify(decisionWithoutMembership.body), /not a member/)
+
+  return {
+    stale_contract_approval_rejected: true,
+    proposal_replay_after_room_removal_rejected: true,
+    decision_after_room_removal_rejected: true,
+  }
 }
 
 async function successfulRecoveryScenario() {
@@ -413,6 +575,7 @@ async function revisedBudgetOverrunScenario() {
 
 const report = {
   checked_at: new Date().toISOString(),
+  authorization_revalidation: await authorizationRevalidationScenario(),
   successful_recovery: await successfulRecoveryScenario(),
   revised_budget_overrun: await revisedBudgetOverrunScenario(),
 }

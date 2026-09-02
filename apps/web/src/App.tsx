@@ -302,6 +302,7 @@ type MissionBudgetRevisionInput = {
   proposed_budget_tokens: number
   proposed_budget_cost_microusd: number
   rationale: string
+  idempotency_key: string
   finish_scope: MissionFinishScopeInput | null
 }
 
@@ -1155,6 +1156,7 @@ function BudgetRevisionPanel({
     mission: Mission,
     revision: MissionBudgetRevision,
     approved: boolean,
+    decisionKey: string,
   ) => Promise<void>
 }) {
   const [proposalOpen, setProposalOpen] = useState(false)
@@ -1171,6 +1173,8 @@ function BudgetRevisionPanel({
   const [finishWriteScope, setFinishWriteScope] = useState('')
   const [finishBudgetTokens, setFinishBudgetTokens] = useState(1)
   const [finishBudgetCostUsd, setFinishBudgetCostUsd] = useState(0.01)
+  const [proposalKey, setProposalKey] = useState(() => crypto.randomUUID())
+  const decisionKeys = useRef<Record<string, string>>({})
 
   const consumedTokens = runs.reduce(
     (total, run) => total + run.input_tokens + run.output_tokens,
@@ -1195,14 +1199,22 @@ function BudgetRevisionPanel({
   const latestApprovedRevision = orderedRevisions.find(
     (revision) => revision.status === 'approved',
   )
-  const finishTasks = tasks.filter((task) => task.status !== 'completed')
+  const latestRun = runs[0]
+  const recoverableSuspension =
+    latestRun?.id === resumableRun?.id &&
+    resumableRun?.breaker_stage === 'suspend'
+      ? resumableRun
+      : undefined
+  const finishTasks = tasks.filter(
+    (task) =>
+      task.status !== 'completed' && task.id === recoverableSuspension?.task_id,
+  )
   const selectedFinishTask = finishTasks.find(
     (task) => task.id === finishTaskId,
   )
   const canManageBudget = ['owner', 'admin'].includes(actorRole)
   const canReviseNow =
-    Boolean(resumableRun) &&
-    resumableRun?.breaker_stage === 'suspend' &&
+    Boolean(recoverableSuspension) &&
     !activeRun &&
     mission.status !== 'completed' &&
     mission.status !== 'cancelled'
@@ -1214,6 +1226,14 @@ function BudgetRevisionPanel({
   const actorName = (actorId: string | null) =>
     actors.find((actor) => actor.id === actorId)?.name ??
     (actorId ? `Actor ${shortId(actorId)}` : 'Not decided')
+  const decisionKey = (
+    revision: MissionBudgetRevision,
+    approved: boolean,
+  ) => {
+    const key = `${revision.id}:${approved ? 'approve' : 'reject'}`
+    decisionKeys.current[key] ??= crypto.randomUUID()
+    return decisionKeys.current[key]
+  }
 
   const seedFinishTask = (
     task: Task | undefined,
@@ -1277,11 +1297,12 @@ function BudgetRevisionPanel({
       ) * 10_000,
     )
     const defaultTask =
-      finishTasks.find((task) => task.id === resumableRun?.task_id) ??
+      finishTasks.find((task) => task.id === recoverableSuspension?.task_id) ??
       finishTasks[0]
     setProposedTokens(nextTokens)
     setProposedCostUsd(nextCostMicrousd / 1_000_000)
     setRationale('')
+    setProposalKey(crypto.randomUUID())
     setReplaceFinishScope(false)
     seedFinishTask(defaultTask, nextTokens, nextCostMicrousd)
     setProposalOpen(true)
@@ -1371,6 +1392,7 @@ function BudgetRevisionPanel({
       proposed_budget_tokens: proposedTokens,
       proposed_budget_cost_microusd: proposedCostMicrousd,
       rationale: rationale.trim(),
+      idempotency_key: proposalKey,
       finish_scope: finishScope,
     })
     if (accepted) setProposalOpen(false)
@@ -1497,7 +1519,14 @@ function BudgetRevisionPanel({
               className="button button-primary"
               type="button"
               disabled={busy || !canManageBudget}
-              onClick={() => void onDecision(mission, pendingRevision, true)}
+              onClick={() =>
+                void onDecision(
+                  mission,
+                  pendingRevision,
+                  true,
+                  decisionKey(pendingRevision, true),
+                )
+              }
             >
               Approve revision
             </button>
@@ -1505,7 +1534,14 @@ function BudgetRevisionPanel({
               className="button button-danger"
               type="button"
               disabled={busy || !canManageBudget}
-              onClick={() => void onDecision(mission, pendingRevision, false)}
+              onClick={() =>
+                void onDecision(
+                  mission,
+                  pendingRevision,
+                  false,
+                  decisionKey(pendingRevision, false),
+                )
+              }
             >
               Reject revision
             </button>
@@ -1817,6 +1853,7 @@ function MissionCard({
     mission: Mission,
     revision: MissionBudgetRevision,
     approved: boolean,
+    decisionKey: string,
   ) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
@@ -2766,7 +2803,7 @@ function App() {
             proposed_budget_cost_microusd:
               input.proposed_budget_cost_microusd,
             rationale: input.rationale,
-            idempotency_key: crypto.randomUUID(),
+            idempotency_key: input.idempotency_key,
             finish_scope: input.finish_scope,
           }),
         },
@@ -2788,6 +2825,7 @@ function App() {
     mission: Mission,
     revision: MissionBudgetRevision,
     approved: boolean,
+    decisionKey: string,
   ) => {
     if (!bootstrap || !selectedActor) return
     setBusy(true)
@@ -2804,7 +2842,7 @@ function App() {
             note: approved
               ? `${selectedActor.name} authorized the revised mission ceiling.`
               : `${selectedActor.name} rejected the proposed mission ceiling.`,
-            decision_key: crypto.randomUUID(),
+            decision_key: decisionKey,
           }),
         },
       )

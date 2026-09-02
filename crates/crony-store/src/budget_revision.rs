@@ -58,6 +58,8 @@ impl PgStore {
             ],
         )
         .await?;
+        assert_mission_room_membership_tx(&mut tx, input.corp_id, input.mission_id, input.actor_id)
+            .await?;
 
         if let Some(row) = sqlx::query(
             r#"
@@ -122,8 +124,9 @@ impl PgStore {
             ));
         }
         ensure_no_active_mission_run_tx(&mut tx, input.corp_id, input.mission_id).await?;
-        ensure_latest_run_is_resumable_suspension_tx(&mut tx, input.corp_id, input.mission_id)
-            .await?;
+        let suspended_task_id =
+            ensure_latest_run_is_resumable_suspension_tx(&mut tx, input.corp_id, input.mission_id)
+                .await?;
 
         if sqlx::query_scalar::<_, bool>(
             r#"
@@ -161,6 +164,7 @@ impl PgStore {
             previous_verification_policy,
             replacement_verification_policy,
         ) = if let Some(scope) = input.finish_scope.as_ref() {
+            ensure_finish_scope_targets_suspension(scope.task_id, suspended_task_id)?;
             let row = sqlx::query(
                 r#"
                 SELECT status, contract, verification_policy
@@ -347,6 +351,8 @@ impl PgStore {
             ],
         )
         .await?;
+        assert_mission_room_membership_tx(&mut tx, input.corp_id, input.mission_id, input.actor_id)
+            .await?;
 
         if let Some(row) = sqlx::query(
             r#"
@@ -387,7 +393,9 @@ impl PgStore {
             SELECT revision.status, revision.version, revision.current_budget_tokens,
                    revision.current_budget_cost_microusd, revision.proposed_budget_tokens,
                    revision.proposed_budget_cost_microusd, revision.replacement_task_id,
-                   revision.replacement_contract, revision.replacement_verification_policy,
+                   revision.previous_contract, revision.replacement_contract,
+                   revision.previous_verification_policy,
+                   revision.replacement_verification_policy,
                    mission.room_id, mission.status AS mission_status,
                    mission.budget_tokens, mission.budget_cost_microusd
             FROM mission_budget_revisions revision
@@ -431,8 +439,12 @@ impl PgStore {
                 ));
             }
             ensure_no_active_mission_run_tx(&mut tx, input.corp_id, input.mission_id).await?;
-            ensure_latest_run_is_resumable_suspension_tx(&mut tx, input.corp_id, input.mission_id)
-                .await?;
+            let suspended_task_id = ensure_latest_run_is_resumable_suspension_tx(
+                &mut tx,
+                input.corp_id,
+                input.mission_id,
+            )
+            .await?;
             let (consumed_tokens, consumed_cost_microusd) =
                 mission_usage_tx(&mut tx, input.corp_id, input.mission_id).await?;
             let proposed_budget_tokens: i64 = row.get("proposed_budget_tokens");
@@ -459,12 +471,47 @@ impl PgStore {
             .await?;
 
             if let Some(task_id) = row.get::<Option<Uuid>, _>("replacement_task_id") {
+                ensure_finish_scope_targets_suspension(task_id, suspended_task_id)?;
+                let expected_contract: Value = row
+                    .get::<Option<Value>, _>("previous_contract")
+                    .context("approved finish scope omitted previous contract")?;
                 let contract: Value = row
                     .get::<Option<Value>, _>("replacement_contract")
                     .context("approved finish scope omitted replacement contract")?;
+                let expected_verification_policy: Value = row
+                    .get::<Option<Value>, _>("previous_verification_policy")
+                    .context("approved finish scope omitted previous verifier policy")?;
                 let verification_policy: Value = row
                     .get::<Option<Value>, _>("replacement_verification_policy")
                     .context("approved finish scope omitted verifier policy")?;
+                let current_task = sqlx::query(
+                    r#"
+                    SELECT status, contract, verification_policy
+                    FROM tasks
+                    WHERE id = $1 AND mission_id = $2 AND corp_id = $3
+                    FOR UPDATE
+                    "#,
+                )
+                .bind(task_id)
+                .bind(input.mission_id)
+                .bind(input.corp_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .context("finish-scope task no longer belongs to the mission")?;
+                let current_task_status: String = current_task.get("status");
+                if current_task_status == "completed" {
+                    return Err(anyhow!(
+                        "finish-scope task cannot be approved from status {current_task_status}"
+                    ));
+                }
+                if current_task.get::<Value, _>("contract") != expected_contract
+                    || current_task.get::<Value, _>("verification_policy")
+                        != expected_verification_policy
+                {
+                    return Err(anyhow!(
+                        "conflict: finish-scope task contract or verifier policy changed after proposal"
+                    ));
+                }
                 let objective = contract
                     .get("objective")
                     .and_then(Value::as_str)
@@ -634,6 +681,11 @@ fn normalize_finish_scope(input: MissionFinishScopeInput) -> Result<MissionFinis
             .map(|value| normalize_text(&value, field, 500))
             .collect()
     };
+    let write_scope = input
+        .write_scope
+        .into_iter()
+        .map(normalize_write_scope)
+        .collect::<Result<Vec<_>>>()?;
     Ok(MissionFinishScopeInput {
         task_id: input.task_id,
         objective: normalize_text(&input.objective, "finish-scope objective", 100_000)?,
@@ -646,7 +698,7 @@ fn normalize_finish_scope(input: MissionFinishScopeInput) -> Result<MissionFinis
             input.acceptance_tests,
             "finish-scope acceptance test",
         )?,
-        write_scope: normalize_entries(input.write_scope, "finish-scope write scope")?,
+        write_scope,
         budget_tokens: input.budget_tokens,
         budget_cost_microusd: input.budget_cost_microusd,
         verification_policy: input.verification_policy,
@@ -665,6 +717,47 @@ fn normalize_text(value: &str, field: &str, max_len: usize) -> Result<String> {
         return Err(anyhow!("{field} cannot contain control characters"));
     }
     Ok(value.to_owned())
+}
+
+fn normalize_write_scope(value: String) -> Result<String> {
+    let value = normalize_text(&value, "finish-scope write scope", 500)?;
+    if value == "**" {
+        return Ok(value);
+    }
+    if value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains("//")
+    {
+        return Err(anyhow!(
+            "finish-scope write scope must be a normalized relative path"
+        ));
+    }
+    let path = value.strip_suffix("/**").unwrap_or(&value);
+    if path.is_empty()
+        || path.contains('*')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(anyhow!(
+            "finish-scope write scope must be an exact relative path or end in /**"
+        ));
+    }
+    Ok(value)
+}
+
+fn ensure_finish_scope_targets_suspension(
+    finish_task_id: Uuid,
+    suspended_task_id: Uuid,
+) -> Result<()> {
+    if finish_task_id != suspended_task_id {
+        return Err(anyhow!(
+            "finish scope must target the task from the latest budget suspension"
+        ));
+    }
+    Ok(())
 }
 
 fn write_scope_contains(authorized: &str, candidate: &str) -> bool {
@@ -744,6 +837,23 @@ async fn ensure_budget_manager_tx(
     Ok(())
 }
 
+async fn assert_mission_room_membership_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    actor_id: Uuid,
+) -> Result<Uuid> {
+    let room_id: Uuid =
+        sqlx::query_scalar("SELECT room_id FROM missions WHERE id = $1 AND corp_id = $2")
+            .bind(mission_id)
+            .bind(corp_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .context("mission not found for budget revision")?;
+    assert_room_membership_tx(tx, corp_id, room_id, actor_id).await?;
+    Ok(room_id)
+}
+
 async fn ensure_no_active_mission_run_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -779,16 +889,17 @@ async fn ensure_latest_run_is_resumable_suspension_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     mission_id: Uuid,
-) -> Result<()> {
+) -> Result<Uuid> {
     let row = sqlx::query(
         r#"
-        SELECT run.breaker_stage, run.workspace_disposition,
+        SELECT run.task_id, run.breaker_stage, run.workspace_disposition,
                run.provider_session_id, run.status
         FROM runs run
         JOIN tasks task ON task.id = run.task_id
         WHERE run.corp_id = $1 AND task.mission_id = $2
         ORDER BY run.created_at DESC, run.id DESC
         LIMIT 1
+        FOR UPDATE OF run
         "#,
     )
     .bind(corp_id)
@@ -809,7 +920,7 @@ async fn ensure_latest_run_is_resumable_suspension_tx(
             "latest mission run is not a terminated, preserved budget suspension"
         ));
     }
-    Ok(())
+    Ok(row.get("task_id"))
 }
 
 pub(super) async fn mission_usage_tx(
@@ -885,5 +996,16 @@ mod tests {
         assert!(write_scope_contains("docs/file.md", "docs/file.md"));
         assert!(!write_scope_contains("crates/server/**", "crates/web/**"));
         assert!(!write_scope_contains("docs/file.md", "docs/other.md"));
+        assert!(normalize_write_scope(".github/workflows/**".to_owned()).is_ok());
+        assert!(normalize_write_scope("docs/file.md".to_owned()).is_ok());
+        assert!(normalize_write_scope("src/../secrets/**".to_owned()).is_err());
+        assert!(normalize_write_scope("C:/outside/**".to_owned()).is_err());
+        assert!(normalize_write_scope("src\\outside/**".to_owned()).is_err());
+        assert!(normalize_write_scope("src/*.rs".to_owned()).is_err());
+        let suspended_task_id = Uuid::new_v4();
+        assert!(
+            ensure_finish_scope_targets_suspension(suspended_task_id, suspended_task_id).is_ok()
+        );
+        assert!(ensure_finish_scope_targets_suspension(Uuid::new_v4(), suspended_task_id).is_err());
     }
 }

@@ -8598,22 +8598,21 @@ async fn assert_room_membership_tx(
     room_id: Uuid,
     actor_id: Uuid,
 ) -> Result<()> {
-    let member: bool = sqlx::query_scalar(
+    let member = sqlx::query_scalar::<_, bool>(
         r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM room_memberships rm
-            JOIN rooms r ON r.id = rm.room_id
-            WHERE rm.room_id = $1 AND rm.actor_id = $2 AND r.corp_id = $3
-        )
+        SELECT TRUE
+        FROM room_memberships rm
+        JOIN rooms r ON r.id = rm.room_id
+        WHERE rm.room_id = $1 AND rm.actor_id = $2 AND r.corp_id = $3
+        FOR KEY SHARE OF rm
         "#,
     )
     .bind(room_id)
     .bind(actor_id)
     .bind(corp_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if !member {
+    if member.is_none() {
         return Err(anyhow!("forbidden: actor is not a member of this room"));
     }
     Ok(())
