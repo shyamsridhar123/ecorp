@@ -245,3 +245,15 @@ recorded:
 The exact code head passed all 23 migration checks, formatting, warning-free workspace clippy, all
 76 Rust tests, production web build, web lint, and `git diff --check`. The isolated process tree,
 PostgreSQL container, and ports `55437` and `8895` were cleaned up.
+
+## Copilot and adjacent credential-store closure — September 2, 2026
+
+Commit `8f73192b1e5ff91b1b09b15cf9bb5d4bcf4c0aea` rejects nested
+`.config/github-copilot` token stores before staging. The same component filter now covers adjacent
+AI/ML and infrastructure credential locations including OpenAI, Anthropic, Hugging Face, Kaggle,
+Weights & Biases, Poetry, Pulumi, OCI, Terraform, NuGet, Maven, Gradle, and RubyGems user stores.
+
+The focused nested-credential regression passed, and the exact code head passed all 23 migration
+checks, formatting, warning-free workspace clippy, all 76 Rust tests, production web build, web
+lint, and `git diff --check`. The immediately preceding fresh portable E2E remains representative
+because this change only expands the pre-export denylist.

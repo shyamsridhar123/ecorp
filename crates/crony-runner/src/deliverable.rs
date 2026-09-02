@@ -618,6 +618,13 @@ fn sensitive_path(path: &str) -> bool {
                 | ".docker"
                 | ".gnupg"
                 | ".password-store"
+                | ".terraform.d"
+                | ".pulumi"
+                | ".oci"
+                | ".gem"
+                | ".nuget"
+                | ".m2"
+                | ".gradle"
         )
     }) || components.windows(2).any(|pair| {
         pair[0] == ".config"
@@ -632,6 +639,13 @@ fn sensitive_path(path: &str) -> bool {
                     | "op"
                     | "rclone"
                     | "containers"
+                    | "github-copilot"
+                    | "openai"
+                    | "anthropic"
+                    | "huggingface"
+                    | "kaggle"
+                    | "wandb"
+                    | "pypoetry"
             )
     }) || file_name.starts_with(".env")
         || matches!(
@@ -642,6 +656,9 @@ fn sensitive_path(path: &str) -> bool {
                 | "_netrc"
                 | ".git-credentials"
                 | ".vault-token"
+                | ".sentryclirc"
+                | ".terraformrc"
+                | "terraform.rc"
                 | "id_rsa"
                 | "id_ed25519"
                 | "application_default_credentials.json"
@@ -915,6 +932,10 @@ mod tests {
         assert!(sensitive_path("services/api/.kube/config"));
         assert!(sensitive_path("nested/.docker/config.json"));
         assert!(sensitive_path("services/api/.config/gh/hosts.yml"));
+        assert!(sensitive_path(
+            "services/api/.config/github-copilot/hosts.json"
+        ));
+        assert!(sensitive_path("services/api/.config/huggingface/token"));
         assert!(sensitive_path("nested/.config/rclone/rclone.conf"));
         assert!(sensitive_path("nested/.git-credentials"));
         assert!(!sensitive_path("docs/azure/guide.json"));
