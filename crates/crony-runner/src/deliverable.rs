@@ -534,6 +534,12 @@ fn sensitive_path(path: &str) -> bool {
                 | ".nuget"
                 | ".m2"
                 | ".gradle"
+                | ".composer"
+                | ".vercel"
+                | ".netlify"
+                | ".wrangler"
+                | ".fly"
+                | ".yarn"
         )
     }) || components.windows(2).any(|pair| {
         pair[0] == ".config"
@@ -555,6 +561,19 @@ fn sensitive_path(path: &str) -> bool {
                     | "kaggle"
                     | "wandb"
                     | "pypoetry"
+                    | "composer"
+                    | "pip"
+                    | "uv"
+                    | "npm"
+                    | "yarn"
+                    | "pnpm"
+                    | "bun"
+                    | "deno"
+                    | "vercel"
+                    | "netlify"
+                    | "cloudflare"
+                    | "fly"
+                    | "azure-devops"
             )
     }) || file_name.starts_with(".env")
         || matches!(
@@ -567,7 +586,11 @@ fn sensitive_path(path: &str) -> bool {
                 | ".vault-token"
                 | ".sentryclirc"
                 | ".terraformrc"
+                | ".yarnrc"
+                | ".yarnrc.yml"
+                | ".yarnrc.yaml"
                 | "terraform.rc"
+                | "npmrc"
                 | "id_rsa"
                 | "id_ed25519"
                 | "application_default_credentials.json"
@@ -575,6 +598,7 @@ fn sensitive_path(path: &str) -> bool {
                 | "kubeconfig"
                 | "credentials"
                 | "credentials.json"
+                | "credentials.toml"
                 | "secrets.json"
         )
         || file_name.ends_with(".pem")
@@ -845,6 +869,11 @@ mod tests {
             "services/api/.config/github-copilot/hosts.json"
         ));
         assert!(sensitive_path("services/api/.config/huggingface/token"));
+        assert!(sensitive_path("services/api/.cargo/credentials.toml"));
+        assert!(!sensitive_path("services/api/.cargo/config.toml"));
+        assert!(sensitive_path("services/api/.config/composer/auth.json"));
+        assert!(sensitive_path("services/api/.config/npm/npmrc"));
+        assert!(sensitive_path("services/api/.vercel/auth.json"));
         assert!(sensitive_path("nested/.config/rclone/rclone.conf"));
         assert!(sensitive_path("nested/.git-credentials"));
         assert!(!sensitive_path("docs/azure/guide.json"));
