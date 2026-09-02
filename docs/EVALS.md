@@ -297,5 +297,7 @@ and the controller rejects `refs/tags/v1` as a publication base before Project r
 claim. A direct control-character base policy returns `400`; a mixed-case target repository
 canonicalizes before plan validation; and a Project with 32 fields, with Status after the default
 30-field page, completes through exact Status-field GraphQL lookup. A canonical PR URL retaining
-mixed-case owner/repository components is accepted and persisted. See
+mixed-case owner/repository components is accepted and persisted. The controller's omitted
+publication base defaults to `HEAD`; a scheduled PR close after Project-stage renewal is detected
+before any Project mutation. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

@@ -506,6 +506,8 @@ field-list pagination cannot hide it.
 Factory policy accepts publication bases only as symbolic `HEAD`, a short branch name, or an
 explicit `refs/heads/*` branch. Tags, remote-tracking refs, and invalid Git branch names fail before
 the controller reads candidates or claims a work item, and the store repeats the policy check.
+Omitting the option defaults to symbolic `HEAD`, matching the source revision selected for the
+factory claim instead of assuming a `main` branch exists.
 
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed
@@ -519,6 +521,9 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
+After the Project-stage renewal and immediately before Project mutation, the publisher re-fetches
+the exact durable PR and revalidates its open state, base/head, content, repository/SHA, URL, draft,
+and auto-merge identity.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
 recovery key instead of conflicting with an earlier operation request. Custom pull-request titles

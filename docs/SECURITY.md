@@ -186,7 +186,7 @@ The Status field definition and option IDs come from an exact GraphQL lookup on 
 node rather than the first page of `field-list`.
 Publication base policy is branch-only: the controller and store accept `HEAD`, short branch names,
 or `refs/heads/*`, while rejecting tags, remote-tracking refs, invalid branch shapes, and control
-characters before durable claim.
+characters before durable claim. The default is symbolic `HEAD`, not an assumed branch name.
 
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before
@@ -198,6 +198,9 @@ trailing newline.
 
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.
+For an unfinished publication, the exact checkpointed PR is re-fetched after the final authority
+renewal and immediately before Project mutation, preventing a closed, retargeted, edited, or
+auto-merge-enabled PR from advancing review state.
 
 ## Required production boundaries
 
