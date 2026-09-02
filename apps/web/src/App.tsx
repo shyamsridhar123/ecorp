@@ -1216,8 +1216,7 @@ function BudgetRevisionPanel({
   const canReviseNow =
     Boolean(recoverableSuspension) &&
     !activeRun &&
-    mission.status !== 'completed' &&
-    mission.status !== 'cancelled'
+    mission.status !== 'completed'
   const proposedCostMicrousd = Math.round(proposedCostUsd * 1_000_000)
   const finishCostMicrousd = Math.round(finishBudgetCostUsd * 1_000_000)
   const proposedRemainingTokens = proposedTokens - consumedTokens
@@ -1884,7 +1883,7 @@ function MissionCard({
   const resumableRun = runs.find(
     (run) =>
       run.provider_session_id &&
-      run.workspace_disposition !== 'removed' &&
+      run.workspace_disposition === 'preserved' &&
       terminalRun(run.status),
   )
   const pendingRun = runs.find((run) => run.status === 'waiting_for_approval')

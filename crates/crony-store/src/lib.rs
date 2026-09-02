@@ -3907,7 +3907,8 @@ impl PgStore {
 
         let lineage = sqlx::query(
             r#"
-            SELECT id, breaker_stage
+            SELECT id, breaker_stage, status, workspace_path,
+                   workspace_disposition, workspace_detail
             FROM runs
             WHERE corp_id = $1 AND workspace_run_id = $2
             ORDER BY created_at DESC, id DESC
@@ -3927,7 +3928,21 @@ impl PgStore {
             ));
         }
         let latest_lineage_run_id = lineage
-            .first()
+            .iter()
+            .find(|candidate| {
+                !lineage_run_is_pre_dispatch_failure(
+                    candidate.get::<String, _>("status").as_str(),
+                    candidate
+                        .get::<Option<String>, _>("workspace_path")
+                        .as_deref(),
+                    candidate
+                        .get::<Option<String>, _>("workspace_disposition")
+                        .as_deref(),
+                    candidate
+                        .get::<Option<String>, _>("workspace_detail")
+                        .as_deref(),
+                )
+            })
             .map(|candidate| candidate.get::<Uuid, _>("id"))
             .context("source run workspace lineage is empty")?;
         if latest_lineage_run_id != source_run_id {
@@ -4129,7 +4144,8 @@ impl PgStore {
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         sqlx::query(
-            "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+            "UPDATE runs SET status = 'failed', summary = $1,
+             workspace_detail = 'dispatch_not_started', updated_at = now() WHERE id = $2",
         )
         .bind(reason)
         .bind(run_id)
@@ -9747,6 +9763,18 @@ fn budget_scope_lock_keys(corp_id: Uuid, requester: Uuid) -> Vec<String> {
     ]
 }
 
+fn lineage_run_is_pre_dispatch_failure(
+    status: &str,
+    workspace_path: Option<&str>,
+    workspace_disposition: Option<&str>,
+    workspace_detail: Option<&str>,
+) -> bool {
+    status == "failed"
+        && workspace_path.is_none()
+        && workspace_disposition.is_none()
+        && workspace_detail == Some("dispatch_not_started")
+}
+
 async fn rolling_budget_remaining_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -9967,8 +9995,9 @@ mod tests {
     use super::{
         FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
         ensure_breaker_allows_human_progress, ensure_new_factory_policy_is_pinned,
-        factory_transition_allowed, normalize_artifact_rejection_reason, normalize_factory_policy,
-        normalize_factory_source, should_retry_runner_failure, validate_factory_lease_seconds,
+        factory_transition_allowed, lineage_run_is_pre_dispatch_failure,
+        normalize_artifact_rejection_reason, normalize_factory_policy, normalize_factory_source,
+        should_retry_runner_failure, validate_factory_lease_seconds,
         validate_factory_plan_against_policy,
     };
 
@@ -10022,6 +10051,24 @@ mod tests {
         assert!(should_retry_runner_failure("healthy", 1, 3));
         assert!(!should_retry_runner_failure("healthy", 3, 3));
         assert!(ensure_breaker_allows_human_progress("constrain", "decision").is_ok());
+        assert!(lineage_run_is_pre_dispatch_failure(
+            "failed",
+            None,
+            None,
+            Some("dispatch_not_started")
+        ));
+        assert!(!lineage_run_is_pre_dispatch_failure(
+            "failed",
+            Some("workspace"),
+            None,
+            Some("dispatch_not_started")
+        ));
+        assert!(!lineage_run_is_pre_dispatch_failure(
+            "failed",
+            None,
+            Some("preserved"),
+            Some("dispatch_not_started")
+        ));
     }
 
     fn factory_work_item(lease_expires_at: chrono::DateTime<Utc>) -> (FactoryWorkItem, Uuid) {

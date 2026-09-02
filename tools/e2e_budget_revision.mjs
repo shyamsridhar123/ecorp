@@ -290,6 +290,89 @@ async function rollingBudgetResumeScenario() {
   return results
 }
 
+async function preDispatchRetryScenario() {
+  const demo = await post('/api/demo/reset', {})
+  await setPolicy(demo)
+  const suspended = await createSuspendedMission(demo, 'pre-dispatch-retry')
+  const task = suspended.terminal.state.snapshot.tasks.find(
+    (candidate) => candidate.id === suspended.mission.task_id,
+  )
+  const proposal = await propose(
+    demo,
+    suspended.mission.mission_id,
+    demo.alice_actor_id,
+    20_000,
+    randomUUID(),
+    null,
+  )
+  await decide(
+    demo,
+    suspended.mission.mission_id,
+    proposal.revision,
+    demo.alice_actor_id,
+    true,
+    randomUUID(),
+  )
+
+  const mismatchedContract = {
+    ...task.contract,
+    source_repository: 'https://github.com/example/unavailable.git',
+    source_base_ref: 'main',
+    source_base_commit: 'f'.repeat(40),
+  }
+  await psql(`
+    UPDATE tasks
+    SET contract = ${sqlLiteral(JSON.stringify(mismatchedContract))}::jsonb
+    WHERE id = ${sqlLiteral(task.id)}::uuid;
+  `)
+  const denied = await postRaw(
+    `/api/corps/${demo.corp_id}/runs/${suspended.launch.run_id}/resume`,
+    {
+      requested_by: demo.alice_actor_id,
+      prompt: 'transient resume with a temporarily unavailable checkout',
+    },
+  )
+  assert.equal(denied.response.status, 409)
+  assert.match(JSON.stringify(denied.body), /required repository checkout/)
+  const failedState = await snapshot(demo)
+  const preDispatchFailure = failedState.snapshot.runs.find(
+    (run) => run.resumed_from_run_id === suspended.launch.run_id,
+  )
+  assert.ok(preDispatchFailure)
+  assert.equal(preDispatchFailure.status, 'failed')
+  assert.equal(preDispatchFailure.workspace_disposition, null)
+  assert.equal(preDispatchFailure.workspace_detail, 'dispatch_not_started')
+
+  await psql(`
+    UPDATE tasks
+    SET contract = ${sqlLiteral(JSON.stringify(task.contract))}::jsonb
+    WHERE id = ${sqlLiteral(task.id)}::uuid;
+  `)
+  const retry = await post(
+    `/api/corps/${demo.corp_id}/runs/${suspended.launch.run_id}/resume`,
+    {
+      requested_by: demo.alice_actor_id,
+      prompt: 'retry after the transient pre-dispatch checkout mismatch',
+    },
+  )
+  const terminal = await waitForRun(demo, retry.run_id)
+  assert.equal(terminal.run.status, 'completed')
+  assert.equal(
+    terminal.run.provider_session_id,
+    suspended.terminal.run.provider_session_id,
+  )
+  assert.equal(terminal.run.workspace_run_id, suspended.launch.run_id)
+  assert.equal(terminal.run.resumed_from_run_id, suspended.launch.run_id)
+
+  return {
+    pre_dispatch_failure_id: preDispatchFailure.id,
+    retry_run_id: retry.run_id,
+    same_provider_session: true,
+    same_workspace_lineage: true,
+    final_status: terminal.run.status,
+  }
+}
+
 async function authorizationRevalidationScenario() {
   const demo = await post('/api/demo/reset', {})
   await setPolicy(demo)
@@ -651,6 +734,7 @@ async function revisedBudgetOverrunScenario() {
 
 const report = {
   checked_at: new Date().toISOString(),
+  pre_dispatch_retry: await preDispatchRetryScenario(),
   rolling_budget_resume: await rollingBudgetResumeScenario(),
   authorization_revalidation: await authorizationRevalidationScenario(),
   successful_recovery: await successfulRecoveryScenario(),
