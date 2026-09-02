@@ -151,6 +151,10 @@ async function runPublisher(
     crashAfter,
     idempotencyKey,
     expectCrash = false,
+    expectFailure,
+    branch,
+    bodyFile,
+    omitAuthorizationId = false,
   } = {},
 ) {
   const args = [
@@ -158,8 +162,6 @@ async function runPublisher(
     demo.corp_id,
     demo.alice_actor_id,
     workItemId,
-    '--authorization-id',
-    authorizationId,
     '--authorization-reason',
     'Publication E2E authorizes review-only branch and pull request creation.',
     '--publisher-id',
@@ -171,7 +173,12 @@ async function runPublisher(
     '--github-cli',
     process.execPath,
   ]
+  if (!omitAuthorizationId) {
+    args.push('--authorization-id', authorizationId)
+  }
   if (idempotencyKey) args.push('--idempotency-key', idempotencyKey)
+  if (branch) args.push('--branch', branch)
+  if (bodyFile) args.push('--body-file', bodyFile)
   try {
     const { stdout, stderr } = await execFile(binary, args, {
       cwd: root,
@@ -199,10 +206,16 @@ async function runPublisher(
     assert.equal(stderr.includes(publisherToken), false)
     return JSON.parse(stdout)
   } catch (error) {
-    if (!expectCrash || error.code !== 86) throw error
     assert.equal(String(error.stdout ?? '').includes(publisherToken), false)
     assert.equal(String(error.stderr ?? '').includes(publisherToken), false)
-    return { crashed: true, stage: crashAfter }
+    if (expectCrash && error.code === 86) {
+      return { crashed: true, stage: crashAfter }
+    }
+    if (expectFailure) {
+      assert.match(String(error.stderr ?? ''), expectFailure)
+      return { failed: true, detail: String(error.stderr ?? '').trim() }
+    }
+    throw error
   }
 }
 
@@ -439,6 +452,7 @@ const resolvedPublicationBase = (
 assert.equal(resolvedPublicationBase, 'main')
 
 const issueNumber = 9101
+const collisionIssueNumber = 9100
 const issue = {
   id: `I_PUBLICATION_${nonce}`,
   number: issueNumber,
@@ -463,6 +477,29 @@ No blockers.
   updatedAt: '2026-09-02T02:00:00Z',
   labels: [{ name: 'factory:ready' }],
 }
+const collisionIssue = {
+  id: `I_PUBLICATION_COLLISION_${nonce}`,
+  number: collisionIssueNumber,
+  title: 'Reject publication onto the resolved base branch',
+  body: `## Outcome
+
+Prove the trusted publisher refuses to push directly to the resolved base branch.
+
+## Acceptance criteria
+
+- [ ] the base branch remains unchanged
+- [ ] retry without an explicit authorization id reaches the same guarded failure
+
+## Dependencies
+
+No blockers.
+`,
+  url: `https://github.com/shyamsridhar123/ecorp/issues/${collisionIssueNumber}`,
+  state: 'OPEN',
+  createdAt: '2026-09-02T01:59:00Z',
+  updatedAt: '2026-09-02T01:59:00Z',
+  labels: [{ name: 'factory:ready' }],
+}
 await writeFile(
   statePath,
   `${JSON.stringify(
@@ -483,6 +520,18 @@ await writeFile(
       },
       items: [
         {
+          id: `PVTI_PUBLICATION_COLLISION_${nonce}`,
+          status: 'Todo',
+          content: {
+            body: collisionIssue.body,
+            number: collisionIssue.number,
+            repository: 'shyamsridhar123/ecorp',
+            title: collisionIssue.title,
+            type: 'Issue',
+            url: collisionIssue.url,
+          },
+        },
+        {
           id: `PVTI_PUBLICATION_${nonce}`,
           status: 'Todo',
           content: {
@@ -495,7 +544,10 @@ await writeFile(
           },
         },
       ],
-      issues: { [String(issueNumber)]: issue },
+      issues: {
+        [String(collisionIssueNumber)]: collisionIssue,
+        [String(issueNumber)]: issue,
+      },
       pull_requests: [],
       next_pr_number: 41,
       item_edits: 0,
@@ -509,6 +561,84 @@ await writeFile(
 )
 
 const demo = await postOk('/api/demo/reset', {})
+const collisionFirstController = await runController(demo, collisionIssueNumber)
+assert.equal(collisionFirstController.factory_state, 'running')
+const collisionCompleted = await waitForMission(
+  demo,
+  collisionFirstController.mission_id,
+)
+assert.equal(collisionCompleted.mission.status, 'completed')
+const collisionVerifiedController = await runController(
+  demo,
+  collisionIssueNumber,
+)
+assert.equal(collisionVerifiedController.factory_state, 'verified')
+const collisionSnapshot = await snapshot(demo)
+const collisionWorkItem = collisionSnapshot.snapshot.factory_work_items.find(
+  (item) => item.id === collisionFirstController.factory_work_item_id,
+)
+assert.ok(collisionWorkItem)
+const collisionTaskIds = new Set(
+  collisionSnapshot.snapshot.tasks
+    .filter((task) => task.mission_id === collisionFirstController.mission_id)
+    .map((task) => task.id),
+)
+const collisionSource = collisionSnapshot.snapshot.source_deliverables.find(
+  (deliverable) =>
+    collisionTaskIds.has(deliverable.task_id) &&
+    deliverable.form === 'commit_branch' &&
+    deliverable.integration_state === 'ready_for_review',
+)
+assert.ok(collisionSource)
+const collisionBodyPath = path.join(
+  root,
+  'output',
+  `publication-body-${nonce}.md`,
+)
+await writeFile(
+  collisionBodyPath,
+  `Implements ${collisionIssue.url}\r\n\r\nBase branch collision guard.\r\n`,
+)
+const remoteMainBefore = (
+  await execFile(
+    'git',
+    ['--git-dir', remotePath, 'rev-parse', 'refs/heads/main'],
+    { cwd: root, windowsHide: true },
+  )
+).stdout.trim()
+const collisionFailurePattern =
+  /publication branch main must differ from resolved pull request base main/
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: 'main',
+  bodyFile: collisionBodyPath,
+  omitAuthorizationId: true,
+  expectFailure: collisionFailurePattern,
+})
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: 'main',
+  bodyFile: collisionBodyPath,
+  omitAuthorizationId: true,
+  expectFailure: collisionFailurePattern,
+})
+const remoteMainAfter = (
+  await execFile(
+    'git',
+    ['--git-dir', remotePath, 'rev-parse', 'refs/heads/main'],
+    { cwd: root, windowsHide: true },
+  )
+).stdout.trim()
+assert.equal(remoteMainAfter, remoteMainBefore)
+assert.equal(remoteMainAfter, sourceBaseCommit)
+let collisionFakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(collisionFakeState.pr_create_calls, 0)
+assert.equal(
+  collisionFakeState.items.find(
+    (item) => item.id === collisionWorkItem.source_project_item_id,
+  ).status,
+  'In Progress',
+)
+await rm(collisionBodyPath, { force: true })
+
 const firstController = await runController(demo, issueNumber)
 assert.equal(firstController.factory_state, 'running')
 const completed = await waitForMission(demo, firstController.mission_id)
@@ -999,6 +1129,9 @@ assert.ok(
 
 const report = {
   checked_at: new Date().toISOString(),
+  base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
+  implicit_authorization_retry_stable: true,
+  body_file_crlf_normalized: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
   source_deliverable_id: source.id,

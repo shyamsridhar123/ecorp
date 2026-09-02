@@ -1915,6 +1915,11 @@ fn validate_pull_request_identity(
             "pull request head does not match the authorized publication target"
         ));
     }
+    if head_ref == base_ref {
+        return Err(anyhow!(
+            "pull request head branch must differ from its resolved base branch"
+        ));
+    }
     if publication.base_ref == "HEAD" {
         if base_ref == "HEAD" || base_ref.starts_with("refs/") {
             return Err(anyhow!(

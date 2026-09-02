@@ -389,6 +389,7 @@ async fn execute_publication(
     fs::write(&workspace.bundle, &bundle).context("write portable Git bundle")?;
     fs::write(&workspace.body, plan.body.as_bytes()).context("write pull request body")?;
     let resolved_base = prepare_repository(&workspace, plan, &document)?;
+    ensure_distinct_publication_branch(&plan.branch, &resolved_base.pull_request_base_ref)?;
     if let Some(persisted_base) = response.publication.pull_request_base_ref.as_deref()
         && persisted_base != resolved_base.pull_request_base_ref
     {
@@ -855,6 +856,15 @@ fn resolve_remote_base(repository: &Path, base_ref: &str) -> Result<ResolvedRemo
     })
 }
 
+fn ensure_distinct_publication_branch(branch: &str, pull_request_base_ref: &str) -> Result<()> {
+    if branch == pull_request_base_ref {
+        bail!(
+            "publication branch {branch} must differ from resolved pull request base {pull_request_base_ref}"
+        );
+    }
+    Ok(())
+}
+
 fn pull_request_base_name(reference: &str) -> Result<String> {
     reference
         .strip_prefix("refs/heads/")
@@ -1273,7 +1283,7 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
             value_string(deliverable, "/sha256").unwrap_or_default()
         )
     };
-    let authorization_id = args.authorization_id.unwrap_or_else(Uuid::new_v4);
+    let body = normalize_publication_body(&body)?;
     let effect_key = existing_publication
         .and_then(|publication| publication.get("effect_key"))
         .and_then(Value::as_str)
@@ -1288,6 +1298,22 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
                 branch
             )
         });
+    let persisted_authorization_id = existing_publication
+        .and_then(|publication| publication.get("authorization_id"))
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .context("persisted publication authorization id is invalid")?;
+    let authorization_id = match (args.authorization_id, persisted_authorization_id) {
+        (Some(requested), Some(persisted)) if requested != persisted => {
+            bail!(
+                "requested authorization id does not match the persisted publication authorization"
+            )
+        }
+        (Some(requested), _) => requested,
+        (None, Some(persisted)) => persisted,
+        (None, None) => stable_authorization_id(args.actor_id, &effect_key),
+    };
     let idempotency_key = args
         .idempotency_key
         .clone()
@@ -1326,6 +1352,34 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
             .context("publication policy omitted review_status")?
             .to_owned(),
     })
+}
+
+fn normalize_publication_body(value: &str) -> Result<String> {
+    let value = value.replace("\r\n", "\n").replace('\r', "\n");
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("pull request body cannot be empty");
+    }
+    if value.len() > 65_536 {
+        bail!("pull request body cannot exceed 65536 bytes");
+    }
+    if value.contains('\0') {
+        bail!("pull request body cannot contain NUL bytes");
+    }
+    Ok(value.to_owned())
+}
+
+fn stable_authorization_id(actor_id: Uuid, effect_key: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"ecorp-publication-authorization-v1\0");
+    digest.update(actor_id.as_bytes());
+    digest.update(effect_key.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 fn ensure_publication_matches_plan(
@@ -1504,5 +1558,19 @@ mod tests {
             "main"
         );
         assert!(pull_request_base_name("HEAD").is_err());
+    }
+
+    #[test]
+    fn publication_branch_authorization_and_body_are_retry_stable() {
+        assert!(ensure_distinct_publication_branch("feature", "main").is_ok());
+        assert!(ensure_distinct_publication_branch("main", "main").is_err());
+        assert_eq!(
+            normalize_publication_body("line one\r\nline two\r\n").expect("normalize"),
+            "line one\nline two"
+        );
+        let actor = Uuid::new_v4();
+        let first = stable_authorization_id(actor, "effect");
+        assert_eq!(first, stable_authorization_id(actor, "effect"));
+        assert_ne!(first, stable_authorization_id(actor, "other-effect"));
     }
 }
