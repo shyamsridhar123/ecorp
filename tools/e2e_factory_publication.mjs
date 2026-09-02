@@ -223,6 +223,9 @@ async function runPublisher(
     repository,
     publisherId = 'trusted-publication-e2e',
     publisherCredentialFile,
+    pauseAt,
+    pauseMarker,
+    pauseMs,
     authorizationReason =
       'Publication E2E authorizes review-only branch and pull request creation.',
     leaseSeconds = 5,
@@ -276,6 +279,13 @@ async function runPublisher(
         ...(crashAfter
           ? { ECORP_PUBLICATION_TEST_CRASH_AFTER: crashAfter }
           : {}),
+        ...(pauseAt ? { ECORP_PUBLICATION_TEST_PAUSE_AT: pauseAt } : {}),
+        ...(pauseMarker
+          ? { ECORP_PUBLICATION_TEST_PAUSE_MARKER: pauseMarker }
+          : {}),
+        ...(pauseMs === undefined
+          ? {}
+          : { ECORP_PUBLICATION_TEST_PAUSE_MS: String(pauseMs) }),
       },
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
@@ -733,6 +743,15 @@ async function setFakeState(patch) {
   const state = JSON.parse(await readFile(statePath, 'utf8'))
   Object.assign(state, patch)
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
+}
+
+async function waitForFile(filePath, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(filePath)) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`timed out waiting for file ${filePath}`)
 }
 
 async function enrollPublicationPublisher(
@@ -1997,6 +2016,40 @@ await setFakeState({
   pr_list_mutation: null,
 })
 
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+const projectEditsBeforeStalePublisher = fakeState.item_edits
+const projectEffectPauseMarker = path.join(
+  root,
+  'output',
+  `publication-project-effect-pause-${nonce}`,
+)
+await rm(projectEffectPauseMarker, { force: true })
+const stalePublisherAttempt = runPublisher(demo, workItem.id, {
+  expectFailure: /not a member of this room/,
+  pauseAt: 'before_project_effect_renewal',
+  pauseMarker: projectEffectPauseMarker,
+  pauseMs: 5000,
+})
+let projectEffectMembershipRevoked = false
+try {
+  await waitForFile(projectEffectPauseMarker)
+  await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+  projectEffectMembershipRevoked = true
+  await stalePublisherAttempt
+} finally {
+  if (projectEffectMembershipRevoked) {
+    await restoreMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
+  }
+  await rm(projectEffectPauseMarker, { force: true })
+}
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.item_edits, projectEditsBeforeStalePublisher)
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_project_remote',
   expectCrash: true,
@@ -2229,6 +2282,7 @@ const report = {
     projectMembershipRenewRejected.response.status,
   pr_revalidated_after_project_renewal:
     fakeState.pr_list_mutations_applied === 1,
+  stale_publisher_blocked_before_project_effect: true,
   bounded_snapshot_work_item_and_deliverable_absent: true,
   published_retry_outside_bounded_snapshot: true,
   exact_project_item_lookup:

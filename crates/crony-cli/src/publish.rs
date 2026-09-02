@@ -563,7 +563,7 @@ async fn execute_publication(
     }
 
     if response.publication.state != PullRequestPublicationState::Published {
-        let (project_id, _, _, status) = project_status(args, plan)?;
+        let (project_id, status_field_id, review_option_id, status) = project_status(args, plan)?;
         if status != plan.project_status_before && status != plan.project_review_status {
             bail!(
                 "GitHub Project item status is {status}, expected {} or {}",
@@ -578,18 +578,28 @@ async fn execute_publication(
             plan,
             response,
             publisher_token,
-            "project-review",
+            "project-review-read",
         )
         .await?;
-        let (_, refreshed_field_id, refreshed_option_id, refreshed_status) =
-            project_status(args, plan)?;
+        let refreshed_status = project_item_status(args, plan, &project_id, &status_field_id)?;
+        revalidate_durable_pull_request(
+            args,
+            plan,
+            &resolved_base.pull_request_base_ref,
+            &response.publication,
+        )?;
         if refreshed_status == plan.project_status_before {
-            revalidate_durable_pull_request(
+            test_pause("before_project_effect_renewal");
+            renew_publication(
+                client,
+                server,
                 args,
                 plan,
-                &resolved_base.pull_request_base_ref,
-                &response.publication,
-            )?;
+                response,
+                publisher_token,
+                "project-review-effect",
+            )
+            .await?;
             let edit_result = gh_run(
                 &args.github_cli,
                 &[
@@ -600,19 +610,20 @@ async fn execute_publication(
                     "--project-id",
                     &project_id,
                     "--field-id",
-                    &refreshed_field_id,
+                    &status_field_id,
                     "--single-select-option-id",
-                    &refreshed_option_id,
+                    &review_option_id,
                 ],
             );
             if let Err(error) = edit_result {
-                let (_, _, _, recovered_status) = project_status(args, plan)?;
+                let recovered_status =
+                    project_item_status(args, plan, &project_id, &status_field_id)?;
                 if recovered_status != plan.project_review_status {
                     return Err(error).context("move GitHub Project item into review");
                 }
             }
         }
-        let (_, _, _, final_status) = project_status(args, plan)?;
+        let final_status = project_item_status(args, plan, &project_id, &status_field_id)?;
         if final_status != plan.project_review_status {
             bail!(
                 "GitHub Project item status is {final_status}, not {}",
@@ -625,6 +636,16 @@ async fn execute_publication(
             &resolved_base.pull_request_base_ref,
             &response.publication,
         )?;
+        renew_publication(
+            client,
+            server,
+            args,
+            plan,
+            response,
+            publisher_token,
+            "project-review-complete",
+        )
+        .await?;
         test_crash("after_project_remote");
         checkpoint(
             client,
@@ -637,13 +658,44 @@ async fn execute_publication(
             json!({
                 "kind": "published",
                 "project_status": final_status,
-                "project_field_id": refreshed_field_id,
-                "project_option_id": refreshed_option_id
+                "project_field_id": status_field_id,
+                "project_option_id": review_option_id
             }),
         )
         .await?;
     }
     Ok(())
+}
+
+fn project_item_status(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+    project_id: &str,
+    status_field_id: &str,
+) -> Result<String> {
+    let item = load_project_item(args, plan)?;
+    if item.kind != "ProjectV2Item"
+        || item.id != plan.project_item_id
+        || item.project.id != project_id
+        || item.project.number != plan.project_number
+        || !item
+            .project
+            .owner
+            .login
+            .eq_ignore_ascii_case(&plan.project_owner)
+    {
+        bail!("GitHub Project item does not match the authorized publication Project");
+    }
+    let status = item
+        .status
+        .context("GitHub Project item has no Status value")?;
+    if status.kind != "ProjectV2ItemFieldSingleSelectValue"
+        || status.field.id != status_field_id
+        || status.field.name != "Status"
+    {
+        bail!("GitHub Project item Status value does not match the Project Status field");
+    }
+    Ok(status.name)
 }
 
 async fn renew_publication(
@@ -1879,6 +1931,21 @@ fn test_crash(stage: &str) {
     if env::var("ECORP_PUBLICATION_TEST_CRASH_AFTER").as_deref() == Ok(stage) {
         std::process::exit(86);
     }
+}
+
+fn test_pause(stage: &str) {
+    if env::var("ECORP_PUBLICATION_TEST_PAUSE_AT").as_deref() != Ok(stage) {
+        return;
+    }
+    if let Ok(marker) = env::var("ECORP_PUBLICATION_TEST_PAUSE_MARKER") {
+        let _ = fs::write(marker, stage.as_bytes());
+    }
+    let milliseconds = env::var("ECORP_PUBLICATION_TEST_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000)
+        .min(30_000);
+    std::thread::sleep(Duration::from_millis(milliseconds));
 }
 
 #[cfg(test)]
