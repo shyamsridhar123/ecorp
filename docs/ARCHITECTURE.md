@@ -428,10 +428,27 @@ run. Factory tasks persist the claimed GitHub repository and source base ref. Ru
 normalized `remote` and `base`, and scheduling rejects a runner whose configured checkout does not
 match before creating a run.
 
+## Portable source-deliverable boundary
+
+Provider artifacts and application deliverables are separate object roles. After the provider
+process terminates, the runner executes the persisted verifier policy in the assigned worktree. A
+passing report is normalized and hashed. The runner then uses a temporary Git index to construct
+the requested patch, archive, typed set, commit/branch bundle, or review report from tracked and
+non-ignored untracked changes.
+
+The resulting bytes use the existing reservation, staging, validation, finalization, and recovery
+path. `source_deliverables` links the ready object to its task, run, verification digest, base
+commit, optional post-verification commit, task branch, retention, and integration state. The
+server returns a runner-only storage acknowledgment; only then can the runner emit passing
+verification and evaluate safe worktree cleanup.
+
+Pull-request publication, merge, and deployment are outside this boundary. A ready source
+deliverable proves portable review material exists; it does not imply external integration. See
+ADR 0021.
+
 ## Near-term architecture work
 
-1. Connect eligible GitHub Project items to the durable factory claim API.
-2. Add verifier-gated, idempotent pull-request publication without implicit merge.
-3. Add stronger OS/container isolation for untrusted child processes.
-4. Add artifact retention sweeping and signing-key rotation.
-5. Add multi-region control-plane and object-store recovery drills.
+1. Add verifier-gated, idempotent pull-request publication without implicit merge.
+2. Add stronger OS/container isolation for untrusted child processes.
+3. Add artifact retention sweeping and signing-key rotation.
+4. Add multi-region control-plane and object-store recovery drills.

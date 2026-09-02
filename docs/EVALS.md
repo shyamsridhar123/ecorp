@@ -223,3 +223,11 @@ whose bytes fail validation, releases an old reservation whose staged and final 
 missing, retries cleanup for a ready row, removes an unreserved staging object only after a fresh
 reservation check, and restores accepted run-to-artifact links. See
 `docs/evidence/2026-09-01-artifact-staging-recovery.md`.
+
+`tools/e2e_portable_deliverables.mjs` verifies that a real runner exports tracked modifications and
+untracked source while excluding provider evidence, uploads the exact bounded bytes through staged
+content-addressed storage, links them to the exact verification digest, supports authorized remote
+download, denies a non-member, optionally creates a commit only on the isolated task branch, and
+receives durable storage acknowledgment before a clean worktree is reclaimed. Browser validation
+checks that provider evidence, verification evidence, source deliverables, and integration state
+are visibly distinct.

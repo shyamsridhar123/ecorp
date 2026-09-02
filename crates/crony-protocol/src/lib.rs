@@ -1,5 +1,5 @@
 use crony_domain::{
-    CorpSnapshot, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
+    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
     TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,12 @@ pub enum ServerToRunner {
     RegistrationRejected {
         reason: String,
     },
+    ArtifactStored {
+        run_id: Uuid,
+        artifact_id: Uuid,
+        artifact_role: String,
+        sha256: String,
+    },
     StartRun {
         corp_id: Uuid,
         room_id: Uuid,
@@ -99,6 +105,7 @@ pub enum ServerToRunner {
         model: Option<String>,
         reasoning_effort: Option<String>,
         verification_policy: VerificationPolicy,
+        deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
     },
     ResumeRun {
@@ -116,6 +123,7 @@ pub enum ServerToRunner {
         model: Option<String>,
         reasoning_effort: Option<String>,
         verification_policy: VerificationPolicy,
+        deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
     },
     ControlMessage {
@@ -254,6 +262,8 @@ pub struct CreateMissionRequest {
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
+    #[serde(default)]
+    pub deliverable: Option<DeliverableSpec>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -420,6 +430,8 @@ pub struct MaterializeFactoryMissionRequest {
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
+    #[serde(default)]
+    pub deliverable: Option<DeliverableSpec>,
     #[serde(default)]
     pub contract: FactoryMissionContract,
 }

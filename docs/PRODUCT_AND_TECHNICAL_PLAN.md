@@ -41,6 +41,10 @@
   before final publication. Staged, finalized, rejected, and orphaned states recover after restart
   or a periodic reconciliation pass. Signed provenance and authorized download replace runner-local
   artifact paths in shared state.
+- Verified missions now export typed portable source deliverables from isolated worktrees. Tracked
+  and non-ignored untracked changes can be downloaded as a deterministic patch, content-addressed
+  archive, typed artifact set, commit/branch bundle, or review report. Exact verification and byte
+  digests are linked before cleanup; pull-request publication and merge remain separate effects.
 
 ---
 

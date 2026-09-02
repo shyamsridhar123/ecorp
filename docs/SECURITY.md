@@ -99,6 +99,17 @@ signs provenance with a deployment key and never exposes backend bucket URLs. Do
 `ready` metadata, Corp authorization, and room membership, then revalidate signature, retention,
 digest, length, and media type before returning an attachment with content sniffing disabled.
 
+Portable source exports use a temporary Git index rooted in the assigned worktree. They include
+tracked changes and non-ignored untracked files, exclude provider evidence, and reject symbolic
+links, Git links, path escapes, runner-internal directories, ignored files, and secret-like names.
+The server signs the artifact role, filename, and exact deliverable metadata in addition to the
+content digest. A run cannot pass verification until the ready source object links the exact
+normalized verification digest to the exact exported-byte digest. The runner waits for durable
+storage acknowledgment before worktree cleanup.
+
+Post-verification commit creation is fixed runner behavior on the isolated task branch. It does not
+authorize credential use, branch publication, pull-request creation, auto-merge, merge, or deploy.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.

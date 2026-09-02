@@ -105,6 +105,11 @@
       "version": 21,
       "file": "0021_artifact_staging.sql",
       "sha384": "82601d7466e7517f66b35923d6e342bd6702bacf828ea263b362a99236a5f93805d8ea09f476793ae2fe4756374f787d"
+    },
+    {
+      "version": 22,
+      "file": "0022_portable_deliverables.sql",
+      "sha384": "c462161a91d362b70c908727e6b17d22d7b18242bed0dca2228ce51e62cbeac630309dfe3385f2ef3d1f328ee286e824"
     }
   ]
 }

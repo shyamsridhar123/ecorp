@@ -4,10 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
-    Corp, CorpSnapshot, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage, Room, RoomMessage,
-    Run, RunStatus, Task, TaskContract, TaskGraphPlan, TaskSecretReference, TaskStatus,
-    VerificationEvidence, VerificationPolicy, VerificationRequest,
+    Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
+    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage,
+    Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract, TaskGraphPlan,
+    TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy, VerificationRequest,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -169,6 +169,7 @@ pub struct LaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
+    pub deliverable: Option<DeliverableSpec>,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
 }
@@ -202,6 +203,7 @@ pub struct ResumeLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub verification_policy: VerificationPolicy,
+    pub deliverable: Option<DeliverableSpec>,
     pub secret_refs: Vec<TaskSecretReference>,
     pub queued_messages: Vec<QueuedRunMessage>,
 }
@@ -384,6 +386,9 @@ pub struct StoredArtifact {
     pub sha256: String,
     pub media_type: String,
     pub bytes: i64,
+    pub artifact_role: String,
+    pub file_name: String,
+    pub metadata: Value,
     pub provenance_signature: String,
     pub retention_until: chrono::DateTime<Utc>,
 }
@@ -1160,7 +1165,8 @@ impl PgStore {
                    r.no_progress_events, r.repeated_tool_count,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
-                   r.verification_status, r.verification_summary, r.status,
+                   r.verification_status, r.verification_summary,
+                   r.verification_sha256, r.deliverable_sha256, r.status,
                    r.summary, r.artifact_id, r.artifact_uri, r.artifact_media_type,
                    r.artifact_signature, r.artifact_path, r.artifact_sha256,
                    r.created_at, r.updated_at
@@ -1277,6 +1283,34 @@ impl PgStore {
         .map(map_verification_request)
         .collect::<Result<Vec<_>>>()?;
 
+        let source_deliverables = sqlx::query(
+            r#"
+            SELECT deliverable.id, deliverable.corp_id, deliverable.task_id, deliverable.run_id,
+                   deliverable.artifact_id, deliverable.form, deliverable.file_name,
+                   artifact.uri, artifact.sha256, artifact.media_type, artifact.bytes,
+                   artifact.provenance_signature, deliverable.verification_sha256,
+                   deliverable.base_commit, deliverable.head_commit, deliverable.branch,
+                   deliverable.integration_state, artifact.retention_until,
+                   deliverable.created_at
+            FROM source_deliverables deliverable
+            JOIN artifacts artifact
+              ON artifact.id = deliverable.artifact_id AND artifact.status = 'ready'
+            JOIN tasks task ON task.id = deliverable.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE deliverable.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY deliverable.created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_source_deliverable)
+        .collect::<Result<Vec<_>>>()?;
+
         let action_approvals = sqlx::query(
             r#"
             SELECT approval.id, approval.corp_id, approval.room_id, approval.mission_id,
@@ -1390,6 +1424,7 @@ impl PgStore {
             queued_messages,
             verification_evidence,
             verification_requests,
+            source_deliverables,
             action_approvals,
             circuit_breaker_incidents,
             factory_work_items,
@@ -3198,6 +3233,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
+                deliverable: contract.deliverable,
                 secret_refs: contract.secret_refs,
                 queued_messages,
             },
@@ -3364,6 +3400,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 verification_policy,
+                deliverable: contract.deliverable,
                 secret_refs: contract.secret_refs,
                 queued_messages,
             },
@@ -3500,7 +3537,12 @@ impl PgStore {
             event_type,
             ..
         } = input;
-        if event_type != "run.artifact_upload"
+        let expected_role = match event_type.as_str() {
+            "run.artifact_upload" => "provider_evidence",
+            "run.deliverable_upload" => "source_deliverable",
+            _ => return Err(anyhow!("unsupported artifact upload event")),
+        };
+        if artifact.artifact_role != expected_role
             || artifact.id != event_id
             || artifact.corp_id != corp_id
             || artifact.run_id != run_id
@@ -3551,7 +3593,8 @@ impl PgStore {
             r#"
             SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
                    verifier, object_key, uri, sha256, media_type, bytes,
-                   provenance_signature, retention_until, status, staging_key, created_at
+                   artifact_role, file_name, metadata, provenance_signature, retention_until,
+                   status, staging_key, created_at
             FROM artifacts
             WHERE corp_id = $1 AND id = $2
             FOR UPDATE
@@ -3572,14 +3615,16 @@ impl PgStore {
             r#"
             SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
                    verifier, object_key, uri, sha256, media_type, bytes,
-                   provenance_signature, retention_until, status, staging_key, created_at
+                   artifact_role, file_name, metadata, provenance_signature, retention_until,
+                   status, staging_key, created_at
             FROM artifacts
-            WHERE corp_id = $1 AND run_id = $2 AND sha256 = $3
+            WHERE corp_id = $1 AND run_id = $2 AND artifact_role = $3 AND sha256 = $4
             FOR UPDATE
             "#,
         )
         .bind(corp_id)
         .bind(run_id)
+        .bind(&artifact.artifact_role)
         .bind(&artifact.sha256)
         .fetch_optional(&mut *tx)
         .await?;
@@ -3594,10 +3639,10 @@ impl PgStore {
             r#"
             INSERT INTO artifacts
                 (id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
-                 verifier, object_key, uri, sha256, media_type, bytes,
-                 retention_until, provenance_signature, status, staging_key)
+                 verifier, object_key, uri, sha256, media_type, bytes, artifact_role, file_name,
+                 metadata, retention_until, provenance_signature, status, staging_key)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    'staged', $15)
+                    $15, $16, $17, 'staged', $18)
             RETURNING created_at
             "#,
         )
@@ -3613,6 +3658,9 @@ impl PgStore {
         .bind(&artifact.sha256)
         .bind(&artifact.media_type)
         .bind(artifact.bytes)
+        .bind(&artifact.artifact_role)
+        .bind(&artifact.file_name)
+        .bind(&artifact.metadata)
         .bind(artifact.retention_until)
         .bind(&artifact.provenance_signature)
         .bind(staging_key)
@@ -3652,6 +3700,7 @@ impl PgStore {
                    artifact.producer_agent_id, artifact.producer_runner_id,
                    artifact.verifier, artifact.object_key, artifact.uri,
                    artifact.sha256, artifact.media_type, artifact.bytes,
+                   artifact.artifact_role, artifact.file_name, artifact.metadata,
                    artifact.provenance_signature, artifact.retention_until,
                    artifact.status, artifact.staging_key,
                    run.status AS run_status, run.agent_id,
@@ -3683,6 +3732,11 @@ impl PgStore {
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let artifact = map_stored_artifact(row);
+        let ready_event_type = if artifact.artifact_role == "source_deliverable" {
+            "run.deliverable"
+        } else {
+            "run.artifact"
+        };
 
         let event = append_event_tx(
             &mut tx,
@@ -3692,7 +3746,7 @@ impl PgStore {
                 ..NewEvent::new(
                     artifact.corp_id,
                     None,
-                    "run.artifact",
+                    ready_event_type,
                     "run",
                     artifact.run_id,
                     format!("artifact:{}:ready", artifact.id),
@@ -3702,6 +3756,9 @@ impl PgStore {
                         "sha256": artifact.sha256,
                         "bytes": artifact.bytes,
                         "media_type": artifact.media_type,
+                        "artifact_role": artifact.artifact_role,
+                        "file_name": artifact.file_name,
+                        "metadata": artifact.metadata,
                         "producer_agent_id": artifact.producer_agent_id,
                         "producer_runner_id": artifact.producer_runner_id,
                         "verifier": artifact.verifier,
@@ -3734,27 +3791,85 @@ impl PgStore {
                 | "waiting_for_approval"
                 | "verifying"
         );
-        sqlx::query(
-            r#"
-            UPDATE runs
-            SET artifact_id = $1,
-                artifact_uri = $2,
-                artifact_media_type = $3,
-                artifact_signature = $4,
-                artifact_path = NULL,
-                artifact_sha256 = $5,
-                updated_at = now()
-            WHERE id = $6
-            "#,
-        )
-        .bind(artifact.id)
-        .bind(&artifact.uri)
-        .bind(&artifact.media_type)
-        .bind(&artifact.provenance_signature)
-        .bind(&artifact.sha256)
-        .bind(artifact.run_id)
-        .execute(&mut *tx)
-        .await?;
+        if artifact.artifact_role == "source_deliverable" {
+            let form = artifact
+                .metadata
+                .get("form")
+                .and_then(Value::as_str)
+                .context("source deliverable omitted form")?;
+            let verification_sha256 = artifact
+                .metadata
+                .get("verification_sha256")
+                .and_then(Value::as_str)
+                .context("source deliverable omitted verification digest")?;
+            let base_commit = artifact
+                .metadata
+                .get("base_commit")
+                .and_then(Value::as_str)
+                .context("source deliverable omitted base commit")?;
+            let head_commit = artifact.metadata.get("head_commit").and_then(Value::as_str);
+            let branch = artifact
+                .metadata
+                .get("branch")
+                .and_then(Value::as_str)
+                .context("source deliverable omitted branch")?;
+            let integration_state = artifact
+                .metadata
+                .get("integration_state")
+                .and_then(Value::as_str)
+                .context("source deliverable omitted integration state")?;
+            sqlx::query(
+                r#"
+                INSERT INTO source_deliverables
+                    (id, corp_id, task_id, run_id, artifact_id, form, file_name,
+                     verification_sha256, base_commit, head_commit, branch, integration_state)
+                VALUES ($1, $2, $3, $4, $1, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (run_id) DO NOTHING
+                "#,
+            )
+            .bind(artifact.id)
+            .bind(artifact.corp_id)
+            .bind(artifact.task_id)
+            .bind(artifact.run_id)
+            .bind(form)
+            .bind(&artifact.file_name)
+            .bind(verification_sha256)
+            .bind(base_commit)
+            .bind(head_commit)
+            .bind(branch)
+            .bind(integration_state)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE runs SET deliverable_sha256 = $1, updated_at = now() WHERE id = $2",
+            )
+            .bind(&artifact.sha256)
+            .bind(artifact.run_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE runs
+                SET artifact_id = $1,
+                    artifact_uri = $2,
+                    artifact_media_type = $3,
+                    artifact_signature = $4,
+                    artifact_path = NULL,
+                    artifact_sha256 = $5,
+                    updated_at = now()
+                WHERE id = $6
+                "#,
+            )
+            .bind(artifact.id)
+            .bind(&artifact.uri)
+            .bind(&artifact.media_type)
+            .bind(&artifact.provenance_signature)
+            .bind(&artifact.sha256)
+            .bind(artifact.run_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         if run_active {
             sqlx::query("UPDATE runs SET status = 'verifying', updated_at = now() WHERE id = $1")
                 .bind(artifact.run_id)
@@ -3867,7 +3982,8 @@ impl PgStore {
             r#"
             SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
                    verifier, object_key, uri, sha256, media_type, bytes,
-                   provenance_signature, retention_until, status, staging_key, created_at
+                   artifact_role, file_name, metadata, provenance_signature, retention_until,
+                   status, staging_key, created_at
             FROM artifacts
             WHERE status = 'staged' OR staging_key IS NOT NULL
             ORDER BY created_at, id
@@ -3893,8 +4009,9 @@ impl PgStore {
             SELECT artifact.id, artifact.corp_id, artifact.task_id, artifact.run_id,
                    artifact.producer_agent_id, artifact.producer_runner_id,
                    artifact.verifier, artifact.object_key, artifact.uri,
-                   artifact.sha256, artifact.media_type, artifact.bytes,
-                   artifact.provenance_signature, artifact.retention_until
+                    artifact.sha256, artifact.media_type, artifact.bytes,
+                    artifact.artifact_role, artifact.file_name, artifact.metadata,
+                    artifact.provenance_signature, artifact.retention_until
             FROM artifacts artifact
             JOIN tasks task ON task.id = artifact.task_id
             JOIN missions mission ON mission.id = task.mission_id
@@ -3907,6 +4024,32 @@ impl PgStore {
         .bind(artifact_id)
         .bind(corp_id)
         .bind(actor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(map_stored_artifact))
+    }
+
+    pub async fn ready_artifact_for_run_role_digest(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        artifact_role: &str,
+        sha256: &str,
+    ) -> Result<Option<StoredArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
+                   verifier, object_key, uri, sha256, media_type, bytes,
+                   artifact_role, file_name, metadata, provenance_signature, retention_until
+            FROM artifacts
+            WHERE corp_id = $1 AND run_id = $2 AND artifact_role = $3 AND sha256 = $4
+              AND status = 'ready'
+            "#,
+        )
+        .bind(corp_id)
+        .bind(run_id)
+        .bind(artifact_role)
+        .bind(sha256)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(map_stored_artifact))
@@ -3934,9 +4077,12 @@ impl PgStore {
                        artifact.object_key,
                        artifact.uri,
                        artifact.sha256,
-                       artifact.media_type,
-                       artifact.bytes,
-                       artifact.provenance_signature,
+                        artifact.media_type,
+                        artifact.bytes,
+                        artifact.artifact_role,
+                        artifact.file_name,
+                        artifact.metadata,
+                        artifact.provenance_signature,
                        artifact.retention_until,
                        row_number() OVER (
                            PARTITION BY parent.id
@@ -3947,13 +4093,16 @@ impl PgStore {
                 JOIN tasks parent ON parent.id = dependency.depends_on_task_id
                 JOIN runs run ON run.task_id = parent.id AND run.status = 'completed'
                 JOIN artifacts artifact
-                  ON artifact.run_id = run.id AND artifact.status = 'ready'
+                  ON artifact.run_id = run.id
+                 AND artifact.status = 'ready'
+                 AND artifact.artifact_role = 'provider_evidence'
                 WHERE child.id = $1 AND child.corp_id = $2
             )
             SELECT dependency_task_id, plan_key, task_title, run_summary,
                    id, corp_id, task_id, run_id, producer_agent_id,
-                   producer_runner_id, verifier, object_key, uri, sha256,
-                   media_type, bytes, provenance_signature, retention_until
+                    producer_runner_id, verifier, object_key, uri, sha256,
+                    media_type, bytes, artifact_role, file_name, metadata,
+                    provenance_signature, retention_until
             FROM ranked
             WHERE rank = 1
             ORDER BY plan_key
@@ -3999,7 +4148,7 @@ impl PgStore {
             r#"
             SELECT r.task_id, r.verification_status AS run_verification_status,
                    r.breaker_stage,
-                   t.mission_id, t.verification_policy, m.room_id,
+                   t.mission_id, t.contract, t.verification_policy, m.room_id,
                    t.attempt_count, t.max_attempts
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
@@ -4036,6 +4185,8 @@ impl PgStore {
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode task verification policy")?;
+        let task_contract: TaskContract =
+            serde_json::from_value(row.get("contract")).context("decode task contract")?;
         if breaker_blocks_runner_progress(&breaker_stage, &event_type) {
             return Err(anyhow!(
                 "run event {event_type} is blocked by breaker stage {breaker_stage}"
@@ -4334,7 +4485,10 @@ impl PgStore {
                     }
                 }
             }
-            "run.artifact" | "run.artifact_upload" => {
+            "run.artifact"
+            | "run.artifact_upload"
+            | "run.deliverable"
+            | "run.deliverable_upload" => {
                 return Err(anyhow!(
                     "artifact events must pass through server-side object storage verification"
                 ));
@@ -4454,6 +4608,46 @@ impl PgStore {
                 .await?;
             }
             "run.verification_passed" => {
+                let (verification_sha256, deliverable_sha256) =
+                    if task_contract.deliverable.is_some() {
+                        let verification_sha256 = payload
+                            .get("verification_sha256")
+                            .and_then(Value::as_str)
+                            .context("verification passed event omitted verification digest")?
+                            .to_owned();
+                        let deliverable_sha256 = payload
+                            .get("deliverable_sha256")
+                            .and_then(Value::as_str)
+                            .context("verification passed event omitted deliverable digest")?
+                            .to_owned();
+                        let linked: bool = sqlx::query_scalar(
+                            r#"
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM source_deliverables deliverable
+                                JOIN artifacts artifact ON artifact.id = deliverable.artifact_id
+                                WHERE deliverable.run_id = $1
+                                  AND deliverable.verification_sha256 = $2
+                                  AND artifact.sha256 = $3
+                                  AND artifact.status = 'ready'
+                                  AND artifact.artifact_role = 'source_deliverable'
+                            )
+                            "#,
+                        )
+                        .bind(run_id)
+                        .bind(&verification_sha256)
+                        .bind(&deliverable_sha256)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        if !linked {
+                            return Err(anyhow!(
+                                "verification passed without an exact ready deliverable linkage"
+                            ));
+                        }
+                        (Some(verification_sha256), Some(deliverable_sha256))
+                    } else {
+                        (None, None)
+                    };
                 let requires_artifact = verification_policy
                     .checks
                     .iter()
@@ -4504,9 +4698,11 @@ impl PgStore {
                     .and_then(Value::as_str)
                     .unwrap_or("all verifier checks passed");
                 sqlx::query(
-                    "UPDATE runs SET verification_status = 'passed', verification_summary = $1, updated_at = now() WHERE id = $2",
+                    "UPDATE runs SET verification_status = 'passed', verification_summary = $1, verification_sha256 = $2, deliverable_sha256 = $3, updated_at = now() WHERE id = $4",
                 )
                 .bind(summary)
+                .bind(&verification_sha256)
+                .bind(&deliverable_sha256)
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
@@ -6405,6 +6601,8 @@ fn format_task_prompt(
          COST BUDGET (MICROUSD): {}\n\
          MODEL: {}\n\
          REASONING EFFORT: {}\n\
+         DELIVERABLE FORM: {}\n\
+         COMMIT AFTER VERIFICATION: {}\n\
          SECRET CAPABILITIES:\n{}\n\
          DEADLINE: {}\n\
          ESCALATION: {}",
@@ -6434,6 +6632,15 @@ fn format_task_prompt(
             .reasoning_effort
             .as_deref()
             .unwrap_or("provider default"),
+        contract
+            .deliverable
+            .as_ref()
+            .map(|deliverable| deliverable.form.as_str())
+            .unwrap_or("none"),
+        contract
+            .deliverable
+            .as_ref()
+            .is_some_and(|deliverable| deliverable.commit_after_verification),
         secret_refs,
         contract
             .deadline_at
@@ -7809,9 +8016,11 @@ async fn sanitize_verification_evidence_tx(
         r#"
         SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
                verifier, object_key, uri, sha256, media_type, bytes,
-               provenance_signature, retention_until
+               artifact_role, file_name, metadata, provenance_signature, retention_until
         FROM artifacts
-        WHERE run_id = $1 AND status = 'ready'
+        WHERE run_id = $1
+          AND status = 'ready'
+          AND artifact_role = 'provider_evidence'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -7897,7 +8106,9 @@ async fn sanitize_verification_evidence_tx(
 
 fn redact_artifact_event_payload(event_type: &str, payload: &mut Value) {
     match event_type {
-        "run.artifact" | "run.artifact_upload" => redact_path_fields(payload),
+        "run.artifact" | "run.artifact_upload" | "run.deliverable" | "run.deliverable_upload" => {
+            redact_path_fields(payload)
+        }
         "run.verification_evidence"
             if payload.get("kind").and_then(Value::as_str) == Some("artifact") =>
         {
@@ -8131,6 +8342,8 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         workspace_detail: row.get("workspace_detail"),
         verification_status: row.get("verification_status"),
         verification_summary: row.get("verification_summary"),
+        verification_sha256: row.get("verification_sha256"),
+        deliverable_sha256: row.get("deliverable_sha256"),
         status: parse_run_status(row.get::<String, _>("status").as_str())?,
         summary: row.get("summary"),
         artifact_id: row.get("artifact_id"),
@@ -8158,6 +8371,9 @@ fn map_stored_artifact(row: sqlx::postgres::PgRow) -> StoredArtifact {
         sha256: row.get("sha256"),
         media_type: row.get("media_type"),
         bytes: row.get("bytes"),
+        artifact_role: row.get("artifact_role"),
+        file_name: row.get("file_name"),
+        metadata: row.get("metadata"),
         provenance_signature: row.get("provenance_signature"),
         retention_until: row.get("retention_until"),
     }
@@ -8193,6 +8409,9 @@ fn ensure_artifact_upload_matches(
         || existing.sha256 != candidate.sha256
         || existing.media_type != candidate.media_type
         || existing.bytes != candidate.bytes
+        || existing.artifact_role != candidate.artifact_role
+        || existing.file_name != candidate.file_name
+        || existing.metadata != candidate.metadata
     {
         return Err(anyhow!(
             "duplicate artifact upload conflicts with persisted metadata"
@@ -8263,6 +8482,38 @@ fn map_verification_request(row: sqlx::postgres::PgRow) -> Result<VerificationRe
         decided_by: row.get("decided_by"),
         decision_note: row.get("decision_note"),
         decided_at: row.get("decided_at"),
+    })
+}
+
+fn map_source_deliverable(row: sqlx::postgres::PgRow) -> Result<SourceDeliverable> {
+    let form = match row.get::<String, _>("form").as_str() {
+        "commit_branch" => DeliverableForm::CommitBranch,
+        "patch" => DeliverableForm::Patch,
+        "archive" => DeliverableForm::Archive,
+        "typed_artifact_set" => DeliverableForm::TypedArtifactSet,
+        "review_only_report" => DeliverableForm::ReviewOnlyReport,
+        other => return Err(anyhow!("unknown source deliverable form {other}")),
+    };
+    Ok(SourceDeliverable {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        task_id: row.get("task_id"),
+        run_id: row.get("run_id"),
+        artifact_id: row.get("artifact_id"),
+        form,
+        file_name: row.get("file_name"),
+        uri: row.get("uri"),
+        sha256: row.get("sha256"),
+        media_type: row.get("media_type"),
+        bytes: row.get("bytes"),
+        provenance_signature: row.get("provenance_signature"),
+        verification_sha256: row.get("verification_sha256"),
+        base_commit: row.get("base_commit"),
+        head_commit: row.get("head_commit"),
+        branch: row.get("branch"),
+        integration_state: row.get("integration_state"),
+        retention_until: row.get("retention_until"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -8590,6 +8841,7 @@ fn runner_event_advances_run(event_type: &str) -> bool {
             | "run.status"
             | "run.approval_requested"
             | "run.artifact_upload"
+            | "run.deliverable_upload"
             | "run.verification_started"
             | "run.verification_evidence"
             | "run.verification_passed"
@@ -8658,6 +8910,7 @@ mod tests {
                 "run.status",
                 "run.approval_requested",
                 "run.artifact_upload",
+                "run.deliverable_upload",
                 "run.verification_started",
                 "run.verification_evidence",
                 "run.verification_passed",
@@ -8783,6 +9036,7 @@ mod tests {
                     secret_refs: Vec::new(),
                     model: model.map(str::to_owned),
                     reasoning_effort: reasoning_effort.map(str::to_owned),
+                    deliverable: None,
                 },
                 assigned_agent_id: Uuid::new_v4(),
                 required_adapter: "codex".to_owned(),

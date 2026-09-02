@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use crony_domain::{
-    Agent, AgentStatus, ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan,
-    TaskSecretReference, VerificationPolicy, VerifierCheck,
+    Agent, AgentStatus, DeliverableSpec, ManualVerificationGate, PlannedTask, TaskContract,
+    TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
 };
 
 pub const MAX_GRAPH_NODES: usize = 8;
@@ -32,6 +32,7 @@ pub struct PlanningRequest<'a> {
     pub secret_refs: &'a [TaskSecretReference],
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
+    pub deliverable: Option<&'a DeliverableSpec>,
 }
 
 pub trait ManagerStrategy: Send + Sync {
@@ -117,6 +118,9 @@ impl ManagerStrategy for SingleTaskStrategy {
         task_contract.secret_refs = request.secret_refs.to_vec();
         task_contract.model = request.preferred_model.map(str::to_owned);
         task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+        if let Some(deliverable) = request.deliverable {
+            task_contract.deliverable = Some(deliverable.clone());
+        }
         Ok(TaskGraphPlan {
             strategy: self.id().to_owned(),
             max_nodes: 1,
@@ -191,6 +195,9 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
         synthesis_contract.budget_cost_microusd = synthesis_cost_budget;
         synthesis_contract.model = synthesis_model;
         synthesis_contract.reasoning_effort = synthesis_reasoning;
+        if let Some(deliverable) = request.deliverable {
+            synthesis_contract.deliverable = Some(deliverable.clone());
+        }
         synthesis_contract.references = vec![
             "task:specialist-a".to_owned(),
             "task:specialist-b".to_owned(),
@@ -496,6 +503,7 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         secret_refs: Vec::new(),
         model: None,
         reasoning_effort: None,
+        deliverable: None,
     }
 }
 
@@ -634,6 +642,9 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
         contract.source_repository.as_deref(),
         contract.source_base_ref.as_deref(),
     )?;
+    if let Some(deliverable) = &contract.deliverable {
+        validate_deliverable(task_key, deliverable)?;
+    }
     if contract
         .model
         .as_ref()
@@ -693,6 +704,18 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
         {
             return Err(anyhow!("task {task_key} secret scope is invalid"));
         }
+    }
+    Ok(())
+}
+
+fn validate_deliverable(task_key: &str, deliverable: &DeliverableSpec) -> Result<()> {
+    if deliverable.paths.len() > 128 {
+        return Err(anyhow!(
+            "task {task_key} deliverable cannot contain more than 128 paths"
+        ));
+    }
+    for path in &deliverable.paths {
+        validate_relative_path(task_key, path)?;
     }
     Ok(())
 }
@@ -922,6 +945,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
         let agents = agents();
         let first = registry
@@ -958,6 +982,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
         let mut plan = registry
             .plan("parallel-specialists", &request, &agents)
@@ -1033,6 +1058,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1041,6 +1067,57 @@ mod tests {
         assert_eq!(
             plan.tasks[0].contract.budget_tokens,
             DEFAULT_SINGLE_TASK_BUDGET_TOKENS
+        );
+    }
+
+    #[test]
+    fn single_strategy_preserves_typed_deliverable_and_rejects_unsafe_scope() {
+        let agents = agents();
+        let registry = StrategyRegistry::new();
+        let requested = DeliverableSpec {
+            form: crony_domain::DeliverableForm::Archive,
+            commit_after_verification: true,
+            paths: vec!["src".to_owned()],
+        };
+        let plan = registry
+            .plan(
+                "single",
+                &PlanningRequest {
+                    mission_title: "export the verified application",
+                    preferred_adapter: Some("fake-process"),
+                    preferred_model: None,
+                    reasoning_effort: None,
+                    secret_refs: &[],
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
+                    deliverable: Some(&requested),
+                },
+                &agents,
+            )
+            .expect("single plan");
+        assert_eq!(plan.tasks[0].contract.deliverable, Some(requested));
+
+        let unsafe_requested = DeliverableSpec {
+            paths: vec!["../escape".to_owned()],
+            ..DeliverableSpec::default()
+        };
+        assert!(
+            registry
+                .plan(
+                    "single",
+                    &PlanningRequest {
+                        mission_title: "reject unsafe export scope",
+                        preferred_adapter: Some("fake-process"),
+                        preferred_model: None,
+                        reasoning_effort: None,
+                        secret_refs: &[],
+                        budget_tokens: None,
+                        budget_cost_microusd: None,
+                        deliverable: Some(&unsafe_requested),
+                    },
+                    &agents,
+                )
+                .is_err()
         );
     }
 
@@ -1059,6 +1136,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1095,6 +1173,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1117,6 +1196,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
 
         let mut plan = registry

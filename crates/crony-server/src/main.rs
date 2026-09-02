@@ -1169,11 +1169,8 @@ async fn download_artifact(
     );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"artifact-{}\"",
-            artifact.id
-        ))
-        .map_err(ApiError::internal)?,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", artifact.file_name))
+            .map_err(ApiError::internal)?,
     );
     headers.insert(
         ETAG,
@@ -1186,6 +1183,10 @@ async fn download_artifact(
     headers.insert(
         HeaderName::from_static("x-crony-artifact-signature"),
         HeaderValue::from_str(&artifact.provenance_signature).map_err(ApiError::internal)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-crony-artifact-role"),
+        HeaderValue::from_str(&artifact.artifact_role).map_err(ApiError::internal)?,
     );
     Ok(response)
 }
@@ -1209,6 +1210,7 @@ struct MissionPlanInput<'a> {
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
+    deliverable: Option<&'a crony_domain::DeliverableSpec>,
     factory_contract: Option<&'a FactoryMissionContract>,
 }
 
@@ -1257,6 +1259,7 @@ async fn plan_mission(
                 secret_refs: input.secret_refs,
                 budget_tokens: input.budget_tokens,
                 budget_cost_microusd: input.budget_cost_microusd,
+                deliverable: input.deliverable,
             },
             &agents,
         )
@@ -1368,6 +1371,7 @@ async fn create_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            deliverable: request.deliverable.as_ref(),
             factory_contract: None,
         },
     )
@@ -1533,6 +1537,7 @@ async fn materialize_factory_mission(
         "secret_refs": &request.secret_refs,
         "budget_tokens": request.budget_tokens,
         "budget_cost_microusd": request.budget_cost_microusd,
+        "deliverable": &request.deliverable,
         "contract": &request.contract
     });
     let materialize_input = MaterializeFactoryMissionInput {
@@ -1572,6 +1577,7 @@ async fn materialize_factory_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            deliverable: request.deliverable.as_ref(),
             factory_contract: Some(&request.contract),
         },
     )
@@ -1802,6 +1808,7 @@ async fn schedule_ready_tasks(
                 model: record.model.clone(),
                 reasoning_effort: record.reasoning_effort.clone(),
                 verification_policy: record.verification_policy.clone(),
+                deliverable: record.deliverable.clone(),
                 secrets,
             })
             .is_err()
@@ -2275,6 +2282,7 @@ async fn resume_run(
         source_repository: record.source_repository.clone(),
         source_base_ref: record.source_base_ref.clone(),
         verification_policy: record.verification_policy.clone(),
+        deliverable: record.deliverable.clone(),
         secret_refs: record.secret_refs.clone(),
         queued_messages: record.queued_messages.clone(),
     };
@@ -2314,6 +2322,7 @@ async fn resume_run(
             model: record.model,
             reasoning_effort: record.reasoning_effort,
             verification_policy: record.verification_policy,
+            deliverable: record.deliverable,
             secrets,
         })
         .is_err()
@@ -3153,6 +3162,10 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     );
                     continue;
                 }
+                let deliverable_ack_sha = (event_type == "run.deliverable_upload")
+                    .then(|| payload.get("sha256").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .map(str::to_owned);
                 let input = RunnerEventInput {
                     event_id,
                     runner_id: runner_id.clone(),
@@ -3166,8 +3179,10 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 };
                 let mut applied_event_type = event_type.clone();
                 let mut result = process_runner_event(&state, input).await;
-                if event_type == "run.artifact_upload"
-                    && let Err(error) = &result
+                if matches!(
+                    event_type.as_str(),
+                    "run.artifact_upload" | "run.deliverable_upload"
+                ) && let Err(error) = &result
                 {
                     let reason = format!("artifact upload rejected: {error}");
                     warn!(%error, %run_id, "artifact upload failed verification");
@@ -3189,6 +3204,30 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 }
                 match result {
                     Ok(Some(event)) => {
+                        if event.event_type == "run.deliverable"
+                            && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
+                                event
+                                    .payload
+                                    .get("artifact_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| Uuid::parse_str(value).ok()),
+                                event
+                                    .payload
+                                    .get("artifact_role")
+                                    .and_then(serde_json::Value::as_str),
+                                event
+                                    .payload
+                                    .get("sha256")
+                                    .and_then(serde_json::Value::as_str),
+                            )
+                        {
+                            let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                run_id,
+                                artifact_id,
+                                artifact_role: artifact_role.to_owned(),
+                                sha256: sha256.to_owned(),
+                            });
+                        }
                         let approval_expiry = if applied_event_type == "run.approval_requested" {
                             event
                                 .payload
@@ -3273,7 +3312,33 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             });
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Some(sha256) = deliverable_ack_sha {
+                            match state
+                                .store
+                                .ready_artifact_for_run_role_digest(
+                                    corp_id,
+                                    run_id,
+                                    "source_deliverable",
+                                    &sha256,
+                                )
+                                .await
+                            {
+                                Ok(Some(artifact)) => {
+                                    let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                        run_id,
+                                        artifact_id: artifact.id,
+                                        artifact_role: artifact.artifact_role,
+                                        sha256: artifact.sha256,
+                                    });
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
+                                }
+                            }
+                        }
+                    }
                     Err(error) => {
                         if error
                             .to_string()
@@ -3338,7 +3403,10 @@ async fn process_runner_event(
     state: &AppState,
     input: RunnerEventInput,
 ) -> anyhow::Result<Option<DomainEvent>> {
-    if input.event_type != "run.artifact_upload" {
+    if !matches!(
+        input.event_type.as_str(),
+        "run.artifact_upload" | "run.deliverable_upload"
+    ) {
         return state.store.apply_runner_event(input).await;
     }
     let context = state
