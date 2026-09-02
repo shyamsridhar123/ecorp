@@ -11,6 +11,8 @@
 **Rolling-budget and lineage hardening:** `91349215f07356dc6319f26aaefb48930363c720`
 **Integrated publication room-scope head:** `c80c36a4e26d32d7fb236f19edaefc1102f1d1c7`
 **Final integrated full-gate head:** `3b0ad5377265620a0cede2046156862d7f379197`
+**Publication main merge:** `d7de6c89155ed059da05cf54bedc381d743df232`
+**Final stacked integration head:** `10f39fe6591de05508c9979615cdfd98cfd4404c`
 
 ## Scope
 
@@ -188,3 +190,48 @@ pnpm lint:web
 Migration validation reported 27 immutable migrations. The Rust workspace ran 80
 non-documentation tests with zero failures. The web production build and lint completed without
 errors.
+
+## Final publication-main integration — September 2, 2026
+
+PR #77 normally merged publication `main` at
+`d7de6c89155ed059da05cf54bedc381d743df232`. Publication publisher credentials remain migration
+0027, so the budget-revision schema moved without content changes to
+`0028_mission_budget_revisions.sql`. Migration validation reported 28 ordered immutable checksums.
+
+Exact merge head `10f39fe6591de05508c9979615cdfd98cfd4404c` passed formatting,
+warning-free workspace clippy, all 95 Rust tests, the production web build, web lint, and
+`git diff --check`.
+
+The first runtime attempt intentionally remains disclosed: without the documented fake Codex
+app-server configuration, the installed real Codex CLI reported 33,185 tokens and correctly reached
+`stop` against the 6,000-token fixture. No product change was made for that harness error. The
+isolated stack was recreated with `CRONY_CODEX_COMMAND=node` and
+`CRONY_CODEX_COMMAND_ARGS=scripts/fake-codex-app-server.mjs`.
+
+On that exact binary and fresh database, `tools/e2e_budget_revision.mjs` passed at
+`2026-09-02T19:51:23.136Z`, immediately followed by
+`tools/e2e_factory_publication.mjs` at `2026-09-02T19:56:51.850Z`. The budget report proved a
+pre-dispatch failure marked `dispatch_not_started` did not strand the preserved source run; retry
+reused the same provider session and workspace lineage and completed. The publication report then
+retained every trusted-publisher, idempotency, authority, recovery, and non-disclosure invariant.
+
+Chromium exercised the operator path at 1,440 and 390 pixels. A real `suspend`-stage run was used;
+only its run/task/mission status triplet was changed to `cancelled` to reproduce the reviewed UI
+state. The cancelled mission still exposed **Authorize recovery budget**. Alice proposed and
+approved the revision in the browser. An injected repository mismatch then produced HTTP `409` and
+a failed descendant with no workspace plus `workspace_detail=dispatch_not_started`; the
+**Resume agent session** control remained available. After restoring the task contract, the browser
+retry completed with the same provider session and workspace lineage.
+
+Final browser state recorded 6,012 consumed tokens, mission status `completed`, no page errors,
+zero console errors after the successful retry, and no horizontal overflow at either viewport.
+The one console error during the negative lane was the expected HTTP `409`.
+
+Screenshots:
+
+```text
+output/playwright/pr77-cancelled-suspend-recovery-desktop.png
+output/playwright/pr77-cancelled-suspend-recovery-mobile.png
+output/playwright/pr77-pre-dispatch-retry-completed-desktop.png
+output/playwright/pr77-pre-dispatch-retry-completed-mobile.png
+```
