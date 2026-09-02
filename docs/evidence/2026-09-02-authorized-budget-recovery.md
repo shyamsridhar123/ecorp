@@ -1,10 +1,10 @@
 # Authorized mission budget recovery validation
 
-**Date:** September 2, 2026  
-**Core implementation:** `c3431f9526e3498c5fa14c0a1fb67ae19f3ff136`  
-**Deterministic E2E checkpoint:** `892c3d24d3375575def97fd2c05f3b9521d55ae2`  
-**Operator UI:** `c4ce25e`  
-**Integrated publication base:** `bef6774851c79a1cd8a773883b9c5b090318b673`  
+**Date:** September 2, 2026
+**Core implementation:** `c3431f9526e3498c5fa14c0a1fb67ae19f3ff136`
+**Deterministic E2E checkpoint:** `892c3d24d3375575def97fd2c05f3b9521d55ae2`
+**Operator UI:** `c4ce25e`
+**Integrated publication base:** `bef6774851c79a1cd8a773883b9c5b090318b673`
 **Cross-scenario reset isolation:** `3a3702e`
 
 ## Scope

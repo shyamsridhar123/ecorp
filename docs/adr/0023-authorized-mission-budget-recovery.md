@@ -1,6 +1,6 @@
 # ADR 0023: Recover budget-suspended missions through explicit revision authority
 
-**Status:** Accepted  
+**Status:** Accepted
 **Date:** September 2, 2026
 
 ## Context
