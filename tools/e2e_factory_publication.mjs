@@ -169,7 +169,7 @@ async function runPublisher(
     '--lease-seconds',
     '5',
     '--wait-seconds',
-    '30',
+    '60',
     '--github-cli',
     process.execPath,
   ]
@@ -189,7 +189,7 @@ async function runPublisher(
         ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
         ECORP_FAKE_GITHUB_STATE: statePath,
         ECORP_PUBLICATION_TEST_REMOTE_URL: remotePath,
-        ECORP_PUBLICATION_EFFECT_LEASE_SECONDS: '10',
+        ECORP_PUBLICATION_EFFECT_LEASE_SECONDS: '30',
         ECORP_GITHUB_COMMAND_TIMEOUT_MS: '1000',
         ECORP_SOURCE_GIT_COMMAND_TIMEOUT_MS: '5000',
         ...(crashAfter
@@ -590,6 +590,9 @@ const collisionSource = collisionSnapshot.snapshot.source_deliverables.find(
     deliverable.integration_state === 'ready_for_review',
 )
 assert.ok(collisionSource)
+await psql(
+  `UPDATE factory_work_items SET policy = jsonb_set(policy, '{publication,branch_prefix}', '\"main\"'::jsonb) WHERE id = ${sqlLiteral(collisionWorkItem.id)}::uuid;`,
+)
 const collisionBodyPath = path.join(
   root,
   'output',
@@ -790,7 +793,8 @@ await psql(
 
 const initialAttempt = await postOk(publicationPath, {
   ...publicationRequest,
-  idempotency_key: `${effectKey}:start:${demo.alice_actor_id}`,
+  idempotency_key: `${effectKey}:initial-authority-attempt`,
+  lease_seconds: 30,
 })
 assert.ok(initialAttempt.publisher_token)
 await psql(
@@ -867,6 +871,7 @@ await waitForPublicationLeaseExpiry(demo, workItem.id)
 const pullRequestAuthorityAttempt = await postOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:pull-request-authority-attempt`,
+  lease_seconds: 30,
 })
 assert.ok(pullRequestAuthorityAttempt.publisher_token)
 await psql(
@@ -940,6 +945,7 @@ await waitForPublicationLeaseExpiry(demo, workItem.id)
 const projectAuthorityAttempt = await postOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:project-authority-attempt`,
+  lease_seconds: 30,
 })
 assert.ok(projectAuthorityAttempt.publisher_token)
 assert.equal(

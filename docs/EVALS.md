@@ -257,5 +257,7 @@ duplicate concurrent publication convergence; credential non-disclosure; exactly
 pull request; same-named fork rejection; exact PR-head SHA binding; symbolic `HEAD` verification;
 separate persistence of policy base `HEAD` and resolved GitHub PR base;
 post-start role, breaker, run-budget, and Corp-budget revocation; and the required
-pull-request-before-review ordering. See
+pull-request-before-review ordering. It also proves the resolved base branch cannot be pushed as the
+publication branch, implicit authorization IDs survive duplicate/restart invocation, and CRLF body
+files canonicalize before idempotency comparison. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

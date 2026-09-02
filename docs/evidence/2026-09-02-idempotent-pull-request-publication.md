@@ -5,6 +5,7 @@
 **Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
 **Final local validation head:** `ae2df7c50d778f0de56fcb694711044d7cfc9bec`
 **Resolved-base fix head:** `59638db`
+**Retry and base-branch guard head:** `aa55790`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -50,6 +51,9 @@ The final exact-head run recorded:
 
 ```json
 {
+  "base_branch_collision_rejected": true,
+  "implicit_authorization_retry_stable": true,
+  "body_file_crlf_normalized": true,
   "publication_attempts": 8,
   "pull_request_number": 41,
   "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
@@ -93,6 +97,12 @@ the resolved `main` branch for GitHub PR operations. After publication
 start, changing the owner to another still-publish-capable role, raising a hard breaker, exhausting
 the selected run budget, and exhausting the Corp aggregate budget each caused the next lease
 renewal to fail before branch, PR, or Project effects.
+
+A separate verified factory item explicitly allowed publication branch `main`. Two CLI invocations
+without `--authorization-id`, using a CRLF body file with a trailing newline, both reached the same
+resolved-base guard. The remote `main` object did not change, no pull request was created, the body
+canonicalized identically on client and server, and the generated authorization identity remained
+stable across retry.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was

@@ -63,6 +63,11 @@ requires a branch target, and verifies that the advertised HEAD object equals th
 ref object before any push. The authorized symbolic input remains `HEAD`, while the resolved branch
 name is used for GitHub PR lookup/creation and persisted as the actual pull-request base.
 
+The publisher refuses to push when the requested publication branch equals that resolved base
+branch. Implicit authorization IDs are deterministically derived from actor and effect identity, and
+recovery reuses a persisted authorization ID. Body files are normalized to LF and trimmed with the
+same rules as the server before the idempotent request is constructed.
+
 Publication does not call GitHub merge APIs, enable auto-merge, deploy, or authorize those effects.
 
 ## Consequences
