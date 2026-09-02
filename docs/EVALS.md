@@ -248,3 +248,10 @@ download, denies a non-member, optionally creates a commit only on the isolated 
 receives durable storage acknowledgment before a clean worktree is reclaimed. Browser validation
 checks that provider evidence, verification evidence, source deliverables, and integration state
 are visibly distinct.
+
+`tools/e2e_factory_publication.mjs` uses a real server, runner, isolated worktrees, portable Git
+bundle, bare Git remote, and deterministic fake GitHub API. It proves policy, role, Corp, budget,
+and breaker rejection; branch-push recovery after a publisher crash and server restart; pull-request
+adoption after external success plus local failure; Project-status recovery after another crash;
+duplicate concurrent publication convergence; credential non-disclosure; exactly one branch and
+pull request; and the required pull-request-before-review ordering.

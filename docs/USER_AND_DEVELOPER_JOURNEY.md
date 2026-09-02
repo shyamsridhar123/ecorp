@@ -100,6 +100,18 @@ provider evidence, verification evidence, the signed source deliverable, and int
 four distinct records. Room members can download the actual deliverable without runner-host path
 access. The room and immutable activity feed preserve the collaboration and replay trail.
 
+### 5. Publish a verified factory result for review
+
+An owner, admin, or manager can run `crony factory-publish <corp> <actor> <work-item>`. The trusted
+CLI derives the exact ready commit/branch deliverable, target, source issue, title/body, authorization
+record, and idempotent effect key from the durable snapshot. It uses the operator's existing GitHub
+credential helper without exposing that credential to the agent or server.
+
+Retries do not create another branch or pull request. The UI shows the target, base, branch, commit,
+authorization, attempt history, failure detail, pull-request link, and Project transition. Project
+status enters review only after the pull request exists. Publication never enables auto-merge and
+does not merge or deploy.
+
 ## The developer journey
 
 ### Local process topology

@@ -459,9 +459,29 @@ Pull-request publication, merge, and deployment are outside this boundary. A rea
 deliverable proves portable review material exists; it does not imply external integration. See
 ADR 0021.
 
+## Idempotent pull-request publication
+
+Publication is a dedicated durable aggregate rather than a generic factory state transition. It
+links one verified factory work item and one ready commit/branch deliverable to an immutable target
+repository, base ref, branch, commit, pull-request title/body, source issue, explicit human
+authorization snapshot, and effect key. Attempts have independent publisher leases and fencing
+tokens; tokens never enter snapshots or events.
+
+The trusted publisher downloads the signed deliverable and imports its embedded Git bundle into a
+temporary bare repository. It verifies the bundle digest, source branch provenance, exact commit,
+authorized base ancestry, and current remote base before adopting or pushing the branch. Existing
+matching branches and pull requests are recovered; conflicting remote identities fail closed and
+branches are never force-pushed.
+
+The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
+checkpoint can be replayed after duplicate delivery, process restart, or external success followed
+by local failure. Project status is not changed until the pull-request identity is durable, and the
+final transaction moves the factory item to `published` and the source deliverable to integration
+state `published`. Auto-merge, merge, and deployment remain false and separately unauthorized. See
+ADR 0022.
+
 ## Near-term architecture work
 
-1. Add verifier-gated, idempotent pull-request publication without implicit merge.
-2. Add stronger OS/container isolation for untrusted child processes.
-3. Add artifact retention sweeping and signing-key rotation.
-4. Add multi-region control-plane and object-store recovery drills.
+1. Add stronger OS/container isolation for untrusted child processes.
+2. Add artifact retention sweeping and signing-key rotation.
+3. Add multi-region control-plane and object-store recovery drills.

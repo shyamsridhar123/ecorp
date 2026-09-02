@@ -185,6 +185,7 @@ cargo run -p crony-cli -- factory `
   --project-number 3 `
   --repository shyamsridhar123/ecorp `
   --source-base-ref HEAD `
+  --publication-base-ref main `
   --adapter codex `
   --budget-tokens 500000 `
   --budget-cost-microusd 1000000 `
@@ -194,9 +195,23 @@ cargo run -p crony-cli -- factory `
 
 Remove `--dry-run` to claim the issue, atomically create its mission, move the Project item to
 `In Progress`, and dispatch the runner. Repeating the command recovers the durable work item rather
-than creating another mission. Pull-request publication, merge, and deployment remain separate;
-the controller never enables auto-merge. The connected runner must advertise the same GitHub
-repository and source base ref or dispatch fails closed.
+than creating another mission. The connected runner must advertise the same GitHub repository,
+source base ref, and immutable source commit or dispatch fails closed.
+
+After the factory item reaches `verified`, an owner, admin, or manager can publish the exact signed
+commit/branch deliverable through the trusted GitHub CLI boundary:
+
+```powershell
+cargo run -p crony-cli -- factory-publish `
+  00000000-0000-4000-8000-000000000001 `
+  00000000-0000-4000-8000-000000000011 `
+  <factory-work-item-id> `
+  --authorization-reason "Publish the verified result for review."
+```
+
+Duplicate calls, process restart, and partial remote success recover the same branch and pull
+request. Project status enters review only after the pull request exists. Publication never enables
+auto-merge and does not merge or deploy.
 
 ## What to try first
 
@@ -208,8 +223,8 @@ repository and source base ref or dispatch fails closed.
    approaches.
 5. Keep **Pause after planning** enabled when you want to inspect the task graph before dispatch.
 6. Approve scoped actions directly inside the mission card.
-7. Download the accepted evidence artifact when the mission completes. Portable source
-   deliverables are tracked in #53.
+7. Download the accepted evidence and source deliverable when the mission completes.
+8. Publish a verified factory commit/branch deliverable as one recoverable pull request.
 
 Example mission:
 

@@ -123,6 +123,19 @@ storage acknowledgment before worktree cleanup.
 Post-verification commit creation is fixed runner behavior on the isolated task branch. It does not
 authorize credential use, branch publication, pull-request creation, auto-merge, merge, or deploy.
 
+Pull-request publication runs only in the trusted publisher CLI after a dedicated server
+authorization check. GitHub credentials stay in the publisher's keyring or process environment;
+they are never returned by the server, passed to the runner or producing agent, written into the
+portable bundle, persisted in authorization/provenance records, or included in command arguments.
+Publisher fencing tokens are opaque, expiring capabilities omitted from shared state and events.
+
+Publication revalidates persisted verifier, deliverable, policy, budget, breaker, Corp, role, target,
+base, branch, and source-issue authority before acquiring an attempt. The publisher accepts only an
+exact signed Git bundle, never force-pushes a conflicting branch, refuses closed or auto-merge
+pull requests, and records the pull-request identity before changing Project status. Duplicate,
+restart, timeout, and external-success/local-failure recovery adopt only matching remote effects.
+The database constrains auto-merge, merge authorization, and deployment authorization to false.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.

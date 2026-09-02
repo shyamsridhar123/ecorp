@@ -48,6 +48,10 @@
 - Governed factory routing now pins the authorized GitHub repository and symbolic ref to an
   immutable commit across policy, tasks, runs, scheduling, runner admission, worktree creation, and
   resume.
+- Verified factory commit/branch deliverables can now be published exactly once through a trusted,
+  credential-owning publisher. Durable attempts recover matching branch, pull-request, and Project
+  effects after duplicate calls, restart, timeout, or partial remote success; merge, auto-merge, and
+  deployment remain separately unauthorized.
 
 ---
 
