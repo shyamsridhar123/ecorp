@@ -18,6 +18,8 @@
 **Source-base and bundle head:** `e17ef45`
 **Integrated gate head:** `85e9e81b24884421b017d6b0409094cc49ef3940`
 **Stacked base:** `4f3b0bf97e95bdde3fb426b1ed500b939bd197e6`
+**Publisher workload-auth head:** `7e723ff7ae283f1d52d2839a65638b84009eba01`
+**Project effect-fencing head:** `4de5a940c4614b9ce41184a0cd2f4cf12680ed64`
 
 ## Scope
 
@@ -28,7 +30,7 @@ It does not merge, enable auto-merge, deploy, or claim a live GitHub pull reques
 
 ## Fresh-database and repository gates
 
-A new PostgreSQL 16 database applied all 26 migrations. Migration 0024 created:
+A new PostgreSQL 16 database applied all 27 migrations. Migration 0024 created:
 
 - `pull_request_publications`
 - `pull_request_publication_attempts`
@@ -38,6 +40,8 @@ Authorization JSON is stored only in the explicit `authorization_snapshot` colum
 Migration 0025 adds the exact pull-request head SHA, head repository owner, and cross-repository
 identity needed to reject same-named fork pull requests.
 Migration 0026 stores the actual GitHub PR base separately from the authorized symbolic base.
+Migration 0027 stores Corp-scoped, hashed, expiring, and revocable publisher workload credentials.
+Only owners and admins can enroll or revoke them; plaintext is returned once.
 
 The exact implementation head passed:
 
@@ -51,7 +55,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 92 non-documentation unit tests with no failures.
+The Rust workspace ran 93 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -73,6 +77,10 @@ The final exact-head run recorded:
   "actor_handoff_authorization_distinct": true,
   "published_retry_after_base_move": true,
   "exact_publication_context_lookup": true,
+  "publisher_enrollment_manage_only": 403,
+  "human_only_start_rejection": 403,
+  "missing_publisher_credential_no_start": true,
+  "invalid_publisher_credential_no_start": true,
   "cross_room_publication_context_denial": 404,
   "cross_room_publication_start_rejection": 403,
   "cross_room_publication_recovery_rejection": 403,
@@ -81,15 +89,16 @@ The final exact-head run recorded:
   "pre_pull_request_room_membership_renewal_rejection": 403,
   "pre_project_room_membership_renewal_rejection": 403,
   "pr_revalidated_after_project_renewal": true,
+  "stale_publisher_blocked_before_project_effect": true,
   "bounded_snapshot_work_item_and_deliverable_absent": true,
   "published_retry_outside_bounded_snapshot": true,
   "exact_project_item_lookup": true,
   "exact_project_field_lookup": true,
   "project_item_count_during_publication": 1003,
   "project_field_count_during_publication": 32,
-  "publication_attempts": 10,
+  "publication_attempts": 11,
   "pull_request_number": 41,
-  "pull_request_head_sha": "3490218cbdf1c8597d7df7a0421a0d2a3afb9283",
+  "pull_request_head_sha": "48287af350011f0e3cb063a8c92ab0cddefc4b0c",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -108,6 +117,15 @@ The final exact-head run recorded:
   "post_start_breaker_renewal_rejection": 400,
   "pre_pull_request_budget_renewal_rejection": 400,
   "pre_project_corp_budget_renewal_rejection": 400,
+  "human_only_renew_rejection": 403,
+  "human_only_branch_checkpoint_rejection": 403,
+  "human_only_failure_checkpoint_rejection": 403,
+  "human_only_completion_checkpoint_rejection": 403,
+  "mismatched_publisher_identity_rejection": 409,
+  "revoked_publisher_credential_rejection": 403,
+  "expired_publisher_credential_rejection": 403,
+  "cross_corp_publisher_credential_rejection": 403,
+  "publisher_workload_auth_survived_restart": true,
   "credential_non_disclosure": true,
   "auto_merge": false,
   "merge_authorized": false,
@@ -123,6 +141,24 @@ The attempt sequence covered:
 4. recovery and durable pull-request identity;
 5. Project transition followed by another publisher crash;
 6. concurrent duplicate recovery calls converging on the same publication and pull request.
+
+## Independent publisher workload authentication
+
+The authorizing human and the publisher workload now authenticate independently. An owner/admin
+enrollment returned one bounded credential whose SHA-256 hash, Corp, exact publisher ID, expiry,
+revocation state, creator, and last-use time were persisted. A member enrollment attempt returned
+`403`. The CLI read the plaintext from a credential file and never placed it in command arguments.
+
+Human-only calls returned `403` for durable start, renewal, branch checkpoint, failure checkpoint,
+and completion checkpoint. Missing and malformed credentials created no publication. A valid
+credential paired with another publisher ID returned `409`; revoked, expired, and cross-Corp
+credentials returned `403`. The credential remained usable after a server restart because the
+server reauthenticated it from durable state.
+
+Start, renewal, failure, and checkpoint transactions re-lock and revalidate the credential's Corp,
+publisher ID, hash, expiry, and revocation state in the same transaction as the publication
+mutation. Plaintext was absent from snapshots, events, publication and attempt rows, credential
+rows, fake GitHub state, and successful or failed CLI output.
 
 The hardened run also seeded an open same-named fork PR with a different owner and head SHA. The
 publisher ignored it, created one same-repository PR, and persisted the exact verified head. It used
@@ -187,6 +223,13 @@ The remote branch remained absent in the first case, no target-repository pull r
 second, and the Project item stayed `In Progress` in the third. Membership was restored only after
 each denial so the rest of the recovery harness could continue.
 
+The final Project-effect regression went later in the sequence. The publisher completed the exact
+Project and pull-request reads, wrote a test marker immediately before the final authority renewal,
+and paused. The harness then removed Alice from the mission room. The final renewal returned `403`;
+the fake GitHub `item-edit` count did not change and the item remained `In Progress`. This proves a
+publisher whose authority changes after the remote reads cannot mutate Project state using its
+earlier successful renewal.
+
 The collision-recovery fixture supplied a pull-request title with leading and trailing whitespace.
 The CLI normalized it before deriving the start idempotency key and before sending the durable
 request, then reached a test crash immediately after exact plan validation. Recovery retained the
@@ -201,7 +244,10 @@ case-insensitively. The URL was accepted, persisted, and recovered.
 
 The controller was invoked without `--publication-base-ref` for both source `HEAD` and a local
 `release` source ref. Its effective publication bases were respectively `HEAD` and `release`,
-proving the default derives from the selected source revision.
+proving the default derives from the selected source revision. A separate recovery fixture had
+source `release` but a persisted publication base `main`; a later mutation-free dry run omitted the
+override and still reported `main`, matching the execution path without mutating Project or ECorp
+state.
 
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
@@ -308,7 +354,20 @@ removed. The publisher validates and imports that sole bundle head while retaini
 with earlier HEAD-labeled bundles. Integrated head
 `85e9e81b24884421b017d6b0409094cc49ef3940` passed all gates and both focused E2Es.
 
-GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
+Publisher workload-auth head `7e723ff7ae283f1d52d2839a65638b84009eba01` added migration
+0027, manage-only enrollment and revocation, exact credential-to-publisher binding, same-transaction
+credential revalidation, file-only CLI delivery, restart recovery, and non-disclosure checks.
+Project effect-fencing head `4de5a940c4614b9ce41184a0cd2f4cf12680ed64` added the final
+authority renewal immediately before Project mutation and another renewal before completion. Fresh
+exact-tree publication and controller E2E invocations passed against the local PostgreSQL 16 stack,
+real server/runner/worktree path, and test-owned fake GitHub state; their reports recorded
+`stale_publisher_blocked_before_project_effect: true` and
+`persisted_recovery_publication_base_ref: "main"`.
+
+The combined tree also passed migration validation for all 27 immutable checksums, warning-free
+workspace clippy, all 93 Rust tests, the production web build, web lint, and `git diff --check`.
+
+GitHub Actions run `33670566531` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not
 a repository test failure.
 

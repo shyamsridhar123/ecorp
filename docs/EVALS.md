@@ -267,7 +267,10 @@ are visibly distinct. See `docs/evidence/2026-09-02-portable-deliverables.md`.
 
 `tools/e2e_factory_publication.mjs` uses a real server, runner, isolated worktrees, portable Git
 bundle, bare Git remote, and deterministic fake GitHub API. It proves policy, role, Corp, budget,
-and breaker rejection; branch-push recovery after a publisher crash and server restart; pull-request
+and breaker rejection; manage-only publisher enrollment; independent publisher workload
+authentication on start, renewal, failure, and every checkpoint; exact publisher-ID binding;
+revoked, expired, invalid, missing, and cross-Corp credential rejection; workload-auth recovery
+after server restart; branch-push recovery after a publisher crash and server restart; pull-request
 adoption after external success plus local failure; Project-status recovery after another crash;
 duplicate concurrent publication convergence; credential non-disclosure; exactly one branch and
 pull request; same-named fork rejection; exact PR-head SHA binding; symbolic `HEAD` verification;
@@ -303,3 +306,10 @@ Project-stage renewal is detected after Project refresh and before any Project m
 coverage detaches worktree HEAD and proves the validated branch still produces an importable bundle
 with no temporary ref left behind. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
+
+The controller recovery preview also proves a source `release` item with persisted publication base
+`main` continues to report `main` when a later dry run omits the override. At the Project boundary,
+the publication harness pauses after the slow Project/PR reads but before the final authority
+renewal, removes the human publisher from the mission room, receives `403`, and proves no Project
+edit or status movement occurred. This demonstrates the second renewal fences the irreversible
+effect rather than merely protecting the earlier reads.

@@ -142,6 +142,12 @@ authorization check. GitHub credentials stay in the publisher's keyring or proce
 they are never returned by the server, passed to the runner or producing agent, written into the
 portable bundle, persisted in authorization/provenance records, or included in command arguments.
 Publisher fencing tokens are opaque, expiring capabilities omitted from shared state and events.
+They are insufficient by themselves: each publication mutation also requires a separate enrolled
+publisher workload credential. Enrollment and revocation require owner/admin `Manage` authority;
+only credential hashes are stored. Corp, publisher ID, hash, expiry, and revocation are rechecked and
+row-locked inside the same transaction that starts, renews, fails, or checkpoints publication. The
+authenticated credential determines the publisher ID; a caller cannot choose another workload
+identity while presenting a valid credential.
 
 Publication revalidates persisted verifier, deliverable, policy, budget, breaker, Corp, role, target,
 base, branch, and source-issue authority before acquiring an attempt. The publisher accepts only an
@@ -158,11 +164,12 @@ policy, claim ownership, and work-item failure details are not disclosed.
 
 Before every branch push, pull-request creation, and Project mutation, lease renewal transactionally
 rechecks the current attempt actor against its persisted role snapshot and reruns current run,
-mission, requester, Corp-budget, and hard-breaker authority. Pull-request adoption requires
-`isCrossRepository = false`, the target repository owner, and the exact verified head SHA. Remote
-`HEAD` is accepted only when its symbolic branch target exists and advertises the same object ID.
-GitHub PR commands receive that verified branch name rather than the literal `HEAD`, and the
-resolved PR base is retained separately from the authorized symbolic base.
+mission, requester, Corp-budget, and hard-breaker authority while also reauthenticating the enrolled
+publisher workload credential. Pull-request adoption requires `isCrossRepository = false`, the
+target repository owner, and the exact verified head SHA. Remote `HEAD` is accepted only when its
+symbolic branch target exists and advertises the same object ID. GitHub PR commands receive that
+verified branch name rather than the literal `HEAD`, and the resolved PR base is retained separately
+from the authorized symbolic base.
 The publisher's mission-room membership is rechecked in the same transaction on new start,
 idempotent replay, expired-lease recovery, and every renewal. Removing a still-manager actor from
 the room therefore blocks branch, pull-request, and Project effects.
@@ -199,13 +206,16 @@ Generated authorization IDs remain stable across restart and duplicate invocatio
 recovery actor receives a new actor-bound ID rather than inheriting the first actor's grant. Local
 body-file normalization matches server canonicalization so idempotency cannot fail on CRLF or a
 trailing newline.
+The CLI reads the publisher credential from a file before its first publication API mutation and
+never places it in arguments, plans, output, events, snapshots, or durable publication records.
 
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.
-For an unfinished publication, Project state is refreshed after the final authority renewal, then
-the exact checkpointed PR is re-fetched immediately before mutation. A second check precedes
-completion, preventing a closed, retargeted, edited, or auto-merge-enabled PR from advancing or
-being recorded as reviewed.
+For an unfinished publication, the publisher renews authority before remote reads, refreshes the
+exact Project item, and re-fetches the checkpointed PR. It then renews authority a second time
+immediately before Project mutation. Another PR check and authority renewal precede completion,
+preventing a stale publisher or a closed, retargeted, edited, or auto-merge-enabled PR from
+advancing or being recorded as reviewed.
 
 ## Required production boundaries
 

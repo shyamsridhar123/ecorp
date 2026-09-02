@@ -478,6 +478,14 @@ repository, base ref, branch, commit, pull-request title/body, source issue, exp
 authorization snapshot, and effect key. Attempts have independent publisher leases and fencing
 tokens; tokens never enter snapshots or events.
 
+Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
+Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
+expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
+require both current human authority and the independently authenticated publisher identity. The
+server derives the publisher ID from that workload credential and requires the request's publisher
+ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
+publication request header.
+
 Publisher planning does not use the bounded browser snapshot as an index. An exact Corp-authorized
 publication-context read loads the requested work item, its durable publication, and every source
 deliverable for the linked bounded mission. This keeps initial publication and restart recovery
@@ -525,16 +533,21 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
-After the Project-stage renewal, the publisher first refreshes the Project field/item state, then
-immediately before Project mutation re-fetches the exact durable PR and revalidates its open state,
-base/head, content, repository/SHA, URL, draft, and auto-merge identity. It repeats the PR check
-before recording completion.
+For the Project effect, the publisher reads the exact Project and Status identities, renews
+authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
+state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a
+second authority renewal immediately before `item-edit`, so slow remote reads cannot leave a stale
+publisher mutating Project state. Before recording completion it refreshes Project status, repeats
+the PR validation, and renews authority again.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
 recovery key instead of conflicting with an earlier operation request. Custom pull-request titles
 and body files use the server's trim, size, control-character, and newline rules before that
 fingerprint or durable start is constructed. Target repository owner/name components are likewise
 validated and lowercased before plan construction.
+Recovery dry-runs and executions reuse the publication base persisted in an existing factory policy
+unless the operator supplies the exact same override; a newly derived source default cannot replace
+the durable publication target.
 
 ## Near-term architecture work
 
