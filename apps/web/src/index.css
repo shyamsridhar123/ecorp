@@ -1,23 +1,23 @@
 :root {
-  --paper: #e6e5e1;
-  --paper-light: #f7f7f4;
-  --paper-deep: #c8c9c7;
-  --ink: #101112;
-  --ink-soft: #55595d;
-  --cobalt: #c82027;
-  --cobalt-dark: #7f1016;
-  --marigold: #b7b9ba;
-  --signal: #e01d25;
-  --mint: #517764;
-  --line: #96999b;
-  --shadow: 5px 5px 0 #101112;
-  --sans: "Arial Narrow", Bahnschrift, "Franklin Gothic Condensed", "Segoe UI", sans-serif;
+  --paper: #0a1020;
+  --paper-light: #101a30;
+  --paper-deep: #070b16;
+  --ink: #e9fbff;
+  --ink-soft: #8ca9bb;
+  --cobalt: #18dfff;
+  --cobalt-dark: #087e9d;
+  --marigold: #ffd166;
+  --signal: #ff3b81;
+  --mint: #5dff9d;
+  --line: #28405b;
+  --shadow: 6px 6px 0 #02050c;
+  --sans: Bahnschrift, "Arial Narrow", "Franklin Gothic Condensed", "Segoe UI", sans-serif;
   --body: "Segoe UI", Aptos, sans-serif;
   --mono: "Cascadia Mono", Consolas, monospace;
 
   font: 16px/1.45 var(--body);
   color: var(--ink);
-  background: #b7b8b6;
+  background: #03050b;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -25,19 +25,35 @@
 }
 
 #root {
-  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 body {
+  position: relative;
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
+  min-height: 100dvh;
   background:
-    radial-gradient(circle at 90% 10%, rgb(200 32 39 / 16%), transparent 27%),
-    linear-gradient(90deg, rgb(16 17 18 / 7%) 1px, transparent 1px),
-    linear-gradient(rgb(16 17 18 / 7%) 1px, transparent 1px),
-    #b7b8b6;
-  background-size: auto, 24px 24px, 24px 24px, auto;
+    radial-gradient(circle at 82% 4%, rgb(255 59 129 / 15%), transparent 27%),
+    linear-gradient(90deg, rgb(24 223 255 / 7%) 1px, transparent 1px),
+    linear-gradient(rgb(24 223 255 / 7%) 1px, transparent 1px),
+    #03050b;
+  background-size: auto, 32px 32px, 32px 32px, auto;
+}
+
+body::before {
+  position: fixed;
+  z-index: 9999;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  background: repeating-linear-gradient(
+    180deg,
+    transparent 0 3px,
+    rgb(0 0 0 / 14%) 3px 4px
+  );
+  mix-blend-mode: multiply;
+  opacity: 0.55;
 }
 
 button,
@@ -61,8 +77,8 @@ button:disabled {
 }
 
 ::selection {
-  color: var(--paper-light);
-  background: var(--cobalt-dark);
+  color: #02050c;
+  background: var(--cobalt);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -159,6 +159,7 @@ async function runController(
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
     writeScope = ['**'],
+    verificationPolicyFile,
   } = {},
 ) {
   const args = [
@@ -190,6 +191,9 @@ async function runController(
   ]
   if (publicationBaseRef) {
     args.push('--publication-base-ref', publicationBaseRef)
+  }
+  if (verificationPolicyFile) {
+    args.push('--verification-policy-file', verificationPolicyFile)
   }
   for (const scope of writeScope) args.push('--write-scope', scope)
   if (issueNumber !== null) args.push('--issue', String(issueNumber))
@@ -479,14 +483,36 @@ await writeFile(
 )
 await rm(releaseSourceRepository, { recursive: true, force: true })
 
-const dryRun = await runController(demo, 9001, true)
+const explicitVerificationPolicy = {
+  checks: [
+    { type: 'artifact', min_bytes: 1 },
+    { type: 'file', path: 'result.md', min_bytes: 50 },
+  ],
+  manual_gate: null,
+}
+const verificationPolicyPath = path.join(
+  root,
+  'output',
+  'factory-explicit-verification-policy.json',
+)
+await writeFile(
+  verificationPolicyPath,
+  `${JSON.stringify(explicitVerificationPolicy, null, 2)}\n`,
+)
+
+const dryRun = await runController(demo, 9001, true, {
+  verificationPolicyFile: verificationPolicyPath,
+})
 assert.equal(dryRun.mode, 'dry_run')
 assert.equal(dryRun.selected.issue_number, 9001)
 assert.equal(dryRun.selected.eligible, true)
 assert.deepEqual(dryRun.mutations, [])
+assert.deepEqual(dryRun.verification_policy, explicitVerificationPolicy)
 assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
 
-const first = await runController(demo, 9001)
+const first = await runController(demo, 9001, false, {
+  verificationPolicyFile: verificationPolicyPath,
+})
 assert.equal(first.mode, 'executed')
 assert.equal(first.issue_number, 9001)
 assert.equal(first.project_status, 'In Progress')
@@ -507,6 +533,10 @@ assert.ok(
 const fencedTask = fencedState.snapshot.tasks.find(
   (task) => task.mission_id === first.mission_id,
 )
+const fencedMission = fencedState.snapshot.missions.find(
+  (mission) => mission.id === first.mission_id,
+)
+assert.equal(fencedMission.description, issue.body.trim())
 assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
 assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
 assert.equal(fencedTask.contract.source_base_commit, sourceBaseCommit)
@@ -515,6 +545,7 @@ assert.deepEqual(fencedTask.contract.deliverable, {
   commit_after_verification: true,
   paths: [],
 })
+assert.deepEqual(fencedTask.verification_policy, explicitVerificationPolicy)
 
 const completed = await waitForMission(demo, first.mission_id)
 assert.equal(completed.mission.status, 'completed')
@@ -1408,6 +1439,8 @@ const report = {
   external_effect_lease_revalidated: true,
   claimed_repository_persisted_to_task: true,
   claimed_commit_persisted_to_task_and_run: true,
+  issue_body_persisted_as_mission_description: true,
+  explicit_verification_policy_persisted: true,
   portable_deliverable_materialized: sourceDeliverables.length === 1,
   portable_deliverable_form: sourceDeliverables[0].form,
   factory_state: factoryItems[0].state,

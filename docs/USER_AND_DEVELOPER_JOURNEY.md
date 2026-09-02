@@ -50,6 +50,20 @@ blank uses that provider's default.
 A mission is an outcome with a task contract, not a chat message. State the expected result and the
 evidence that should prove it.
 
+The arcade-style composer keeps one decision screen visible at a time:
+
+1. **Mission:** short outcome plus the complete durable specification.
+2. **Loadout:** runtime, model, budget, deliverable, and orchestration pattern.
+3. **Win conditions:** tabbed outcome, guardrail, context, and verifier controls.
+
+Win conditions accept explicit objectives, expected output, acceptance criteria, allowed tools,
+prohibited actions, repository or issue references, approved context sources, and
+worktree-relative write scope. Enable **Custom victory gates** to add typed artifact, file, command,
+test, JSON-schema, or screenshot checks and an optional human-approval or independent-review gate.
+Enabling it pauses after planning by default. Expand each planned task to inspect the exact
+persisted completion plan before dispatch. After a mission is created, the composer collapses to a
+single **New mission** control so the active mission log remains primary.
+
 Choose the portable result before dispatch:
 
 - **Source archive** packages changed tracked and non-ignored untracked files with hashes.
@@ -65,6 +79,13 @@ separate authorized effects.
 By default, **Plan and run mission** creates the task graph and immediately dispatches ready tasks.
 Enable **Pause after planning** when a human should inspect the generated graph before selecting
 **Dispatch mission**.
+
+Before a ready mission's first run, an authorized operator can save a versioned `redispatch`
+contract revision and then explicitly dispatch it. After a failed, cancelled, or lost provider
+attempt preserves a resumable session and worktree, an authorized operator can save a bounded
+`resume` revision and then explicitly resume that source run. The revision form shows the complete
+typed contract and verifier JSON; revision history preserves the actor, reason, action, source run,
+and version.
 
 Strategy meanings:
 

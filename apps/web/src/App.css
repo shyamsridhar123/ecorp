@@ -2838,6 +2838,257 @@ html {
   font-size: 10px;
 }
 
+.mission-description-field label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mission-description-field label span {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.mission-contract-builder {
+  border: 1px solid var(--ink);
+  background: #f5eedb;
+}
+
+.mission-contract-builder > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.mission-contract-builder > summary::-webkit-details-marker {
+  display: none;
+}
+
+.mission-contract-builder > summary span,
+.mission-contract-builder > summary strong,
+.mission-contract-builder > summary small {
+  display: block;
+}
+
+.mission-contract-builder > summary strong {
+  font: 700 11px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.mission-contract-builder > summary small {
+  max-width: 560px;
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.mission-contract-builder > summary > span:last-child {
+  color: var(--signal);
+  font: 700 9px/1 var(--mono);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.mission-contract-fields {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  border-top: 1px solid var(--ink);
+}
+
+.mission-contract-fields label,
+.verification-policy-editor label,
+.contract-revision-panel label {
+  display: grid;
+  gap: 6px;
+  color: var(--ink);
+  font: 700 10px/1.2 var(--mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.mission-contract-grid,
+.verification-check-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mission-contract-fields textarea,
+.mission-contract-fields input,
+.mission-contract-fields select,
+.verification-policy-editor textarea,
+.verification-policy-editor input,
+.verification-policy-editor select,
+.contract-revision-panel textarea,
+.contract-revision-panel input,
+.contract-revision-panel select {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px;
+  color: var(--ink);
+  font: 12px/1.4 var(--sans);
+  border: 1px solid var(--ink);
+  background: var(--paper-light);
+}
+
+.mission-contract-fields textarea {
+  min-height: 0;
+}
+
+.contract-section-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.contract-section-heading strong,
+.contract-section-heading span {
+  display: block;
+}
+
+.contract-section-heading strong {
+  font: 700 11px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.contract-section-heading span {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.verification-policy-editor {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--cobalt);
+  background: #e8eef2;
+}
+
+.verification-check-editor-list {
+  display: grid;
+  gap: 10px;
+}
+
+.verification-check-editor {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--paper-light);
+}
+
+.verification-check-editor legend {
+  padding: 0 6px;
+  font: 700 10px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.verification-check-toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.verification-check-toolbar label {
+  flex: 1;
+}
+
+.manual-gate-editor {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--cobalt);
+}
+
+.verification-policy-preview {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border-left: 4px solid var(--cobalt);
+  background: #f8f4e8;
+}
+
+.verification-policy-preview > strong {
+  font: 700 10px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.verification-policy-preview ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.verification-policy-preview li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.verification-policy-preview li > span {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  color: var(--paper-light);
+  font: 700 9px/1 var(--mono);
+  background: var(--cobalt);
+}
+
+.verification-policy-preview li p {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.verification-gate-summary {
+  display: grid;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.verification-gate-summary span,
+.verification-gate-summary strong,
+.verification-gate-summary small {
+  display: block;
+}
+
+.verification-gate-summary span {
+  color: var(--ink-soft);
+  font: 700 9px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.verification-gate-summary strong {
+  font-size: 11px;
+}
+
+.verification-gate-summary small {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.contract-error {
+  margin: 0;
+  color: var(--danger);
+  font: 700 10px/1.4 var(--mono);
+}
+
 .mission-field .field-warning {
   padding: 7px 8px;
   color: #6b4810;
@@ -3181,6 +3432,123 @@ summary:focus-visible {
 .task-contract li {
   font-size: 12px;
   line-height: 1.4;
+}
+
+.mission-description {
+  margin: 8px 0 10px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.mission-chip-row,
+.task-contract-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.contract-version-chip,
+.task-contract-heading > span {
+  padding: 4px 6px;
+  color: var(--cobalt-dark);
+  font: 700 8px/1 var(--mono);
+  text-transform: uppercase;
+  white-space: nowrap;
+  border: 1px solid var(--cobalt);
+  background: #e8eef2;
+}
+
+.task-contract-heading p {
+  flex: 1;
+}
+
+.contract-revision-panel {
+  display: grid;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.contract-revision-panel form {
+  display: grid;
+  gap: 12px;
+}
+
+.contract-json-editor {
+  min-height: 0 !important;
+  color: #182b38 !important;
+  font: 11px/1.45 var(--mono) !important;
+  tab-size: 2;
+}
+
+.contract-revision-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.contract-revision-footer > span {
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.contract-revision-open {
+  width: 100%;
+}
+
+.contract-revision-history {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  background: #f5eedb;
+}
+
+.contract-revision-history > summary {
+  padding: 10px;
+  cursor: pointer;
+  font: 700 10px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.contract-revision-history ol {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0 10px 10px;
+  list-style: none;
+}
+
+.contract-revision-history li {
+  display: grid;
+  gap: 5px;
+  padding: 9px;
+  border-left: 4px solid var(--marigold);
+  background: var(--paper-light);
+}
+
+.contract-revision-history li > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.contract-revision-history li strong,
+.contract-revision-history li span,
+.contract-revision-history li small {
+  font-size: 10px;
+}
+
+.contract-revision-history li p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.contract-revision-history li small {
+  color: var(--ink-soft);
 }
 
 .verification-box {
@@ -3557,5 +3925,26 @@ summary:focus-visible {
 
   .budget-history li strong {
     text-align: left;
+  }
+
+  .mission-contract-grid,
+  .verification-check-grid,
+  .contract-revision-footer {
+    grid-template-columns: 1fr;
+  }
+
+  .mission-contract-builder > summary,
+  .contract-section-heading,
+  .verification-check-toolbar,
+  .mission-chip-row,
+  .task-contract-heading,
+  .contract-revision-history li > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .verification-check-toolbar .button,
+  .contract-revision-footer .button {
+    width: 100%;
   }
 }

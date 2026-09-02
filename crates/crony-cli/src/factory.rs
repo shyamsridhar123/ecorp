@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::Args;
-use crony_domain::write_scope_is_valid;
+use crony_domain::{VerificationPolicy, write_scope_is_valid};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -82,6 +82,9 @@ pub struct FactoryArgs {
 
     #[arg(long, default_value = "**")]
     pub write_scope: Vec<String>,
+
+    #[arg(long, env = "ECORP_FACTORY_VERIFICATION_POLICY_FILE")]
+    pub verification_policy_file: Option<PathBuf>,
 
     #[arg(long)]
     pub issue: Option<i64>,
@@ -221,6 +224,7 @@ impl EvaluatedItem {
 pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
     normalize_args(&mut args)?;
     validate_args(&args)?;
+    let requested_verification_policy = load_verification_policy(&args)?;
     let project_items = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project_items.items.len() < project_items.total_count {
         bail!(
@@ -273,6 +277,22 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         })
         .transpose()?
         .unwrap_or_else(|| selected_publication_base_ref(&args).to_owned());
+    let preview_verification_policy = selected_index
+        .map(|index| {
+            if evaluated[index].recovery {
+                resolve_recovery_verification_policy(
+                    existing.get(&evaluated[index].project_item.id).context(
+                        "recoverable factory item disappeared from the selected-item lookup",
+                    )?,
+                    requested_verification_policy.as_ref(),
+                )
+            } else {
+                Ok(requested_verification_policy.clone())
+            }
+        })
+        .transpose()?
+        .flatten()
+        .or(requested_verification_policy.clone());
     let evaluated_json = evaluated
         .iter()
         .map(EvaluatedItem::as_json)
@@ -287,6 +307,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "repository": args.repository,
             "source_base_ref": args.source_base_ref,
             "publication_base_ref": preview_publication_base_ref,
+            "verification_policy": preview_verification_policy,
             "source_base_commit": selected_source_base_commit
                 .as_ref()
                 .map(|resolved| resolved.commit.as_str()),
@@ -334,6 +355,16 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )?
     } else {
         selected_publication_base_ref(&args).to_owned()
+    };
+    let verification_policy = if refreshed.recovery {
+        resolve_recovery_verification_policy(
+            persisted
+                .as_ref()
+                .context("recoverable factory item disappeared from the selected-item lookup")?,
+            requested_verification_policy.as_ref(),
+        )?
+    } else {
+        requested_verification_policy.clone()
     };
     let stable_prefix = format!(
         "github-project:{}:{}:{}:{}",
@@ -389,6 +420,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                 "merge": false,
                 "deploy": false
             },
+            "verification_policy": verification_policy.clone(),
         })
     };
     let claim_generation = persisted.as_ref().map(|item| item.version).unwrap_or(0);
@@ -469,6 +501,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "expected_version": work_item_version,
             "idempotency_key": format!("{stable_prefix}:materialize"),
             "title": bounded_title(refreshed.issue.number, &refreshed.issue.title),
+            "description": &refreshed.issue.body,
             "preferred_adapter": args.adapter,
             "preferred_model": args.model,
             "reasoning_effort": args.reasoning_effort,
@@ -501,7 +534,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                     )
                 ],
                 "write_scope": args.write_scope,
-            }
+            },
+            "verification_policy": verification_policy,
         });
         let materialize = server_json(
             client,
@@ -839,6 +873,13 @@ fn validate_args(args: &FactoryArgs) -> Result<()> {
     {
         bail!("factory write scope is invalid");
     }
+    if args
+        .verification_policy_file
+        .as_ref()
+        .is_some_and(|path| !path.is_file())
+    {
+        bail!("factory verification policy file does not exist");
+    }
     Ok(())
 }
 
@@ -870,6 +911,43 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
         .map(|scope| scope.trim().to_owned())
         .collect();
     Ok(())
+}
+
+fn load_verification_policy(args: &FactoryArgs) -> Result<Option<VerificationPolicy>> {
+    let Some(path) = args.verification_policy_file.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path).context("read factory verification policy file")?;
+    if bytes.is_empty() || bytes.len() > 100_000 {
+        bail!("factory verification policy file is empty or too large");
+    }
+    serde_json::from_slice(&bytes)
+        .context("decode factory verification policy file")
+        .map(Some)
+}
+
+fn resolve_recovery_verification_policy(
+    item: &ExistingFactoryItem,
+    requested: Option<&VerificationPolicy>,
+) -> Result<Option<VerificationPolicy>> {
+    let persisted_value = item.policy.get("verification_policy");
+    let persisted = persisted_value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<VerificationPolicy>(value.clone())
+                .context("decode persisted factory verification policy")
+        })
+        .transpose()?;
+    match (persisted, requested) {
+        (Some(persisted), Some(requested)) if &persisted != requested => {
+            bail!("factory recovery verification policy does not match the persisted policy")
+        }
+        (Some(persisted), _) => Ok(Some(persisted)),
+        (None, Some(_)) => bail!(
+            "factory recovery cannot add a verification policy that was not persisted at claim"
+        ),
+        (None, None) => Ok(None),
+    }
 }
 
 pub(crate) fn normalize_github_component(value: &str, field: &str) -> Result<String> {
@@ -2368,6 +2446,7 @@ Blocked by #999 outside the section.
             budget_cost_microusd: 1,
             lease_seconds: 30,
             write_scope: vec!["**".to_owned()],
+            verification_policy_file: None,
             issue: None,
             dry_run: true,
             github_cli: "gh".into(),
@@ -2411,6 +2490,7 @@ Blocked by #999 outside the section.
             budget_cost_microusd: 1,
             lease_seconds: 30,
             write_scope: vec!["**".to_owned()],
+            verification_policy_file: None,
             issue: None,
             dry_run: true,
             github_cli: "gh".into(),

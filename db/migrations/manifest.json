@@ -140,6 +140,11 @@
       "version": 28,
       "file": "0028_mission_budget_revisions.sql",
       "sha384": "e49e0dfc0ad4abe44513e7d8900f9a147fe49abaa9d1bb966b2e5a0835fc83e4a33ade6cdcf4b74be478f8d3490f8e6b"
+    },
+    {
+      "version": 29,
+      "file": "0029_mission_contract_revisions.sql",
+      "sha384": "c7f13f0e6be558c7c5e04bceedca544deca02573ac005bfdb309920f1775449a36781d009ac0a84612588a391f24338d"
     }
   ]
 }

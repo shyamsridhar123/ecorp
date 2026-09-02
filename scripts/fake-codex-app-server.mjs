@@ -149,6 +149,7 @@ function startTurn(message) {
   })
   if (resumed) {
     writeFileSync(`${workspace}/resumed.txt`, 'resumed\n')
+    writeFileSync(`${workspace}/resume-prompt.txt`, `${prompt}\n`)
     finalMessage = 'Synthetic Codex session resumed and completed.'
   } else {
     writeFileSync(`${workspace}/base.txt`, 'base\n')
@@ -179,7 +180,7 @@ function startTurn(message) {
       if (!terminal) emitUsage(3_000, 0)
     }, 120)
     completionTimer = setTimeout(() => finish('completed'), 1_000)
-  } else if (prompt.includes('[fail]')) {
+  } else if (prompt.includes('[fail]') && !resumed) {
     completionTimer = setTimeout(() => finish('failed', 'synthetic failure'), 80)
   } else {
     completionTimer = setTimeout(

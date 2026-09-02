@@ -10,6 +10,8 @@ repository.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crony-domain = { path = "../crony-domain" }
+hex.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 uuid.workspace = true

@@ -333,6 +333,27 @@ The scheduler:
 - injects verified dependency artifacts into synthesis prompts
 - marks the mission complete only after every task completes
 
+## Mission specifications and contract revisions
+
+Mission titles remain bounded labels. The durable `missions.description` field carries the complete
+operator specification and is injected into every planned task alongside its role-specific
+objective. Operator contract overlays preserve explicit expected output, acceptance criteria,
+allowed tools, prohibited actions, references, and write scope. A supplied typed verifier policy
+replaces the delivery task's generated policy before the plan is validated.
+
+Missions and tasks begin at specification/contract version 1. A contract change transaction locks
+the mission and task, rechecks actor and room authority, rejects active work, compares the expected
+version, updates the current projections, inserts the immutable prior/replacement snapshot, and
+emits `mission.contract_revised`.
+
+`redispatch` revisions are pre-execution only. `resume` revisions require the latest terminal,
+preserved, non-stop provider/worktree lineage and cannot change source, secret, provider, budget, or
+deliverable authority. They also cannot widen tools or write scope or remove prohibitions. A
+revision records the intended next action but never starts it; dispatch and resume remain separate
+commands. Resume rebuilds the provider prompt from the current task contract, ensuring the revised
+description, objective, acceptance criteria, guardrails, and references reach the preserved
+provider session.
+
 ## Evidence-gated completion
 
 Every task stores a typed verification policy. Automated checks execute on the runner, never on the

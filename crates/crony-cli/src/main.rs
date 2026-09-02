@@ -221,6 +221,7 @@ async fn main() -> Result<()> {
                 format!("{}/api/corps/{corp_id}/missions", args.server),
                 Some(serde_json::to_value(CreateMissionRequest {
                     title,
+                    description: String::new(),
                     requested_by: actor_id,
                     preferred_adapter: adapter,
                     preferred_model: None,
@@ -235,6 +236,8 @@ async fn main() -> Result<()> {
                             || matches!(deliverable, DeliverableArg::CommitBranch),
                         paths: Vec::new(),
                     }),
+                    contract: None,
+                    verification_policy: None,
                 })?),
             )
             .await?

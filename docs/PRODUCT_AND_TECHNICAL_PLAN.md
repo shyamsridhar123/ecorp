@@ -49,6 +49,10 @@
   and non-ignored untracked changes can be downloaded as a deterministic patch, content-addressed
   archive, typed artifact set, commit/branch bundle, or review report. Exact verification and byte
   digests are linked before cleanup; pull-request publication and merge remain separate effects.
+- Operators can now persist a long-form mission specification, authored contract boundaries,
+  approved references, and an explicit typed verifier policy. The browser previews every automated
+  check and manual gate before dispatch. Contract changes are versioned and actor-attributed, with
+  separate fail-closed actions for pre-run redispatch and bounded preserved-session resume.
 - Governed factory routing now pins the authorized GitHub repository and symbolic ref to an
   immutable commit across policy, tasks, runs, scheduling, runner admission, worktree creation, and
   resume.

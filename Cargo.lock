@@ -570,7 +570,9 @@ dependencies = [
  "anyhow",
  "chrono",
  "crony-domain",
+ "hex",
  "serde_json",
+ "sha2",
  "sqlx",
  "uuid",
 ]

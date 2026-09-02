@@ -95,6 +95,16 @@ its retry limit.
 blocks completion, an owner approval gate, and an independent-review gate that rejects the
 requester before accepting Bob's member-role decision.
 
+`tools/e2e_mission_contracts.mjs` submits a long-form specification, repository/issue/approved
+context references, a user-authored task contract, and all six verifier types through the public
+mission API. It proves the generated task preserves that authority, failed tests block completion
+despite provider evidence, and an independent reviewer must decide the manual gate. It also proves
+versioned and exactly idempotent `redispatch` and `resume` revisions, explicit post-revision
+dispatch/resume, current-room and role enforcement, stale-version rejection, authority-widening
+denial, and preserved provider-session/worktree reuse. Desktop and 390-pixel Chromium validation
+exercise the structured contract editor, exact completion-plan preview, revision form/history, and
+responsive layout.
+
 `tools/e2e_identity.mjs` proves production OIDC enforcement, actor-spoof and cross-Corp rejection,
 authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
 rejection, active-run revocation, superseded-socket rejection, and rejection of a current socket
