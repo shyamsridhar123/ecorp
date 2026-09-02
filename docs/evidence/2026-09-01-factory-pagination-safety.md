@@ -1,4 +1,4 @@
-# Factory pagination-safety validation — September 1, 2026
+# Factory pagination-safety validation — September 1–2, 2026
 
 ## Scope
 
@@ -17,23 +17,26 @@ work item is older than the snapshot's 500-row factory projection.
 runner, scheduler, worktree manager, fake-process child, verifier, event journal, and deterministic
 GitHub CLI boundary.
 
-Run completed at `2026-09-01T23:46:02.372Z`.
+Review-hardening rerun completed at `2026-09-02T00:58:57.407Z`.
 
 Pagination regression:
 
 - target Project item: `PVTI_FAKE_FACTORY_9020`
-- target work item: `8aec968d-6dec-4c9f-8752-3e515efac35d`
-- target mission: `2d106a1a-621d-447c-96fd-58fc1733c048`
-- target run: `a9839219-2f3b-4411-b04a-bb32aac09686`
+- target work item: `6b71fa30-7988-4624-b073-d4ea646e2eed`
+- target mission: `15a05e65-5dd4-489b-a603-b820d052ce2c`
+- target run: `c5469812-9179-4241-a81a-a90d6b7b58d4`
 - 501 newer historical factory work items were created after the recoverable target
 - the legacy shared snapshot returned 500 factory items and omitted the target
 - selected-item lookup returned exactly one authoritative match
+- the same item ID existed in Project `other/8` with a conflicting policy, while lookup for
+  Project `acme/7` returned only the configured Project's row
 - duplicate requested IDs were deduplicated
-- requests above 1,000 IDs and identifiers above 240 characters were rejected
+- requests above 1,000 IDs and identifiers above 160 characters were rejected
 - the guest lookup was rejected with `403` without returning source metadata
-- recovery reused the exact work item, mission, and persisted policy despite different current CLI
-  budget and write-scope arguments
-- recovery produced one mission and one run, then reached `verified`
+- recovery reused the exact work item, mission, and persisted policy despite changing current CLI
+  lease duration from 300 to 600 seconds as well as budget and write-scope arguments
+- a fresh post-replay lookup and snapshot counted exactly one matching work item, mission, task,
+  and run, then confirmed the factory state was `verified`
 - no misleading policy-mismatch error or duplicate mission/run occurred
 
 The complete controller regression also retained its prior dry-run, status-sync failure, bounded
@@ -54,4 +57,6 @@ source-revalidation coverage.
 ## Runtime cleanup
 
 The test-owned server and runner were stopped with `tools/stop_local.ps1`. Ports `8791` and `5187`
-had no listeners afterward, and no test-owned ECorp process remained.
+had no listeners afterward, and no test-owned ECorp process remained. The rerun used and then
+removed the isolated Postgres database `crony_issue67_df02_20260902_001`; the shared database was
+not modified after it reported a migration from another worktree.

@@ -308,7 +308,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_issue_url": refreshed.issue.url,
         "source_title": refreshed.issue.title,
         "source_revision": refreshed.issue.updated_at,
-        "idempotency_key": format!("{stable_prefix}:claim:{}", args.actor_id),
+        "idempotency_key": format!(
+            "{stable_prefix}:claim:{}:lease:{}",
+            args.actor_id, args.lease_seconds
+        ),
         "lease_seconds": args.lease_seconds,
         "policy": policy,
     });
@@ -323,8 +326,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         let replay_version = value_i64(&claim, "/work_item/version")?;
         let mut reclaim_body = claim_body;
         reclaim_body["idempotency_key"] = Value::String(format!(
-            "{stable_prefix}:reclaim:{}:{replay_version}",
-            args.actor_id
+            "{stable_prefix}:reclaim:{}:{replay_version}:lease:{}",
+            args.actor_id, args.lease_seconds
         ));
         claim = server_json(client, Method::POST, claim_path, Some(reclaim_body)).await?;
     }
@@ -1151,6 +1154,8 @@ async fn lookup_factory_work_items(
         ),
         Some(json!({
             "actor_id": args.actor_id,
+            "source_project_owner": args.owner,
+            "source_project_number": args.project_number,
             "source_project_item_ids": source_project_item_ids,
         })),
     )
@@ -1169,6 +1174,13 @@ async fn lookup_factory_work_items(
             items.len(),
             total_count
         );
+    }
+    for item in items {
+        if value_string(item, "/source_project_owner")? != args.owner
+            || value_i64(item, "/source_project_number")? != i64::from(args.project_number)
+        {
+            bail!("factory work-item lookup returned an item from another GitHub Project");
+        }
     }
     existing_factory_items(items)
 }

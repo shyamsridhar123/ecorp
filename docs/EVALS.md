@@ -190,8 +190,11 @@ controller E2E proves an independent reviewer, not the requester, advances
 `awaiting_approval -> verified`. The same E2E creates 501 newer historical factory items, proves
 the recoverable target is absent from the legacy 500-item snapshot, then recovers the exact work
 item, mission, persisted policy, and single run through the selected-Project-item lookup. It also
-proves explicit lookup counts, identifier and request-count bounds, and guest denial. CLI unit
-coverage verifies Markdown section boundaries for dependency and acceptance parsing. See
+proves explicit lookup counts, identifier and request-count bounds, guest denial, isolation from an
+equal item ID with a conflicting policy in another Project, and recovery after the lease duration
+changes. A fresh post-replay lookup and snapshot count every matching work item, mission, task, and
+run to prove there is exactly one of each. CLI unit coverage verifies Markdown section boundaries
+for dependency and acceptance parsing. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
 `docs/evidence/2026-09-01-factory-pagination-safety.md`.
 

@@ -359,6 +359,8 @@ pub struct ClaimFactoryWorkItemRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupFactoryWorkItemsRequest {
     pub actor_id: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
     #[serde(default)]
     pub source_project_item_ids: Vec<String>,
 }

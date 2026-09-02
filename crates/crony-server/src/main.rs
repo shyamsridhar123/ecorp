@@ -1456,7 +1456,13 @@ async fn lookup_factory_work_items(
     .await?;
     let items = state
         .store
-        .factory_work_items_by_project_item_ids(corp_id, actor_id, &request.source_project_item_ids)
+        .factory_work_items_by_project_item_ids(
+            corp_id,
+            actor_id,
+            &request.source_project_owner,
+            request.source_project_number,
+            &request.source_project_item_ids,
+        )
         .await
         .map_err(map_store_error)?;
     let total_count = items.len();

@@ -41,9 +41,19 @@ async function snapshot(demo) {
   )
 }
 
-async function lookupFactoryItems(demo, sourceProjectItemIds, actorId = demo.alice_actor_id) {
+async function lookupFactoryItems(
+  demo,
+  sourceProjectItemIds,
+  {
+    actorId = demo.alice_actor_id,
+    sourceProjectOwner = 'acme',
+    sourceProjectNumber = 7,
+  } = {},
+) {
   return post(`/api/corps/${demo.corp_id}/factory/work-items/lookup`, {
     actor_id: actorId,
+    source_project_owner: sourceProjectOwner,
+    source_project_number: sourceProjectNumber,
     source_project_item_ids: sourceProjectItemIds,
   })
 }
@@ -52,12 +62,14 @@ function factoryPolicy({
   budgetTokens = 20_000,
   budgetCostMicrousd = 1_000_000,
   writeScope = ['**'],
+  projectOwner = 'acme',
+  projectNumber = 7,
 } = {}) {
   return {
     schema_version: 1,
     source_of_truth: 'github_project',
-    project_owner: 'acme',
-    project_number: 7,
+    project_owner: projectOwner,
+    project_number: projectNumber,
     project_status: 'Todo',
     required_label: 'factory:ready',
     dependencies: [],
@@ -479,6 +491,34 @@ const paginationState = {
     'injected pagination recovery status failure',
 }
 await writeFile(statePath, `${JSON.stringify(paginationState, null, 2)}\n`)
+const crossProjectCollisionPolicy = factoryPolicy({
+  budgetTokens: 10_000,
+  budgetCostMicrousd: 500_000,
+  writeScope: ['other-project/**'],
+  projectOwner: 'other',
+  projectNumber: 8,
+})
+const crossProjectCollision = await post(
+  `/api/corps/${paginationDemo.corp_id}/factory/work-items/claim`,
+  {
+    actor_id: paginationDemo.alice_actor_id,
+    source_project_owner: 'other',
+    source_project_number: 8,
+    source_project_item_id: 'PVTI_FAKE_FACTORY_9020',
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    source_issue_number: paginationIssue.number,
+    source_issue_node_id: paginationIssue.id,
+    source_issue_url: paginationIssue.url,
+    source_title: paginationIssue.title,
+    source_revision: paginationIssue.updatedAt,
+    idempotency_key: 'factory-cross-project-collision-9020',
+    lease_seconds: 300,
+    policy: crossProjectCollisionPolicy,
+  },
+)
+assert.equal(crossProjectCollision.work_item.source_project_owner, 'other')
+assert.equal(crossProjectCollision.work_item.source_project_number, 8)
 let paginationInitialFailure
 try {
   await runController(paginationDemo, 9020)
@@ -489,11 +529,31 @@ assert.ok(paginationInitialFailure, 'pagination recovery fixture did not block i
 const paginationInitialSnapshot = await snapshot(paginationDemo)
 const paginationInitialItem =
   paginationInitialSnapshot.snapshot.factory_work_items.find(
-    (item) => item.source_project_item_id === 'PVTI_FAKE_FACTORY_9020',
+    (item) =>
+      item.source_project_owner === 'acme' &&
+      item.source_project_number === 7 &&
+      item.source_project_item_id === 'PVTI_FAKE_FACTORY_9020',
   )
 assert.equal(paginationInitialItem.state, 'blocked')
 assert.ok(paginationInitialItem.mission_id)
 const paginationPersistedPolicy = paginationInitialItem.policy
+const configuredProjectLookup = await lookupFactoryItems(paginationDemo, [
+  'PVTI_FAKE_FACTORY_9020',
+])
+assert.equal(configuredProjectLookup.total_count, 1)
+assert.equal(configuredProjectLookup.items[0].id, paginationInitialItem.id)
+assert.deepEqual(configuredProjectLookup.items[0].policy, paginationPersistedPolicy)
+const otherProjectLookup = await lookupFactoryItems(
+  paginationDemo,
+  ['PVTI_FAKE_FACTORY_9020'],
+  {
+    sourceProjectOwner: 'other',
+    sourceProjectNumber: 8,
+  },
+)
+assert.equal(otherProjectLookup.total_count, 1)
+assert.equal(otherProjectLookup.items[0].id, crossProjectCollision.work_item.id)
+assert.deepEqual(otherProjectLookup.items[0].policy, crossProjectCollisionPolicy)
 
 const historicalWorkItemCount = 501
 await createHistoricalFactoryItems(paginationDemo, historicalWorkItemCount)
@@ -521,6 +581,8 @@ const guestPaginationLookup = await fetch(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       actor_id: paginationDemo.eve_actor_id,
+      source_project_owner: 'acme',
+      source_project_number: 7,
       source_project_item_ids: ['PVTI_FAKE_FACTORY_9020'],
     }),
   },
@@ -536,6 +598,8 @@ const oversizedPaginationLookup = await fetch(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       actor_id: paginationDemo.alice_actor_id,
+      source_project_owner: 'acme',
+      source_project_number: 7,
       source_project_item_ids: Array.from(
         { length: 1001 },
         (_, index) => `PVTI_LOOKUP_BOUND_${index}`,
@@ -551,6 +615,8 @@ const overlongPaginationLookup = await fetch(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       actor_id: paginationDemo.alice_actor_id,
+      source_project_owner: 'acme',
+      source_project_number: 7,
       source_project_item_ids: [`PVTI_${'X'.repeat(236)}`],
     }),
   },
@@ -558,6 +624,7 @@ const overlongPaginationLookup = await fetch(
 assert.equal(overlongPaginationLookup.status, 400)
 
 const paginationRecovered = await runController(paginationDemo, 9020, false, {
+  leaseSeconds: 600,
   budgetTokens: 30_000,
   budgetCostMicrousd: 2_000_000,
   writeScope: ['crates/**'],
@@ -572,6 +639,7 @@ const paginationCompleted = await waitForMission(
 )
 assert.equal(paginationCompleted.mission.status, 'completed')
 const paginationVerified = await runController(paginationDemo, 9020, false, {
+  leaseSeconds: 600,
   budgetTokens: 30_000,
   budgetCostMicrousd: 2_000_000,
   writeScope: ['crates/**'],
@@ -587,17 +655,33 @@ const paginationFinalItem = paginationFinalLookup.items[0]
 assert.equal(paginationFinalItem.id, paginationInitialItem.id)
 assert.equal(paginationFinalItem.state, 'verified')
 assert.deepEqual(paginationFinalItem.policy, paginationPersistedPolicy)
-const paginationMissionCount =
-  paginationCompleted.state.snapshot.missions.filter(
-    (item) => item.id === paginationInitialItem.mission_id,
-  ).length
-assert.equal(paginationMissionCount, 1)
-const paginationTaskIds = new Set(
-  paginationCompleted.state.snapshot.tasks
-    .filter((task) => task.mission_id === paginationInitialItem.mission_id)
-    .map((task) => task.id),
+const paginationPostReplaySnapshot = await snapshot(paginationDemo)
+const paginationPostReplayLookup = await lookupFactoryItems(paginationDemo, [
+  'PVTI_FAKE_FACTORY_9020',
+])
+const paginationMatchingWorkItems = paginationPostReplayLookup.items.filter(
+  (item) =>
+    item.source_project_owner === 'acme' &&
+    item.source_project_number === 7 &&
+    item.source_project_item_id === 'PVTI_FAKE_FACTORY_9020' &&
+    item.source_issue_number === paginationIssue.number,
 )
-const paginationRuns = paginationCompleted.state.snapshot.runs.filter((run) =>
+assert.equal(paginationMatchingWorkItems.length, 1)
+const paginationMissionIds = new Set(
+  paginationMatchingWorkItems
+    .map((item) => item.mission_id)
+    .filter((missionId) => missionId !== null),
+)
+const paginationMissions = paginationPostReplaySnapshot.snapshot.missions.filter(
+  (mission) => paginationMissionIds.has(mission.id),
+)
+assert.equal(paginationMissions.length, 1)
+const paginationTasks = paginationPostReplaySnapshot.snapshot.tasks.filter((task) =>
+  paginationMissionIds.has(task.mission_id),
+)
+assert.equal(paginationTasks.length, 1)
+const paginationTaskIds = new Set(paginationTasks.map((task) => task.id))
+const paginationRuns = paginationPostReplaySnapshot.snapshot.runs.filter((run) =>
   paginationTaskIds.has(run.task_id),
 )
 assert.equal(paginationRuns.length, 1)
@@ -1111,10 +1195,28 @@ const report = {
     lookup_input_count_bounded: oversizedPaginationLookup.status === 400,
     lookup_identifier_size_bounded: overlongPaginationLookup.status === 400,
     guest_lookup_rejected: guestPaginationLookup.status === 403,
+    project_scoped_lookup: {
+      configured_project_count: configuredProjectLookup.total_count,
+      other_project_count: otherProjectLookup.total_count,
+      conflicting_policy_excluded: true,
+    },
+    changed_lease_seconds: {
+      initial: 300,
+      recovery: 600,
+      recovered_without_idempotency_conflict: true,
+    },
     factory_work_item_id: paginationFinalItem.id,
     mission_id: paginationInitialItem.mission_id,
     run_ids: paginationRuns.map((run) => run.id),
-    exactly_one_mission: paginationMissionCount === 1,
+    post_replay_counts: {
+      work_items: paginationMatchingWorkItems.length,
+      missions: paginationMissions.length,
+      tasks: paginationTasks.length,
+      runs: paginationRuns.length,
+    },
+    exactly_one_work_item: paginationMatchingWorkItems.length === 1,
+    exactly_one_mission: paginationMissions.length === 1,
+    exactly_one_task: paginationTasks.length === 1,
     exactly_one_run: paginationRuns.length === 1,
     persisted_policy_reused: true,
     recovered_without_policy_mismatch: true,

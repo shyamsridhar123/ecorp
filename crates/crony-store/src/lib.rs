@@ -1403,8 +1403,15 @@ impl PgStore {
         &self,
         corp_id: Uuid,
         viewer_actor_id: Uuid,
+        source_project_owner: &str,
+        source_project_number: i64,
         source_project_item_ids: &[String],
     ) -> Result<Vec<FactoryWorkItem>> {
+        if source_project_number <= 0 {
+            return Err(anyhow!("factory source project number must be positive"));
+        }
+        let source_project_owner =
+            normalize_github_component(source_project_owner, "source project owner", 100)?;
         if source_project_item_ids.len() > 1_000 {
             return Err(anyhow!(
                 "factory work-item lookup cannot exceed 1,000 Project item ids"
@@ -1412,7 +1419,7 @@ impl PgStore {
         }
         let mut normalized_ids = source_project_item_ids
             .iter()
-            .map(|value| normalize_factory_text(value, "source Project item id", 240))
+            .map(|value| normalize_factory_identifier(value, "source Project item id", 160))
             .collect::<Result<Vec<_>>>()?;
         normalized_ids.sort();
         normalized_ids.dedup();
@@ -1429,7 +1436,10 @@ impl PgStore {
                    mission_id, failure_detail, created_at, updated_at
             FROM factory_work_items
             WHERE corp_id = $1
-              AND source_project_item_id = ANY($3)
+              AND source_kind = 'github_project_issue'
+              AND source_project_owner = $3
+              AND source_project_number = $4
+              AND source_project_item_id = ANY($5)
               AND EXISTS (
                   SELECT 1
                   FROM actors viewer
@@ -1443,6 +1453,8 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(viewer_actor_id)
+        .bind(source_project_owner)
+        .bind(source_project_number)
         .bind(&normalized_ids)
         .fetch_all(&self.pool)
         .await?
