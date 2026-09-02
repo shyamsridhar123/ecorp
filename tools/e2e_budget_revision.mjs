@@ -135,13 +135,17 @@ async function waitForRun(demo, runId, timeoutMs = 30_000) {
   throw new Error(`timed out waiting for budget revision run ${runId}`)
 }
 
-async function setPolicy(demo) {
+async function setPolicy(demo, overrides = {}) {
   await post(`/api/corps/${demo.corp_id}/budget-policy`, {
     actor_id: demo.alice_actor_id,
-    actor_tokens_per_24h: 10_000_000,
-    actor_cost_microusd_per_24h: 1_000_000_000,
-    corp_tokens_per_24h: 100_000_000,
-    corp_cost_microusd_per_24h: 10_000_000_000,
+    actor_tokens_per_24h:
+      overrides.actor_tokens_per_24h ?? 10_000_000,
+    actor_cost_microusd_per_24h:
+      overrides.actor_cost_microusd_per_24h ?? 1_000_000_000,
+    corp_tokens_per_24h:
+      overrides.corp_tokens_per_24h ?? 100_000_000,
+    corp_cost_microusd_per_24h:
+      overrides.corp_cost_microusd_per_24h ?? 10_000_000_000,
     no_progress_event_limit: 100,
     repeated_tool_limit: 100,
   })
@@ -227,6 +231,63 @@ async function decide(
       decision_key: decisionKey,
     },
   )
+}
+
+async function rollingBudgetResumeScenario() {
+  const results = {}
+  for (const scenario of [
+    {
+      name: 'actor',
+      policy: {
+        actor_tokens_per_24h: 6_000,
+        corp_tokens_per_24h: 100_000_000,
+      },
+    },
+    {
+      name: 'corp',
+      policy: {
+        actor_tokens_per_24h: 10_000_000,
+        corp_tokens_per_24h: 6_000,
+      },
+    },
+  ]) {
+    const demo = await post('/api/demo/reset', {})
+    await setPolicy(demo, scenario.policy)
+    const suspended = await createSuspendedMission(
+      demo,
+      `${scenario.name}-rolling-budget`,
+    )
+    const proposal = await propose(
+      demo,
+      suspended.mission.mission_id,
+      demo.alice_actor_id,
+      20_000,
+      randomUUID(),
+      null,
+    )
+    await decide(
+      demo,
+      suspended.mission.mission_id,
+      proposal.revision,
+      demo.alice_actor_id,
+      true,
+      randomUUID(),
+    )
+    const before = await snapshot(demo)
+    const denied = await postRaw(
+      `/api/corps/${demo.corp_id}/runs/${suspended.launch.run_id}/resume`,
+      {
+        requested_by: demo.alice_actor_id,
+        prompt: `resume through exhausted ${scenario.name} rolling budget`,
+      },
+    )
+    assert.equal(denied.response.status, 409)
+    assert.match(JSON.stringify(denied.body), /rolling budget/)
+    const after = await snapshot(demo)
+    assert.equal(after.snapshot.runs.length, before.snapshot.runs.length)
+    results[`${scenario.name}_resume_rejected_before_run`] = true
+  }
+  return results
 }
 
 async function authorizationRevalidationScenario() {
@@ -558,6 +619,20 @@ async function revisedBudgetOverrunScenario() {
     events.filter((event) => event.type === 'run.completed').length,
     0,
   )
+  const runCountBeforeAncestorRetry = terminal.state.snapshot.runs.length
+  const ancestorRetry = await postRaw(
+    `/api/corps/${demo.corp_id}/runs/${suspended.launch.run_id}/resume`,
+    {
+      requested_by: demo.alice_actor_id,
+      prompt: 'retry the suspended ancestor after its descendant stopped',
+    },
+  )
+  assert.equal(ancestorRetry.response.status, 409)
+  assert.match(JSON.stringify(ancestorRetry.body), /lineage.*stop-stage/)
+  assert.equal(
+    (await snapshot(demo)).snapshot.runs.length,
+    runCountBeforeAncestorRetry,
+  )
 
   return {
     mission_id: suspended.mission.mission_id,
@@ -570,11 +645,13 @@ async function revisedBudgetOverrunScenario() {
     breaker_stage: terminal.run.breaker_stage,
     accepted_artifact: terminal.run.artifact_id,
     completed_events: 0,
+    stopped_lineage_ancestor_resume_rejected: true,
   }
 }
 
 const report = {
   checked_at: new Date().toISOString(),
+  rolling_budget_resume: await rollingBudgetResumeScenario(),
   authorization_revalidation: await authorizationRevalidationScenario(),
   successful_recovery: await successfulRecoveryScenario(),
   revised_budget_overrun: await revisedBudgetOverrunScenario(),

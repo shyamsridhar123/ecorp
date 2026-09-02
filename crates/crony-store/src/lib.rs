@@ -316,6 +316,14 @@ pub struct ResumeLaunchRecord {
     pub queued_messages: Vec<QueuedRunMessage>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RollingBudgetRemaining {
+    actor_tokens: i64,
+    actor_cost_microusd: i64,
+    corp_tokens: i64,
+    corp_cost_microusd: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedRunMessage {
     pub id: Uuid,
@@ -3807,12 +3815,35 @@ impl PgStore {
         requested_by: Uuid,
     ) -> Result<(ResumeLaunchRecord, DomainEvent)> {
         let mut tx = self.pool.begin().await?;
+        let resume_context = sqlx::query(
+            r#"
+            SELECT run.workspace_run_id, mission.requested_by
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            "#,
+        )
+        .bind(source_run_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("source run not found")?;
+        let expected_workspace_run_id: Uuid = resume_context.get("workspace_run_id");
+        let expected_requester: Uuid = resume_context.get("requested_by");
+        let mut resume_lock_keys = budget_scope_lock_keys(corp_id, expected_requester);
+        resume_lock_keys.push(format!(
+            "resume:workspace:{corp_id}:{expected_workspace_run_id}"
+        ));
+        lock_factory_keys_tx(&mut tx, &resume_lock_keys).await?;
+
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
                    r.breaker_stage AS source_breaker_stage,
                    t.mission_id, t.contract, t.verification_policy, m.room_id,
+                   m.requested_by,
                    m.budget_tokens AS mission_budget_tokens,
                    m.budget_cost_microusd AS mission_budget_cost_microusd,
                    a.adapter
@@ -3836,6 +3867,11 @@ impl PgStore {
             .try_get::<Option<String>, _>("provider_session_id")?
             .context("source run has no resumable provider session")?;
         let workspace_run_id: Uuid = row.get("workspace_run_id");
+        if workspace_run_id != expected_workspace_run_id {
+            return Err(anyhow!(
+                "source run workspace lineage changed during resume authorization"
+            ));
+        }
         let workspace_base_commit: String = row
             .try_get::<Option<String>, _>("workspace_base_commit")?
             .context("source run has no persisted workspace base commit")?;
@@ -3858,10 +3894,47 @@ impl PgStore {
         }
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
+        let requester: Uuid = row.get("requested_by");
+        if requester != expected_requester {
+            return Err(anyhow!(
+                "source run requester changed during resume authorization"
+            ));
+        }
         let adapter: String = row.get("adapter");
         let model = contract.model.clone();
         let reasoning_effort = contract.reasoning_effort.clone();
         assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
+
+        let lineage = sqlx::query(
+            r#"
+            SELECT id, breaker_stage
+            FROM runs
+            WHERE corp_id = $1 AND workspace_run_id = $2
+            ORDER BY created_at DESC, id DESC
+            FOR UPDATE
+            "#,
+        )
+        .bind(corp_id)
+        .bind(workspace_run_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if lineage
+            .iter()
+            .any(|candidate| candidate.get::<String, _>("breaker_stage") == "stop")
+        {
+            return Err(anyhow!(
+                "provider workspace lineage reached a stop-stage breaker and cannot be resumed"
+            ));
+        }
+        let latest_lineage_run_id = lineage
+            .first()
+            .map(|candidate| candidate.get::<Uuid, _>("id"))
+            .context("source run workspace lineage is empty")?;
+        if latest_lineage_run_id != source_run_id {
+            return Err(anyhow!(
+                "source run is not the latest run in its provider workspace lineage"
+            ));
+        }
 
         let active: bool = sqlx::query_scalar(
             r#"
@@ -3891,10 +3964,26 @@ impl PgStore {
                 "mission has no remaining authorized budget; an owner or admin must approve a budget revision before resume"
             ));
         }
-        let resume_budget_tokens = contract.budget_tokens.min(remaining_mission_tokens);
+        let rolling = rolling_budget_remaining_tx(&mut tx, corp_id, requester).await?;
+        if rolling.actor_tokens <= 0
+            || rolling.actor_cost_microusd <= 0
+            || rolling.corp_tokens <= 0
+            || rolling.corp_cost_microusd <= 0
+        {
+            return Err(anyhow!(
+                "requester or Corp rolling budget has no remaining authority; wait for the window to clear or revise Corp policy before resume"
+            ));
+        }
+        let resume_budget_tokens = contract
+            .budget_tokens
+            .min(remaining_mission_tokens)
+            .min(rolling.actor_tokens)
+            .min(rolling.corp_tokens);
         let resume_budget_cost_microusd = contract
             .budget_cost_microusd
-            .min(remaining_mission_cost_microusd);
+            .min(remaining_mission_cost_microusd)
+            .min(rolling.actor_cost_microusd)
+            .min(rolling.corp_cost_microusd);
 
         let run_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
@@ -3971,6 +4060,10 @@ impl PgStore {
                         "mission_cost_microusd_used": mission_cost_used,
                         "remaining_mission_tokens": remaining_mission_tokens,
                         "remaining_mission_cost_microusd": remaining_mission_cost_microusd,
+                        "remaining_actor_tokens_24h": rolling.actor_tokens,
+                        "remaining_actor_cost_microusd_24h": rolling.actor_cost_microusd,
+                        "remaining_corp_tokens_24h": rolling.corp_tokens,
+                        "remaining_corp_cost_microusd_24h": rolling.corp_cost_microusd,
                         "resume_budget_tokens": resume_budget_tokens,
                         "resume_budget_cost_microusd": resume_budget_cost_microusd,
                     }),
@@ -4745,6 +4838,31 @@ impl PgStore {
             mut payload,
         } = input;
         let mut tx = self.pool.begin().await?;
+        if event_type == "run.usage" {
+            let requester: Uuid = sqlx::query_scalar(
+                r#"
+                SELECT mission.requested_by
+                FROM runs run
+                JOIN tasks task ON task.id = run.task_id
+                JOIN missions mission ON mission.id = task.mission_id
+                WHERE run.id = $1 AND run.corp_id = $2 AND run.agent_id = $3
+                  AND run.runner_id = $4 AND run.assignment_token = $5
+                  AND run.status IN (
+                    'provisioning', 'starting', 'running',
+                    'waiting_for_input', 'waiting_for_approval', 'verifying'
+                  )
+                "#,
+            )
+            .bind(run_id)
+            .bind(corp_id)
+            .bind(agent_id)
+            .bind(&runner_id)
+            .bind(assignment_token)
+            .fetch_one(&mut *tx)
+            .await
+            .context("runner usage event does not match an active run")?;
+            lock_factory_keys_tx(&mut tx, &budget_scope_lock_keys(corp_id, requester)).await?;
+        }
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.verification_status AS run_verification_status,
@@ -5970,6 +6088,7 @@ impl PgStore {
                 "forbidden: only a Corp owner or admin can change budget policy"
             ));
         }
+        lock_factory_keys_tx(&mut tx, &budget_scope_lock_keys(corp_id, actor_id)).await?;
         if actor_tokens_per_24h <= 0
             || actor_cost_microusd_per_24h <= 0
             || corp_tokens_per_24h <= 0
@@ -9619,6 +9738,80 @@ fn ensure_breaker_allows_human_progress(stage: &str, action: &str) -> Result<()>
         ));
     }
     Ok(())
+}
+
+fn budget_scope_lock_keys(corp_id: Uuid, requester: Uuid) -> Vec<String> {
+    vec![
+        format!("budget:actor:{corp_id}:{requester}"),
+        format!("budget:corp:{corp_id}"),
+    ]
+}
+
+async fn rolling_budget_remaining_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    requester: Uuid,
+) -> Result<RollingBudgetRemaining> {
+    let row = sqlx::query(
+        r#"
+        SELECT COALESCE(policy.actor_tokens_per_24h, 4000000) AS actor_token_limit,
+               COALESCE(policy.actor_cost_microusd_per_24h, 10000000) AS actor_cost_limit,
+               COALESCE(policy.corp_tokens_per_24h, 20000000) AS corp_token_limit,
+               COALESCE(policy.corp_cost_microusd_per_24h, 100000000) AS corp_cost_limit,
+               (
+                   SELECT COALESCE(SUM(run.input_tokens + run.output_tokens), 0)::BIGINT
+                   FROM runs run
+                   JOIN tasks task ON task.id = run.task_id
+                   JOIN missions mission ON mission.id = task.mission_id
+                   WHERE mission.corp_id = corp.id
+                     AND mission.requested_by = $2
+                     AND run.created_at >= now() - interval '24 hours'
+               ) AS actor_tokens_used,
+               (
+                   SELECT COALESCE(SUM(run.cost_microusd), 0)::BIGINT
+                   FROM runs run
+                   JOIN tasks task ON task.id = run.task_id
+                   JOIN missions mission ON mission.id = task.mission_id
+                   WHERE mission.corp_id = corp.id
+                     AND mission.requested_by = $2
+                     AND run.created_at >= now() - interval '24 hours'
+               ) AS actor_cost_used,
+               (
+                   SELECT COALESCE(SUM(run.input_tokens + run.output_tokens), 0)::BIGINT
+                   FROM runs run
+                   WHERE run.corp_id = corp.id
+                     AND run.created_at >= now() - interval '24 hours'
+               ) AS corp_tokens_used,
+               (
+                   SELECT COALESCE(SUM(run.cost_microusd), 0)::BIGINT
+                   FROM runs run
+                   WHERE run.corp_id = corp.id
+                     AND run.created_at >= now() - interval '24 hours'
+               ) AS corp_cost_used
+        FROM corps corp
+        LEFT JOIN corp_budget_policies policy ON policy.corp_id = corp.id
+        WHERE corp.id = $1
+        "#,
+    )
+    .bind(corp_id)
+    .bind(requester)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("Corp not found while evaluating rolling resume budget")?;
+    Ok(RollingBudgetRemaining {
+        actor_tokens: row
+            .get::<i64, _>("actor_token_limit")
+            .saturating_sub(row.get("actor_tokens_used")),
+        actor_cost_microusd: row
+            .get::<i64, _>("actor_cost_limit")
+            .saturating_sub(row.get("actor_cost_used")),
+        corp_tokens: row
+            .get::<i64, _>("corp_token_limit")
+            .saturating_sub(row.get("corp_tokens_used")),
+        corp_cost_microusd: row
+            .get::<i64, _>("corp_cost_limit")
+            .saturating_sub(row.get("corp_cost_used")),
+    })
 }
 
 async fn ensure_run_not_hard_blocked_tx(
