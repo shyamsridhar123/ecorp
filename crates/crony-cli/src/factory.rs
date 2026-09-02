@@ -868,6 +868,18 @@ fn resolve_recovery_source_base_commit_from_item(
         .policy
         .as_object()
         .context("persisted factory policy is not a JSON object")?;
+    let source_base_ref = policy
+        .get("source_base_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("persisted factory policy has no source_base_ref")?;
+    validate_source_base_ref(source_base_ref)?;
+    if source_base_ref != args.source_base_ref {
+        bail!(
+            "factory recovery source base ref mismatch: persisted policy requires {source_base_ref}, controller requested {}",
+            args.source_base_ref
+        );
+    }
     if let Some(commit) = policy.get("source_base_commit").and_then(Value::as_str) {
         let commit = commit.to_ascii_lowercase();
         validate_source_base_commit(&commit)?;
@@ -884,12 +896,16 @@ fn resolve_recovery_source_base_commit_from_item(
         bail!("persisted factory policy has no immutable source_base_commit");
     }
     Ok(ResolvedSourceCommit {
-        commit: resolve_source_base_commit(args)?,
+        commit: resolve_source_base_commit_at_ref(args, source_base_ref)?,
         legacy_upgrade_required: true,
     })
 }
 
 fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
+    resolve_source_base_commit_at_ref(args, &args.source_base_ref)
+}
+
+fn resolve_source_base_commit_at_ref(args: &FactoryArgs, source_base_ref: &str) -> Result<String> {
     let remote = source_git_output(
         &args.source_repository_path,
         &["config", "--get", "remote.origin.url"],
@@ -905,7 +921,7 @@ fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
             args.repository
         );
     }
-    let revision = format!("{}^{{commit}}", args.source_base_ref);
+    let revision = format!("{source_base_ref}^{{commit}}");
     let commit = source_git_output(
         &args.source_repository_path,
         &["rev-parse", "--verify", &revision],
@@ -913,7 +929,7 @@ fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
     .with_context(|| {
         format!(
             "resolve factory source base ref {} in {}",
-            args.source_base_ref,
+            source_base_ref,
             args.source_repository_path.display()
         )
     })?;

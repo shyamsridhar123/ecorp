@@ -93,6 +93,8 @@ function factoryPolicy({
     dependencies: [],
     repository_allowlist: ['shyamsridhar123/ecorp'],
     source_base_ref: 'HEAD',
+    source_base_commit: sourceBaseCommit,
+    source_commit_upgrade_required: false,
     adapter_allowlist: ['fake-process'],
     strategy_allowlist: ['single'],
     model: null,

@@ -7614,11 +7614,41 @@ fn validate_factory_lease_seconds(value: i64) -> Result<i64> {
 }
 
 fn normalize_factory_policy(policy: Value) -> Result<Value> {
-    let policy = match policy {
+    let mut policy = match policy {
         Value::Null => json!({}),
         Value::Object(_) => policy,
         _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
     };
+    let policy_object = policy
+        .as_object_mut()
+        .context("factory policy snapshot must be a JSON object")?;
+    let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
+    validate_factory_base_ref(&source_base_ref)?;
+    let source_base_commit =
+        factory_policy_required_string(policy_object, "source_base_commit", 64)?
+            .to_ascii_lowercase();
+    validate_factory_base_commit(&source_base_commit)?;
+    match policy_object.get("source_commit_upgrade_required") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(anyhow!(
+                "factory source_commit_upgrade_required is reserved for migrated legacy records"
+            ));
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "factory source_commit_upgrade_required must be a boolean"
+            ));
+        }
+    }
+    policy_object.insert(
+        "source_base_commit".to_owned(),
+        Value::String(source_base_commit),
+    );
+    policy_object.insert(
+        "source_commit_upgrade_required".to_owned(),
+        Value::Bool(false),
+    );
     if serde_json::to_vec(&policy)?.len() > 65_536 {
         return Err(anyhow!("factory policy snapshot cannot exceed 65536 bytes"));
     }
@@ -9015,8 +9045,9 @@ mod tests {
     use super::{
         FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
         ensure_breaker_allows_human_progress, factory_transition_allowed,
-        normalize_artifact_rejection_reason, normalize_factory_source, should_retry_runner_failure,
-        validate_factory_lease_seconds, validate_factory_plan_against_policy,
+        normalize_artifact_rejection_reason, normalize_factory_policy, normalize_factory_source,
+        should_retry_runner_failure, validate_factory_lease_seconds,
+        validate_factory_plan_against_policy,
     };
 
     #[test]
@@ -9230,6 +9261,44 @@ mod tests {
         assert!(validate_factory_lease_seconds(30).is_ok());
         assert!(validate_factory_lease_seconds(3_600).is_ok());
         assert!(validate_factory_lease_seconds(3_601).is_err());
+    }
+
+    #[test]
+    fn new_factory_claim_policies_require_an_immutable_source_commit() {
+        let normalized = normalize_factory_policy(json!({
+            "source_base_ref": "HEAD",
+            "source_base_commit": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }))
+        .expect("pinned source policy");
+        assert_eq!(
+            normalized
+                .get("source_base_commit")
+                .and_then(|value| value.as_str()),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            normalized
+                .get("source_commit_upgrade_required")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        assert!(
+            normalize_factory_policy(json!({"source_base_ref": "HEAD"}))
+                .unwrap_err()
+                .to_string()
+                .contains("source_base_commit")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "source_commit_upgrade_required": true
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("reserved for migrated legacy records")
+        );
     }
 
     #[test]
