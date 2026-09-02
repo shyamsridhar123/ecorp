@@ -14,9 +14,11 @@ use clap::Args;
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_GITHUB_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Args)]
 pub struct FactoryArgs {
@@ -42,6 +44,13 @@ pub struct FactoryArgs {
 
     #[arg(long, env = "ECORP_FACTORY_SOURCE_BASE_REF", default_value = "HEAD")]
     pub source_base_ref: String,
+
+    #[arg(
+        long,
+        env = "ECORP_FACTORY_SOURCE_REPOSITORY_PATH",
+        default_value = "."
+    )]
+    pub source_repository_path: PathBuf,
 
     #[arg(long)]
     pub adapter: String,
@@ -161,12 +170,18 @@ struct ProjectFieldOption {
 
 #[derive(Debug, Clone)]
 struct ExistingFactoryItem {
+    version: i64,
     source_revision: String,
     claim_owner_id: Uuid,
     state: String,
     mission_id: Option<Uuid>,
     policy: Value,
     lease_expires_at: DateTime<Utc>,
+}
+
+struct ResolvedSourceCommit {
+    commit: String,
+    legacy_upgrade_required: bool,
 }
 
 #[derive(Debug)]
@@ -231,6 +246,18 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             .then_with(|| left.issue.number.cmp(&right.issue.number))
     });
     let selected_index = evaluated.iter().position(EvaluatedItem::eligible);
+    let selected_source_base_commit = selected_index
+        .map(|index| {
+            if evaluated[index].recovery {
+                resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)
+            } else {
+                resolve_source_base_commit(&args).map(|commit| ResolvedSourceCommit {
+                    commit,
+                    legacy_upgrade_required: false,
+                })
+            }
+        })
+        .transpose()?;
     let evaluated_json = evaluated
         .iter()
         .map(EvaluatedItem::as_json)
@@ -243,6 +270,13 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "project_owner": args.owner,
             "project_number": args.project_number,
             "repository": args.repository,
+            "source_base_ref": args.source_base_ref,
+            "source_base_commit": selected_source_base_commit
+                .as_ref()
+                .map(|resolved| resolved.commit.as_str()),
+            "legacy_source_upgrade_required": selected_source_base_commit
+                .as_ref()
+                .is_some_and(|resolved| resolved.legacy_upgrade_required),
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
             "mutations": [],
@@ -256,6 +290,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     })?;
     let selected = evaluated.swap_remove(selected_index);
+    let source_resolution = selected_source_base_commit
+        .context("selected factory issue did not resolve an immutable source commit")?;
+    let ResolvedSourceCommit {
+        commit: source_base_commit,
+        legacy_upgrade_required,
+    } = source_resolution;
     let refreshed = refresh_selected(&args, &existing, &selected)?;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let stable_prefix = format!(
@@ -282,6 +322,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "dependencies": refreshed.dependencies,
             "repository_allowlist": [args.repository],
             "source_base_ref": args.source_base_ref,
+            "source_base_commit": source_base_commit,
+            "source_commit_upgrade_required": false,
             "adapter_allowlist": adapter_allowlist,
             "strategy_allowlist": [args.strategy],
             "model": args.model,
@@ -300,6 +342,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "auto_merge": false,
         })
     };
+    let claim_generation = existing
+        .get(&refreshed.project_item.id)
+        .map(|item| item.version)
+        .unwrap_or(0);
     let claim_body = json!({
         "actor_id": args.actor_id,
         "source_project_owner": args.owner,
@@ -312,7 +358,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_issue_url": refreshed.issue.url,
         "source_title": refreshed.issue.title,
         "source_revision": refreshed.issue.updated_at,
-        "idempotency_key": format!("{stable_prefix}:claim:{}", args.actor_id),
+        "source_base_ref": args.source_base_ref,
+        "source_base_commit": source_base_commit,
+        "idempotency_key": format!(
+            "{stable_prefix}:claim:{}:{claim_generation}",
+            args.actor_id
+        ),
         "lease_seconds": args.lease_seconds,
         "policy": policy,
     });
@@ -338,6 +389,31 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     let control_token = value_uuid(&claim, "/claim_token")
         .context("factory work item has no usable controller fencing token")?;
     let mut work_item_version = value_i64(&claim, "/work_item/version")?;
+    let mut source_commit_upgraded = false;
+    if legacy_upgrade_required {
+        let upgrade = server_json(
+            client,
+            Method::POST,
+            format!(
+                "{server}/api/corps/{}/factory/work-items/{work_item_id}/upgrade-source-commit",
+                args.corp_id
+            ),
+            Some(json!({
+                "actor_id": args.actor_id,
+                "claim_token": control_token,
+                "expected_version": work_item_version,
+                "idempotency_key": format!("{stable_prefix}:upgrade-source-commit"),
+                "source_base_commit": source_base_commit,
+            })),
+        )
+        .await?;
+        work_item_version = value_i64(&upgrade, "/work_item/version")?;
+        mission_id = value_optional_uuid(&upgrade, "/work_item/mission_id")?;
+        source_commit_upgraded = !upgrade
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
     let mut materialized = false;
     if mission_id.is_none() {
         let materialize_body = json!({
@@ -670,6 +746,9 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "issue_number": refreshed.issue.number,
         "issue_url": refreshed.issue.url,
         "source_revision": refreshed.issue.updated_at,
+        "source_base_ref": args.source_base_ref,
+        "source_base_commit": source_base_commit,
+        "legacy_source_commit_upgraded": source_commit_upgraded,
         "factory_work_item_id": work_item_id,
         "factory_state": work_item_state,
         "factory_version": work_item_version,
@@ -764,6 +843,113 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
         bail!("factory source base ref is invalid");
     }
     Ok(())
+}
+
+fn resolve_recovery_source_base_commit(
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    existing: &HashMap<String, ExistingFactoryItem>,
+) -> Result<ResolvedSourceCommit> {
+    let policy = existing
+        .get(&selected.project_item.id)
+        .context("recoverable factory item disappeared from the ECorp snapshot")?
+        .policy
+        .as_object()
+        .context("persisted factory policy is not a JSON object")?;
+    if let Some(commit) = policy.get("source_base_commit").and_then(Value::as_str) {
+        let commit = commit.to_ascii_lowercase();
+        validate_source_base_commit(&commit)?;
+        return Ok(ResolvedSourceCommit {
+            commit,
+            legacy_upgrade_required: false,
+        });
+    }
+    if policy
+        .get("source_commit_upgrade_required")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("persisted factory policy has no immutable source_base_commit");
+    }
+    Ok(ResolvedSourceCommit {
+        commit: resolve_source_base_commit(args)?,
+        legacy_upgrade_required: true,
+    })
+}
+
+fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
+    let remote = source_git_output(
+        &args.source_repository_path,
+        &["config", "--get", "remote.origin.url"],
+    )
+    .context("resolve factory source repository origin")?;
+    let remote =
+        String::from_utf8(remote).context("factory source repository origin is not UTF-8")?;
+    let identity = parse_github_repository_identity(&remote)
+        .context("factory source repository origin is not a supported GitHub remote")?;
+    if !identity.eq_ignore_ascii_case(&args.repository) {
+        bail!(
+            "factory source repository identity mismatch: --repository is {}, local origin is {identity}",
+            args.repository
+        );
+    }
+    let revision = format!("{}^{{commit}}", args.source_base_ref);
+    let commit = source_git_output(
+        &args.source_repository_path,
+        &["rev-parse", "--verify", &revision],
+    )
+    .with_context(|| {
+        format!(
+            "resolve factory source base ref {} in {}",
+            args.source_base_ref,
+            args.source_repository_path.display()
+        )
+    })?;
+    let commit = String::from_utf8(commit)
+        .context("resolved factory source commit is not UTF-8")?
+        .trim()
+        .to_ascii_lowercase();
+    validate_source_base_commit(&commit)?;
+    Ok(commit)
+}
+
+fn validate_source_base_commit(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "factory source base commit must be a full 40- or 64-character hexadecimal Git object id"
+        );
+    }
+    Ok(())
+}
+
+fn parse_github_repository_identity(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path.to_owned()
+    } else {
+        let url = Url::parse(remote).ok()?;
+        if !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        {
+            return None;
+        }
+        url.path().trim_start_matches('/').to_owned()
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some()
+        || owner.is_empty()
+        || repository.is_empty()
+        || !owner.chars().chain(repository.chars()).all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
 }
 
 fn factory_adapter_allowlist(args: &FactoryArgs) -> Result<Vec<String>> {
@@ -1141,6 +1327,7 @@ fn existing_factory_items(snapshot: &Value) -> Result<HashMap<String, ExistingFa
             Ok((
                 project_item_id,
                 ExistingFactoryItem {
+                    version: value_i64(item, "/version")?,
                     source_revision: value_string(item, "/source_revision")?,
                     claim_owner_id: value_uuid(item, "/claim_owner_id")?,
                     state: value_string(item, "/state")?,
@@ -1697,12 +1884,73 @@ fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(stdout)
 }
 
+fn source_git_output(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run git -C {} {}", repository.display(), args.join(" ")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture source Git standard output")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture source Git standard error")?;
+    let stdout_reader = thread::spawn(move || read_process_output(stdout));
+    let stderr_reader = thread::spawn(move || read_process_output(stderr));
+    let timeout = source_git_command_timeout();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll source Git process")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_process_output(stdout_reader, "source Git standard output");
+            let _ = join_process_output(stderr_reader, "source Git standard error");
+            bail!(
+                "git -C {} {} timed out after {} ms",
+                repository.display(),
+                args.join(" "),
+                timeout.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = join_process_output(stdout_reader, "source Git standard output")?;
+    let stderr = join_process_output(stderr_reader, "source Git standard error")?;
+    if !status.success() {
+        bail!(
+            "git -C {} {} failed: {}",
+            repository.display(),
+            args.join(" "),
+            sanitize_failure_detail(&String::from_utf8_lossy(&stderr))
+        );
+    }
+    Ok(stdout)
+}
+
 fn github_command_timeout() -> Duration {
     let timeout_ms = env::var("ECORP_GITHUB_COMMAND_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_GITHUB_COMMAND_TIMEOUT_MS)
         .clamp(100, DEFAULT_GITHUB_COMMAND_TIMEOUT_MS);
+    Duration::from_millis(timeout_ms)
+}
+
+fn source_git_command_timeout() -> Duration {
+    let timeout_ms = env::var("ECORP_SOURCE_GIT_COMMAND_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS)
+        .clamp(100, DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS);
     Duration::from_millis(timeout_ms)
 }
 
@@ -1805,7 +2053,8 @@ mod tests {
     use super::{
         ExistingFactoryItem, acceptance_tests, blocked_dependency_numbers,
         factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        sanitize_failure_detail, truncate_utf8,
+        parse_github_repository_identity, sanitize_failure_detail, truncate_utf8,
+        validate_source_base_commit,
     };
 
     #[test]
@@ -1868,6 +2117,18 @@ Blocked by #999 outside the section.
             sanitize_failure_detail("GitHub failed:\r\nAuthorization: redacted\trequest"),
             "GitHub failed: Authorization: redacted request"
         );
+        assert_eq!(
+            parse_github_repository_identity("git@github.com:ShyamSridhar123/ECorp.git").as_deref(),
+            Some("ShyamSridhar123/ECorp")
+        );
+    }
+
+    #[test]
+    fn source_commit_requires_a_full_git_object_id() {
+        assert!(validate_source_base_commit(&"a".repeat(40)).is_ok());
+        assert!(validate_source_base_commit(&"B".repeat(64)).is_ok());
+        assert!(validate_source_base_commit(&"a".repeat(39)).is_err());
+        assert!(validate_source_base_commit(&"g".repeat(40)).is_err());
     }
 
     #[test]
@@ -1876,6 +2137,7 @@ Blocked by #999 outside the section.
         let owner = Uuid::new_v4();
         let replacement = Uuid::new_v4();
         let mut item = ExistingFactoryItem {
+            version: 1,
             source_revision: "2026-09-01T14:00:00Z".to_owned(),
             claim_owner_id: owner,
             state: "running".to_owned(),

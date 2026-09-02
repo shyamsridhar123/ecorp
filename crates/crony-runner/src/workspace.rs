@@ -20,6 +20,7 @@ pub struct WorkspaceManager {
     repository: PathBuf,
     repository_identity: Option<String>,
     base_ref: String,
+    base_commit: String,
     git_lock: Arc<Mutex<()>>,
 }
 
@@ -73,13 +74,14 @@ impl WorkspaceManager {
             repository,
             repository_identity: None,
             base_ref,
+            base_commit: String::new(),
             git_lock: Arc::new(Mutex::new(())),
         };
         manager
             .git_success(&manager.repository, &["rev-parse", "--git-dir"])
             .await
             .context("configured source path is not a Git repository")?;
-        manager.resolve_base_commit().await?;
+        manager.base_commit = manager.resolve_base_commit().await?;
         manager.repository_identity = manager
             .git_text(
                 &manager.repository,
@@ -107,8 +109,65 @@ impl WorkspaceManager {
         &self.base_ref
     }
 
-    pub async fn prepare(&self, task_id: Uuid, workspace_run_id: Uuid) -> Result<WorkspaceLease> {
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub fn verify_source_identity(
+        &self,
+        repository: Option<&str>,
+        base_ref: Option<&str>,
+        base_commit: Option<&str>,
+    ) -> Result<()> {
+        let (Some(repository), Some(base_ref), Some(base_commit)) =
+            (repository, base_ref, base_commit)
+        else {
+            if repository.is_none() && base_ref.is_none() && base_commit.is_none() {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "source assignment must include repository, base ref, and immutable base commit"
+            ));
+        };
+        let configured_repository = self
+            .repository_identity()
+            .context("runner source repository has no resolved GitHub identity")?;
+        if !configured_repository.eq_ignore_ascii_case(repository) {
+            return Err(anyhow!(
+                "source repository mismatch: assignment requires {repository}, runner is configured for {configured_repository}"
+            ));
+        }
+        if self.base_ref != base_ref {
+            return Err(anyhow!(
+                "source base ref mismatch: assignment requires {base_ref}, runner is configured for {}",
+                self.base_ref
+            ));
+        }
+        if !self.base_commit.eq_ignore_ascii_case(base_commit) {
+            return Err(anyhow!(
+                "source base commit mismatch: assignment requires {base_commit}, runner is pinned to {}",
+                self.base_commit
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn prepare(
+        &self,
+        task_id: Uuid,
+        workspace_run_id: Uuid,
+        assigned_base_commit: Option<&str>,
+        resume_base_commit: Option<&str>,
+    ) -> Result<WorkspaceLease> {
         let _guard = self.git_lock.lock().await;
+        if assigned_base_commit
+            .zip(resume_base_commit)
+            .is_some_and(|(assigned, resumed)| !assigned.eq_ignore_ascii_case(resumed))
+        {
+            return Err(anyhow!(
+                "resumed workspace base commit does not match the pinned source assignment"
+            ));
+        }
         let branch = branch_name(task_id, workspace_run_id);
         let path = self
             .worktrees_root
@@ -117,8 +176,19 @@ impl WorkspaceManager {
         self.ensure_target_parent(&path).await?;
 
         if tokio::fs::try_exists(&path).await? {
-            return self.verify_existing(path, branch).await;
+            return self
+                .verify_existing(path, branch, assigned_base_commit.or(resume_base_commit))
+                .await;
         }
+        if resume_base_commit.is_some() {
+            return Err(anyhow!(
+                "preserved workspace is missing and cannot be recreated for resume"
+            ));
+        }
+        let base_commit = match assigned_base_commit {
+            Some(commit) => commit.to_owned(),
+            None => self.resolve_base_commit_locked().await?,
+        };
 
         let branch_ref = format!("refs/heads/{branch}");
         let branch_exists = self
@@ -132,24 +202,6 @@ impl WorkspaceManager {
                 ],
             )
             .await?;
-        let base_commit = if branch_exists {
-            match self
-                .git_text(&self.repository, &["merge-base", &branch, &self.base_ref])
-                .await
-            {
-                Ok(value) => value,
-                Err(_) => {
-                    self.git_text(
-                        &self.repository,
-                        &["rev-parse", &format!("{branch}^{{commit}}")],
-                    )
-                    .await?
-                }
-            }
-        } else {
-            self.resolve_base_commit_locked().await?
-        };
-
         let mut args = vec![OsString::from("worktree"), OsString::from("add")];
         if branch_exists {
             args.push(path.as_os_str().to_owned());
@@ -163,7 +215,7 @@ impl WorkspaceManager {
         self.git_success_os(&self.repository, &args)
             .await
             .with_context(|| format!("create worktree {} on branch {branch}", path.display()))?;
-        self.verify_existing(path, branch).await
+        self.verify_existing(path, branch, Some(&base_commit)).await
     }
 
     pub async fn finalize(&self, workspace: &WorkspaceLease) -> Result<WorkspaceCleanup> {
@@ -180,7 +232,11 @@ impl WorkspaceManager {
         }
 
         if let Err(error) = self
-            .verify_existing(workspace.path.clone(), workspace.branch.clone())
+            .verify_existing(
+                workspace.path.clone(),
+                workspace.branch.clone(),
+                Some(&workspace.base_commit),
+            )
             .await
         {
             return Ok(preserved(format!(
@@ -347,7 +403,12 @@ impl WorkspaceManager {
         })
     }
 
-    async fn verify_existing(&self, path: PathBuf, branch: String) -> Result<WorkspaceLease> {
+    async fn verify_existing(
+        &self,
+        path: PathBuf,
+        branch: String,
+        expected_base_commit: Option<&str>,
+    ) -> Result<WorkspaceLease> {
         self.verify_managed_path(&path).await?;
         let top = self
             .git_text_os(
@@ -391,32 +452,44 @@ impl WorkspaceManager {
                 current_branch.trim()
             ));
         }
-        let current_base_commit = self.resolve_base_commit_locked().await?;
-        let base_commit = match self
-            .git_text_os(
+        let base_commit = match expected_base_commit {
+            Some(commit) => commit.to_owned(),
+            None => {
+                let current_base_commit = self.resolve_base_commit_locked().await?;
+                self.git_text_os(
+                    &canonical_path,
+                    &[
+                        OsString::from("merge-base"),
+                        OsString::from("HEAD"),
+                        OsString::from(&current_base_commit),
+                    ],
+                )
+                .await?
+                .trim()
+                .to_owned()
+            }
+        };
+        let base_is_ancestor = self
+            .git_exit_success(
                 &canonical_path,
                 &[
                     OsString::from("merge-base"),
+                    OsString::from("--is-ancestor"),
+                    OsString::from(&base_commit),
                     OsString::from("HEAD"),
-                    OsString::from(&current_base_commit),
                 ],
             )
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => {
-                self.git_text_os(
-                    &canonical_path,
-                    &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
-                )
-                .await?
-            }
-        };
+            .await?;
+        if !base_is_ancestor {
+            return Err(anyhow!(
+                "worktree does not descend from expected base commit {base_commit}"
+            ));
+        }
         Ok(WorkspaceLease {
             path: canonical_path,
             branch,
             base_ref: self.base_ref.clone(),
-            base_commit: base_commit.trim().to_owned(),
+            base_commit,
         })
     }
 
@@ -691,6 +764,15 @@ mod tests {
                 OsStr::new("init"),
             ],
         );
+        command(
+            &repository,
+            &[
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                OsStr::new("https://github.com/shyamsridhar123/ecorp.git"),
+            ],
+        );
         (root, repository, managed)
     }
 
@@ -733,11 +815,11 @@ mod tests {
         let task = Uuid::new_v4();
         let first_owner = Uuid::new_v4();
         let first = manager
-            .prepare(task, first_owner)
+            .prepare(task, first_owner, None, None)
             .await
             .expect("first worktree");
         let second = manager
-            .prepare(task, Uuid::new_v4())
+            .prepare(task, Uuid::new_v4(), None, None)
             .await
             .expect("second worktree");
 
@@ -754,7 +836,7 @@ mod tests {
         std::fs::write(first.path.join("first.txt"), "first\n").expect("first change");
         std::fs::write(second.path.join("second.txt"), "second\n").expect("second change");
         let resumed = manager
-            .prepare(task, first_owner)
+            .prepare(task, first_owner, None, None)
             .await
             .expect("reuse existing worktree");
         assert_eq!(resumed.path, first.path);
@@ -793,7 +875,7 @@ mod tests {
             .await
             .expect("initialize manager");
         let clean = manager
-            .prepare(Uuid::new_v4(), Uuid::new_v4())
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
             .await
             .expect("clean worktree");
         let clean_branch = clean.branch.clone();
@@ -810,7 +892,7 @@ mod tests {
         assert!(!branch.success());
 
         let ignored = manager
-            .prepare(Uuid::new_v4(), Uuid::new_v4())
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
             .await
             .expect("ignored-file worktree");
         std::fs::write(ignored.path.join("valuable.log"), "ignored but valuable\n")
@@ -824,7 +906,7 @@ mod tests {
         assert!(ignored.path.join("valuable.log").exists());
 
         let committed = manager
-            .prepare(Uuid::new_v4(), Uuid::new_v4())
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
             .await
             .expect("committed worktree");
         std::fs::write(committed.path.join("work.txt"), "valuable\n").expect("write work");
@@ -868,7 +950,7 @@ mod tests {
         assert!(!committed.path.exists());
 
         let uncertain = manager
-            .prepare(Uuid::new_v4(), Uuid::new_v4())
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
             .await
             .expect("uncertain worktree");
         command(
@@ -900,7 +982,7 @@ mod tests {
         std::fs::create_dir_all(&occupied).expect("create occupied path");
         std::fs::write(occupied.join("not-a-worktree.txt"), "sentinel\n").expect("write sentinel");
         let error = manager
-            .prepare(task, run)
+            .prepare(task, run, None, None)
             .await
             .expect_err("occupied non-worktree must fail");
         assert!(error.to_string().contains("inspect existing worktree"));
@@ -910,6 +992,118 @@ mod tests {
             "sentinel\n"
         );
         assert!(!repository.join("not-a-worktree.txt").exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn source_identity_requires_the_exact_resolved_commit() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let commit = manager.base_commit().to_owned();
+        manager
+            .verify_source_identity(Some("SHYAMSRIDHAR123/ECORP"), Some("HEAD"), Some(&commit))
+            .expect("matching immutable source identity");
+        assert!(
+            manager
+                .verify_source_identity(
+                    Some("shyamsridhar123/ecorp"),
+                    Some("HEAD"),
+                    Some("1111111111111111111111111111111111111111"),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("commit mismatch")
+        );
+        assert!(
+            manager
+                .verify_source_identity(Some("shyamsridhar123/ecorp"), Some("HEAD"), None,)
+                .unwrap_err()
+                .to_string()
+                .contains("must include")
+        );
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn unpinned_worktrees_follow_the_live_ref_while_pinned_and_resumed_work_stays_fixed() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let startup_commit = manager.base_commit().to_owned();
+        let first_task = Uuid::new_v4();
+        let first_run = Uuid::new_v4();
+        let first = manager
+            .prepare(first_task, first_run, None, None)
+            .await
+            .expect("first unpinned worktree");
+        assert_eq!(first.base_commit, startup_commit);
+
+        std::fs::write(repository.join("advanced.txt"), "advanced\n")
+            .expect("write advanced source");
+        command(
+            &repository,
+            &[OsStr::new("add"), OsStr::new("advanced.txt")],
+        );
+        command(
+            &repository,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("user.name=ECorp Test"),
+                OsStr::new("-c"),
+                OsStr::new("user.email=crony@example.invalid"),
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("advance configured base"),
+            ],
+        );
+        let advanced_commit = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repository)
+            .output()
+            .expect("resolve advanced commit");
+        assert!(advanced_commit.status.success());
+        let advanced_commit = String::from_utf8(advanced_commit.stdout)
+            .expect("advanced commit utf8")
+            .trim()
+            .to_owned();
+
+        let later_unpinned = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("later unpinned worktree");
+        assert_eq!(later_unpinned.base_commit, advanced_commit);
+        assert!(later_unpinned.path.join("advanced.txt").exists());
+
+        let pinned_task = Uuid::new_v4();
+        let pinned_run = Uuid::new_v4();
+        let pinned = manager
+            .prepare(pinned_task, pinned_run, Some(&startup_commit), None)
+            .await
+            .expect("pinned worktree");
+        assert_eq!(pinned.base_commit, startup_commit);
+        assert!(!pinned.path.join("advanced.txt").exists());
+
+        let resumed = manager
+            .prepare(
+                pinned_task,
+                pinned_run,
+                Some(&startup_commit),
+                Some(&startup_commit),
+            )
+            .await
+            .expect("resume pinned worktree");
+        assert_eq!(resumed.path, pinned.path);
+        assert_eq!(resumed.base_commit, startup_commit);
+
+        let resumed_unpinned = manager
+            .prepare(first_task, first_run, None, Some(&startup_commit))
+            .await
+            .expect("resume unpinned worktree");
+        assert_eq!(resumed_unpinned.path, first.path);
+        assert_eq!(resumed_unpinned.base_commit, startup_commit);
         cleanup_fixture(&root, &repository);
     }
 

@@ -45,6 +45,9 @@
   and non-ignored untracked changes can be downloaded as a deterministic patch, content-addressed
   archive, typed artifact set, commit/branch bundle, or review report. Exact verification and byte
   digests are linked before cleanup; pull-request publication and merge remain separate effects.
+- Governed factory routing now pins the authorized GitHub repository and symbolic ref to an
+  immutable commit across policy, tasks, runs, scheduling, runner admission, worktree creation, and
+  resume.
 
 ---
 

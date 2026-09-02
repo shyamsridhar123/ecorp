@@ -424,9 +424,22 @@ It renews again immediately before the mutation, and every GitHub CLI subprocess
 deadline below the minimum effect lease. After the mutation it renews, repeats the
 source-eligibility check, and renews once more immediately before launch.
 Any changed or newly blocked source durably moves the factory item to `blocked` without launching a
-run. Factory tasks persist the claimed GitHub repository and source base ref. Runners advertise a
-normalized `remote` and `base`, and scheduling rejects a runner whose configured checkout does not
-match before creating a run.
+run. Before a new claim, the trusted controller verifies the configured GitHub remote and resolves
+the human-readable source ref to a full immutable Git object ID. Factory policy, task contracts,
+and run launch records retain the repository, symbolic ref, and resolved commit together.
+Runners resolve that same tuple once at startup and advertise it as structured workspace
+capability data. Scheduling compares the immutable commit rather than trusting a matching `HEAD`
+label, and the runner repeats the check before creating or reusing a worktree. Pinned assignments
+start from their exact authorized commit. Ordinary unpinned assignments preserve the prior behavior
+of resolving the configured symbolic ref under the Git lock for each new worktree. Resume carries
+the source run's persisted workspace base commit and must reuse a preserved branch descending from
+that exact identity.
+
+Migration 0022 derives legacy factory commits only when persisted workspace evidence identifies one
+unambiguous commit. Legacy claims or materialized no-run missions without derivable evidence are
+marked `source_commit_upgrade_required`. A fenced operator may explicitly pin a freshly resolved
+commit before launch; the operation updates policy and any no-run task contracts atomically,
+increments the factory version, and appends an audit event.
 
 ## Portable source-deliverable boundary
 

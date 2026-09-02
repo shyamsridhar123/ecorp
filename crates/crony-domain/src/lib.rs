@@ -252,6 +252,8 @@ pub struct TaskContract {
     pub source_repository: Option<String>,
     #[serde(default)]
     pub source_base_ref: Option<String>,
+    #[serde(default)]
+    pub source_base_commit: Option<String>,
     pub acceptance_tests: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub prohibited_actions: Vec<String>,
@@ -459,6 +461,9 @@ pub struct Run {
     pub breaker_stage: String,
     pub no_progress_events: i32,
     pub repeated_tool_count: i32,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
+    pub source_base_commit: Option<String>,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
     pub workspace_base_ref: Option<String>,
