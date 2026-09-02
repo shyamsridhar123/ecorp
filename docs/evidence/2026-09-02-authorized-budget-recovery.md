@@ -6,10 +6,11 @@
 **Operator UI:** `c4ce25e`
 **Integrated publication base:** `bef6774851c79a1cd8a773883b9c5b090318b673`
 **Cross-scenario reset isolation:** `3a3702e`
-**Full repository gate head:** `70b615e416add32ca64da9107983bd4a8caef707`
+**Initial full repository gate head:** `70b615e416add32ca64da9107983bd4a8caef707`
 **Authority and retry hardening:** `2231c8d723fc7dd9dbedcc1c16cb9162c0b6dbaa`
 **Rolling-budget and lineage hardening:** `91349215f07356dc6319f26aaefb48930363c720`
 **Integrated publication room-scope head:** `c80c36a4e26d32d7fb236f19edaefc1102f1d1c7`
+**Final integrated full-gate head:** `3b0ad5377265620a0cede2046156862d7f379197`
 
 ## Scope
 
@@ -166,6 +167,11 @@ suite ran immediately before the expanded publication suite on the same rebuilt 
 recovery passed all rolling-budget, room, stale-contract, path, and lineage cases. Publication then
 passed start/recovery/status room isolation and membership revocation immediately before branch,
 pull-request, and Project effects, while retaining every prior publication invariant.
+
+After the final documentation integration, exact committed head
+`3b0ad5377265620a0cede2046156862d7f379197` passed all 27 migration checks,
+`cargo fmt --check`, warning-free workspace clippy, all 80 Rust tests, the production web build,
+web lint, and `git diff --check`.
 
 The exact committed head `70b615e416add32ca64da9107983bd4a8caef707` then passed the complete
 repository-required sequence:
