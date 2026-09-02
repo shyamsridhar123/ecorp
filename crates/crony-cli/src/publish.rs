@@ -577,17 +577,15 @@ async fn execute_publication(
             "project-review",
         )
         .await?;
-        let pull_request = find_pull_request(args, plan, &resolved_base.pull_request_base_ref)?
-            .context("persisted publication pull request no longer matches its durable identity")?;
-        ensure_remote_pull_request_matches(
-            &pull_request,
-            plan,
-            &resolved_base.pull_request_base_ref,
-        )?;
-        ensure_pull_request_matches_publication(&pull_request, &response.publication)?;
         let (_, refreshed_field_id, refreshed_option_id, refreshed_status) =
             project_status(args, plan)?;
         if refreshed_status == plan.project_status_before {
+            revalidate_durable_pull_request(
+                args,
+                plan,
+                &resolved_base.pull_request_base_ref,
+                &response.publication,
+            )?;
             let edit_result = gh_run(
                 &args.github_cli,
                 &[
@@ -617,6 +615,12 @@ async fn execute_publication(
                 plan.project_review_status
             );
         }
+        revalidate_durable_pull_request(
+            args,
+            plan,
+            &resolved_base.pull_request_base_ref,
+            &response.publication,
+        )?;
         test_crash("after_project_remote");
         checkpoint(
             client,
@@ -1210,6 +1214,18 @@ fn ensure_pull_request_matches_publication(
         bail!("GitHub pull request no longer matches the durable publication identity");
     }
     Ok(())
+}
+
+fn revalidate_durable_pull_request(
+    args: &FactoryPublishArgs,
+    plan: &PublicationPlan,
+    pull_request_base_ref: &str,
+    publication: &PullRequestPublication,
+) -> Result<()> {
+    let pull_request = find_pull_request(args, plan, pull_request_base_ref)?
+        .context("persisted publication pull request no longer matches its durable identity")?;
+    ensure_remote_pull_request_matches(&pull_request, plan, pull_request_base_ref)?;
+    ensure_pull_request_matches_publication(&pull_request, publication)
 }
 
 fn project_status(
