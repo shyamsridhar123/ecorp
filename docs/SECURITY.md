@@ -113,6 +113,16 @@ generic action label.
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
 
+Mission budget recovery is a dedicated owner/admin operation, not a resume parameter. Original
+limits and consumed usage are never reset. Proposal and decision requests are Corp-scoped,
+role-gated, versioned, and exactly idempotent; approval rechecks the current mission limits and
+usage under lock before changing authority.
+
+Finish-scope recovery cannot widen the task budget, write boundary, or verifier policy. Resume
+rejects exhausted authority before provider dispatch and clamps the new run to remaining mission
+and task limits. A `stop` breaker cannot be revised away or resumed. Shared snapshots expose
+revision rationale and decisions for audit but no runner assignment or fencing token.
+
 Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
 declared media type in memory, then performs authoritative assignment, task, budget, and breaker
 checks while reserving the event-specific staging key in Postgres. No object bytes are written

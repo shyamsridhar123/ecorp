@@ -124,6 +124,23 @@ Monotonic steer, constrain, suspend, and stop transitions create immutable incid
 runner directives. Suspend is a terminal provider checkpoint: the session and worktree are
 preserved for an explicit resume. A hard overrun stops immediately.
 
+Mission limits retain immutable original token/cost values plus the current authorized ceiling.
+An exhausted `suspend` can be recovered only through a versioned `mission_budget_revisions`
+aggregate proposed and decided by an owner or admin. The row records current and proposed limits,
+usage at proposal, rationale, exact idempotency keys, proposer, decider, and optional before/after
+task-contract snapshots.
+
+Only one revision can be pending. Proposal and approval both lock and revalidate the Corp, mission,
+latest run, active-run set, current budget, and cumulative usage. Limits never decrease and the
+approved ceiling must still exceed all consumed usage. An optional finish scope targets one
+unfinished task, may reduce its remaining token/cost budget and write scope, and must retain the
+existing verifier policy.
+
+Resume rejects exhausted mission authority before creating a run. An approved recovery creates the
+new run in the same provider session and preserved worktree, with token/cost limits clamped to the
+smaller of the revised task contract and remaining mission authority. A source run at `stop` is
+never recoverable through revision or resume. See ADR 0023.
+
 ## Current vertical slice
 
 ```text
