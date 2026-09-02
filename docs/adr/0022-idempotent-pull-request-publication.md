@@ -70,6 +70,10 @@ recovery reuses a persisted ID only for the same actor and derives a new actor-b
 Body files are normalized to LF and trimmed with the same rules as the server before the idempotent
 request is constructed.
 
+If the authorized snapshot already contains a durable `published` publication, duplicate calls
+return that result before consulting the mutable remote base. Completed publication recovery never
+requires the original base branch to remain unchanged.
+
 Publication does not call GitHub merge APIs, enable auto-merge, deploy, or authorize those effects.
 
 ## Consequences

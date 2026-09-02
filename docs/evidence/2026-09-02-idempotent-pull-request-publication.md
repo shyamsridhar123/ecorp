@@ -7,6 +7,7 @@
 **Resolved-base fix head:** `59638db`
 **Retry and base-branch guard head:** `aa55790`
 **Preflight and actor-handoff head:** `6f4c57c`
+**Completed-retry head:** `173e20e`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -56,6 +57,7 @@ The final exact-head run recorded:
   "implicit_authorization_retry_stable": true,
   "body_file_crlf_normalized": true,
   "actor_handoff_authorization_distinct": true,
+  "published_retry_after_base_move": true,
   "publication_attempts": 8,
   "pull_request_number": 41,
   "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
@@ -111,6 +113,10 @@ server, and the generated authorization identity remained stable across crash, r
 The main publication then expired an Alice-owned attempt, promoted Bob to manager for recovery, and
 proved Bob's attempt received a different authorization ID whose snapshot named Bob. Bob was
 returned to member afterward and Alice completed the remaining recovery path.
+
+After publication completed, the fake remote `main` branch advanced to another commit. A duplicate
+publisher invocation returned the same persisted publication without remote preflight, PR creation,
+or Project mutation.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was

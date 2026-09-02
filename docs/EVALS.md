@@ -261,5 +261,6 @@ pull-request-before-review ordering. It also proves the resolved base branch can
 publication branch, implicit authorization IDs survive duplicate/restart invocation, and CRLF body
 files canonicalize before idempotency comparison. The base-collision case leaves no durable
 publication and accepts a corrected branch afterward, while a second manager's recovery attempt
-receives a distinct actor-bound authorization identity. See
+receives a distinct actor-bound authorization identity. A completed-publication retry also returns
+the persisted result after the remote base advances, without another PR or Project mutation. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

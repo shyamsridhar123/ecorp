@@ -152,6 +152,9 @@ recovery actor receives a new actor-bound ID rather than inheriting the first ac
 body-file normalization matches server canonicalization so idempotency cannot fail on CRLF or a
 trailing newline.
 
+A retry of a durable `published` result performs no remote preflight or external effect. It returns
+the persisted PR identity even if the PR was later merged or the base branch advanced.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.
