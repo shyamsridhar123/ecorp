@@ -850,7 +850,7 @@ fn validate_verification_policy(task_key: &str, policy: &VerificationPolicy) -> 
             || roles.len() > 16
             || roles
                 .iter()
-                .any(|role| role.trim().is_empty() || role.len() > 64)
+                .any(|role| !matches!(role.as_str(), "owner" | "admin" | "manager" | "member"))
         {
             return Err(anyhow!(
                 "task {task_key} manual verification gate is invalid"
@@ -1263,6 +1263,15 @@ mod tests {
             .expect("valid human gate");
         plan.tasks[0].verification_policy.manual_gate =
             Some(ManualVerificationGate::HumanApproval { roles: Vec::new() });
+        assert!(validate_plan(&plan, &agents).is_err());
+
+        let mut plan = registry
+            .plan("human-approval", &request, &agents)
+            .expect("valid human gate");
+        plan.tasks[0].verification_policy.manual_gate =
+            Some(ManualVerificationGate::HumanApproval {
+                roles: vec!["spectator".to_owned()],
+            });
         assert!(validate_plan(&plan, &agents).is_err());
 
         let mut plan = registry

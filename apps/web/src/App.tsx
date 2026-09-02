@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, FormEvent } from 'react'
 import './App.css'
+import './Arcade.css'
 
 type Actor = {
   id: string
@@ -25,6 +26,8 @@ type Mission = {
   id: string
   requested_by: string
   title: string
+  description: string
+  specification_version: number
   strategy: string
   max_nodes: number
   max_depth: number
@@ -51,6 +54,14 @@ type TaskContract = {
   budget_cost_microusd: number
   deadline_at: string | null
   escalation: string
+  secret_refs: {
+    secret_id: string
+    env_name: string
+    tool: string
+    resource: string
+  }[]
+  model: string | null
+  reasoning_effort: string | null
   deliverable: {
     form: 'commit_branch' | 'patch' | 'archive' | 'typed_artifact_set' | 'review_only_report'
     commit_after_verification: boolean
@@ -65,15 +76,74 @@ type Task = {
   objective: string
   plan_key: string
   contract: TaskContract
+  contract_version: number
   depth: number
   max_attempts: number
   attempt_count: number
   required_adapter: string | null
   depends_on: string[]
-  verification_policy: Record<string, unknown>
+  verification_policy: VerificationPolicy
   verification_status: string
   status: string
   assigned_agent_id: string | null
+}
+
+type VerifierCheck =
+  | { type: 'artifact'; min_bytes: number }
+  | { type: 'file'; path: string; min_bytes: number }
+  | { type: 'command'; program: string; args: string[]; timeout_ms: number }
+  | { type: 'test'; program: string; args: string[]; timeout_ms: number }
+  | { type: 'json_schema'; path: string; required_keys: string[] }
+  | { type: 'screenshot'; path: string; min_bytes: number }
+
+type ManualVerificationGate =
+  | { type: 'human_approval'; roles: string[] }
+  | { type: 'independent_review'; roles: string[]; exclude_requester: boolean }
+
+type VerificationPolicy = {
+  checks: VerifierCheck[]
+  manual_gate: ManualVerificationGate | null
+}
+
+type MissionContractRevision = {
+  id: string
+  mission_id: string
+  task_id: string
+  version: number
+  revised_by: string
+  next_action: 'redispatch' | 'resume'
+  source_run_id: string | null
+  reason: string
+  previous_description: string
+  replacement_description: string
+  previous_contract: TaskContract
+  replacement_contract: TaskContract
+  previous_verification_policy: VerificationPolicy
+  replacement_verification_policy: VerificationPolicy
+  created_at: string
+}
+
+type MissionContractInput = Pick<
+  TaskContract,
+  | 'objective'
+  | 'expected_output'
+  | 'acceptance_tests'
+  | 'allowed_tools'
+  | 'prohibited_actions'
+  | 'references'
+  | 'write_scope'
+>
+
+type MissionContractRevisionInput = {
+  task_id: string
+  expected_contract_version: number
+  next_action: 'redispatch' | 'resume'
+  source_run_id: string | null
+  reason: string
+  idempotency_key: string
+  description: string
+  contract: TaskContract
+  verification_policy: VerificationPolicy
 }
 
 type Run = {
@@ -409,6 +479,7 @@ type SnapshotResponse = {
     rooms: { id: string; name: string; purpose: string }[]
     agents: Agent[]
     missions: Mission[]
+    mission_contract_revisions: MissionContractRevision[]
     mission_budget_revisions: MissionBudgetRevision[]
     tasks: Task[]
     runs: Run[]
@@ -608,7 +679,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function shortId(value: string | null | undefined): string {
-  return value ? value.slice(0, 8) : '—'
+  return value ? value.slice(0, 8) : 'none'
 }
 
 function time(value: string): string {
@@ -644,12 +715,636 @@ function nonEmptyLines(value: string): string[] {
     .filter(Boolean)
 }
 
+function commaOrLines(value: string): string[] {
+  return value
+    .split(/[\r\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function defaultVerifierCheck(type: VerifierCheck['type'] = 'artifact'): VerifierCheck {
+  if (type === 'artifact') return { type, min_bytes: 1 }
+  if (type === 'file') return { type, path: 'README.md', min_bytes: 1 }
+  if (type === 'screenshot') {
+    return { type, path: 'evidence/browser.png', min_bytes: 1_000 }
+  }
+  if (type === 'json_schema') {
+    return { type, path: 'evidence/result.json', required_keys: ['status'] }
+  }
+  return {
+    type,
+    program: type === 'test' ? 'pnpm' : 'git',
+    args: type === 'test' ? ['test'] : ['status', '--short'],
+    timeout_ms: 60_000,
+  }
+}
+
+function verifierCheckSummary(check: VerifierCheck): string {
+  if (check.type === 'artifact') {
+    return `Provider artifact · at least ${check.min_bytes.toLocaleString()} bytes`
+  }
+  if (check.type === 'file') {
+    return `File ${check.path} · at least ${check.min_bytes.toLocaleString()} bytes`
+  }
+  if (check.type === 'screenshot') {
+    return `Screenshot ${check.path} · at least ${check.min_bytes.toLocaleString()} bytes`
+  }
+  if (check.type === 'json_schema') {
+    return `JSON ${check.path} · keys: ${check.required_keys.join(', ')}`
+  }
+  return `${check.type === 'test' ? 'Test' : 'Command'} · ${[check.program, ...check.args].join(' ')} · ${Math.round(check.timeout_ms / 1_000)}s`
+}
+
+function verificationPolicyErrors(policy: VerificationPolicy): string[] {
+  const errors: string[] = []
+  if (!policy.checks.length) errors.push('Add at least one verifier check.')
+  if (policy.checks.length > 16) errors.push('Verifier policies support at most 16 checks.')
+  policy.checks.forEach((check, index) => {
+    const label = `Check ${index + 1}`
+    if ('min_bytes' in check && (!Number.isFinite(check.min_bytes) || check.min_bytes < 1)) {
+      errors.push(`${label} needs a positive byte floor.`)
+    }
+    if ('path' in check && !check.path.trim()) errors.push(`${label} needs a repository path.`)
+    if ((check.type === 'command' || check.type === 'test') && !check.program.trim()) {
+      errors.push(`${label} needs an executable program.`)
+    }
+    if (
+      (check.type === 'command' || check.type === 'test') &&
+      (!Number.isFinite(check.timeout_ms) || check.timeout_ms < 100 || check.timeout_ms > 60_000)
+    ) {
+      errors.push(`${label} timeout must be between 100 and 60,000 ms.`)
+    }
+    if (check.type === 'json_schema' && !check.required_keys.length) {
+      errors.push(`${label} needs at least one required JSON key.`)
+    }
+  })
+  if (policy.manual_gate && !policy.manual_gate.roles.length) {
+    errors.push('The manual gate needs at least one eligible role.')
+  } else if (
+    policy.manual_gate?.roles.some(
+      (role) => !['owner', 'admin', 'manager', 'member'].includes(role),
+    )
+  ) {
+    errors.push('Manual-gate roles must be owner, admin, manager, or member.')
+  }
+  return errors
+}
+
 function leaseTokenKey(actorId: string, agentId: string): string {
   return `${actorId}:${agentId}`
 }
 
 function StatusMark({ status }: { status: Agent['status'] }) {
   return <span className={`status-mark status-${status}`} aria-label={status} />
+}
+
+function VerificationPolicyPreview({
+  policy,
+  heading = 'Completion gates',
+}: {
+  policy: VerificationPolicy
+  heading?: string
+}) {
+  return (
+    <div className="verification-policy-preview" data-testid="verification-policy-preview">
+      <strong>{heading}</strong>
+      <ol>
+        {policy.checks.map((check, index) => (
+          <li key={`${check.type}-${index}`}>
+            <span>{index + 1}</span>
+            <p>{verifierCheckSummary(check)}</p>
+          </li>
+        ))}
+      </ol>
+      <div className="verification-gate-summary">
+        <span>Manual gate</span>
+        <strong>
+          {policy.manual_gate
+            ? `${statusLabel(policy.manual_gate.type)} · ${policy.manual_gate.roles.join(', ')}`
+            : 'None'}
+        </strong>
+        {policy.manual_gate?.type === 'independent_review' ? (
+          <small>
+            {policy.manual_gate.exclude_requester
+              ? 'Mission requester is excluded from the decision.'
+              : 'Mission requester may decide if their role is eligible.'}
+          </small>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+function VerificationPolicyEditor({
+  policy,
+  onChange,
+  idPrefix,
+}: {
+  policy: VerificationPolicy
+  onChange: (policy: VerificationPolicy) => void
+  idPrefix: string
+}) {
+  const [selectedCheckIndex, setSelectedCheckIndex] = useState(0)
+  const selectedIndex = Math.min(
+    selectedCheckIndex,
+    Math.max(0, policy.checks.length - 1),
+  )
+  const selectedCheck = policy.checks[selectedIndex]
+  const replaceCheck = (index: number, check: VerifierCheck) => {
+    const checks = policy.checks.slice()
+    checks[index] = check
+    onChange({ ...policy, checks })
+  }
+  const removeCheck = (index: number) => {
+    setSelectedCheckIndex(Math.max(0, Math.min(index - 1, policy.checks.length - 2)))
+    onChange({
+      ...policy,
+      checks: policy.checks.filter((_, candidate) => candidate !== index),
+    })
+  }
+  const setGate = (type: 'none' | ManualVerificationGate['type']) => {
+    if (type === 'none') {
+      onChange({ ...policy, manual_gate: null })
+      return
+    }
+    onChange({
+      ...policy,
+      manual_gate:
+        type === 'human_approval'
+          ? { type, roles: ['owner', 'admin'] }
+          : {
+              type,
+              roles: ['member', 'manager', 'admin', 'owner'],
+              exclude_requester: true,
+            },
+    })
+  }
+  const errors = verificationPolicyErrors(policy)
+
+  return (
+    <div className="verification-policy-editor" data-testid={`${idPrefix}-verification-editor`}>
+      <div className="contract-section-heading">
+        <div>
+          <strong>Victory gate editor</strong>
+          <span>Each check executes on the runner inside the assigned worktree.</span>
+        </div>
+        <button
+          className="button button-secondary"
+          type="button"
+          disabled={policy.checks.length >= 16}
+          onClick={() => {
+            setSelectedCheckIndex(policy.checks.length)
+            onChange({
+              ...policy,
+              checks: [...policy.checks, defaultVerifierCheck('file')],
+            })
+          }}
+        >
+          Add check
+        </button>
+      </div>
+      {policy.checks.length ? (
+        <>
+          <nav className="verification-check-tabs" aria-label="Verifier checks">
+            {policy.checks.map((check, index) => (
+              <button
+                key={`${check.type}-${index}`}
+                type="button"
+                className={selectedIndex === index ? 'check-tab-active' : ''}
+                aria-pressed={selectedIndex === index}
+                onClick={() => setSelectedCheckIndex(index)}
+              >
+                <span>{String(index + 1).padStart(2, '0')}</span>
+                <strong>{statusLabel(check.type)}</strong>
+              </button>
+            ))}
+          </nav>
+          {selectedCheck ? (
+            <fieldset className="verification-check-editor">
+              <legend>Check {selectedIndex + 1}</legend>
+              <div className="verification-check-toolbar">
+                <label>
+                  Type
+                  <select
+                    aria-label={`Verifier check ${selectedIndex + 1} type`}
+                    value={selectedCheck.type}
+                    onChange={(event) =>
+                      replaceCheck(
+                        selectedIndex,
+                        defaultVerifierCheck(
+                          event.target.value as VerifierCheck['type'],
+                        ),
+                      )
+                    }
+                  >
+                    <option value="artifact">Provider artifact</option>
+                    <option value="file">File</option>
+                    <option value="command">Command</option>
+                    <option value="test">Test</option>
+                    <option value="json_schema">JSON schema</option>
+                    <option value="screenshot">Screenshot</option>
+                  </select>
+                </label>
+                <button
+                  className="button button-quiet"
+                  type="button"
+                  onClick={() => removeCheck(selectedIndex)}
+                >
+                  Remove
+                </button>
+              </div>
+              {selectedCheck.type === 'artifact' ? (
+                <label>
+                  Minimum artifact bytes
+                  <input
+                    type="number"
+                    min={1}
+                    value={selectedCheck.min_bytes}
+                    onChange={(event) =>
+                      replaceCheck(selectedIndex, {
+                        ...selectedCheck,
+                        min_bytes: Number(event.target.value),
+                      })
+                    }
+                  />
+                </label>
+              ) : null}
+              {selectedCheck.type === 'file' || selectedCheck.type === 'screenshot' ? (
+                <div className="verification-check-grid">
+                  <label>
+                    Worktree-relative path
+                    <input
+                      value={selectedCheck.path}
+                      onChange={(event) =>
+                        replaceCheck(selectedIndex, {
+                          ...selectedCheck,
+                          path: event.target.value,
+                        })
+                      }
+                      placeholder={
+                        selectedCheck.type === 'screenshot'
+                          ? 'evidence/browser.png'
+                          : 'path/to/result.txt'
+                      }
+                    />
+                  </label>
+                  <label>
+                    Minimum bytes
+                    <input
+                      type="number"
+                      min={1}
+                      value={selectedCheck.min_bytes}
+                      onChange={(event) =>
+                        replaceCheck(selectedIndex, {
+                          ...selectedCheck,
+                          min_bytes: Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+              ) : null}
+              {selectedCheck.type === 'command' || selectedCheck.type === 'test' ? (
+                <>
+                  <div className="verification-check-grid">
+                    <label>
+                      Program
+                      <input
+                        value={selectedCheck.program}
+                        onChange={(event) =>
+                          replaceCheck(selectedIndex, {
+                            ...selectedCheck,
+                            program: event.target.value,
+                          })
+                        }
+                        placeholder="pnpm"
+                      />
+                    </label>
+                    <label>
+                      Timeout in milliseconds
+                      <input
+                        type="number"
+                        min={100}
+                        max={60_000}
+                        value={selectedCheck.timeout_ms}
+                        onChange={(event) =>
+                          replaceCheck(selectedIndex, {
+                            ...selectedCheck,
+                            timeout_ms: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <label>
+                    Arguments, one per line
+                    <textarea
+                      rows={3}
+                      value={selectedCheck.args.join('\n')}
+                      onChange={(event) =>
+                        replaceCheck(selectedIndex, {
+                          ...selectedCheck,
+                          args: nonEmptyLines(event.target.value),
+                        })
+                      }
+                      placeholder={'--dir\napps/web\ntest'}
+                    />
+                  </label>
+                </>
+              ) : null}
+              {selectedCheck.type === 'json_schema' ? (
+                <>
+                  <label>
+                    JSON file
+                    <input
+                      value={selectedCheck.path}
+                      onChange={(event) =>
+                        replaceCheck(selectedIndex, {
+                          ...selectedCheck,
+                          path: event.target.value,
+                        })
+                      }
+                      placeholder="evidence/result.json"
+                    />
+                  </label>
+                  <label>
+                    Required top-level keys
+                    <textarea
+                      rows={3}
+                      value={selectedCheck.required_keys.join('\n')}
+                      onChange={(event) =>
+                        replaceCheck(selectedIndex, {
+                          ...selectedCheck,
+                          required_keys: nonEmptyLines(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                </>
+              ) : null}
+            </fieldset>
+          ) : null}
+        </>
+      ) : (
+        <div className="default-gate-callout">
+          <span>NO CHECKS</span>
+          <strong>Add a victory gate</strong>
+        </div>
+      )}
+      <div className="manual-gate-editor">
+        <label>
+          Final reviewer gate
+          <select
+            value={policy.manual_gate?.type ?? 'none'}
+            onChange={(event) =>
+              setGate(event.target.value as 'none' | ManualVerificationGate['type'])
+            }
+          >
+            <option value="none">No manual gate</option>
+            <option value="human_approval">Human approval</option>
+            <option value="independent_review">Independent review</option>
+          </select>
+        </label>
+        {policy.manual_gate ? (
+          <label>
+            Eligible roles
+            <textarea
+              rows={2}
+              value={policy.manual_gate.roles.join(', ')}
+              onChange={(event) =>
+                onChange({
+                  ...policy,
+                  manual_gate: policy.manual_gate
+                    ? {
+                        ...policy.manual_gate,
+                        roles: commaOrLines(event.target.value),
+                      }
+                    : null,
+                })
+              }
+            />
+          </label>
+        ) : null}
+        {policy.manual_gate?.type === 'independent_review' ? (
+          <label className="mission-run-toggle">
+            <input
+              type="checkbox"
+              checked={policy.manual_gate.exclude_requester}
+              onChange={(event) =>
+                onChange({
+                  ...policy,
+                  manual_gate:
+                    policy.manual_gate?.type === 'independent_review'
+                      ? {
+                          ...policy.manual_gate,
+                          exclude_requester: event.target.checked,
+                        }
+                      : policy.manual_gate,
+                })
+              }
+            />
+            <span>
+              <strong>Exclude the mission requester</strong>
+              <small>Require another operator to accept the evidence.</small>
+            </span>
+          </label>
+        ) : null}
+      </div>
+      {errors.length ? <p className="contract-error">{errors[0]}</p> : null}
+      <details className="verification-plan-disclosure">
+        <summary>Preview exact completion plan</summary>
+        <VerificationPolicyPreview policy={policy} heading="Exact completion plan" />
+      </details>
+    </div>
+  )
+}
+
+function ContractRevisionPanel({
+  mission,
+  task,
+  runs,
+  actorId,
+  actorRole,
+  busy,
+  onRevise,
+}: {
+  mission: Mission
+  task: Task
+  runs: Run[]
+  actorId: string
+  actorRole: string
+  busy: boolean
+  onRevise: (
+    mission: Mission,
+    task: Task,
+    input: MissionContractRevisionInput,
+  ) => Promise<boolean>
+}) {
+  const [open, setOpen] = useState(false)
+  const [description, setDescription] = useState(mission.description)
+  const [reason, setReason] = useState('')
+  const [contractJson, setContractJson] = useState(() =>
+    JSON.stringify(task.contract, null, 2),
+  )
+  const [policyJson, setPolicyJson] = useState(() =>
+    JSON.stringify(task.verification_policy, null, 2),
+  )
+  const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID())
+  const canRevise =
+    actorId === mission.requested_by || ['owner', 'admin', 'manager'].includes(actorRole)
+  const activeRun = runs.some((run) => !terminalRun(run.status))
+  const redispatchEligible = mission.status === 'ready' && runs.length === 0
+  const sourceRun = runs.find(
+    (run) =>
+      run.task_id === task.id &&
+      terminalRun(run.status) &&
+      run.provider_session_id &&
+      run.workspace_disposition === 'preserved' &&
+      run.breaker_stage !== 'stop',
+  )
+  const nextAction: MissionContractRevisionInput['next_action'] | null =
+    !activeRun && redispatchEligible ? 'redispatch' : !activeRun && sourceRun ? 'resume' : null
+  const resetDraft = () => {
+    setDescription(mission.description)
+    setReason('')
+    setContractJson(JSON.stringify(task.contract, null, 2))
+    setPolicyJson(JSON.stringify(task.verification_policy, null, 2))
+    setIdempotencyKey(crypto.randomUUID())
+  }
+  useEffect(() => {
+    if (!open) resetDraft()
+    // Reset only after a committed version arrives or the selected mission changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mission.id, mission.specification_version, task.id, task.contract_version])
+
+  let parsedContract: TaskContract | null = null
+  let parsedPolicy: VerificationPolicy | null = null
+  let parseError: string | null = null
+  try {
+    parsedContract = JSON.parse(contractJson) as TaskContract
+    parsedPolicy = JSON.parse(policyJson) as VerificationPolicy
+    const policyError = verificationPolicyErrors(parsedPolicy)[0]
+    if (policyError) parseError = policyError
+  } catch (caught) {
+    parseError = caught instanceof Error ? caught.message : String(caught)
+  }
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!nextAction || !parsedContract || !parsedPolicy || !reason.trim() || parseError) return
+    const saved = await onRevise(mission, task, {
+      task_id: task.id,
+      expected_contract_version: task.contract_version,
+      next_action: nextAction,
+      source_run_id: nextAction === 'resume' ? sourceRun?.id ?? null : null,
+      reason,
+      idempotency_key: idempotencyKey,
+      description,
+      contract: parsedContract,
+      verification_policy: parsedPolicy,
+    })
+    if (saved) {
+      setOpen(false)
+      setIdempotencyKey(crypto.randomUUID())
+    }
+  }
+
+  if (!nextAction || !canRevise) return null
+  return (
+    <div className="contract-revision-panel" data-testid={`contract-revision-${task.id}`}>
+      {open ? (
+        <form onSubmit={submit}>
+          <div className="contract-section-heading">
+            <div>
+              <strong>
+                Revise for {nextAction === 'resume' ? 'preserved-session resume' : 'redispatch'}
+              </strong>
+              <span>
+                Revision {task.contract_version + 1} is durable and never starts work automatically.
+              </span>
+            </div>
+            <button
+              className="button button-quiet"
+              type="button"
+              onClick={() => {
+                setOpen(false)
+                resetDraft()
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+          <label>
+            Revision reason
+            <textarea
+              rows={2}
+              maxLength={4_000}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              placeholder="What changed, and why is this revision required?"
+            />
+          </label>
+          <label>
+            Mission description / specification
+            <textarea
+              rows={6}
+              maxLength={100_000}
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+            />
+          </label>
+          <label>
+            Typed task contract · JSON
+            <textarea
+              className="contract-json-editor"
+              rows={18}
+              value={contractJson}
+              onChange={(event) => setContractJson(event.target.value)}
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            Typed verifier policy · JSON
+            <textarea
+              className="contract-json-editor"
+              rows={12}
+              value={policyJson}
+              onChange={(event) => setPolicyJson(event.target.value)}
+              spellCheck={false}
+            />
+          </label>
+          {nextAction === 'resume' ? (
+            <small>
+              Resume revisions cannot widen tools or write scope, remove prohibitions, or change
+              source, model, secrets, budget, reasoning, or deliverable authority.
+            </small>
+          ) : null}
+          <div className="contract-revision-footer">
+            <span className={parseError ? 'contract-error' : ''}>
+              {parseError ??
+                `Save revision ${task.contract_version + 1}; then explicitly ${nextAction === 'resume' ? 'resume the preserved run' : 'dispatch the mission'}.`}
+            </span>
+            <button
+              className="button button-primary"
+              type="submit"
+              disabled={busy || Boolean(parseError) || !reason.trim()}
+            >
+              Save revision
+            </button>
+          </div>
+        </form>
+      ) : (
+        <button
+          className="button button-secondary contract-revision-open"
+          type="button"
+          disabled={busy}
+          onClick={() => setOpen(true)}
+        >
+          Revise contract for {nextAction}
+        </button>
+      )}
+    </div>
+  )
 }
 
 function FactoryPanel({
@@ -682,7 +1377,7 @@ function FactoryPanel({
           <h2>Governed issue intake</h2>
           <p>
             GitHub Project work is claimed once, fenced, linked to one mission, and advanced by
-            durable evidence—not labels alone.
+            durable evidence, not labels alone.
           </p>
         </div>
         <div className="operations-summary">
@@ -1812,6 +2507,7 @@ function MissionCard({
   evidence,
   deliverables,
   revisions,
+  contractRevisions,
   actors,
   verificationRequests,
   actionApprovals,
@@ -1824,6 +2520,7 @@ function MissionCard({
   onDownloadDeliverable,
   onProposeBudgetRevision,
   onBudgetRevisionDecision,
+  onContractRevision,
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
@@ -1834,6 +2531,7 @@ function MissionCard({
   evidence: VerificationEvidence[]
   deliverables: SourceDeliverable[]
   revisions: MissionBudgetRevision[]
+  contractRevisions: MissionContractRevision[]
   actors: Actor[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
@@ -1854,6 +2552,11 @@ function MissionCard({
     approved: boolean,
     decisionKey: string,
   ) => Promise<void>
+  onContractRevision: (
+    mission: Mission,
+    task: Task,
+    input: MissionContractRevisionInput,
+  ) => Promise<boolean>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
@@ -1922,7 +2625,11 @@ function MissionCard({
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
-      <div className="strategy-chip">{statusLabel(mission.strategy)}</div>
+      {mission.description ? <p className="mission-description">{mission.description}</p> : null}
+      <div className="mission-chip-row">
+        <div className="strategy-chip">{statusLabel(mission.strategy)}</div>
+        <div className="contract-version-chip">Specification v{mission.specification_version}</div>
+      </div>
       <dl>
         <div>
           <dt>Tasks</dt>
@@ -1958,10 +2665,13 @@ function MissionCard({
                 <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
               </summary>
               <div className="task-contract">
-                <p>{task.objective}</p>
+                <div className="task-contract-heading">
+                  <p>{task.objective}</p>
+                  <span>Contract v{task.contract_version}</span>
+                </div>
                 <dl>
                   <div><dt>Agent</dt><dd>{assignedAgent?.name ?? 'Unassigned'} · {adapterLabel(task.required_adapter ?? assignedAgent?.adapter ?? 'unknown')}</dd></div>
-                  <div><dt>Depends on</dt><dd>{dependencies.length ? dependencies.join(', ') : 'Nothing — ready independently'}</dd></div>
+                  <div><dt>Depends on</dt><dd>{dependencies.length ? dependencies.join(', ') : 'Nothing; ready independently'}</dd></div>
                   <div><dt>Expected output</dt><dd>{task.contract.expected_output}</dd></div>
                   <div>
                     <dt>Repository</dt>
@@ -1977,6 +2687,8 @@ function MissionCard({
                   </div>
                   <div><dt>Budget</dt><dd>{task.contract.budget_tokens.toLocaleString()} tokens</dd></div>
                   <div><dt>Write scope</dt><dd>{task.contract.write_scope.length ? task.contract.write_scope.join(', ') : 'No repository writes declared'}</dd></div>
+                  <div><dt>Allowed tools</dt><dd>{task.contract.allowed_tools.join(', ')}</dd></div>
+                  <div><dt>References</dt><dd>{task.contract.references.length ? task.contract.references.join(', ') : 'None attached'}</dd></div>
                   <div>
                     <dt>Deliverable</dt>
                     <dd>
@@ -1993,11 +2705,67 @@ function MissionCard({
                 <ul>
                   {task.contract.acceptance_tests.map((test) => <li key={test}>{test}</li>)}
                 </ul>
+                <strong>Prohibited actions</strong>
+                <ul>
+                  {task.contract.prohibited_actions.map((action) => (
+                    <li key={action}>{action}</li>
+                  ))}
+                </ul>
+                <VerificationPolicyPreview
+                  policy={task.verification_policy}
+                  heading="Exact completion plan"
+                />
+                <ContractRevisionPanel
+                  mission={mission}
+                  task={task}
+                  runs={runs}
+                  actorId={actorId}
+                  actorRole={actorRole}
+                  busy={busy}
+                  onRevise={onContractRevision}
+                />
               </div>
             </details>
           )
         })}
       </div>
+      {contractRevisions.length ? (
+        <details className="contract-revision-history" data-testid="contract-revision-history">
+          <summary>
+            {contractRevisions.length} contract revision
+            {contractRevisions.length === 1 ? '' : 's'}
+          </summary>
+          <ol>
+            {contractRevisions
+              .toSorted(
+                (left, right) =>
+                  right.version - left.version ||
+                  right.created_at.localeCompare(left.created_at),
+              )
+              .map((revision) => {
+                const task = taskById.get(revision.task_id)
+                const actor = actors.find((candidate) => candidate.id === revision.revised_by)
+                return (
+                  <li key={revision.id}>
+                    <div>
+                      <strong>
+                        v{revision.version} · {statusLabel(revision.next_action)}
+                      </strong>
+                      <span>{task?.plan_key ?? shortId(revision.task_id)}</span>
+                    </div>
+                    <p>{revision.reason}</p>
+                    <small>
+                      {actor?.name ?? shortId(revision.revised_by)} · {time(revision.created_at)}
+                      {revision.source_run_id
+                        ? ` · source run ${shortId(revision.source_run_id)}`
+                        : ''}
+                    </small>
+                  </li>
+                )
+              })}
+          </ol>
+        </details>
+      ) : null}
       {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
         <div className="evidence-box evidence-provider" data-testid="provider-evidence">
           <strong>Provider evidence</strong>
@@ -2437,6 +3205,27 @@ function App() {
   const [data, setData] = useState<SnapshotResponse | null>(null)
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
+  const [missionDescription, setMissionDescription] = useState('')
+  const [missionObjective, setMissionObjective] = useState('')
+  const [missionExpectedOutput, setMissionExpectedOutput] = useState('')
+  const [missionAcceptanceTests, setMissionAcceptanceTests] = useState('')
+  const [missionAllowedTools, setMissionAllowedTools] = useState('')
+  const [missionProhibitedActions, setMissionProhibitedActions] = useState('')
+  const [missionReferences, setMissionReferences] = useState('')
+  const [missionWriteScope, setMissionWriteScope] = useState('')
+  const [customVerification, setCustomVerification] = useState(false)
+  const [missionVerificationPolicy, setMissionVerificationPolicy] =
+    useState<VerificationPolicy>(() => ({
+      checks: [defaultVerifierCheck('artifact')],
+      manual_gate: null,
+    }))
+  const [missionComposerStep, setMissionComposerStep] = useState<
+    'brief' | 'loadout' | 'proof'
+  >('brief')
+  const [missionComposerCollapsed, setMissionComposerCollapsed] = useState(false)
+  const [missionContractTab, setMissionContractTab] = useState<
+    'outcome' | 'guardrails' | 'context'
+  >('outcome')
   const [missionAdapter, setMissionAdapter] = useState('')
   const [missionModel, setMissionModel] = useState('')
   const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
@@ -2463,6 +3252,13 @@ function App() {
   const [connectionToken, setConnectionToken] = useState('')
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
+  const composerInitialized = useRef(false)
+
+  useEffect(() => {
+    if (!data || composerInitialized.current) return
+    composerInitialized.current = true
+    setMissionComposerCollapsed(data.snapshot.missions.length > 0)
+  }, [data])
 
   useEffect(() => {
     const focus = (raw: string) => {
@@ -2657,6 +3453,25 @@ function App() {
     : availableAdapters.some((adapter) => adapter.name === missionAdapter)
       ? missionAdapter
       : preferredAdapter?.name ?? ''
+  const missionContract: MissionContractInput = {
+    objective: missionObjective.trim(),
+    expected_output: missionExpectedOutput.trim(),
+    acceptance_tests: nonEmptyLines(missionAcceptanceTests),
+    allowed_tools: nonEmptyLines(missionAllowedTools),
+    prohibited_actions: nonEmptyLines(missionProhibitedActions),
+    references: nonEmptyLines(missionReferences),
+    write_scope: nonEmptyLines(missionWriteScope),
+  }
+  const missionContractHasInput =
+    Boolean(missionContract.objective || missionContract.expected_output) ||
+    missionContract.acceptance_tests.length > 0 ||
+    missionContract.allowed_tools.length > 0 ||
+    missionContract.prohibited_actions.length > 0 ||
+    missionContract.references.length > 0 ||
+    missionContract.write_scope.length > 0
+  const missionVerifierErrors = customVerification && !deterministicHarness
+    ? verificationPolicyErrors(missionVerificationPolicy)
+    : []
 
   const selectActor = (actor: Actor) => {
     setSelectedActorId(actor.id)
@@ -2681,6 +3496,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           title: missionTitle,
+          description: missionDescription,
           requested_by: selectedActor.id,
           preferred_adapter: effectiveMissionAdapter,
           preferred_model: !deterministicHarness && selectedModel ? missionModel : null,
@@ -2697,6 +3513,11 @@ function App() {
               commitDeliverable || missionDeliverable === 'commit_branch',
             paths: [],
           },
+          contract: missionContractHasInput ? missionContract : null,
+          verification_policy:
+            !deterministicHarness && customVerification
+              ? missionVerificationPolicy
+              : null,
         }),
       })
       let launched: LaunchMissionResponse | null = null
@@ -2710,6 +3531,22 @@ function App() {
         )
       }
       setMissionTitle('')
+      setMissionDescription('')
+      setMissionObjective('')
+      setMissionExpectedOutput('')
+      setMissionAcceptanceTests('')
+      setMissionAllowedTools('')
+      setMissionProhibitedActions('')
+      setMissionReferences('')
+      setMissionWriteScope('')
+      setCustomVerification(false)
+      setMissionVerificationPolicy({
+        checks: [defaultVerifierCheck('artifact')],
+        manual_gate: null,
+      })
+      setMissionComposerStep('brief')
+      setMissionContractTab('outcome')
+      setMissionComposerCollapsed(true)
       const refreshed = await refresh(bootstrap.corp_id, selectedActor.id)
       if (launched) {
         const launchedRun = refreshed.snapshot.runs.find(
@@ -2777,6 +3614,40 @@ function App() {
       await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const createContractRevision = async (
+    mission: Mission,
+    task: Task,
+    input: MissionContractRevisionInput,
+  ): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/missions/${mission.id}/contract-revisions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            ...input,
+          }),
+        },
+      )
+      await refresh(bootstrap.corp_id, selectedActor.id)
+      setAnnouncement(
+        `Contract revision ${task.contract_version + 1} recorded. Explicitly ${
+          input.next_action === 'resume' ? 'resume the preserved run' : 'dispatch the mission'
+        } when ready.`,
+      )
+      return true
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+      return false
     } finally {
       setBusy(false)
     }
@@ -3459,7 +4330,11 @@ function App() {
         publicationAttempts={data.snapshot.pull_request_publication_attempts}
       />
 
-      <section className="office-grid">
+      <section
+        className={`office-grid ${
+          missionComposerCollapsed ? 'office-grid-operating' : 'office-grid-authoring'
+        }`}
+      >
         <div className="floor-panel panel" id="floor">
           <div className="panel-heading">
             <div>
@@ -3522,247 +4397,540 @@ function App() {
               <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
             </div>
           </div>
-          <form className="mission-form" onSubmit={createMission}>
-            <div className="mission-form-heading">
+          {missionComposerCollapsed ? (
+            <div className="arcade-new-mission-bar">
               <div>
-                <strong>What should the crew deliver?</strong>
-                <span>Write the outcome and the proof you expect—not a chat message.</span>
+                <span>MISSION SLOT READY</span>
+                <strong>Launch another quest</strong>
+                <small>The active mission log stays below.</small>
               </div>
-              <span>{missionTitle.length}/240</span>
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => {
+                  setMissionComposerStep('brief')
+                  setMissionComposerCollapsed(false)
+                }}
+              >
+                New mission
+              </button>
             </div>
-            <textarea
-              id="mission-title"
-              aria-label="Mission outcome"
-              value={missionTitle}
-              onChange={(event) => setMissionTitle(event.target.value)}
-              placeholder="Example: Fix checkout totals, add regression tests, and attach the test evidence."
-              rows={4}
-              maxLength={240}
-            />
-            <div className="mission-examples" aria-label="Mission examples">
-              {MISSION_EXAMPLES.map((example) => (
+          ) : (
+          <form className="mission-form arcade-mission-form" onSubmit={createMission}>
+            <div className="arcade-composer-header">
+              <div>
+                <span className="arcade-ready">1P READY</span>
+                <strong>New mission</strong>
+                <small>Brief it. Load it. Prove it.</small>
+              </div>
+              <div className="arcade-score" aria-label="Mission configuration status">
+                <span>SPEC</span>
+                <strong>{missionDescription ? 'ON' : 'OFF'}</strong>
+                <span>GATES</span>
+                <strong>{customVerification ? missionVerificationPolicy.checks.length : 0}</strong>
+              </div>
+            </div>
+
+            <nav className="mission-stage-nav" aria-label="Mission setup stages">
+              {[
+                ['brief', '01', 'Mission'],
+                ['loadout', '02', 'Loadout'],
+                ['proof', '03', 'Win conditions'],
+              ].map(([step, number, label]) => (
                 <button
-                  key={example.label}
+                  key={step}
                   type="button"
-                  onClick={() => setMissionTitle(example.value)}
+                  className={missionComposerStep === step ? 'stage-active' : ''}
+                  aria-current={missionComposerStep === step ? 'step' : undefined}
+                  onClick={() =>
+                    setMissionComposerStep(step as 'brief' | 'loadout' | 'proof')
+                  }
                 >
-                  {example.label}
+                  <span>{number}</span>
+                  <strong>{label}</strong>
                 </button>
               ))}
-            </div>
-            <div className="mission-field">
-              <label htmlFor="mission-adapter">Who should run it?</label>
-              <select
-                id="mission-adapter"
-                value={effectiveMissionAdapter}
-                disabled={deterministicHarness}
-                onChange={(event) => {
-                  setMissionAdapter(event.target.value)
-                  setMissionModel('')
-                  setMissionReasoningEffort('')
-                }}
-              >
-                {availableAdapters.map((adapter) => (
-                  <option key={adapter.name} value={adapter.name}>
-                    {adapterLabel(adapter.name)}
-                    {adapter.name === 'github-copilot'
-                      ? ` · ${adapter.models.filter((model) => model.policy_state !== 'disabled').length} models`
-                      : adapter.name === 'fake-process'
-                        ? ' · no AI'
-                        : ''}
-                  </option>
-                ))}
-              </select>
-              <small className={deterministicHarness || effectiveMissionAdapter === 'fake-process' ? 'field-warning' : ''}>
-                {deterministicHarness
-                  ? 'This lifecycle fixture always uses the deterministic test harness. AI models and reasoning settings do not apply.'
-                  : selectedAdapter
-                  ? adapterDescription(selectedAdapter.name)
-                  : 'Connect a runner to make an agent runtime available.'}
-              </small>
-            </div>
-            {!deterministicHarness && selectedAdapter?.models.length ? (
-              <div className="mission-field">
-                <label htmlFor="mission-model">Model</label>
-                <select
-                  id="mission-model"
-                  value={selectedModel ? missionModel : ''}
-                  onChange={(event) => {
-                    const nextModel = selectedAdapter.models.find(
-                      (model) => model.id === event.target.value,
+            </nav>
+
+            <section className="mission-stage-screen">
+              {missionComposerStep === 'brief' ? (
+                <div className="mission-stage-content stage-brief">
+                  <div className="stage-title">
+                    <span>Mission select</span>
+                    <h3>Name the outcome</h3>
+                    <p>Give the crew one clear objective, then attach the full specification.</p>
+                  </div>
+                  <label className="arcade-input mission-title-input">
+                    Mission outcome
+                    <span>{missionTitle.length}/240</span>
+                    <textarea
+                      id="mission-title"
+                      aria-label="Mission outcome"
+                      value={missionTitle}
+                      onChange={(event) => setMissionTitle(event.target.value)}
+                      placeholder="Fix checkout totals and prove the browser flow."
+                      rows={3}
+                      maxLength={240}
+                    />
+                  </label>
+                  <div className="mission-examples" aria-label="Mission examples">
+                    {MISSION_EXAMPLES.map((example) => (
+                      <button
+                        key={example.label}
+                        type="button"
+                        onClick={() => setMissionTitle(example.value)}
+                      >
+                        {example.label}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="arcade-input mission-description-field">
+                    <span>
+                      Durable specification
+                      <small>{missionDescription.length.toLocaleString()}/100,000</small>
+                    </span>
+                    <textarea
+                      id="mission-description"
+                      aria-label="Mission specification"
+                      value={missionDescription}
+                      onChange={(event) => setMissionDescription(event.target.value)}
+                      placeholder="Paste the issue, requirements, constraints, edge cases, and approved context."
+                      rows={7}
+                      maxLength={100_000}
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              {missionComposerStep === 'loadout' ? (
+                <div className="mission-stage-content stage-loadout">
+                  <div className="stage-title">
+                    <span>Choose your fighter</span>
+                    <h3>Set the execution loadout</h3>
+                    <p>Pick the runtime, budget, delivery format, and orchestration pattern.</p>
+                  </div>
+                  <div className="loadout-grid">
+                    <div className="mission-field">
+                      <label htmlFor="mission-adapter">Agent runtime</label>
+                      <select
+                        id="mission-adapter"
+                        value={effectiveMissionAdapter}
+                        disabled={deterministicHarness}
+                        onChange={(event) => {
+                          setMissionAdapter(event.target.value)
+                          setMissionModel('')
+                          setMissionReasoningEffort('')
+                        }}
+                      >
+                        {availableAdapters.map((adapter) => (
+                          <option key={adapter.name} value={adapter.name}>
+                            {adapterLabel(adapter.name)}
+                            {adapter.name === 'github-copilot'
+                              ? ` • ${adapter.models.filter((model) => model.policy_state !== 'disabled').length} models`
+                              : adapter.name === 'fake-process'
+                                ? ' • no AI'
+                                : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <small
+                        className={
+                          deterministicHarness || effectiveMissionAdapter === 'fake-process'
+                            ? 'field-warning'
+                            : ''
+                        }
+                      >
+                        {deterministicHarness
+                          ? 'This test fixture owns its runtime settings.'
+                          : selectedAdapter
+                            ? adapterDescription(selectedAdapter.name)
+                            : 'Connect a runner to unlock an agent runtime.'}
+                      </small>
+                    </div>
+                    {!deterministicHarness && selectedAdapter?.models.length ? (
+                      <div className="mission-field">
+                        <label htmlFor="mission-model">Model</label>
+                        <select
+                          id="mission-model"
+                          value={selectedModel ? missionModel : ''}
+                          onChange={(event) => {
+                            const nextModel = selectedAdapter.models.find(
+                              (model) => model.id === event.target.value,
+                            )
+                            setMissionModel(event.target.value)
+                            setMissionReasoningEffort(
+                              nextModel?.default_reasoning_effort ?? '',
+                            )
+                          }}
+                        >
+                          <option value="">Provider default</option>
+                          {selectedAdapter.models.map((model) => (
+                            <option
+                              key={model.id}
+                              value={model.id}
+                              disabled={model.policy_state === 'disabled'}
+                            >
+                              {model.name} • {model.id}
+                              {model.policy_state === 'disabled' ? ' • disabled' : ''}
+                            </option>
+                          ))}
+                        </select>
+                        <small>
+                          {selectedModel
+                            ? `${selectedModel.max_context_window_tokens?.toLocaleString() ?? 'Unknown'} context tokens${selectedModel.supports_vision ? ' • vision' : ''}`
+                            : 'Use the provider default or select an enabled model.'}
+                        </small>
+                      </div>
+                    ) : null}
+                    {!deterministicHarness && selectedModel?.supports_reasoning_effort ? (
+                      <div className="mission-field">
+                        <label htmlFor="mission-reasoning">Reasoning</label>
+                        <select
+                          id="mission-reasoning"
+                          value={
+                            selectedModel.supported_reasoning_efforts.includes(
+                              missionReasoningEffort,
+                            )
+                              ? missionReasoningEffort
+                              : ''
+                          }
+                          onChange={(event) =>
+                            setMissionReasoningEffort(event.target.value)
+                          }
+                        >
+                          <option value="">Provider default</option>
+                          {selectedModel.supported_reasoning_efforts.map((effort) => (
+                            <option key={effort} value={effort}>
+                              {effort}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : null}
+                    {!deterministicHarness ? (
+                      <div className="mission-field">
+                        <label htmlFor="mission-budget">Token ceiling</label>
+                        <select
+                          id="mission-budget"
+                          value={missionBudgetTokens}
+                          onChange={(event) =>
+                            setMissionBudgetTokens(Number(event.target.value))
+                          }
+                        >
+                          <option value={500_000}>Quick • 500K</option>
+                          <option value={1_000_000}>Standard • 1M</option>
+                          <option value={2_000_000}>Large • 2M</option>
+                        </select>
+                        <small>A hard mission safety ceiling.</small>
+                      </div>
+                    ) : null}
+                    <div className="mission-field">
+                      <label htmlFor="mission-deliverable">Prize</label>
+                      <select
+                        id="mission-deliverable"
+                        value={missionDeliverable}
+                        onChange={(event) =>
+                          setMissionDeliverable(
+                            event.target.value as NonNullable<
+                              TaskContract['deliverable']
+                            >['form'],
+                          )
+                        }
+                      >
+                        <option value="archive">Source archive</option>
+                        <option value="patch">Git patch</option>
+                        <option value="typed_artifact_set">Typed artifact set</option>
+                        <option value="commit_branch">Commit and branch bundle</option>
+                        <option value="review_only_report">Review report</option>
+                      </select>
+                      <small>Portable source bytes, never a runner-local path.</small>
+                    </div>
+                    <div className="mission-field">
+                      <label htmlFor="mission-strategy">Formation</label>
+                      <select
+                        id="mission-strategy"
+                        value={missionStrategy}
+                        onChange={(event) => setMissionStrategy(event.target.value)}
+                      >
+                        <option value="single">Solo run</option>
+                        <option value="parallel-specialists">Two specialists and synthesis</option>
+                        {developerMode ? (
+                          <optgroup label="Test fixtures">
+                            <option value="verification-matrix">Verification matrix</option>
+                            <option value="human-approval">Human approval</option>
+                            <option value="independent-review">Independent review</option>
+                            <option value="verification-failure">Failure path</option>
+                          </optgroup>
+                        ) : null}
+                      </select>
+                      <small>
+                        {missionStrategy === 'parallel-specialists'
+                          ? 'Parallel roots converge on one synthesis task.'
+                          : missionStrategy === 'single'
+                            ? 'One bounded worker owns the outcome.'
+                            : 'A deterministic product-behavior fixture.'}
+                      </small>
+                    </div>
+                  </div>
+                  <div className="loadout-switches">
+                    <label className="mission-run-toggle">
+                      <input
+                        type="checkbox"
+                        checked={commitDeliverable || missionDeliverable === 'commit_branch'}
+                        disabled={missionDeliverable === 'commit_branch'}
+                        onChange={(event) => setCommitDeliverable(event.target.checked)}
+                      />
+                      <span>
+                        <strong>Commit verified work</strong>
+                        <small>Only inside the isolated task branch.</small>
+                      </span>
+                    </label>
+                    <label className="mission-run-toggle">
+                      <input
+                        type="checkbox"
+                        checked={pauseAfterPlanning}
+                        onChange={(event) => setPauseAfterPlanning(event.target.checked)}
+                      />
+                      <span>
+                        <strong>Hold at briefing</strong>
+                        <small>Review the generated plan before launch.</small>
+                      </span>
+                    </label>
+                    <label className="developer-mode-toggle">
+                      <input
+                        type="checkbox"
+                        checked={developerMode}
+                        onChange={(event) => {
+                          const enabled = event.target.checked
+                          setDeveloperMode(enabled)
+                          if (!enabled && usesDeterministicHarness(missionStrategy)) {
+                            setMissionStrategy('single')
+                          }
+                        }}
+                      />
+                      <span>
+                        <strong>Debug cartridges</strong>
+                        <small>Expose deterministic lifecycle fixtures.</small>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              ) : null}
+
+              {missionComposerStep === 'proof' ? (
+                <div className="mission-stage-content stage-proof">
+                  <div className="stage-title">
+                    <span>Boss rules</span>
+                    <h3>Define the win conditions</h3>
+                    <p>Only the active contract panel is shown. The persisted plan stays inspectable.</p>
+                  </div>
+                  <div className="contract-tab-shell">
+                    <nav className="contract-tab-nav" aria-label="Mission contract sections">
+                      {[
+                        ['outcome', 'Outcome'],
+                        ['guardrails', 'Guardrails'],
+                        ['context', 'Context'],
+                      ].map(([tab, label]) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          className={missionContractTab === tab ? 'contract-tab-active' : ''}
+                          onClick={() =>
+                            setMissionContractTab(
+                              tab as 'outcome' | 'guardrails' | 'context',
+                            )
+                          }
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </nav>
+                    <div className="contract-tab-panel">
+                      {missionContractTab === 'outcome' ? (
+                        <div className="mission-contract-grid">
+                          <label>
+                            Authoritative objective
+                            <textarea
+                              rows={6}
+                              value={missionObjective}
+                              onChange={(event) => setMissionObjective(event.target.value)}
+                              placeholder="What must be true when the task is complete?"
+                            />
+                          </label>
+                          <label>
+                            Expected output
+                            <textarea
+                              rows={6}
+                              value={missionExpectedOutput}
+                              onChange={(event) =>
+                                setMissionExpectedOutput(event.target.value)
+                              }
+                              placeholder="Runnable application, report, migration, or commit."
+                            />
+                          </label>
+                        </div>
+                      ) : null}
+                      {missionContractTab === 'guardrails' ? (
+                        <div className="mission-contract-grid">
+                          <label>
+                            Allowed tools
+                            <textarea
+                              rows={6}
+                              value={missionAllowedTools}
+                              onChange={(event) => setMissionAllowedTools(event.target.value)}
+                              placeholder={'filesystem\nshell\ntest'}
+                            />
+                          </label>
+                          <label>
+                            Prohibited actions
+                            <textarea
+                              rows={6}
+                              value={missionProhibitedActions}
+                              onChange={(event) =>
+                                setMissionProhibitedActions(event.target.value)
+                              }
+                              placeholder={'modify files outside the worktree\nforce push\ndisable verification'}
+                            />
+                          </label>
+                          <label className="contract-wide-field">
+                            Authorized write scope
+                            <textarea
+                              rows={4}
+                              value={missionWriteScope}
+                              onChange={(event) => setMissionWriteScope(event.target.value)}
+                              placeholder={'apps/web/**\ncrates/crony-server/**'}
+                            />
+                          </label>
+                        </div>
+                      ) : null}
+                      {missionContractTab === 'context' ? (
+                        <div className="mission-contract-grid">
+                          <label>
+                            Acceptance criteria
+                            <textarea
+                              rows={7}
+                              value={missionAcceptanceTests}
+                              onChange={(event) =>
+                                setMissionAcceptanceTests(event.target.value)
+                              }
+                              placeholder={'All targeted tests pass\nThe browser flow succeeds'}
+                            />
+                          </label>
+                          <label>
+                            References and approved context
+                            <textarea
+                              rows={7}
+                              value={missionReferences}
+                              onChange={(event) => setMissionReferences(event.target.value)}
+                              placeholder={'docs/SPEC.md\nhttps://github.com/owner/repo/issues/123'}
+                            />
+                          </label>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <label className="mission-run-toggle custom-verification-toggle">
+                    <input
+                      type="checkbox"
+                      checked={customVerification && !deterministicHarness}
+                      disabled={deterministicHarness}
+                      onChange={(event) => {
+                        setCustomVerification(event.target.checked)
+                        if (event.target.checked) setPauseAfterPlanning(true)
+                      }}
+                    />
+                    <span>
+                      <strong>Custom victory gates</strong>
+                      <small>Run exact file, test, schema, screenshot, and reviewer checks.</small>
+                    </span>
+                  </label>
+                  {customVerification && !deterministicHarness ? (
+                    <VerificationPolicyEditor
+                      policy={missionVerificationPolicy}
+                      onChange={setMissionVerificationPolicy}
+                      idPrefix="mission"
+                    />
+                  ) : deterministicHarness ? (
+                    <small className="field-warning">
+                      Debug cartridges own their verifier policy.
+                    </small>
+                  ) : (
+                    <div className="default-gate-callout">
+                      <span>DEFAULT GATE</span>
+                      <strong>Provider artifact must exist</strong>
+                      <small>Turn on custom victory gates for application-level proof.</small>
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </section>
+
+            <div className="arcade-form-controls">
+              {missionComposerStep !== 'brief' ? (
+                <button
+                  className="button button-quiet"
+                  type="button"
+                  onClick={() =>
+                    setMissionComposerStep(
+                      missionComposerStep === 'proof' ? 'loadout' : 'brief',
                     )
-                    setMissionModel(event.target.value)
-                    setMissionReasoningEffort(
-                      nextModel?.default_reasoning_effort ?? '',
-                    )
-                  }}
-                >
-                  <option value="">Provider default</option>
-                  {selectedAdapter.models.map((model) => (
-                    <option
-                      key={model.id}
-                      value={model.id}
-                      disabled={model.policy_state === 'disabled'}
-                    >
-                      {model.name} · {model.id}
-                      {model.policy_state === 'disabled' ? ' · disabled by policy' : ''}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  {selectedModel
-                    ? `${selectedModel.max_context_window_tokens?.toLocaleString() ?? 'Unknown'} context tokens${selectedModel.supports_vision ? ' · vision' : ''}`
-                    : 'Use the provider default or choose an account-enabled model.'}
-                </small>
-              </div>
-            ) : null}
-            {!deterministicHarness && selectedModel?.supports_reasoning_effort ? (
-              <div className="mission-field">
-                <label htmlFor="mission-reasoning">Reasoning effort</label>
-                <select
-                  id="mission-reasoning"
-                  value={
-                    selectedModel.supported_reasoning_efforts.includes(missionReasoningEffort)
-                      ? missionReasoningEffort
-                      : ''
-                  }
-                  onChange={(event) =>
-                    setMissionReasoningEffort(event.target.value)
                   }
                 >
-                  <option value="">Provider default</option>
-                  {selectedModel.supported_reasoning_efforts.map((effort) => (
-                    <option key={effort} value={effort}>
-                      {effort}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : null}
-            {!deterministicHarness ? (
-              <div className="mission-field">
-                <label htmlFor="mission-budget">Mission token budget</label>
-                <select
-                  id="mission-budget"
-                  value={missionBudgetTokens}
-                  onChange={(event) => setMissionBudgetTokens(Number(event.target.value))}
+                  Back
+                </button>
+              ) : <span />}
+              {missionComposerStep === 'brief' ? (
+                <button
+                  className="button button-primary"
+                  type="button"
+                  disabled={!missionTitle.trim()}
+                  onClick={() => setMissionComposerStep('loadout')}
                 >
-                  <option value={500_000}>Quick task · 500,000 tokens</option>
-                  <option value={1_000_000}>Standard · 1,000,000 tokens</option>
-                  <option value={2_000_000}>Large build · 2,000,000 tokens</option>
-                </select>
-                <small>
-                  This is a hard safety ceiling across the run. Use Large build for games or
-                  other multi-file work with high reasoning effort.
-                </small>
-              </div>
-            ) : null}
-            <div className="mission-field">
-              <label htmlFor="mission-deliverable">Portable deliverable</label>
-              <select
-                id="mission-deliverable"
-                value={missionDeliverable}
-                onChange={(event) =>
-                  setMissionDeliverable(
-                    event.target.value as NonNullable<TaskContract['deliverable']>['form'],
-                  )
-                }
-              >
-                <option value="archive">Source archive</option>
-                <option value="patch">Deterministic Git patch</option>
-                <option value="typed_artifact_set">Typed artifact set</option>
-                <option value="commit_branch">Verified commit and branch bundle</option>
-                <option value="review_only_report">Review-only report</option>
-              </select>
-              <small>
-                Source exports include tracked changes and untracked files, but never ignored
-                secret-like paths or runner internals.
-              </small>
+                  Select loadout
+                </button>
+              ) : null}
+              {missionComposerStep === 'loadout' ? (
+                <button
+                  className="button button-primary"
+                  type="button"
+                  disabled={!effectiveMissionAdapter}
+                  onClick={() => setMissionComposerStep('proof')}
+                >
+                  Set win conditions
+                </button>
+              ) : null}
+              {missionComposerStep === 'proof' ? (
+                <button
+                  className="button button-primary mission-submit"
+                  type="submit"
+                  disabled={
+                    busy ||
+                    !missionTitle.trim() ||
+                    !effectiveMissionAdapter ||
+                    missionVerifierErrors.length > 0
+                  }
+                >
+                  {busy
+                    ? 'Loading mission'
+                    : pauseAfterPlanning
+                      ? 'Create mission plan'
+                      : 'Launch mission'}
+                </button>
+              ) : null}
             </div>
-            <label className="mission-run-toggle">
-              <input
-                type="checkbox"
-                checked={commitDeliverable || missionDeliverable === 'commit_branch'}
-                disabled={missionDeliverable === 'commit_branch'}
-                onChange={(event) => setCommitDeliverable(event.target.checked)}
-              />
-              <span>
-                <strong>Commit after verification</strong>
-                <small>
-                  Creates a commit only on the isolated task branch. Publication and merge stay
-                  separate authorized effects.
-                </small>
-              </span>
-            </label>
-            <label className="developer-mode-toggle">
-              <input
-                type="checkbox"
-                checked={developerMode}
-                onChange={(event) => {
-                  const enabled = event.target.checked
-                  setDeveloperMode(enabled)
-                  if (!enabled && usesDeterministicHarness(missionStrategy)) {
-                    setMissionStrategy('single')
-                  }
-                }}
-              />
-              <span>
-                <strong>Developer mode</strong>
-                <small>Expose deterministic lifecycle and verification fixtures.</small>
-              </span>
-            </label>
-            <div className="mission-field">
-              <label htmlFor="mission-strategy">Execution pattern</label>
-              <select
-                id="mission-strategy"
-                value={missionStrategy}
-                onChange={(event) => setMissionStrategy(event.target.value)}
-              >
-                <option value="single">One agent delivers the outcome</option>
-                <option value="parallel-specialists">Two specialists, then synthesis</option>
-                {developerMode ? (
-                  <optgroup label="Deterministic verification fixtures">
-                    <option value="verification-matrix">Automated verification matrix</option>
-                    <option value="human-approval">Pause for human approval</option>
-                    <option value="independent-review">Require an independent reviewer</option>
-                    <option value="verification-failure">Verification failure demo</option>
-                  </optgroup>
-                ) : null}
-              </select>
-              <small>
-                {missionStrategy === 'single'
-                  ? 'Best for a focused build, fix, or review.'
-                  : missionStrategy === 'parallel-specialists'
-                    ? 'ECorp runs two independent approaches before a final synthesis task.'
-                    : missionStrategy.includes('approval') || missionStrategy.includes('review')
-                      ? 'The run pauses until an authorized human records a decision.'
-                      : 'This strategy exercises ECorp verification behavior.'}
-              </small>
-            </div>
-            <label className="mission-run-toggle">
-              <input
-                type="checkbox"
-                checked={pauseAfterPlanning}
-                onChange={(event) => setPauseAfterPlanning(event.target.checked)}
-              />
-              <span>
-                <strong>Pause after planning</strong>
-                <small>Inspect the generated task graph before dispatching agents.</small>
-              </span>
-            </label>
-            <button
-              className="button button-primary mission-submit"
-              type="submit"
-              disabled={busy || !missionTitle.trim() || !effectiveMissionAdapter}
-            >
-              {busy ? 'Working…' : pauseAfterPlanning ? 'Create mission plan' : 'Plan and run mission'}
-            </button>
-            <p className="mission-submit-note">
-              {pauseAfterPlanning
-                ? 'No agent starts until you press “Dispatch mission” on the new plan.'
-                : 'The mission is planned and dispatched immediately. Risky actions still require approval.'}
-            </p>
+            {missionVerifierErrors.length ? (
+              <p className="contract-error">{missionVerifierErrors[0]}</p>
+            ) : null}
+            {missionComposerStep === 'proof' ? (
+              <p className="mission-submit-note">
+                {pauseAfterPlanning
+                  ? 'The crew waits at briefing until you dispatch the reviewed plan.'
+                  : 'The mission launches immediately. Risky effects still require approval.'}
+              </p>
+            ) : null}
           </form>
+          )}
           <div className="mission-list">
             {latestMissions.length ? (
               latestMissions.map((mission) => {
@@ -3781,6 +4949,9 @@ function App() {
                     revisions={data.snapshot.mission_budget_revisions.filter(
                       (revision) => revision.mission_id === mission.id,
                     )}
+                    contractRevisions={data.snapshot.mission_contract_revisions.filter(
+                      (revision) => revision.mission_id === mission.id,
+                    )}
                     actors={data.snapshot.actors}
                     verificationRequests={data.snapshot.verification_requests}
                     actionApprovals={data.snapshot.action_approvals}
@@ -3793,6 +4964,7 @@ function App() {
                     onDownloadDeliverable={downloadDeliverable}
                     onProposeBudgetRevision={proposeBudgetRevision}
                     onBudgetRevisionDecision={decideBudgetRevision}
+                    onContractRevision={createContractRevision}
                     onVerificationDecision={decideVerification}
                     onActionApprovalDecision={decideActionApproval}
                   />

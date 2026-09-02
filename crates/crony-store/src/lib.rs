@@ -5,17 +5,21 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
     Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
-    FactoryWorkItemState, ManualVerificationGate, Mission, MissionBudgetRevision, MissionStatus,
-    NewEvent, PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    FactoryWorkItemState, ManualVerificationGate, Mission, MissionBudgetRevision,
+    MissionContractRevision, MissionContractRevisionAction, MissionStatus, NewEvent,
+    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
-    VerificationRequest, write_scope_is_valid,
+    VerificationRequest, VerifierCheck, repository_relative_path_is_valid, write_scope_allows_path,
+    write_scope_is_valid,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 mod budget_revision;
+mod contract_revision;
 mod publication;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -58,6 +62,29 @@ pub struct DemoIds {
 pub struct MissionPlanIds {
     pub mission_id: Uuid,
     pub task_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMissionContractRevisionInput {
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub actor_id: Uuid,
+    pub expected_contract_version: i64,
+    pub next_action: MissionContractRevisionAction,
+    pub source_run_id: Option<Uuid>,
+    pub reason: String,
+    pub idempotency_key: Uuid,
+    pub description: String,
+    pub contract: TaskContract,
+    pub verification_policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct MissionContractRevisionOutcome {
+    pub revision: MissionContractRevision,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +154,7 @@ pub struct MaterializeFactoryMissionInput {
     pub expected_version: i64,
     pub idempotency_key: String,
     pub title: String,
+    pub description: String,
     pub request: Value,
 }
 
@@ -326,6 +354,7 @@ pub struct ResumeLaunchRecord {
     pub assignment_token: Uuid,
     pub adapter: String,
     pub provider_session_id: String,
+    pub task_prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub source_repository: Option<String>,
@@ -1154,6 +1183,10 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM mission_contract_revisions WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM mission_budget_revisions WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1245,7 +1278,8 @@ impl PgStore {
 
         let missions = sqlx::query(
             r#"
-            SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title, m.strategy,
+            SELECT m.id, m.corp_id, m.room_id, m.requested_by, m.title,
+                   m.description, m.specification_version, m.strategy,
                    m.max_nodes, m.max_depth, m.original_budget_tokens,
                    m.original_budget_cost_microusd, m.budget_tokens,
                    m.budget_cost_microusd, m.status, m.created_at, m.updated_at
@@ -1261,6 +1295,30 @@ impl PgStore {
         .await?
         .into_iter()
         .map(map_mission)
+        .collect::<Result<Vec<_>>>()?;
+
+        let mission_contract_revisions = sqlx::query(
+            r#"
+            SELECT revision.id, revision.corp_id, revision.mission_id, revision.task_id,
+                   revision.version, revision.revised_by, revision.next_action,
+                   revision.source_run_id, revision.reason, revision.previous_description,
+                   revision.replacement_description, revision.previous_contract,
+                   revision.replacement_contract, revision.previous_verification_policy,
+                   revision.replacement_verification_policy, revision.created_at
+            FROM mission_contract_revisions revision
+            JOIN missions mission ON mission.id = revision.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE revision.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY revision.created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_mission_contract_revision)
         .collect::<Result<Vec<_>>>()?;
 
         let mission_budget_revisions = sqlx::query(
@@ -1294,7 +1352,7 @@ impl PgStore {
         let mut tasks = sqlx::query(
             r#"
             SELECT t.id, t.mission_id, t.corp_id, t.title, t.objective, t.plan_key,
-                   t.contract, t.depth, t.max_attempts, t.attempt_count,
+                   t.contract, t.contract_version, t.depth, t.max_attempts, t.attempt_count,
                    t.required_adapter, t.verification_policy, t.verification_status,
                    t.status, t.assigned_agent_id,
                    t.created_at, t.updated_at
@@ -1685,6 +1743,7 @@ impl PgStore {
             rooms,
             agents,
             missions,
+            mission_contract_revisions,
             mission_budget_revisions,
             tasks,
             runs,
@@ -3604,6 +3663,7 @@ impl PgStore {
             input.corp_id,
             input.actor_id,
             &title,
+            &input.description,
             &constrained_plan,
         )
         .await?;
@@ -3685,10 +3745,12 @@ impl PgStore {
         corp_id: Uuid,
         requested_by: Uuid,
         title: &str,
+        description: &str,
         plan: &TaskGraphPlan,
     ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
         let mut tx = self.pool.begin().await?;
-        let outcome = create_mission_tx(&mut tx, corp_id, requested_by, title, plan).await?;
+        let outcome =
+            create_mission_tx(&mut tx, corp_id, requested_by, title, description, plan).await?;
         tx.commit().await?;
         Ok(outcome)
     }
@@ -4056,8 +4118,9 @@ impl PgStore {
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
                    r.breaker_stage AS source_breaker_stage,
-                   t.mission_id, t.contract, t.verification_policy, m.room_id,
-                   m.requested_by,
+                   t.mission_id, t.title AS task_title, t.attempt_count,
+                   t.contract, t.verification_policy, m.room_id,
+                   m.requested_by, m.title AS mission_title,
                    m.budget_tokens AS mission_budget_tokens,
                    m.budget_cost_microusd AS mission_budget_cost_microusd,
                    a.adapter
@@ -4100,6 +4163,12 @@ impl PgStore {
                 .context("decode verification policy")?;
         let contract: TaskContract =
             serde_json::from_value(row.get("contract")).context("decode task contract")?;
+        let task_prompt = format_task_prompt(
+            &row.get::<String, _>("mission_title"),
+            &row.get::<String, _>("task_title"),
+            &contract,
+            row.get::<i32, _>("attempt_count").max(1),
+        );
         let source_breaker_stage: String = row.get("source_breaker_stage");
         if source_breaker_stage == "stop" {
             return Err(anyhow!(
@@ -4316,6 +4385,7 @@ impl PgStore {
                 assignment_token,
                 adapter,
                 provider_session_id,
+                task_prompt,
                 model,
                 reasoning_effort,
                 source_repository: contract.source_repository.clone(),
@@ -7791,9 +7861,11 @@ async fn create_mission_tx(
     corp_id: Uuid,
     requested_by: Uuid,
     title: &str,
+    description: &str,
     plan: &TaskGraphPlan,
 ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
     let title = normalize_mission_title(title)?;
+    let description = normalize_mission_description(description)?;
 
     let room_id: Uuid =
         sqlx::query_scalar("SELECT id FROM rooms WHERE corp_id = $1 ORDER BY created_at LIMIT 1")
@@ -7807,10 +7879,10 @@ async fn create_mission_tx(
     sqlx::query(
         r#"
         INSERT INTO missions
-            (id, corp_id, room_id, requested_by, title, strategy,
+            (id, corp_id, room_id, requested_by, title, description, strategy,
              max_nodes, max_depth, original_budget_tokens,
              original_budget_cost_microusd, budget_tokens, budget_cost_microusd, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, $10, 'ready')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $10, $11, 'ready')
         "#,
     )
     .bind(mission_id)
@@ -7818,6 +7890,7 @@ async fn create_mission_tx(
     .bind(room_id)
     .bind(requested_by)
     .bind(&title)
+    .bind(&description)
     .bind(&plan.strategy)
     .bind(plan.max_nodes)
     .bind(plan.max_depth)
@@ -7839,8 +7912,11 @@ async fn create_mission_tx(
                 mission_id,
                 format!("mission:{mission_id}:created"),
                 json!({
-                    "title": title,
-                    "strategy": plan.strategy,
+                        "title": title,
+                        "description_bytes": description.len(),
+                        "description_sha256": hex::encode(Sha256::digest(description.as_bytes())),
+                        "specification_version": 1,
+                        "strategy": plan.strategy,
                     "max_nodes": plan.max_nodes,
                     "max_depth": plan.max_depth,
                     "budget_tokens": plan.budget_tokens,
@@ -7892,9 +7968,9 @@ async fn create_mission_tx(
             r#"
             INSERT INTO tasks
                 (id, mission_id, corp_id, title, objective, plan_key, contract,
-                 depth, max_attempts, attempt_count, required_adapter, status,
+                 contract_version, depth, max_attempts, attempt_count, required_adapter, status,
                  assigned_agent_id, verification_policy, verification_status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, 'pending')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, 0, $10, $11, $12, $13, 'pending')
             "#,
         )
         .bind(task_id)
@@ -8007,6 +8083,23 @@ async fn create_mission_tx(
 
 fn normalize_mission_title(value: &str) -> Result<String> {
     normalize_factory_text(value, "mission title", 240)
+}
+
+fn normalize_mission_description(value: &str) -> Result<String> {
+    let value = value.replace("\r\n", "\n").replace('\r', "\n");
+    let value = value.trim();
+    if value.len() > 100_000 {
+        return Err(anyhow!("mission description cannot exceed 100000 bytes"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(anyhow!(
+            "mission description cannot contain unsupported control characters"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn apply_factory_source_constraints(
@@ -8202,6 +8295,24 @@ fn validate_factory_plan_against_policy(
             "factory policy does not allow secret {secret_id} for task {}",
             task.key
         ));
+    }
+    if let Some(policy_value) = policy
+        .get("verification_policy")
+        .filter(|value| !value.is_null())
+    {
+        let expected: VerificationPolicy = serde_json::from_value(policy_value.clone())
+            .context("decode factory policy verification policy")?;
+        let delivery_depth = plan.tasks.iter().map(|task| task.depth).max().unwrap_or(0);
+        if let Some(task) = plan
+            .tasks
+            .iter()
+            .find(|task| task.depth == delivery_depth && task.verification_policy != expected)
+        {
+            return Err(anyhow!(
+                "factory task {} does not preserve the persisted delivery verification policy",
+                task.key
+            ));
+        }
     }
     if policy.get("verification_required").and_then(Value::as_bool) != Some(true)
         || plan
@@ -8482,6 +8593,16 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
             let base_ref = factory_policy_required_string(publication, "base_ref", 240)?;
             validate_factory_publication_base_ref(&base_ref)?;
         }
+    }
+    if let Some(verification_policy) = policy_object
+        .get("verification_policy")
+        .filter(|value| !value.is_null())
+    {
+        let verification_policy: VerificationPolicy =
+            serde_json::from_value(verification_policy.clone())
+                .context("factory verification policy is invalid")?;
+        contract_revision::validate_mission_verification_policy(&verification_policy)
+            .context("factory verification policy is invalid")?;
     }
     if policy_object.contains_key("write_scope")
         && let Some(scope) = factory_policy_string_array(policy_object, "write_scope")?
@@ -9335,6 +9456,8 @@ fn map_mission(row: sqlx::postgres::PgRow) -> Result<Mission> {
         room_id: row.get("room_id"),
         requested_by: row.get("requested_by"),
         title: row.get("title"),
+        description: row.get("description"),
+        specification_version: row.get("specification_version"),
         strategy: row.get("strategy"),
         max_nodes: row.get("max_nodes"),
         max_depth: row.get("max_depth"),
@@ -9468,6 +9591,40 @@ fn map_factory_work_item(row: sqlx::postgres::PgRow) -> Result<FactoryWorkItem> 
     })
 }
 
+fn map_mission_contract_revision(row: sqlx::postgres::PgRow) -> Result<MissionContractRevision> {
+    let next_action = match row.get::<String, _>("next_action").as_str() {
+        "redispatch" => MissionContractRevisionAction::Redispatch,
+        "resume" => MissionContractRevisionAction::Resume,
+        other => return Err(anyhow!("unknown mission contract revision action {other}")),
+    };
+    Ok(MissionContractRevision {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        mission_id: row.get("mission_id"),
+        task_id: row.get("task_id"),
+        version: row.get("version"),
+        revised_by: row.get("revised_by"),
+        next_action,
+        source_run_id: row.get("source_run_id"),
+        reason: row.get("reason"),
+        previous_description: row.get("previous_description"),
+        replacement_description: row.get("replacement_description"),
+        previous_contract: serde_json::from_value(row.get("previous_contract"))
+            .context("decode previous mission contract")?,
+        replacement_contract: serde_json::from_value(row.get("replacement_contract"))
+            .context("decode replacement mission contract")?,
+        previous_verification_policy: serde_json::from_value(
+            row.get("previous_verification_policy"),
+        )
+        .context("decode previous mission verifier policy")?,
+        replacement_verification_policy: serde_json::from_value(
+            row.get("replacement_verification_policy"),
+        )
+        .context("decode replacement mission verifier policy")?,
+        created_at: row.get("created_at"),
+    })
+}
+
 fn map_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     Ok(Task {
         id: row.get("id"),
@@ -9477,6 +9634,7 @@ fn map_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         objective: row.get("objective"),
         plan_key: row.get("plan_key"),
         contract: serde_json::from_value(row.get("contract")).context("decode task contract")?,
+        contract_version: row.get("contract_version"),
         depth: row.get("depth"),
         max_attempts: row.get("max_attempts"),
         attempt_count: row.get("attempt_count"),
@@ -10571,6 +10729,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid write scope")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "verification_policy": {
+                    "checks": [{
+                        "type": "file",
+                        "path": "../outside.txt",
+                        "min_bytes": 1
+                    }],
+                    "manual_gate": null
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("factory verification policy is invalid")
         );
     }
 

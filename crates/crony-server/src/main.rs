@@ -27,20 +27,23 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
-use crony_domain::{DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference};
+use crony_domain::{
+    DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference, VerificationPolicy,
+};
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
-    ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse, CreateMissionRequest,
-    CreateMissionResponse, CreatePublicationPublisherCredentialRequest,
-    CreatePublicationPublisherCredentialResponse, CreateRoomMessageRequest,
-    CreateRoomMessageResponse, CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse,
-    CreateSecretRequest, CreateSecretResponse, DecideMissionBudgetRevisionRequest,
-    DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse, FactoryMissionContract,
-    FactoryPublicationContextResponse, FactoryWorkItemResponse, InterruptRunRequest,
-    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
-    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
-    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
-    MissionBudgetRevisionResponse, ProposeMissionBudgetRevisionRequest,
+    ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
+    CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
+    CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
+    CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
+    CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
+    DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
+    EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
+    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
+    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
+    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
+    MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
+    MissionContractRevisionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
@@ -52,7 +55,8 @@ use crony_protocol::{
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
+    ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
+    DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
     MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
     PendingRunnerCommand, PgStore, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
@@ -490,6 +494,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/missions/{mission_id}/budget-revisions",
             post(propose_mission_budget_revision),
+        )
+        .route(
+            "/api/corps/{corp_id}/missions/{mission_id}/contract-revisions",
+            post(create_mission_contract_revision),
         )
         .route(
             "/api/corps/{corp_id}/missions/{mission_id}/budget-revisions/{revision_id}/decision",
@@ -1139,6 +1147,47 @@ async fn propose_mission_budget_revision(
     }))
 }
 
+async fn create_mission_contract_revision(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateMissionContractRevisionRequest>,
+) -> Result<Json<MissionContractRevisionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .create_mission_contract_revision(CreateMissionContractRevisionInput {
+            corp_id,
+            mission_id,
+            task_id: request.task_id,
+            actor_id,
+            expected_contract_version: request.expected_contract_version,
+            next_action: request.next_action,
+            source_run_id: request.source_run_id,
+            reason: request.reason,
+            idempotency_key: request.idempotency_key,
+            description: request.description,
+            contract: request.contract,
+            verification_policy: request.verification_policy,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(MissionContractRevisionResponse {
+        revision: outcome.revision,
+        replayed: outcome.replayed,
+    }))
+}
+
 async fn decide_mission_budget_revision(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1384,6 +1433,7 @@ struct ArtifactDownloadQuery {
 
 struct MissionPlanInput<'a> {
     title: &'a str,
+    description: &'a str,
     preferred_adapter: Option<&'a str>,
     preferred_model: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
@@ -1392,7 +1442,9 @@ struct MissionPlanInput<'a> {
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
     deliverable: Option<&'a crony_domain::DeliverableSpec>,
-    factory_contract: Option<&'a FactoryMissionContract>,
+    contract: Option<&'a FactoryMissionContract>,
+    verification_policy: Option<&'a VerificationPolicy>,
+    require_factory_manual_gate: bool,
 }
 
 async fn plan_mission(
@@ -1445,20 +1497,27 @@ async fn plan_mission(
             &agents,
         )
         .map_err(ApiError::bad_request)?;
-    if let Some(contract) = input.factory_contract {
-        apply_factory_contract(&mut plan, contract)?;
-        validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
+    if let Some(contract) = input.contract {
+        apply_mission_contract(&mut plan, contract)?;
     }
+    apply_mission_description(&mut plan, input.description)?;
+    if let Some(policy) = input.verification_policy {
+        apply_verification_policy(&mut plan, policy);
+    }
+    if input.require_factory_manual_gate {
+        enforce_factory_manual_gate(&mut plan);
+    }
+    validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
     Ok(plan)
 }
 
-fn apply_factory_contract(
+fn apply_mission_contract(
     plan: &mut TaskGraphPlan,
     contract: &FactoryMissionContract,
 ) -> Result<(), ApiError> {
     if contract.objective.len() > 100_000 || contract.expected_output.len() > 10_000 {
         return Err(ApiError::bad_request(
-            "factory mission objective or expected output is too large",
+            "mission objective or expected output is too large",
         ));
     }
     for (name, values) in [
@@ -1470,7 +1529,7 @@ fn apply_factory_contract(
     ] {
         if values.len() > 64 {
             return Err(ApiError::bad_request(format!(
-                "factory mission {name} cannot contain more than 64 entries"
+                "mission {name} cannot contain more than 64 entries"
             )));
         }
     }
@@ -1506,6 +1565,53 @@ fn apply_factory_contract(
         if !contract.write_scope.is_empty() {
             task.contract.write_scope = contract.write_scope.clone();
         }
+    }
+    Ok(())
+}
+
+fn apply_mission_description(plan: &mut TaskGraphPlan, description: &str) -> Result<(), ApiError> {
+    let description = description.replace("\r\n", "\n").replace('\r', "\n");
+    let description = description.trim();
+    if description.len() > 100_000 {
+        return Err(ApiError::bad_request(
+            "mission description cannot exceed 100000 bytes",
+        ));
+    }
+    if description
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(ApiError::bad_request(
+            "mission description cannot contain unsupported control characters",
+        ));
+    }
+    if description.is_empty() {
+        return Ok(());
+    }
+    const SEPARATOR: &str = "\n\nTASK-SPECIFIC OBJECTIVE:\n";
+    for task in &mut plan.tasks {
+        let original = task.contract.objective.trim();
+        task.contract.objective = if description.len() + SEPARATOR.len() + original.len() <= 100_000
+        {
+            format!("{description}{SEPARATOR}{original}")
+        } else {
+            description.to_owned()
+        };
+    }
+    Ok(())
+}
+
+fn apply_verification_policy(plan: &mut TaskGraphPlan, policy: &VerificationPolicy) {
+    let delivery_depth = plan.tasks.iter().map(|task| task.depth).max().unwrap_or(0);
+    for task in &mut plan.tasks {
+        if task.depth == delivery_depth {
+            task.verification_policy = policy.clone();
+        }
+    }
+}
+
+fn enforce_factory_manual_gate(plan: &mut TaskGraphPlan) {
+    for task in &mut plan.tasks {
         if task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
         {
             task.verification_policy.manual_gate =
@@ -1515,7 +1621,6 @@ fn apply_factory_contract(
                 });
         }
     }
-    Ok(())
 }
 
 fn append_unique(target: &mut Vec<String>, values: &[String]) {
@@ -1545,6 +1650,7 @@ async fn create_mission(
         corp_id,
         MissionPlanInput {
             title: &request.title,
+            description: &request.description,
             preferred_adapter: request.preferred_adapter.as_deref(),
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
@@ -1553,13 +1659,21 @@ async fn create_mission(
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
             deliverable: request.deliverable.as_ref(),
-            factory_contract: None,
+            contract: request.contract.as_ref(),
+            verification_policy: request.verification_policy.as_ref(),
+            require_factory_manual_gate: false,
         },
     )
     .await?;
     let (ids, events) = state
         .store
-        .create_mission(corp_id, requested_by, &request.title, &plan)
+        .create_mission(
+            corp_id,
+            requested_by,
+            &request.title,
+            &request.description,
+            &plan,
+        )
         .await
         .map_err(map_store_error)?;
     for event in events {
@@ -1777,6 +1891,7 @@ async fn materialize_factory_mission(
     .await?;
     let operation_request = json!({
         "title": &request.title,
+        "description": &request.description,
         "preferred_adapter": &request.preferred_adapter,
         "preferred_model": &request.preferred_model,
         "reasoning_effort": &request.reasoning_effort,
@@ -1785,7 +1900,8 @@ async fn materialize_factory_mission(
         "budget_tokens": request.budget_tokens,
         "budget_cost_microusd": request.budget_cost_microusd,
         "deliverable": &request.deliverable,
-        "contract": &request.contract
+        "contract": &request.contract,
+        "verification_policy": &request.verification_policy
     });
     let materialize_input = MaterializeFactoryMissionInput {
         corp_id,
@@ -1795,6 +1911,7 @@ async fn materialize_factory_mission(
         expected_version: request.expected_version,
         idempotency_key: request.idempotency_key.clone(),
         title: request.title.clone(),
+        description: request.description.clone(),
         request: operation_request,
     };
     if let Some(outcome) = state
@@ -1817,6 +1934,7 @@ async fn materialize_factory_mission(
         corp_id,
         MissionPlanInput {
             title: &request.title,
+            description: &request.description,
             preferred_adapter: request.preferred_adapter.as_deref(),
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
@@ -1825,7 +1943,9 @@ async fn materialize_factory_mission(
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
             deliverable: request.deliverable.as_ref(),
-            factory_contract: Some(&request.contract),
+            contract: Some(&request.contract),
+            verification_policy: request.verification_policy.as_ref(),
+            require_factory_manual_gate: true,
         },
     )
     .await?;
@@ -2883,7 +3003,7 @@ async fn resume_run(
         assignment_token: record.assignment_token,
         attempt: 0,
         adapter: record.adapter.clone(),
-        mission_title: prompt.to_owned(),
+        mission_title: record.task_prompt.clone(),
         model: record.model.clone(),
         reasoning_effort: record.reasoning_effort.clone(),
         source_repository: record.source_repository.clone(),
@@ -2895,7 +3015,11 @@ async fn resume_run(
         secret_refs: record.secret_refs.clone(),
         queued_messages: record.queued_messages.clone(),
     };
-    let mut resume_prompt = prompt.to_owned();
+    let mut resume_prompt = format!(
+        "{}\n\nRESUME INSTRUCTION:\n{}",
+        record.task_prompt,
+        prompt.trim()
+    );
     append_operator_notes(&mut resume_prompt, &record.queued_messages);
     let secrets = match resolve_run_secrets(&state, &launch_record, &record.runner_id).await {
         Ok(secrets) => secrets,
@@ -4340,14 +4464,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crony_domain::{ManualVerificationGate, TaskGraphPlan};
+    use crony_domain::{
+        ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan, VerificationPolicy,
+        VerifierCheck,
+    };
     use crony_protocol::{FactoryMissionContract, RunnerCapability, RunnerModel};
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        apply_factory_contract, artifact_content_disposition, capability_satisfies_requirement,
-        runner_requirement_mismatch,
+        apply_mission_contract, apply_mission_description, artifact_content_disposition,
+        capability_satisfies_requirement, enforce_factory_manual_gate, runner_requirement_mismatch,
     };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
@@ -4503,7 +4630,7 @@ mod tests {
             }]
         }))
         .expect("valid plan");
-        apply_factory_contract(
+        apply_mission_contract(
             &mut plan,
             &FactoryMissionContract {
                 objective: String::new(),
@@ -4516,6 +4643,7 @@ mod tests {
             },
         )
         .expect("factory contract");
+        enforce_factory_manual_gate(&mut plan);
         assert!(matches!(
             plan.tasks[0].verification_policy.manual_gate,
             Some(ManualVerificationGate::IndependentReview {
@@ -4523,6 +4651,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn mission_description_is_normalized_and_delivered_to_each_task() {
+        let mut plan = TaskGraphPlan {
+            strategy: "single".to_owned(),
+            max_nodes: 1,
+            max_depth: 0,
+            budget_tokens: 1_000,
+            budget_cost_microusd: 1_000_000,
+            tasks: vec![PlannedTask {
+                key: "deliver".to_owned(),
+                title: "Deliver".to_owned(),
+                contract: TaskContract {
+                    objective: "Produce the role-specific output.".to_owned(),
+                    expected_output: "Output".to_owned(),
+                    source_repository: None,
+                    source_base_ref: None,
+                    source_base_commit: None,
+                    acceptance_tests: vec!["tests pass".to_owned()],
+                    allowed_tools: vec!["filesystem".to_owned()],
+                    prohibited_actions: vec!["do not escape".to_owned()],
+                    references: Vec::new(),
+                    write_scope: vec!["**".to_owned()],
+                    budget_tokens: 1_000,
+                    budget_cost_microusd: 1_000_000,
+                    deadline_at: None,
+                    escalation: "ask".to_owned(),
+                    secret_refs: Vec::new(),
+                    model: None,
+                    reasoning_effort: None,
+                    deliverable: None,
+                },
+                assigned_agent_id: Uuid::new_v4(),
+                required_adapter: "fake-process".to_owned(),
+                depends_on: Vec::new(),
+                depth: 0,
+                max_attempts: 1,
+                verification_policy: VerificationPolicy {
+                    checks: vec![VerifierCheck::Artifact { min_bytes: 1 }],
+                    manual_gate: None,
+                },
+            }],
+        };
+        assert!(apply_mission_description(&mut plan, "line one\r\nline two").is_ok());
+        assert_eq!(
+            plan.tasks[0].contract.objective,
+            "line one\nline two\n\nTASK-SPECIFIC OBJECTIVE:\nProduce the role-specific output."
+        );
+        assert!(apply_mission_description(&mut plan, "bad\u{0007}value").is_err());
     }
 
     #[test]

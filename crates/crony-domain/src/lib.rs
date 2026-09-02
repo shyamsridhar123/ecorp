@@ -230,6 +230,8 @@ pub struct Mission {
     pub room_id: Uuid,
     pub requested_by: Uuid,
     pub title: String,
+    pub description: String,
+    pub specification_version: i64,
     pub strategy: String,
     pub max_nodes: i32,
     pub max_depth: i32,
@@ -240,6 +242,42 @@ pub struct Mission {
     pub status: MissionStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionContractRevisionAction {
+    Redispatch,
+    Resume,
+}
+
+impl MissionContractRevisionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redispatch => "redispatch",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionContractRevision {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub version: i64,
+    pub revised_by: Uuid,
+    pub next_action: MissionContractRevisionAction,
+    pub source_run_id: Option<Uuid>,
+    pub reason: String,
+    pub previous_description: String,
+    pub replacement_description: String,
+    pub previous_contract: TaskContract,
+    pub replacement_contract: TaskContract,
+    pub previous_verification_policy: VerificationPolicy,
+    pub replacement_verification_policy: VerificationPolicy,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +554,7 @@ pub struct Task {
     pub objective: String,
     pub plan_key: String,
     pub contract: TaskContract,
+    pub contract_version: i64,
     pub depth: i32,
     pub max_attempts: i32,
     pub attempt_count: i32,
@@ -850,6 +889,8 @@ pub struct CorpSnapshot {
     pub rooms: Vec<Room>,
     pub agents: Vec<Agent>,
     pub missions: Vec<Mission>,
+    #[serde(default)]
+    pub mission_contract_revisions: Vec<MissionContractRevision>,
     pub mission_budget_revisions: Vec<MissionBudgetRevision>,
     pub tasks: Vec<Task>,
     pub runs: Vec<Run>,

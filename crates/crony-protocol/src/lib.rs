@@ -1,6 +1,7 @@
 use crony_domain::{
     CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    MissionBudgetRevision, PullRequestPublication, SourceDeliverable, TaskSecretReference,
+    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction,
+    PullRequestPublication, SourceDeliverable, TaskContract, TaskSecretReference,
     VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -271,6 +272,8 @@ pub struct CreateRoomMessageResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMissionRequest {
     pub title: String,
+    #[serde(default)]
+    pub description: String,
     pub requested_by: Uuid,
     pub preferred_adapter: Option<String>,
     pub preferred_model: Option<String>,
@@ -282,6 +285,10 @@ pub struct CreateMissionRequest {
     pub budget_cost_microusd: Option<i64>,
     #[serde(default)]
     pub deliverable: Option<DeliverableSpec>,
+    #[serde(default)]
+    pub contract: Option<FactoryMissionContract>,
+    #[serde(default)]
+    pub verification_policy: Option<VerificationPolicy>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -464,6 +471,8 @@ pub struct MaterializeFactoryMissionRequest {
     pub expected_version: i64,
     pub idempotency_key: String,
     pub title: String,
+    #[serde(default)]
+    pub description: String,
     pub preferred_adapter: Option<String>,
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -476,6 +485,8 @@ pub struct MaterializeFactoryMissionRequest {
     pub deliverable: Option<DeliverableSpec>,
     #[serde(default)]
     pub contract: FactoryMissionContract,
+    #[serde(default)]
+    pub verification_policy: Option<VerificationPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +643,26 @@ pub struct ResumeRunResponse {
     pub run_id: Uuid,
     pub runner_id: String,
     pub provider_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMissionContractRevisionRequest {
+    pub actor_id: Uuid,
+    pub task_id: Uuid,
+    pub expected_contract_version: i64,
+    pub next_action: MissionContractRevisionAction,
+    pub source_run_id: Option<Uuid>,
+    pub reason: String,
+    pub idempotency_key: Uuid,
+    pub description: String,
+    pub contract: TaskContract,
+    pub verification_policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionContractRevisionResponse {
+    pub revision: MissionContractRevision,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

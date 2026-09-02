@@ -110,6 +110,19 @@ External paths, network URLs, sandbox bypass, managed-policy approvals, and ambi
 commands suspend durably. Shell approval cards include the bounded command text rather than only a
 generic action label.
 
+Mission descriptions, task contracts, and verifier policies are authority-bearing records.
+Creation validates their bounds before persistence, and every revision stores both prior and
+replacement values rather than rewriting history invisibly. Revision idempotency is scoped by Corp
+and exact normalized request. New operations and replay require current mission-room membership;
+the mission and task are locked while membership, actor role, active runs, expected version, and
+mission budget are rechecked.
+
+Pre-dispatch `redispatch` revisions are rejected after any run exists. `resume` revisions require
+the latest terminal preserved provider/worktree checkpoint and reject any lineage that reached a
+hard stop. Resume cannot change source identity, secret references, model, reasoning, budget, or
+deliverable authority; it cannot widen tools or write paths or remove a prohibition. The revision
+does not itself dispatch, preventing a contract mutation from implicitly authorizing execution.
+
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
 
