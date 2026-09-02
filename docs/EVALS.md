@@ -147,6 +147,11 @@ start, streaming, usage de-duplication, live `turn/steer`, graceful `turn/interr
 resume, completed evidence, cancelled evidence, and failed evidence without requiring credentials.
 `tools/e2e_codex.mjs` also emits multiple usage updates during an active turn and proves the
 resulting stop-stage breaker interrupts the Codex path before accepted artifact or completion.
+An authenticated Codex `0.151.0-alpha.7.2` run on September 2, 2026 independently exceeded a
+one-token ceiling, persisted usage before `stop` and runner acknowledgment, rejected its late
+artifact, produced no completion or retry, removed the clean worktree, and rendered a coherent
+failed state in desktop and mobile Chromium. See
+`docs/evidence/2026-09-02-real-provider-budget-stop.md`.
 
 The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
