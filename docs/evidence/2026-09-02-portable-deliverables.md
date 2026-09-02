@@ -263,3 +263,34 @@ Commit `4e8069fde669fcc5df8565d87035d840a812d476` additionally rejects Cargo's
 yarn, pnpm, Bun, Deno, Vercel, Netlify, Cloudflare, Fly, and Azure DevOps user credential stores
 are covered at their standard hidden/config paths. The focused credential regression and the exact
 complete local gate again passed with 76 Rust tests.
+
+## Artifact filename header hardening — September 2, 2026
+
+Commit `51daba62eff3a00e79c40ad3bbe31b1bd5f93af0` closes the final PR #71
+Content-Disposition finding:
+
+- newly uploaded artifact filenames reject double quotes in addition to separators and control
+  characters;
+- downloads no longer interpolate persisted names into a quoted header parameter;
+- every response uses a conservative ASCII fallback plus a percent-encoded UTF-8 `filename*`
+  parameter, so legacy persisted names cannot inject additional disposition parameters; and
+- the artifact E2E asserts the exact attachment header through the real download route.
+
+Both malicious-name regressions passed. The complete local repository gate passed with 23
+immutable migrations, formatting, warning-free workspace clippy, all 78 Rust tests, production web
+build, web lint, and `git diff --check`.
+
+Fresh isolated browser-independent runtime evidence used Postgres, the exact-head server, an
+enrolled outbound runner, isolated Git worktrees, and the normal HTTP artifact API:
+
+- `tools/e2e_artifacts.mjs` passed at `2026-09-02T16:55:54.865Z` with run
+  `97b32ecc-4258-48b7-99d8-d1869b073a99`, verified artifact
+  `7b4569b4-aa32-4346-a587-6b66ab3178a4`, and unauthorized download HTTP `404`;
+- `tools/e2e_portable_deliverables.mjs` passed at `2026-09-02T16:57:08.257Z` with archive run
+  `93763a79-a3d2-49c0-aa26-c785d6a4ac86`, bounded commit
+  `9979867b540c69b7e5360c9ab1e7bc248b4a1e16`, retained-before-cleanup ordering `true`, and
+  unauthorized download HTTP `404`; and
+- the test-owned server, runner, and temporary database were removed after completion.
+
+GitHub-hosted checks remain unavailable because the account has exhausted its Actions credits.
+They were not used as evidence and are not treated as a repository failure.
