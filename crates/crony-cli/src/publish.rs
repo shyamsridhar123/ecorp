@@ -80,6 +80,7 @@ struct PublicationPlan {
     artifact_id: Uuid,
     target_repository: String,
     base_ref: String,
+    verified_base_commit: String,
     branch: String,
     commit_sha: String,
     title: String,
@@ -226,6 +227,7 @@ pub async fn run(client: &Client, server: &str, args: FactoryPublishArgs) -> Res
     if args.dry_run {
         return Ok(plan_json(&args, &plan, "dry_run", None));
     }
+    preflight_publication_target(&plan)?;
 
     let mut response =
         start_publication(client, server, &args, &plan, &plan.idempotency_key).await?;
@@ -740,12 +742,7 @@ fn prepare_repository(
     document: &CommitBranchDocument,
 ) -> Result<ResolvedRemoteBase> {
     source_git_output(&workspace.repository, &["init", "--bare"])?;
-    let remote_url = env::var("ECORP_PUBLICATION_TEST_REMOTE_URL")
-        .unwrap_or_else(|_| format!("https://github.com/{}.git", plan.target_repository));
-    source_git_output(
-        &workspace.repository,
-        &["remote", "add", "origin", &remote_url],
-    )?;
+    add_publication_remote(&workspace.repository, &plan.target_repository)?;
     source_git_output(
         &workspace.repository,
         &["fetch", "--no-tags", "origin", &plan.base_ref],
@@ -810,6 +807,32 @@ fn prepare_repository(
     )
     .context("verify publication commit descends from the authorized base")?;
     Ok(resolved_base)
+}
+
+fn preflight_publication_target(plan: &PublicationPlan) -> Result<()> {
+    let workspace = TemporaryPublisherWorkspace::create()?;
+    source_git_output(&workspace.repository, &["init", "--bare"])?;
+    add_publication_remote(&workspace.repository, &plan.target_repository)?;
+    let resolved = resolve_remote_base(&workspace.repository, &plan.base_ref)?;
+    if !resolved
+        .commit
+        .eq_ignore_ascii_case(&plan.verified_base_commit)
+    {
+        bail!(
+            "remote base {} resolved to {}, not verified commit {}",
+            resolved.pull_request_base_ref,
+            resolved.commit,
+            plan.verified_base_commit
+        );
+    }
+    ensure_distinct_publication_branch(&plan.branch, &resolved.pull_request_base_ref)
+}
+
+fn add_publication_remote(repository: &Path, target_repository: &str) -> Result<()> {
+    let remote_url = env::var("ECORP_PUBLICATION_TEST_REMOTE_URL")
+        .unwrap_or_else(|_| format!("https://github.com/{target_repository}.git"));
+    source_git_output(repository, &["remote", "add", "origin", &remote_url])?;
+    Ok(())
 }
 
 fn ensure_remote_base(
@@ -1250,6 +1273,7 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         })
         .context("publication base ref was not provided or authorized by policy")?;
     let commit_sha = value_string(deliverable, "/head_commit")?;
+    let verified_base_commit = value_string(deliverable, "/base_commit")?;
     let issue_number = value_i64(work_item, "/source_issue_number")?;
     let branch = existing_publication
         .and_then(|publication| publication.get("branch"))
@@ -1298,13 +1322,23 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
                 branch
             )
         });
+    let persisted_publication_actor_id = existing_publication
+        .and_then(|publication| publication.get("actor_id"))
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .context("persisted publication actor id is invalid")?;
     let persisted_authorization_id = existing_publication
         .and_then(|publication| publication.get("authorization_id"))
         .and_then(Value::as_str)
         .map(Uuid::parse_str)
         .transpose()
         .context("persisted publication authorization id is invalid")?;
-    let authorization_id = match (args.authorization_id, persisted_authorization_id) {
+    let same_authorization_actor = persisted_publication_actor_id == Some(args.actor_id);
+    let reusable_authorization_id = same_authorization_actor
+        .then_some(persisted_authorization_id)
+        .flatten();
+    let authorization_id = match (args.authorization_id, reusable_authorization_id) {
         (Some(requested), Some(persisted)) if requested != persisted => {
             bail!(
                 "requested authorization id does not match the persisted publication authorization"
@@ -1327,6 +1361,7 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         artifact_id: value_uuid(deliverable, "/artifact_id")?,
         target_repository,
         base_ref,
+        verified_base_commit,
         branch,
         commit_sha,
         title,
@@ -1416,6 +1451,7 @@ fn plan_json(
         "artifact_id": plan.artifact_id,
         "target_repository": plan.target_repository,
         "base_ref": plan.base_ref,
+        "verified_base_commit": plan.verified_base_commit,
         "branch": plan.branch,
         "commit_sha": plan.commit_sha,
         "title": plan.title,
@@ -1572,5 +1608,6 @@ mod tests {
         let first = stable_authorization_id(actor, "effect");
         assert_eq!(first, stable_authorization_id(actor, "effect"));
         assert_ne!(first, stable_authorization_id(actor, "other-effect"));
+        assert_ne!(first, stable_authorization_id(Uuid::new_v4(), "effect"));
     }
 }

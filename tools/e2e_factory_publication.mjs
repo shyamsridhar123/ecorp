@@ -155,12 +155,13 @@ async function runPublisher(
     branch,
     bodyFile,
     omitAuthorizationId = false,
+    actorId = demo.alice_actor_id,
   } = {},
 ) {
   const args = [
     'factory-publish',
     demo.corp_id,
-    demo.alice_actor_id,
+    actorId,
     workItemId,
     '--authorization-reason',
     'Publication E2E authorizes review-only branch and pull request creation.',
@@ -615,22 +616,38 @@ await runPublisher(demo, collisionWorkItem.id, {
   branch: 'main',
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  expectFailure: collisionFailurePattern,
+})
+const collisionPreflightState = await snapshot(demo)
+assert.equal(
+  collisionPreflightState.snapshot.pull_request_publications.some(
+    (publication) =>
+      publication.factory_work_item_id === collisionWorkItem.id,
+  ),
+  false,
+)
+assert.equal(
+  collisionPreflightState.snapshot.factory_work_items.find(
+    (item) => item.id === collisionWorkItem.id,
+  ).state,
+  'verified',
+)
+const collisionRecoveryBranch = `main-safe-${collisionSource.head_commit.slice(0, 12)}`
+await runPublisher(demo, collisionWorkItem.id, {
+  branch: collisionRecoveryBranch,
+  bodyFile: collisionBodyPath,
+  omitAuthorizationId: true,
   crashAfter: 'after_start',
   expectCrash: true,
 })
 const collisionRestartedServerPid = await restartLocalServer()
 await waitForPublicationLeaseExpiry(demo, collisionWorkItem.id)
 await runPublisher(demo, collisionWorkItem.id, {
-  branch: 'main',
+  branch: collisionRecoveryBranch,
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
-  expectFailure: collisionFailurePattern,
-})
-await runPublisher(demo, collisionWorkItem.id, {
-  branch: 'main',
-  bodyFile: collisionBodyPath,
-  omitAuthorizationId: true,
-  expectFailure: collisionFailurePattern,
+  crashAfter: 'after_start',
+  expectCrash: true,
 })
 const remoteMainAfter = (
   await execFile(
@@ -643,6 +660,10 @@ assert.equal(remoteMainAfter, remoteMainBefore)
 assert.equal(remoteMainAfter, sourceBaseCommit)
 let collisionFakeState = JSON.parse(await readFile(statePath, 'utf8'))
 assert.equal(collisionFakeState.pr_create_calls, 0)
+const collisionPublication = (await snapshot(demo)).snapshot.pull_request_publications.find(
+  (publication) => publication.factory_work_item_id === collisionWorkItem.id,
+)
+assert.equal(collisionPublication.branch, collisionRecoveryBranch)
 assert.equal(
   collisionFakeState.items.find(
     (item) => item.id === collisionWorkItem.source_project_item_id,
@@ -862,12 +883,37 @@ assert.equal(publicationSnapshot.publication.branch_pushed_at, null)
 
 const restartedServerPid = await restartLocalServer()
 await waitForPublicationLeaseExpiry(demo, workItem.id)
+await psql(
+  `UPDATE actors SET role = 'manager' WHERE id = ${sqlLiteral(demo.bob_actor_id)}::uuid;`,
+)
 await runPublisher(demo, workItem.id, {
+  actorId: demo.bob_actor_id,
+  omitAuthorizationId: true,
   crashAfter: 'after_branch_checkpoint',
   expectCrash: true,
 })
 publicationSnapshot = await publicationState(demo, workItem.id)
 assert.equal(publicationSnapshot.publication.state, 'branch_pushed')
+const bobPublicationAttempt =
+  publicationSnapshot.state.snapshot.pull_request_publication_attempts
+    .filter(
+      (attempt) =>
+        attempt.publication_id === publicationSnapshot.publication.id &&
+        attempt.actor_id === demo.bob_actor_id,
+    )
+    .sort((left, right) => right.attempt - left.attempt)[0]
+assert.ok(bobPublicationAttempt)
+assert.equal(
+  bobPublicationAttempt.authorization_snapshot.actor_id,
+  demo.bob_actor_id,
+)
+assert.notEqual(
+  bobPublicationAttempt.authorization_id,
+  publicationSnapshot.publication.authorization_id,
+)
+await psql(
+  `UPDATE actors SET role = 'member' WHERE id = ${sqlLiteral(demo.bob_actor_id)}::uuid;`,
+)
 let fakeState = JSON.parse(await readFile(statePath, 'utf8'))
 assert.equal(
   fakeState.pull_requests.filter(
@@ -1148,6 +1194,7 @@ const report = {
   implicit_authorization_retry_stable: true,
   body_file_crlf_normalized: true,
   implicit_authorization_restart_pid: collisionRestartedServerPid,
+  actor_handoff_authorization_distinct: true,
   factory_work_item_id: workItem.id,
   mission_id: firstController.mission_id,
   source_deliverable_id: source.id,
