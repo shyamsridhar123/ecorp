@@ -41,6 +41,76 @@ async function snapshot(demo) {
   )
 }
 
+async function lookupFactoryItems(demo, sourceProjectItemIds, actorId = demo.alice_actor_id) {
+  return post(`/api/corps/${demo.corp_id}/factory/work-items/lookup`, {
+    actor_id: actorId,
+    source_project_item_ids: sourceProjectItemIds,
+  })
+}
+
+function factoryPolicy({
+  budgetTokens = 20_000,
+  budgetCostMicrousd = 1_000_000,
+  writeScope = ['**'],
+} = {}) {
+  return {
+    schema_version: 1,
+    source_of_truth: 'github_project',
+    project_owner: 'acme',
+    project_number: 7,
+    project_status: 'Todo',
+    required_label: 'factory:ready',
+    dependencies: [],
+    repository_allowlist: ['shyamsridhar123/ecorp'],
+    source_base_ref: 'HEAD',
+    adapter_allowlist: ['fake-process'],
+    strategy_allowlist: ['single'],
+    model: null,
+    reasoning_effort: null,
+    write_scope: writeScope,
+    allowed_tools: ['filesystem', 'shell'],
+    prohibited_actions: [
+      'modify files outside the assigned worktree',
+      'use undeclared long-lived credentials',
+      'merge or deploy without a separate current authorization',
+    ],
+    secret_ids: [],
+    verification_required: true,
+    budget_tokens: budgetTokens,
+    budget_cost_microusd: budgetCostMicrousd,
+    auto_merge: false,
+  }
+}
+
+async function createHistoricalFactoryItems(demo, count) {
+  const claimPath = `/api/corps/${demo.corp_id}/factory/work-items/claim`
+  const batchSize = 32
+  for (let start = 0; start < count; start += batchSize) {
+    await Promise.all(
+      Array.from({ length: Math.min(batchSize, count - start) }, (_, offset) => {
+        const index = start + offset
+        const suffix = String(index).padStart(4, '0')
+        return post(claimPath, {
+          actor_id: demo.alice_actor_id,
+          source_project_owner: 'acme',
+          source_project_number: 7,
+          source_project_item_id: `PVTI_FAKE_FACTORY_HISTORY_${suffix}`,
+          source_repository_owner: 'shyamsridhar123',
+          source_repository_name: 'ecorp',
+          source_issue_number: 20_000 + index,
+          source_issue_node_id: `I_FAKE_FACTORY_HISTORY_${suffix}`,
+          source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${20_000 + index}`,
+          source_title: `Historical factory work item ${suffix}`,
+          source_revision: `2026-08-31T${String(Math.floor(index / 60) % 24).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+          idempotency_key: `factory-history-${suffix}`,
+          lease_seconds: 300,
+          policy: factoryPolicy(),
+        })
+      }),
+    )
+  }
+}
+
 async function runController(
   demo,
   issueNumber,
@@ -51,6 +121,9 @@ async function runController(
     repository = 'ShyamSridhar123/ECorp',
     strategy = 'single',
     githubTimeoutMs,
+    budgetTokens = 20_000,
+    budgetCostMicrousd = 1_000_000,
+    writeScope = ['**'],
   } = {},
 ) {
   const args = [
@@ -68,14 +141,15 @@ async function runController(
     '--strategy',
     strategy,
     '--budget-tokens',
-    '20000',
+    String(budgetTokens),
     '--budget-cost-microusd',
-    '1000000',
+    String(budgetCostMicrousd),
     '--lease-seconds',
     String(leaseSeconds),
     '--github-cli',
     process.execPath,
   ]
+  for (const scope of writeScope) args.push('--write-scope', scope)
   if (issueNumber !== null) args.push('--issue', String(issueNumber))
   if (dryRun) args.push('--dry-run')
   const { stdout } = await execFile(binary, args, {
@@ -94,7 +168,7 @@ async function runController(
   return JSON.parse(stdout)
 }
 
-async function waitForMission(demo, missionId, timeoutMs = 30_000) {
+async function waitForMission(demo, missionId, timeoutMs = 180_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const state = await snapshot(demo)
@@ -370,6 +444,163 @@ const recoveredFakeState = JSON.parse(await readFile(statePath, 'utf8'))
 assert.equal(recoveredFakeState.items[0].status, 'In Progress')
 assert.equal(recoveredFakeState.item_edit_failures, 1)
 const recoveredProjectStatus = recoveredFakeState.items[0].status
+
+const paginationDemo = await post('/api/demo/reset', {})
+const paginationIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9020',
+  number: 9020,
+  title: 'Recover an authoritative factory item beyond the snapshot limit',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9020',
+  createdAt: '2026-09-01T14:20:00Z',
+  updatedAt: '2026-09-01T14:20:00Z',
+}
+const paginationState = {
+  repository: 'shyamsridhar123/ecorp',
+  project: recoveredFakeState.project,
+  items: [
+    {
+      id: 'PVTI_FAKE_FACTORY_9020',
+      status: 'Todo',
+      content: {
+        body: paginationIssue.body,
+        number: paginationIssue.number,
+        repository: 'shyamsridhar123/ecorp',
+        title: paginationIssue.title,
+        type: 'Issue',
+        url: paginationIssue.url,
+      },
+    },
+  ],
+  issues: { '9020': paginationIssue },
+  item_edits: 0,
+  fail_next_item_edit: true,
+  fail_next_item_edit_message:
+    'injected pagination recovery status failure',
+}
+await writeFile(statePath, `${JSON.stringify(paginationState, null, 2)}\n`)
+let paginationInitialFailure
+try {
+  await runController(paginationDemo, 9020)
+} catch (error) {
+  paginationInitialFailure = error
+}
+assert.ok(paginationInitialFailure, 'pagination recovery fixture did not block initially')
+const paginationInitialSnapshot = await snapshot(paginationDemo)
+const paginationInitialItem =
+  paginationInitialSnapshot.snapshot.factory_work_items.find(
+    (item) => item.source_project_item_id === 'PVTI_FAKE_FACTORY_9020',
+  )
+assert.equal(paginationInitialItem.state, 'blocked')
+assert.ok(paginationInitialItem.mission_id)
+const paginationPersistedPolicy = paginationInitialItem.policy
+
+const historicalWorkItemCount = 501
+await createHistoricalFactoryItems(paginationDemo, historicalWorkItemCount)
+const truncatedPaginationSnapshot = await snapshot(paginationDemo)
+assert.equal(truncatedPaginationSnapshot.snapshot.factory_work_items.length, 500)
+assert.equal(
+  truncatedPaginationSnapshot.snapshot.factory_work_items.some(
+    (item) => item.id === paginationInitialItem.id,
+  ),
+  false,
+)
+const paginationLookup = await lookupFactoryItems(paginationDemo, [
+  'PVTI_FAKE_FACTORY_9020',
+  'PVTI_FAKE_FACTORY_MISSING',
+  'PVTI_FAKE_FACTORY_9020',
+])
+assert.equal(paginationLookup.total_count, 1)
+assert.equal(paginationLookup.items.length, 1)
+assert.equal(paginationLookup.items[0].id, paginationInitialItem.id)
+assert.deepEqual(paginationLookup.items[0].policy, paginationPersistedPolicy)
+const guestPaginationLookup = await fetch(
+  `${server}/api/corps/${paginationDemo.corp_id}/factory/work-items/lookup`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: paginationDemo.eve_actor_id,
+      source_project_item_ids: ['PVTI_FAKE_FACTORY_9020'],
+    }),
+  },
+)
+const guestPaginationLookupBody = await guestPaginationLookup.text()
+assert.equal(guestPaginationLookup.status, 403)
+assert.equal(guestPaginationLookupBody.includes(paginationIssue.title), false)
+assert.equal(guestPaginationLookupBody.includes(paginationInitialItem.id), false)
+const oversizedPaginationLookup = await fetch(
+  `${server}/api/corps/${paginationDemo.corp_id}/factory/work-items/lookup`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: paginationDemo.alice_actor_id,
+      source_project_item_ids: Array.from(
+        { length: 1001 },
+        (_, index) => `PVTI_LOOKUP_BOUND_${index}`,
+      ),
+    }),
+  },
+)
+assert.equal(oversizedPaginationLookup.status, 400)
+const overlongPaginationLookup = await fetch(
+  `${server}/api/corps/${paginationDemo.corp_id}/factory/work-items/lookup`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: paginationDemo.alice_actor_id,
+      source_project_item_ids: [`PVTI_${'X'.repeat(236)}`],
+    }),
+  },
+)
+assert.equal(overlongPaginationLookup.status, 400)
+
+const paginationRecovered = await runController(paginationDemo, 9020, false, {
+  budgetTokens: 30_000,
+  budgetCostMicrousd: 2_000_000,
+  writeScope: ['crates/**'],
+})
+assert.equal(paginationRecovered.factory_work_item_id, paginationInitialItem.id)
+assert.equal(paginationRecovered.mission_id, paginationInitialItem.mission_id)
+assert.equal(paginationRecovered.materialized_now, false)
+assert.equal(paginationRecovered.factory_state, 'running')
+const paginationCompleted = await waitForMission(
+  paginationDemo,
+  paginationRecovered.mission_id,
+)
+assert.equal(paginationCompleted.mission.status, 'completed')
+const paginationVerified = await runController(paginationDemo, 9020, false, {
+  budgetTokens: 30_000,
+  budgetCostMicrousd: 2_000_000,
+  writeScope: ['crates/**'],
+})
+assert.equal(paginationVerified.factory_work_item_id, paginationInitialItem.id)
+assert.equal(paginationVerified.mission_id, paginationInitialItem.mission_id)
+assert.equal(paginationVerified.factory_state, 'verified')
+const paginationFinalLookup = await lookupFactoryItems(paginationDemo, [
+  'PVTI_FAKE_FACTORY_9020',
+])
+assert.equal(paginationFinalLookup.total_count, 1)
+const paginationFinalItem = paginationFinalLookup.items[0]
+assert.equal(paginationFinalItem.id, paginationInitialItem.id)
+assert.equal(paginationFinalItem.state, 'verified')
+assert.deepEqual(paginationFinalItem.policy, paginationPersistedPolicy)
+const paginationMissionCount =
+  paginationCompleted.state.snapshot.missions.filter(
+    (item) => item.id === paginationInitialItem.mission_id,
+  ).length
+assert.equal(paginationMissionCount, 1)
+const paginationTaskIds = new Set(
+  paginationCompleted.state.snapshot.tasks
+    .filter((task) => task.mission_id === paginationInitialItem.mission_id)
+    .map((task) => task.id),
+)
+const paginationRuns = paginationCompleted.state.snapshot.runs.filter((run) =>
+  paginationTaskIds.has(run.task_id),
+)
+assert.equal(paginationRuns.length, 1)
 
 const timeoutDemo = await post('/api/demo/reset', {})
 const timeoutIssue = {
@@ -869,6 +1100,25 @@ const report = {
     retry_reused_existing_mission: true,
     recovered_factory_state: recoveredItem.state,
     project_status: recoveredProjectStatus,
+  },
+  pagination_safe_recovery: {
+    issue_number: 9020,
+    project_item_id: 'PVTI_FAKE_FACTORY_9020',
+    historical_work_item_count: historicalWorkItemCount,
+    snapshot_limit: truncatedPaginationSnapshot.snapshot.factory_work_items.length,
+    target_absent_from_snapshot: true,
+    selected_item_lookup_count: paginationLookup.total_count,
+    lookup_input_count_bounded: oversizedPaginationLookup.status === 400,
+    lookup_identifier_size_bounded: overlongPaginationLookup.status === 400,
+    guest_lookup_rejected: guestPaginationLookup.status === 403,
+    factory_work_item_id: paginationFinalItem.id,
+    mission_id: paginationInitialItem.mission_id,
+    run_ids: paginationRuns.map((run) => run.id),
+    exactly_one_mission: paginationMissionCount === 1,
+    exactly_one_run: paginationRuns.length === 1,
+    persisted_policy_reused: true,
+    recovered_without_policy_mismatch: true,
+    factory_state: paginationFinalItem.state,
   },
   project_status_timeout: {
     issue_number: 9011,

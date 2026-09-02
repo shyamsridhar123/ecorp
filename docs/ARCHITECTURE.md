@@ -413,6 +413,13 @@ reserved for the verifier-gated publication operation in #61.
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.
+Controller discovery does not use that bounded snapshot as an index. After listing the current
+GitHub Project candidates, the trusted controller sends only those Project item IDs to a
+Corp-authorized lookup endpoint. The lookup accepts at most 1,000 identifiers, bounds each
+identifier to 240 characters, deduplicates the request, and returns an explicit match count.
+Recovery re-fetches the selected Project item through the same path immediately before claim so
+the persisted source revision, policy snapshot, work item, and mission remain authoritative even
+when more recent historical work items have displaced it from the shared snapshot.
 
 GitHub remains the planning and status source of truth, but external status changes must follow
 durable ECorp transitions. Pull-request publication, merge, and deployment are separate effects

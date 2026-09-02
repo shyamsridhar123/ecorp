@@ -187,9 +187,13 @@ requirement, and rejection of a runner checked out to another repository before 
 `crony-store` unit coverage separately proves exact retention of policy-pinned model and reasoning
 settings on every materialized task and rejects provider-backed tasks without a manual gate. The
 controller E2E proves an independent reviewer, not the requester, advances
-`awaiting_approval -> verified`. CLI unit coverage verifies Markdown section boundaries for
-dependency and acceptance parsing. See
-`docs/evidence/2026-09-01-governed-dark-factory-foundation.md`.
+`awaiting_approval -> verified`. The same E2E creates 501 newer historical factory items, proves
+the recoverable target is absent from the legacy 500-item snapshot, then recovers the exact work
+item, mission, persisted policy, and single run through the selected-Project-item lookup. It also
+proves explicit lookup counts, identifier and request-count bounds, and guest denial. CLI unit
+coverage verifies Markdown section boundaries for dependency and acceptance parsing. See
+`docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
+`docs/evidence/2026-09-01-factory-pagination-safety.md`.
 
 An authenticated Windows probe on August 29, 2026 validated the same path against Codex CLI
 `0.150.0-alpha.8`: one run accepted live steering and completed, a second run was interrupted and

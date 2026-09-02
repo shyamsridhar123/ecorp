@@ -356,6 +356,19 @@ pub struct ClaimFactoryWorkItemRequest {
     pub policy: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LookupFactoryWorkItemsRequest {
+    pub actor_id: Uuid,
+    #[serde(default)]
+    pub source_project_item_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LookupFactoryWorkItemsResponse {
+    pub items: Vec<FactoryWorkItem>,
+    pub total_count: usize,
+}
+
 const fn default_factory_lease_seconds() -> i64 {
     300
 }
