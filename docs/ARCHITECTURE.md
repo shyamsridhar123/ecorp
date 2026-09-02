@@ -483,7 +483,7 @@ publication-context read loads the requested work item, its durable publication,
 deliverable for the linked bounded mission. This keeps initial publication and restart recovery
 available after newer history has displaced any of those objects from shared snapshot limits. Both
 that context and the exact publication-status read join through the viewer's current mission-room
-membership.
+membership; an out-of-room actor receives no work-item source metadata or policy either.
 
 The trusted publisher downloads the signed deliverable and imports its embedded Git bundle into a
 temporary bare repository. It verifies the bundle digest, source branch provenance, exact commit,
@@ -499,6 +499,9 @@ against its advertised explicit branch target. ECorp preserves `HEAD` as the aut
 but passes and persists the resolved branch name, such as `main`, as the actual GitHub PR base.
 Project status reads query the known Project item node ID directly and verify its Project and Status
 field identity; a bounded Project item listing is never used to prove that the item disappeared.
+Factory policy accepts publication bases only as symbolic `HEAD`, a short branch name, or an
+explicit `refs/heads/*` branch. Tags, remote-tracking refs, and invalid Git branch names fail before
+the controller reads candidates or claims a work item, and the store repeats the policy check.
 
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed

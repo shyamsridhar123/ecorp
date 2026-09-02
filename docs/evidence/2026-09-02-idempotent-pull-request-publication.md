@@ -12,6 +12,7 @@
 **Review-blocker closure head:** `5afe09f6abdd4ffa3d25f2365539463d0d51cd23`
 **Room-membership closure head:** `b631bd9e2f0ad8321631c046b38a549da64fec6e`
 **Title-normalization closure head:** `ba20a8347a67c1e1ab6e4b188ad3602b131654c1`
+**Context and base-ref closure head:** `7e8f13f24e5a3f4e923695b2ac00d369a99e15f7`
 **Stacked base:** `e308e54382c573244b67ab7c6d28e94316f2cdd0`
 
 ## Scope
@@ -46,7 +47,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 78 non-documentation unit tests with no failures.
+The Rust workspace ran 79 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -66,6 +67,7 @@ The final exact-head run recorded:
   "actor_handoff_authorization_distinct": true,
   "published_retry_after_base_move": true,
   "exact_publication_context_lookup": true,
+  "cross_room_publication_context_denial": 404,
   "cross_room_publication_start_rejection": 403,
   "cross_room_publication_recovery_rejection": 403,
   "cross_room_publication_status_denial": 404,
@@ -78,7 +80,7 @@ The final exact-head run recorded:
   "project_item_count_during_publication": 1003,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "c1bac06312caa58628a8e29854d041a1254d1d08",
+  "pull_request_head_sha": "5dcf53dcf8d2b97733a8f5dbda5e9f0fee2f320f",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -160,6 +162,11 @@ mission room. A direct start and an expired-lease recovery both returned `403`. 
 publisher attempt was active, the fixture requested exact publication status by the known work-item
 UUID; the endpoint returned `404`, and its response omitted the pull-request body, authorization
 reason and ID, publisher ID, and a persisted failure-detail canary.
+
+The same actor's publication-context read also returned `404`. The response omitted the exact work
+item ID, source issue URL/title, claim owner, policy JSON, and a persisted work-item failure canary,
+proving the initial context lookup is room-scoped rather than only filtering its nested publication
+and deliverables.
 
 The authorized publisher was then removed from the mission room after attempt start at each external
 effect boundary. The pre-branch, pre-pull-request, and pre-Project renewals all returned `403`.
@@ -243,6 +250,12 @@ controller and publication E2Es. No web UI source changed.
 The title-normalization implementation commit
 `ba20a8347a67c1e1ab6e4b188ad3602b131654c1` passed the same repository gates and another fresh
 exact-head run of both focused E2Es.
+
+The context/base-ref implementation commit
+`7e8f13f24e5a3f4e923695b2ac00d369a99e15f7` passed the same repository gates and fresh isolated
+runs of both focused E2Es. The controller report recorded
+`non_branch_publication_base_rejected_before_claim: true`; the invalid `refs/tags/v1` invocation
+created no factory work item and made no Project mutation.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not

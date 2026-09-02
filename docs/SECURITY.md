@@ -150,6 +150,8 @@ The publisher reads its requested work item, publication, and mission deliverabl
 Corp-authorized context endpoint rather than trusting bounded shared snapshots. Exact publication
 status reads apply the same mission-room join; knowing a work-item UUID does not expose pull-request
 body, authorization reason/snapshot, publisher identity, or failure detail to another-room members.
+The context's initial work-item lookup applies that join too, so source issue metadata, factory
+policy, claim ownership, and work-item failure details are not disclosed.
 
 Before every branch push, pull-request creation, and Project mutation, lease renewal transactionally
 rechecks the current attempt actor against its persisted role snapshot and reruns current run,
@@ -177,6 +179,8 @@ the same bounds and control-character rules as the server before plan comparison
 GitHub Project status is read from the exact stored Project item node ID. The publisher verifies the
 returned Project ID, owner, number, item ID, Status field ID, and field type before any mutation, so
 truncated item listings cannot turn a present item into an apparent disappearance.
+Publication base policy is branch-only: the controller and store accept `HEAD`, short branch names,
+or `refs/heads/*`, while rejecting tags and remote-tracking refs before durable claim.
 
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before

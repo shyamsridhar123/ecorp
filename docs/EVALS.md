@@ -292,5 +292,7 @@ recovery return `403`, exact publication status returns `404` without sensitive 
 the active publisher from the mission room makes each pre-branch, pre-PR, and pre-Project renewal
 return `403` before its external effect. A whitespace-padded custom pull-request title is normalized
 before start and idempotency, reaches post-plan validation, and recovers with the exact persisted
-title. See
+title. The cross-room context read also returns `404` without work-item source/policy/failure data,
+and the controller rejects `refs/tags/v1` as a publication base before Project reads or durable
+claim. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
