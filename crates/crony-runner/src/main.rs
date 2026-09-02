@@ -163,6 +163,7 @@ struct Assignment {
     source_base_commit: Option<String>,
     resume_workspace_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
+    write_scope: Vec<String>,
     deliverable: Option<DeliverableSpec>,
     secrets: Vec<ResolvedSecret>,
 }
@@ -598,6 +599,7 @@ async fn run_connection(
                 source_base_ref,
                 source_base_commit,
                 verification_policy,
+                write_scope,
                 deliverable,
                 secrets,
             } => {
@@ -620,6 +622,7 @@ async fn run_connection(
                     source_base_commit,
                     resume_workspace_base_commit: None,
                     verification_policy,
+                    write_scope,
                     deliverable,
                     secrets,
                 };
@@ -723,6 +726,7 @@ async fn run_connection(
                 source_base_commit,
                 workspace_base_commit,
                 verification_policy,
+                write_scope,
                 deliverable,
                 secrets,
             } => {
@@ -745,6 +749,7 @@ async fn run_connection(
                     source_base_commit,
                     resume_workspace_base_commit: workspace_base_commit,
                     verification_policy,
+                    write_scope,
                     deliverable,
                     secrets,
                 };
@@ -1380,6 +1385,7 @@ async fn send_verification_events(
             workspace,
             &report,
             &artifacts,
+            &assignment.write_scope,
         )
         .await
         {

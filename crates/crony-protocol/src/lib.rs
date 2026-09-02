@@ -114,6 +114,8 @@ pub enum ServerToRunner {
         source_base_ref: Option<String>,
         source_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
+        #[serde(default)]
+        write_scope: Vec<String>,
         deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
     },
@@ -136,6 +138,8 @@ pub enum ServerToRunner {
         source_base_commit: Option<String>,
         workspace_base_commit: Option<String>,
         verification_policy: VerificationPolicy,
+        #[serde(default)]
+        write_scope: Vec<String>,
         deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
     },
