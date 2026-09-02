@@ -354,6 +354,16 @@ async fn execute_publication(
     publisher_token: Uuid,
 ) -> Result<()> {
     ensure_publication_matches_plan(&response.publication, plan)?;
+    renew_publication(
+        client,
+        server,
+        args,
+        plan,
+        response,
+        publisher_token,
+        "prepare",
+    )
+    .await?;
     let bytes = download_deliverable(client, server, args, plan.artifact_id).await?;
     let document: CommitBranchDocument =
         serde_json::from_slice(&bytes).context("decode commit/branch deliverable")?;
@@ -535,7 +545,7 @@ async fn renew_publication(
             "publisher_token": publisher_token,
             "expected_version": version,
             "idempotency_key": format!("{}:renew:{stage}:{version}", plan.effect_key),
-            "lease_seconds": args.lease_seconds,
+            "lease_seconds": effect_lease_seconds(args),
         })),
     )
     .await?;
@@ -652,6 +662,12 @@ fn validate_deliverable_document(
         || !document
             .head_commit
             .eq_ignore_ascii_case(&publication.commit_sha)
+        || document.branch
+            != publication
+                .provenance
+                .pointer("/deliverable/source_branch")
+                .and_then(Value::as_str)
+                .context("publication provenance omitted source branch")?
         || document.verification_sha256
             != publication
                 .provenance
@@ -702,9 +718,8 @@ fn prepare_repository(
         &["bundle", "verify", path_text(&workspace.bundle)?],
     )
     .context("verify portable Git bundle prerequisites")?;
-    let source_ref = format!("refs/heads/{}", document.branch);
     let import_ref = "refs/heads/ecorp-import";
-    let refspec = format!("{source_ref}:{import_ref}");
+    let refspec = format!("HEAD:{import_ref}");
     source_git_output(
         &workspace.repository,
         &[
@@ -1137,10 +1152,10 @@ fn publication_plan(args: &FactoryPublishArgs, snapshot: &Value) -> Result<Publi
         project_owner: value_string(work_item, "/source_project_owner")?,
         project_number: value_i64(work_item, "/source_project_number")?,
         project_item_id: value_string(work_item, "/source_project_item_id")?,
-        project_status_before: policy
-            .get("project_status")
+        project_status_before: publication_policy
+            .get("status_before")
             .and_then(Value::as_str)
-            .unwrap_or("In Progress")
+            .context("publication policy omitted status_before")?
             .to_owned(),
         project_review_status: publication_policy
             .get("review_status")
@@ -1226,6 +1241,14 @@ fn default_publisher_id() -> String {
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "local".to_owned());
     format!("crony-cli:{host}")
+}
+
+fn effect_lease_seconds(args: &FactoryPublishArgs) -> i64 {
+    env::var("ECORP_PUBLICATION_EFFECT_LEASE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| args.lease_seconds.max(120))
+        .clamp(args.lease_seconds, 3_600)
 }
 
 fn publication_rank(state: PullRequestPublicationState) -> u8 {

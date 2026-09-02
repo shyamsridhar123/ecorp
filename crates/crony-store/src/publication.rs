@@ -1406,6 +1406,12 @@ async fn validate_publication_prerequisites(
         .filter(|value| !value.trim().is_empty())
         .context("publication policy omitted review_status")?
         .to_owned();
+    let project_status_before = publication_policy
+        .get("status_before")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("publication policy omitted status_before")?
+        .to_owned();
     if !input.body.contains(&work_item.source_issue_url) {
         return Err(anyhow!(
             "pull request body must link the claimed source issue URL"
@@ -1569,12 +1575,6 @@ async fn validate_publication_prerequisites(
             "pull-request publication requires persisted passing verification evidence"
         ));
     }
-    let project_status_before = policy
-        .get("project_status")
-        .and_then(Value::as_str)
-        .unwrap_or("In Progress")
-        .to_owned();
-
     Ok(PublicationPrerequisites {
         work_item,
         mission_id,

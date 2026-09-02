@@ -182,6 +182,9 @@ async function runPublisher(
         ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
         ECORP_FAKE_GITHUB_STATE: statePath,
         ECORP_PUBLICATION_TEST_REMOTE_URL: remotePath,
+        ECORP_PUBLICATION_EFFECT_LEASE_SECONDS: '10',
+        ECORP_GITHUB_COMMAND_TIMEOUT_MS: '1000',
+        ECORP_SOURCE_GIT_COMMAND_TIMEOUT_MS: '5000',
         ...(crashAfter
           ? { ECORP_PUBLICATION_TEST_CRASH_AFTER: crashAfter }
           : {}),
@@ -344,6 +347,15 @@ async function publicationState(demo, workItemId) {
       (item) => item.factory_work_item_id === workItemId,
     ),
   }
+}
+
+async function waitForPublicationLeaseExpiry(demo, workItemId) {
+  const current = await publicationState(demo, workItemId)
+  const expiry = Date.parse(
+    current.publication?.publisher_lease_expires_at ?? new Date().toISOString(),
+  )
+  const delay = Math.max(0, expiry - Date.now()) + 500
+  await new Promise((resolve) => setTimeout(resolve, delay))
 }
 
 await rm(statePath, { force: true })
@@ -576,7 +588,7 @@ assert.equal(publicationSnapshot.publication.state, 'publishing')
 assert.equal(publicationSnapshot.publication.branch_pushed_at, null)
 
 const restartedServerPid = await restartLocalServer()
-await new Promise((resolve) => setTimeout(resolve, 5_500))
+await waitForPublicationLeaseExpiry(demo, workItem.id)
 await setFakeState({ fail_pr_create_after_success: true })
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_pull_request_checkpoint',
@@ -595,7 +607,7 @@ assert.equal(
   'In Progress',
 )
 
-await new Promise((resolve) => setTimeout(resolve, 5_500))
+await waitForPublicationLeaseExpiry(demo, workItem.id)
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_project_remote',
   expectCrash: true,
@@ -609,7 +621,7 @@ assert.equal(
   'In Review',
 )
 
-await new Promise((resolve) => setTimeout(resolve, 5_500))
+await waitForPublicationLeaseExpiry(demo, workItem.id)
 const concurrent = await Promise.all([
   runPublisher(demo, workItem.id, {
     idempotencyKey: `${effectKey}:concurrent-a`,

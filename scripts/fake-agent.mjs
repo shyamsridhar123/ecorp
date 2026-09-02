@@ -27,7 +27,10 @@ const failRun = mission.includes("[always-fail]");
 const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
-const portableDeliverable = mission.includes("[portable-deliverable]");
+const portableDeliverable =
+  mission.includes("[portable-deliverable]") ||
+  (/DELIVERABLE FORM:\s*commit_branch/i.test(mission) &&
+    /COMMIT AFTER VERIFICATION:\s*true/i.test(mission));
 const secretProbe = mission.includes("[secret-probe]");
 const approvalExpiry = mission.includes("[approval-expiry]");
 const approvalBudgetRace = mission.includes("[approval-budget-race]");

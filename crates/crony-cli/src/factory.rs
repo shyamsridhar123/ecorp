@@ -353,6 +353,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                 "repository_allowlist": [args.repository],
                 "base_ref": args.publication_base_ref,
                 "branch_prefix": "ecorp/",
+                "status_before": "In Progress",
                 "review_status": "In Review",
                 "auto_merge": false,
                 "merge": false,

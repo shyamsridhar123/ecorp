@@ -302,7 +302,7 @@ async fn create_git_bundle(
             OsString::from("bundle"),
             OsString::from("create"),
             bundle_path.as_os_str().to_owned(),
-            OsString::from(branch_ref),
+            OsString::from("HEAD"),
             OsString::from(format!("^{base_commit}")),
         ],
     )
@@ -824,6 +824,25 @@ mod tests {
                 .contains(&exported.verification_sha256)
         );
         assert!(git(&root, &["show", "--format=", "--name-only", "HEAD"]).contains("new.txt"));
+        assert!(exported.publication_ready);
+        let document: Value =
+            serde_json::from_slice(&exported.bytes).expect("parse commit/branch deliverable");
+        let bundle = BASE64
+            .decode(
+                document["git_bundle_base64"]
+                    .as_str()
+                    .expect("bundle base64"),
+            )
+            .expect("decode bundle");
+        let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+        assert_eq!(
+            document["git_bundle_sha256"].as_str(),
+            Some(bundle_sha256.as_str())
+        );
+        let bundle_path = root.join("published.bundle");
+        fs::write(&bundle_path, bundle).expect("write bundle");
+        assert!(git(&root, &["bundle", "list-heads", "published.bundle"]).ends_with(" HEAD"));
+        fs::remove_file(bundle_path).expect("remove bundle");
         assert_eq!(git(&root, &["status", "--porcelain=v1"]), "?? provider.md");
         fs::remove_dir_all(root).expect("remove fixture");
     }
