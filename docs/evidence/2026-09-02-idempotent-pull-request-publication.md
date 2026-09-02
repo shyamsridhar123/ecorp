@@ -11,6 +11,7 @@
 **PR-content and deliverable-pin head:** `86472e2`
 **Review-blocker closure head:** `5afe09f6abdd4ffa3d25f2365539463d0d51cd23`
 **Room-membership closure head:** `b631bd9e2f0ad8321631c046b38a549da64fec6e`
+**Title-normalization closure head:** `ba20a8347a67c1e1ab6e4b188ad3602b131654c1`
 **Stacked base:** `e308e54382c573244b67ab7c6d28e94316f2cdd0`
 
 ## Scope
@@ -58,6 +59,7 @@ The final exact-head run recorded:
 {
   "base_branch_collision_rejected": true,
   "invalid_git_branches_rejected_before_start": true,
+  "custom_title_normalized": true,
   "implicit_authorization_retry_stable": true,
   "cross_publisher_default_start_recovery": true,
   "body_file_crlf_normalized": true,
@@ -76,7 +78,7 @@ The final exact-head run recorded:
   "project_item_count_during_publication": 1003,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "4ecbd945a92e97b2cbb6f8d17155d1d298d29988",
+  "pull_request_head_sha": "c1bac06312caa58628a8e29854d041a1254d1d08",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -165,6 +167,11 @@ The remote branch remained absent in the first case, no target-repository pull r
 second, and the Project item stayed `In Progress` in the third. Membership was restored only after
 each denial so the rest of the recovery harness could continue.
 
+The collision-recovery fixture supplied a pull-request title with leading and trailing whitespace.
+The CLI normalized it before deriving the start idempotency key and before sending the durable
+request, then reached a test crash immediately after exact plan validation. Recovery retained the
+trimmed title and created no remote pull request or Project mutation for that fixture.
+
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
 GitHub create operation refused the duplicate head, and ECorp retained `branch_pushed` without a PR
@@ -232,6 +239,10 @@ All four review threads were replied to and resolved.
 The later room-membership implementation commit
 `b631bd9e2f0ad8321631c046b38a549da64fec6e` passed the same repository gates plus fresh isolated
 controller and publication E2Es. No web UI source changed.
+
+The title-normalization implementation commit
+`ba20a8347a67c1e1ab6e4b188ad3602b131654c1` passed the same repository gates and another fresh
+exact-head run of both focused E2Es.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not

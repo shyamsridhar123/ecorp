@@ -514,7 +514,9 @@ recovery, and every renewal also require the acting publisher to remain a curren
 mission room.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
-recovery key instead of conflicting with an earlier operation request.
+recovery key instead of conflicting with an earlier operation request. Custom pull-request titles
+and body files use the server's trim, size, control-character, and newline rules before that
+fingerprint or durable start is constructed.
 
 ## Near-term architecture work
 

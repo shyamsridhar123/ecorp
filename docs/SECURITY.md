@@ -171,7 +171,8 @@ Publication branches pass `git check-ref-format --branch` before the durable sta
 server independently rejects invalid path components such as doubled separators and `.lock`
 suffixes. Default start keys hash the complete normalized request, including publisher identity,
 authorization reason, and lease duration, so changed recovery authority cannot reuse a request key
-whose persisted operation has different fields.
+whose persisted operation has different fields. CLI-provided titles and bodies are normalized with
+the same bounds and control-character rules as the server before plan comparison and idempotency.
 
 GitHub Project status is read from the exact stored Project item node ID. The publisher verifies the
 returned Project ID, owner, number, item ID, Status field ID, and field type before any mutation, so
