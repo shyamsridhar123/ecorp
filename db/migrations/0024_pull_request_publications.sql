@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS pull_request_publications (
     body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 65536),
     actor_id UUID NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
     authorization_id UUID NOT NULL,
-    authorization JSONB NOT NULL,
+    authorization_snapshot JSONB NOT NULL,
     effect_key TEXT NOT NULL CHECK (length(effect_key) BETWEEN 1 AND 500),
     idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 500),
     state TEXT NOT NULL CHECK (
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS pull_request_publication_attempts (
     attempt INTEGER NOT NULL CHECK (attempt > 0),
     actor_id UUID NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
     authorization_id UUID NOT NULL,
-    authorization JSONB NOT NULL,
+    authorization_snapshot JSONB NOT NULL,
     publisher_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('running', 'failed', 'abandoned', 'published')),
     failure_detail TEXT,

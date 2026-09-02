@@ -29,6 +29,8 @@ pub struct ExportedDeliverable {
     pub base_commit: String,
     pub head_commit: Option<String>,
     pub branch: String,
+    pub git_bundle_sha256: Option<String>,
+    pub publication_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +59,13 @@ pub async fn export(
         .parent()
         .context("deliverable worktree has no managed parent")?
         .join(format!(".ecorp-deliverable-{}.index", run_id.simple()));
+    let temporary_bundle = workspace
+        .path
+        .parent()
+        .context("deliverable worktree has no managed parent")?
+        .join(format!(".ecorp-deliverable-{}.bundle", run_id.simple()));
     let _ = tokio::fs::remove_file(&temporary_index).await;
+    let _ = tokio::fs::remove_file(&temporary_bundle).await;
 
     let result = export_with_index(
         spec,
@@ -66,9 +74,11 @@ pub async fn export(
         report,
         provider_artifacts,
         &temporary_index,
+        &temporary_bundle,
     )
     .await;
     let _ = tokio::fs::remove_file(&temporary_index).await;
+    let _ = tokio::fs::remove_file(&temporary_bundle).await;
     result
 }
 
@@ -79,6 +89,7 @@ async fn export_with_index(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     temporary_index: &Path,
+    temporary_bundle: &Path,
 ) -> Result<ExportedDeliverable> {
     git_success(
         workspace_root,
@@ -160,6 +171,27 @@ async fn export_with_index(
     )
     .await?
     .stdout;
+    let git_bundle = if spec.form == DeliverableForm::CommitBranch {
+        let head_commit = head_commit
+            .as_deref()
+            .context("commit/branch deliverable omitted its committed head")?;
+        Some(
+            create_git_bundle(
+                workspace_root,
+                temporary_index,
+                temporary_bundle,
+                &workspace.branch,
+                &workspace.base_commit,
+                head_commit,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let git_bundle_sha256 = git_bundle
+        .as_ref()
+        .map(|bundle| hex::encode(Sha256::digest(bundle)));
 
     let (bytes, file_name, media_type) = match spec.form {
         DeliverableForm::Patch => (
@@ -185,6 +217,8 @@ async fn export_with_index(
                 "verification_sha256": verification_sha256,
                 "patch_sha256": hex::encode(Sha256::digest(&patch)),
                 "patch_base64": include_content.then(|| BASE64.encode(&patch)),
+                "git_bundle_sha256": git_bundle_sha256,
+                "git_bundle_base64": git_bundle.as_ref().map(|bundle| BASE64.encode(bundle)),
                 "changes": archived,
             });
             let name = match form {
@@ -222,7 +256,64 @@ async fn export_with_index(
         base_commit: workspace.base_commit.clone(),
         head_commit,
         branch: workspace.branch.clone(),
+        git_bundle_sha256,
+        publication_ready: spec.form == DeliverableForm::CommitBranch,
     })
+}
+
+async fn create_git_bundle(
+    workspace: &Path,
+    index: &Path,
+    bundle_path: &Path,
+    branch: &str,
+    base_commit: &str,
+    head_commit: &str,
+) -> Result<Vec<u8>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let resolved_head = git_text(
+        workspace,
+        index,
+        &[
+            OsString::from("rev-parse"),
+            OsString::from(format!("{branch_ref}^{{commit}}")),
+        ],
+    )
+    .await?;
+    if resolved_head != head_commit {
+        return Err(anyhow!(
+            "commit/branch deliverable head no longer matches its isolated branch"
+        ));
+    }
+    git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("merge-base"),
+            OsString::from("--is-ancestor"),
+            OsString::from(base_commit),
+            OsString::from(head_commit),
+        ],
+    )
+    .await?;
+    git_success(
+        workspace,
+        index,
+        &[
+            OsString::from("bundle"),
+            OsString::from("create"),
+            bundle_path.as_os_str().to_owned(),
+            OsString::from(branch_ref),
+            OsString::from(format!("^{base_commit}")),
+        ],
+    )
+    .await?;
+    let bundle = tokio::fs::read(bundle_path)
+        .await
+        .context("read portable Git bundle")?;
+    if bundle.is_empty() {
+        return Err(anyhow!("portable Git bundle is empty"));
+    }
+    Ok(bundle)
 }
 
 async fn changed_paths(

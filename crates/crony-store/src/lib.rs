@@ -1424,7 +1424,7 @@ impl PgStore {
                    publication.target_repository, publication.base_ref, publication.branch,
                    publication.commit_sha, publication.title, publication.body,
                    publication.actor_id, publication.authorization_id,
-                   publication.authorization, publication.effect_key,
+                   publication.authorization_snapshot, publication.effect_key,
                    publication.idempotency_key, publication.state, publication.version,
                    publication.attempt_count, publication.publisher_id,
                    publication.publisher_lease_expires_at, publication.failure_detail,
@@ -1465,7 +1465,7 @@ impl PgStore {
         let pull_request_publication_attempts = sqlx::query(
             r#"
             SELECT attempt.id, attempt.corp_id, attempt.publication_id, attempt.attempt,
-                   attempt.actor_id, attempt.authorization_id, attempt.authorization,
+                   attempt.actor_id, attempt.authorization_id, attempt.authorization_snapshot,
                    attempt.publisher_id, attempt.state, attempt.failure_detail,
                    attempt.started_at, attempt.finished_at
             FROM pull_request_publication_attempts attempt
@@ -9011,7 +9011,7 @@ fn map_pull_request_publication(row: sqlx::postgres::PgRow) -> Result<PullReques
         body: row.get("body"),
         actor_id: row.get("actor_id"),
         authorization_id: row.get("authorization_id"),
-        authorization: row.get("authorization"),
+        authorization_snapshot: row.get("authorization_snapshot"),
         effect_key: row.get("effect_key"),
         idempotency_key: row.get("idempotency_key"),
         state: parse_pull_request_publication_state(row.get::<String, _>("state").as_str())?,
@@ -9051,7 +9051,7 @@ fn map_pull_request_publication_attempt(
         attempt: row.get("attempt"),
         actor_id: row.get("actor_id"),
         authorization_id: row.get("authorization_id"),
-        authorization: row.get("authorization"),
+        authorization_snapshot: row.get("authorization_snapshot"),
         publisher_id: row.get("publisher_id"),
         state: row.get("state"),
         failure_detail: row.get("failure_detail"),

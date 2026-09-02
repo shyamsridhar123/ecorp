@@ -25,6 +25,7 @@ pub enum Permission {
     Operate,
     Approve,
     EmergencyStop,
+    Publish,
     Manage,
 }
 
@@ -62,6 +63,9 @@ impl CorpRole {
                 )
             }
             Permission::EmergencyStop => {
+                matches!(self, Self::Owner | Self::Admin | Self::Manager)
+            }
+            Permission::Publish => {
                 matches!(self, Self::Owner | Self::Admin | Self::Manager)
             }
             Permission::Manage => matches!(self, Self::Owner | Self::Admin),

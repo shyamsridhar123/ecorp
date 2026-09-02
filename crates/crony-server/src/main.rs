@@ -36,19 +36,23 @@ use crony_protocol::{
     CreateSecretResponse, DemoBootstrapResponse, EmergencyStopRequest, EmergencyStopResponse,
     FactoryMissionContract, FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse,
     LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
-    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse, QueueMessageRequest,
-    QueueMessageResponse, ReleaseLeaseRequest, RenewFactoryWorkItemRequest, ResolvedSecret,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
+    QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
+    RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokeRunnerRequest, RevokeRunnerResponse,
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SetBudgetPolicyRequest, SnapshotResponse, TransferLeaseRequest,
-    TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
+    SetBudgetPolicyRequest, SnapshotResponse, StartPullRequestPublicationRequest,
+    TransferLeaseRequest, TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
     ClaimFactoryWorkItemInput, FactorySourceInput, LaunchRecord, MaterializeFactoryMissionInput,
-    NewRoomMessageInput, PendingRunnerCommand, PgStore, QueuedRunMessage,
-    RenewFactoryWorkItemInput, RunClaim, RunnerConnectInput, RunnerEventInput,
-    TransitionFactoryWorkItemInput, UpgradeFactorySourceCommitInput,
+    NewRoomMessageInput, PendingRunnerCommand, PgStore, PullRequestPublicationCheckpointInput,
+    PullRequestPublicationOutcome, QueuedRunMessage, RecordPullRequestPublicationCheckpointInput,
+    RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
+    RunnerEventInput, StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
+    UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -423,6 +427,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
             post(materialize_factory_mission),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/publication",
+            get(get_pull_request_publication).post(start_pull_request_publication),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/publications/{publication_id}/renew",
+            post(renew_pull_request_publication),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/publications/{publication_id}/checkpoint",
+            post(record_pull_request_publication_checkpoint),
         )
         .route(
             "/api/corps/{corp_id}/rooms/{room_id}/messages",
@@ -1640,6 +1656,198 @@ async fn materialize_factory_mission(
         work_item: outcome.work_item,
         replayed: outcome.replayed,
     }))
+}
+
+async fn get_pull_request_publication(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<PullRequestPublicationResponse>, ApiError> {
+    authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let publication = state
+        .store
+        .pull_request_publication_for_work_item(corp_id, work_item_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("pull-request publication was not found"))?;
+    let busy = publication.state != crony_domain::PullRequestPublicationState::Published
+        && publication
+            .publisher_lease_expires_at
+            .is_some_and(|expiry| expiry > Utc::now());
+    Ok(Json(PullRequestPublicationResponse {
+        publication,
+        publisher_token: None,
+        replayed: false,
+        busy,
+    }))
+}
+
+async fn start_pull_request_publication(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<StartPullRequestPublicationRequest>,
+) -> Result<Json<PullRequestPublicationResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Publish,
+    )
+    .await?;
+    let actor_role = state
+        .store
+        .human_authorization(corp_id, actor_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::forbidden("publication actor is not a human Corp member"))?
+        .role;
+    let outcome = state
+        .store
+        .start_pull_request_publication(StartPullRequestPublicationInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            actor_role,
+            source_deliverable_id: request.source_deliverable_id,
+            target_repository: request.target_repository,
+            base_ref: request.base_ref,
+            branch: request.branch,
+            title: request.title,
+            body: request.body,
+            authorization_id: request.authorization_id,
+            authorization_reason: request.authorization_reason,
+            effect_key: request.effect_key,
+            idempotency_key: request.idempotency_key,
+            publisher_id: request.publisher_id,
+            lease_seconds: request.lease_seconds,
+        })
+        .await
+        .map_err(map_store_error)?;
+    publish_publication_events(&state, &outcome);
+    Ok(Json(publication_response(outcome)))
+}
+
+async fn renew_pull_request_publication(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, publication_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RenewPullRequestPublicationRequest>,
+) -> Result<Json<PullRequestPublicationResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Publish,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .renew_pull_request_publication(RenewPullRequestPublicationInput {
+            corp_id,
+            publication_id,
+            actor_id,
+            publisher_token: request.publisher_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            lease_seconds: request.lease_seconds,
+        })
+        .await
+        .map_err(map_store_error)?;
+    publish_publication_events(&state, &outcome);
+    Ok(Json(publication_response(outcome)))
+}
+
+async fn record_pull_request_publication_checkpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, publication_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RecordPullRequestPublicationCheckpointRequest>,
+) -> Result<Json<PullRequestPublicationResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Publish,
+    )
+    .await?;
+    let checkpoint = match request.checkpoint {
+        PullRequestPublicationCheckpoint::BranchPushed { commit_sha } => {
+            PullRequestPublicationCheckpointInput::BranchPushed { commit_sha }
+        }
+        PullRequestPublicationCheckpoint::PullRequestCreated {
+            number,
+            node_id,
+            url,
+            state,
+            draft,
+            head_ref,
+            base_ref,
+            auto_merge_enabled,
+        } => PullRequestPublicationCheckpointInput::PullRequestCreated {
+            number,
+            node_id,
+            url,
+            state,
+            draft,
+            head_ref,
+            base_ref,
+            auto_merge_enabled,
+        },
+        PullRequestPublicationCheckpoint::Published {
+            project_status,
+            project_field_id,
+            project_option_id,
+        } => PullRequestPublicationCheckpointInput::Published {
+            project_status,
+            project_field_id,
+            project_option_id,
+        },
+        PullRequestPublicationCheckpoint::Failed { failure_detail } => {
+            PullRequestPublicationCheckpointInput::Failed { failure_detail }
+        }
+    };
+    let outcome = state
+        .store
+        .record_pull_request_publication_checkpoint(RecordPullRequestPublicationCheckpointInput {
+            corp_id,
+            publication_id,
+            actor_id,
+            publisher_token: request.publisher_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            checkpoint,
+        })
+        .await
+        .map_err(map_store_error)?;
+    publish_publication_events(&state, &outcome);
+    Ok(Json(publication_response(outcome)))
+}
+
+fn publish_publication_events(state: &AppState, outcome: &PullRequestPublicationOutcome) {
+    for event in outcome.events.iter().cloned() {
+        publish(state, event);
+    }
+}
+
+fn publication_response(outcome: PullRequestPublicationOutcome) -> PullRequestPublicationResponse {
+    PullRequestPublicationResponse {
+        publication: outcome.publication,
+        publisher_token: outcome.publisher_token,
+        replayed: outcome.replayed,
+        busy: outcome.busy,
+    }
 }
 
 async fn create_room_message(

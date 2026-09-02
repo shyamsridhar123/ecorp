@@ -8,7 +8,7 @@ const PUBLICATION_SELECT: &str = r#"
            publication.target_repository, publication.base_ref, publication.branch,
            publication.commit_sha, publication.title, publication.body,
            publication.actor_id, publication.authorization_id,
-           publication.authorization, publication.effect_key,
+           publication.authorization_snapshot, publication.effect_key,
            publication.idempotency_key, publication.state, publication.version,
            publication.attempt_count, publication.publisher_id,
            publication.publisher_token, publication.publisher_lease_expires_at,
@@ -336,7 +336,7 @@ impl PgStore {
                 "status_before": prerequisites.project_status_before,
                 "review_status": prerequisites.review_status,
             },
-            "authorization": authorization,
+            "authorization_snapshot": authorization,
             "effects": {
                 "effect_key": normalized.effect_key,
                 "auto_merge": false,
@@ -350,7 +350,7 @@ impl PgStore {
                 (id, corp_id, factory_work_item_id, mission_id, source_deliverable_id,
                  artifact_id, task_id, run_id, source_issue_number, source_issue_url,
                  target_repository, base_ref, branch, commit_sha, title, body,
-                 actor_id, authorization_id, authorization, effect_key, idempotency_key,
+                 actor_id, authorization_id, authorization_snapshot, effect_key, idempotency_key,
                  state, version, attempt_count, publisher_id, publisher_token,
                  publisher_lease_expires_at, project_owner, project_number,
                  project_item_id, project_status_before, auto_merge_enabled,
@@ -1797,7 +1797,7 @@ async fn insert_publication_attempt_tx(
         r#"
         INSERT INTO pull_request_publication_attempts
             (id, corp_id, publication_id, attempt, actor_id, authorization_id,
-             authorization, publisher_id, state)
+             authorization_snapshot, publisher_id, state)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'running')
         "#,
     )
@@ -1890,7 +1890,7 @@ fn publication_returning_columns() -> &'static str {
         id, corp_id, factory_work_item_id, mission_id, source_deliverable_id,
         artifact_id, task_id, run_id, source_issue_number, source_issue_url,
         target_repository, base_ref, branch, commit_sha, title, body,
-        actor_id, authorization_id, authorization, effect_key, idempotency_key,
+        actor_id, authorization_id, authorization_snapshot, effect_key, idempotency_key,
         state, version, attempt_count, publisher_id, publisher_lease_expires_at,
         failure_detail, branch_pushed_at, pull_request_number, pull_request_node_id,
         pull_request_url, pull_request_state, pull_request_draft, project_owner,
