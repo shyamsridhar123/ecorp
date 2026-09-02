@@ -1,6 +1,6 @@
 # Idempotent pull-request publication validation
 
-**Date:** September 2, 2026  
+**Date:** September 2, 2026
 **Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`
 **Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
 **Final local validation head:** `ae2df7c50d778f0de56fcb694711044d7cfc9bec`
