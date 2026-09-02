@@ -130,6 +130,11 @@
       "version": 26,
       "file": "0026_pull_request_resolved_base.sql",
       "sha384": "fffa900b0287178d67be3a4a86ce8b9a588c59c52006a753d293b3895a05d61b3f6ea59e904a0d3cbf723716499286d0"
+    },
+    {
+      "version": 27,
+      "file": "0027_publication_publisher_credentials.sql",
+      "sha384": "dd1c995e46beecc20dedd9c032edf05713f6f7eaa288d290a91bdf6e3a2cfb8127c5c696dceb5f1896a6aa913d67cde3"
     }
   ]
 }

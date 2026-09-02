@@ -258,6 +258,21 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             }
         })
         .transpose()?;
+    let preview_publication_base_ref = selected_index
+        .map(|index| {
+            if evaluated[index].recovery {
+                resolve_recovery_publication_base_ref(
+                    &args,
+                    existing.get(&evaluated[index].project_item.id).context(
+                        "recoverable factory item disappeared from the selected-item lookup",
+                    )?,
+                )
+            } else {
+                Ok(selected_publication_base_ref(&args).to_owned())
+            }
+        })
+        .transpose()?
+        .unwrap_or_else(|| selected_publication_base_ref(&args).to_owned());
     let evaluated_json = evaluated
         .iter()
         .map(EvaluatedItem::as_json)
@@ -271,7 +286,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "project_number": args.project_number,
             "repository": args.repository,
             "source_base_ref": args.source_base_ref,
-            "publication_base_ref": selected_publication_base_ref(&args),
+            "publication_base_ref": preview_publication_base_ref,
             "source_base_commit": selected_source_base_commit
                 .as_ref()
                 .map(|resolved| resolved.commit.as_str()),
@@ -310,6 +325,16 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         legacy_upgrade_required,
     } = source_resolution;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
+    let publication_base_ref = if refreshed.recovery {
+        resolve_recovery_publication_base_ref(
+            &args,
+            persisted
+                .as_ref()
+                .context("recoverable factory item disappeared from the selected-item lookup")?,
+        )?
+    } else {
+        selected_publication_base_ref(&args).to_owned()
+    };
     let stable_prefix = format!(
         "github-project:{}:{}:{}:{}",
         args.owner, args.project_number, refreshed.project_item.id, refreshed.issue.updated_at
@@ -356,7 +381,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "publication": {
                 "allowed": true,
                 "repository_allowlist": [args.repository],
-                "base_ref": selected_publication_base_ref(&args),
+                "base_ref": publication_base_ref,
                 "branch_prefix": "ecorp/",
                 "status_before": "In Progress",
                 "review_status": "In Review",
@@ -381,7 +406,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "source_revision": refreshed.issue.updated_at,
         "source_base_ref": args.source_base_ref,
         "source_base_commit": source_base_commit,
-        "publication_base_ref": selected_publication_base_ref(&args),
+        "publication_base_ref": publication_base_ref,
         "idempotency_key": format!(
             "{stable_prefix}:claim:{}:{claim_generation}:lease:{}",
             args.actor_id, args.lease_seconds
@@ -901,6 +926,31 @@ fn selected_publication_base_ref(args: &FactoryArgs) -> &str {
     args.publication_base_ref
         .as_deref()
         .unwrap_or(&args.source_base_ref)
+}
+
+fn resolve_recovery_publication_base_ref(
+    args: &FactoryArgs,
+    item: &ExistingFactoryItem,
+) -> Result<String> {
+    let publication = item
+        .policy
+        .get("publication")
+        .and_then(Value::as_object)
+        .context("persisted factory policy has no publication object")?;
+    let persisted = publication
+        .get("base_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("persisted factory publication policy has no base_ref")?;
+    publication_base_branch(persisted)?;
+    if let Some(requested) = args.publication_base_ref.as_deref()
+        && requested != persisted
+    {
+        bail!(
+            "factory recovery publication base ref mismatch: persisted policy requires {persisted}, controller requested {requested}"
+        );
+    }
+    Ok(persisted.to_owned())
 }
 
 fn publication_base_branch(value: &str) -> Result<Option<&str>> {
@@ -2205,7 +2255,8 @@ mod tests {
     use super::{
         ExistingFactoryItem, FactoryArgs, acceptance_tests, blocked_dependency_numbers,
         factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        parse_github_repository_identity, publication_base_branch, sanitize_failure_detail,
+        parse_github_repository_identity, publication_base_branch,
+        resolve_recovery_publication_base_ref, sanitize_failure_detail,
         selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
     };
 
@@ -2324,6 +2375,54 @@ Blocked by #999 outside the section.
         assert_eq!(selected_publication_base_ref(&args), "release");
         args.publication_base_ref = Some("main".to_owned());
         assert_eq!(selected_publication_base_ref(&args), "main");
+    }
+
+    #[test]
+    fn recovery_publication_base_reuses_persisted_policy() {
+        let now = Utc::now();
+        let mut item = ExistingFactoryItem {
+            version: 1,
+            source_revision: "2026-09-02T00:00:00Z".to_owned(),
+            claim_owner_id: Uuid::new_v4(),
+            state: "running".to_owned(),
+            mission_id: Some(Uuid::new_v4()),
+            policy: json!({
+                "publication": {
+                    "base_ref": "main"
+                }
+            }),
+            lease_expires_at: now + Duration::minutes(5),
+        };
+        let mut args = FactoryArgs {
+            corp_id: Uuid::new_v4(),
+            actor_id: item.claim_owner_id,
+            owner: "owner".to_owned(),
+            project_number: 1,
+            repository: "owner/repo".to_owned(),
+            source_base_ref: "release".to_owned(),
+            publication_base_ref: None,
+            source_repository_path: ".".into(),
+            adapter: "fake-process".to_owned(),
+            allowed_adapters: Vec::new(),
+            strategy: "single".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            budget_tokens: 1,
+            budget_cost_microusd: 1,
+            lease_seconds: 30,
+            write_scope: vec!["**".to_owned()],
+            issue: None,
+            dry_run: true,
+            github_cli: "gh".into(),
+        };
+        assert_eq!(
+            resolve_recovery_publication_base_ref(&args, &item).unwrap(),
+            "main"
+        );
+        args.publication_base_ref = Some("release".to_owned());
+        assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
+        item.policy = json!({});
+        assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
     }
 
     #[test]

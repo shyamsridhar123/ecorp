@@ -62,6 +62,9 @@ pub struct FactoryPublishArgs {
     #[arg(long, env = "ECORP_PUBLICATION_PUBLISHER_ID")]
     pub publisher_id: Option<String>,
 
+    #[arg(long, env = "ECORP_PUBLICATION_PUBLISHER_CREDENTIAL_FILE")]
+    pub publisher_credential_file: Option<PathBuf>,
+
     #[arg(long, env = "ECORP_GITHUB_CLI", default_value = "gh")]
     pub github_cli: PathBuf,
 
@@ -339,7 +342,7 @@ async fn start_publication(
     plan: &PublicationPlan,
     idempotency_key: &str,
 ) -> Result<PullRequestPublicationResponse> {
-    let response = server_json(
+    let response = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -361,6 +364,7 @@ async fn start_publication(
             "publisher_id": plan.publisher_id,
             "lease_seconds": args.lease_seconds,
         })),
+        args,
     )
     .await?;
     serde_json::from_value(response).context("decode publication start response")
@@ -652,7 +656,7 @@ async fn renew_publication(
     stage: &str,
 ) -> Result<()> {
     let version = response.publication.version;
-    let value = server_json(
+    let value = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -666,6 +670,7 @@ async fn renew_publication(
             "idempotency_key": format!("{}:renew:{stage}:{version}", plan.effect_key),
             "lease_seconds": effect_lease_seconds(args),
         })),
+        args,
     )
     .await?;
     *response = serde_json::from_value(value).context("decode publication renewal response")?;
@@ -687,7 +692,7 @@ async fn checkpoint(
     checkpoint: Value,
 ) -> Result<()> {
     let version = response.publication.version;
-    let value = server_json(
+    let value = publisher_server_json(
         client,
         Method::POST,
         format!(
@@ -701,6 +706,7 @@ async fn checkpoint(
             "idempotency_key": format!("{}:checkpoint:{stage}:{version}", plan.effect_key),
             "checkpoint": checkpoint
         })),
+        args,
     )
     .await?;
     *response = serde_json::from_value(value).context("decode publication checkpoint response")?;
@@ -1764,7 +1770,51 @@ fn validate_args(args: &FactoryPublishArgs) -> Result<()> {
     if args.body_file.as_ref().is_some_and(|path| !path.is_file()) {
         bail!("pull request body file does not exist");
     }
+    if args
+        .publisher_credential_file
+        .as_ref()
+        .is_some_and(|path| !path.is_file())
+    {
+        bail!("trusted publication publisher credential file does not exist");
+    }
     Ok(())
+}
+
+async fn publisher_server_json(
+    client: &Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    args: &FactoryPublishArgs,
+) -> Result<Value> {
+    let path = args
+        .publisher_credential_file
+        .as_ref()
+        .context("trusted publication publisher credential file is required")?;
+    let credential =
+        fs::read_to_string(path).context("read trusted publication publisher credential file")?;
+    let credential = credential.trim();
+    if credential.is_empty() || credential.len() > 256 || credential.chars().any(char::is_control) {
+        bail!("trusted publication publisher credential file is invalid");
+    }
+    let mut request = client
+        .request(method, &url)
+        .header("x-crony-publication-publisher-credential", credential);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("request {url}"))?;
+    let status = response.status();
+    let text = response.text().await?;
+    let body: Value = serde_json::from_str(&text)
+        .with_context(|| format!("decode response from {url}: {text}"))?;
+    if !status.is_success() {
+        bail!("ECorp API returned {status}: {body}");
+    }
+    Ok(body)
 }
 
 fn default_publisher_id() -> String {

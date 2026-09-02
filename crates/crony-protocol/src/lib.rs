@@ -495,6 +495,39 @@ pub struct FactoryPublicationContextResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePublicationPublisherCredentialRequest {
+    pub actor_id: Uuid,
+    pub publisher_id: String,
+    #[serde(default = "default_publication_publisher_credential_ttl_seconds")]
+    pub expires_in_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePublicationPublisherCredentialResponse {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub credential: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokePublicationPublisherCredentialRequest {
+    pub actor_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokePublicationPublisherCredentialResponse {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub revoked: bool,
+}
+
+const fn default_publication_publisher_credential_ttl_seconds() -> i64 {
+    86_400
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartPullRequestPublicationRequest {
     pub actor_id: Uuid,
     pub source_deliverable_id: Uuid,

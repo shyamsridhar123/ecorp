@@ -163,6 +163,7 @@ pub struct StartPullRequestPublicationInput {
     pub effect_key: String,
     pub idempotency_key: String,
     pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub lease_seconds: i64,
 }
 
@@ -171,6 +172,8 @@ pub struct RenewPullRequestPublicationInput {
     pub corp_id: Uuid,
     pub publication_id: Uuid,
     pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub publisher_token: Uuid,
     pub expected_version: i64,
     pub idempotency_key: String,
@@ -212,6 +215,8 @@ pub struct RecordPullRequestPublicationCheckpointInput {
     pub corp_id: Uuid,
     pub publication_id: Uuid,
     pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub publisher_credential_hash: String,
     pub publisher_token: Uuid,
     pub expected_version: i64,
     pub idempotency_key: String,
@@ -232,6 +237,22 @@ pub struct FactoryPublicationContext {
     pub work_item: FactoryWorkItem,
     pub publication: Option<PullRequestPublication>,
     pub source_deliverables: Vec<SourceDeliverable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub event: DomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationPublisherCredentialRevocationOutcome {
+    pub credential_id: Uuid,
+    pub publisher_id: String,
+    pub revoked: bool,
+    pub event: Option<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -1764,6 +1785,196 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rooms)
+    }
+
+    pub async fn create_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        publisher_id: &str,
+        credential_hash: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<PublicationPublisherCredentialOutcome> {
+        let publisher_id = normalize_factory_identifier(publisher_id, "trusted publisher id", 160)?;
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "publication publisher credential hash must be a SHA-256 digest"
+            ));
+        }
+        if expires_at <= Utc::now() {
+            return Err(anyhow!(
+                "publication publisher credential expiry must be in the future"
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can enroll a publication publisher"
+            ));
+        }
+
+        let credential_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO publication_publisher_credentials
+                (id, corp_id, publisher_id, credential_hash, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .bind(&publisher_id)
+        .bind(&credential_hash)
+        .bind(actor_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                Some(actor_id),
+                "factory.publication_publisher_enrolled",
+                "publication_publisher",
+                credential_id,
+                format!("publication-publisher-enrolled:{credential_id}"),
+                json!({
+                    "publisher_id": publisher_id,
+                    "expires_at": expires_at
+                }),
+            ),
+        )
+        .await?
+        .context("publication publisher enrollment event was unexpectedly deduplicated")?;
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialOutcome {
+            credential_id,
+            publisher_id,
+            expires_at,
+            event,
+        })
+    }
+
+    pub async fn authenticate_publication_publisher(
+        &self,
+        corp_id: Uuid,
+        credential_hash: &str,
+    ) -> Result<String> {
+        let credential_hash = credential_hash.trim().to_ascii_lowercase();
+        if credential_hash.len() != 64
+            || !credential_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!(
+                "forbidden: invalid publication publisher credential"
+            ));
+        }
+        let publisher_id = sqlx::query_scalar(
+            r#"
+            UPDATE publication_publisher_credentials
+            SET last_used_at = now()
+            WHERE id = (
+                SELECT id
+                FROM publication_publisher_credentials
+                WHERE corp_id = $1
+                  AND credential_hash = $2
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+                FOR UPDATE
+            )
+            RETURNING publisher_id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(&credential_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("forbidden: unknown, expired, or revoked publication publisher credential")?;
+        Ok(publisher_id)
+    }
+
+    pub async fn revoke_publication_publisher_credential(
+        &self,
+        corp_id: Uuid,
+        actor_id: Uuid,
+        credential_id: Uuid,
+        reason: &str,
+    ) -> Result<PublicationPublisherCredentialRevocationOutcome> {
+        let reason =
+            normalize_factory_text(reason, "publisher credential revocation reason", 2_000)?;
+        let mut tx = self.pool.begin().await?;
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM actors WHERE id = $1 AND corp_id = $2 AND kind = 'human'",
+        )
+        .bind(actor_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+            return Err(anyhow!(
+                "forbidden: only a Corp owner or admin can revoke a publication publisher"
+            ));
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT publisher_id, revoked_at
+            FROM publication_publisher_credentials
+            WHERE id = $1 AND corp_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(credential_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("publication publisher credential was not found")?;
+        let publisher_id: String = row.get("publisher_id");
+        let already_revoked = row
+            .get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
+            .is_some();
+        let event = if already_revoked {
+            None
+        } else {
+            sqlx::query(
+                "UPDATE publication_publisher_credentials SET revoked_at = now() WHERE id = $1",
+            )
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+            append_event_tx(
+                &mut tx,
+                NewEvent::new(
+                    corp_id,
+                    Some(actor_id),
+                    "factory.publication_publisher_revoked",
+                    "publication_publisher",
+                    credential_id,
+                    format!("publication-publisher-revoked:{credential_id}"),
+                    json!({
+                        "publisher_id": publisher_id.clone(),
+                        "reason": reason
+                    }),
+                ),
+            )
+            .await?
+        };
+        tx.commit().await?;
+        Ok(PublicationPublisherCredentialRevocationOutcome {
+            credential_id,
+            publisher_id,
+            revoked: !already_revoked,
+            event,
+        })
     }
 
     pub async fn create_runner_enrollment(
