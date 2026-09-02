@@ -159,6 +159,28 @@ impl FactoryWorkItemState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestPublicationState {
+    Requested,
+    Publishing,
+    BranchPushed,
+    PullRequestCreated,
+    Published,
+}
+
+impl PullRequestPublicationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Publishing => "publishing",
+            Self::BranchPushed => "branch_pushed",
+            Self::PullRequestCreated => "pull_request_created",
+            Self::Published => "published",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Corp {
     pub id: Uuid,
@@ -574,6 +596,69 @@ pub struct SourceDeliverable {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestPublication {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub factory_work_item_id: Uuid,
+    pub mission_id: Uuid,
+    pub source_deliverable_id: Uuid,
+    pub artifact_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub source_issue_number: i64,
+    pub source_issue_url: String,
+    pub target_repository: String,
+    pub base_ref: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub title: String,
+    pub body: String,
+    pub actor_id: Uuid,
+    pub authorization_id: Uuid,
+    pub authorization: Value,
+    pub effect_key: String,
+    pub idempotency_key: String,
+    pub state: PullRequestPublicationState,
+    pub version: i64,
+    pub attempt_count: i32,
+    pub publisher_id: Option<String>,
+    pub publisher_lease_expires_at: Option<DateTime<Utc>>,
+    pub failure_detail: Option<String>,
+    pub branch_pushed_at: Option<DateTime<Utc>>,
+    pub pull_request_number: Option<i64>,
+    pub pull_request_node_id: Option<String>,
+    pub pull_request_url: Option<String>,
+    pub pull_request_state: Option<String>,
+    pub pull_request_draft: Option<bool>,
+    pub project_owner: String,
+    pub project_number: i64,
+    pub project_item_id: String,
+    pub project_status_before: String,
+    pub project_status_after: Option<String>,
+    pub project_status_updated_at: Option<DateTime<Utc>>,
+    pub auto_merge_enabled: bool,
+    pub merge_authorized: bool,
+    pub deployment_authorized: bool,
+    pub provenance: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestPublicationAttempt {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub publication_id: Uuid,
+    pub attempt: i32,
+    pub actor_id: Uuid,
+    pub publisher_id: String,
+    pub state: String,
+    pub failure_detail: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 const fn default_task_cost_budget() -> i64 {
     1_000_000
 }
@@ -695,6 +780,10 @@ pub struct CorpSnapshot {
     pub verification_requests: Vec<VerificationRequest>,
     #[serde(default)]
     pub source_deliverables: Vec<SourceDeliverable>,
+    #[serde(default)]
+    pub pull_request_publications: Vec<PullRequestPublication>,
+    #[serde(default)]
+    pub pull_request_publication_attempts: Vec<PullRequestPublicationAttempt>,
     pub action_approvals: Vec<ActionApproval>,
     pub circuit_breaker_incidents: Vec<CircuitBreakerIncident>,
     #[serde(default)]
@@ -717,6 +806,11 @@ mod tests {
             serde_json::to_string(&FactoryWorkItemState::MissionCreated)
                 .expect("serialize factory state"),
             "\"mission_created\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PullRequestPublicationState::PullRequestCreated)
+                .expect("serialize publication state"),
+            "\"pull_request_created\""
         );
     }
 }

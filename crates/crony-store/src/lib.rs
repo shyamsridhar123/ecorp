@@ -5,9 +5,11 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
     Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
-    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent, QueuedMessage,
-    Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract, TaskGraphPlan,
-    TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy, VerificationRequest,
+    FactoryWorkItemState, ManualVerificationGate, Mission, MissionStatus, NewEvent,
+    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
+    TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
+    VerificationRequest,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
@@ -132,6 +134,82 @@ pub struct FactoryMissionOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct StartPullRequestPublicationInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub actor_role: String,
+    pub source_deliverable_id: Uuid,
+    pub target_repository: String,
+    pub base_ref: String,
+    pub branch: String,
+    pub title: String,
+    pub body: String,
+    pub authorization_id: Uuid,
+    pub authorization_reason: String,
+    pub effect_key: String,
+    pub idempotency_key: String,
+    pub publisher_id: String,
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenewPullRequestPublicationInput {
+    pub corp_id: Uuid,
+    pub publication_id: Uuid,
+    pub actor_id: Uuid,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub lease_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PullRequestPublicationCheckpointInput {
+    BranchPushed {
+        commit_sha: String,
+    },
+    PullRequestCreated {
+        number: i64,
+        node_id: String,
+        url: String,
+        state: String,
+        draft: bool,
+        head_ref: String,
+        base_ref: String,
+        auto_merge_enabled: bool,
+    },
+    Published {
+        project_status: String,
+        project_field_id: String,
+        project_option_id: String,
+    },
+    Failed {
+        failure_detail: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPullRequestPublicationCheckpointInput {
+    pub corp_id: Uuid,
+    pub publication_id: Uuid,
+    pub actor_id: Uuid,
+    pub publisher_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub checkpoint: PullRequestPublicationCheckpointInput,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestPublicationOutcome {
+    pub publication: PullRequestPublication,
+    pub publisher_token: Option<Uuid>,
+    pub events: Vec<DomainEvent>,
+    pub replayed: bool,
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone)]
 struct FactoryOperation {
     work_item_id: Uuid,
     actor_id: Uuid,
@@ -149,6 +227,27 @@ struct NewFactoryOperation<'a> {
     operation: &'a str,
     resulting_version: i64,
     claim_token: Option<Uuid>,
+    request: &'a Value,
+}
+
+#[derive(Debug, Clone)]
+struct PullRequestPublicationOperation {
+    publication_id: Uuid,
+    actor_id: Uuid,
+    operation: String,
+    resulting_version: i64,
+    publisher_token: Option<Uuid>,
+    request: Value,
+}
+
+struct NewPullRequestPublicationOperation<'a> {
+    corp_id: Uuid,
+    idempotency_key: &'a str,
+    publication_id: Uuid,
+    actor_id: Uuid,
+    operation: &'a str,
+    resulting_version: i64,
+    publisher_token: Option<Uuid>,
     request: &'a Value,
 }
 
@@ -1311,6 +1410,84 @@ impl PgStore {
         .map(map_source_deliverable)
         .collect::<Result<Vec<_>>>()?;
 
+        let pull_request_publications = sqlx::query(
+            r#"
+            SELECT publication.id, publication.corp_id, publication.factory_work_item_id,
+                   publication.mission_id, publication.source_deliverable_id,
+                   publication.artifact_id, publication.task_id, publication.run_id,
+                   publication.source_issue_number, publication.source_issue_url,
+                   publication.target_repository, publication.base_ref, publication.branch,
+                   publication.commit_sha, publication.title, publication.body,
+                   publication.actor_id, publication.authorization_id,
+                   publication.authorization, publication.effect_key,
+                   publication.idempotency_key, publication.state, publication.version,
+                   publication.attempt_count, publication.publisher_id,
+                   publication.publisher_lease_expires_at, publication.failure_detail,
+                   publication.branch_pushed_at, publication.pull_request_number,
+                   publication.pull_request_node_id, publication.pull_request_url,
+                   publication.pull_request_state, publication.pull_request_draft,
+                   publication.project_owner, publication.project_number,
+                   publication.project_item_id, publication.project_status_before,
+                   publication.project_status_after, publication.project_status_updated_at,
+                   publication.auto_merge_enabled, publication.merge_authorized,
+                   publication.deployment_authorized, publication.provenance,
+                   publication.created_at, publication.updated_at
+            FROM pull_request_publications publication
+            JOIN missions mission ON mission.id = publication.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE publication.corp_id = $1
+              AND membership.actor_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = publication.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY publication.created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_pull_request_publication)
+        .collect::<Result<Vec<_>>>()?;
+
+        let pull_request_publication_attempts = sqlx::query(
+            r#"
+            SELECT attempt.id, attempt.corp_id, attempt.publication_id, attempt.attempt,
+                   attempt.actor_id, attempt.publisher_id, attempt.state,
+                   attempt.failure_detail, attempt.started_at, attempt.finished_at
+            FROM pull_request_publication_attempts attempt
+            JOIN pull_request_publications publication ON publication.id = attempt.publication_id
+            JOIN missions mission ON mission.id = publication.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE attempt.corp_id = $1
+              AND membership.actor_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = attempt.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY attempt.started_at DESC
+            LIMIT 1000
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_pull_request_publication_attempt)
+        .collect();
+
         let action_approvals = sqlx::query(
             r#"
             SELECT approval.id, approval.corp_id, approval.room_id, approval.mission_id,
@@ -1425,6 +1602,8 @@ impl PgStore {
             verification_evidence,
             verification_requests,
             source_deliverables,
+            pull_request_publications,
+            pull_request_publication_attempts,
             action_approvals,
             circuit_breaker_incidents,
             factory_work_items,
