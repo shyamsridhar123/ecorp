@@ -34,9 +34,10 @@ use crony_protocol::{
     CreateMissionResponse, CreateRoomMessageRequest, CreateRoomMessageResponse,
     CreateRunnerEnrollmentRequest, CreateRunnerEnrollmentResponse, CreateSecretRequest,
     CreateSecretResponse, DecideMissionBudgetRevisionRequest, DemoBootstrapResponse,
-    EmergencyStopRequest, EmergencyStopResponse, FactoryMissionContract, FactoryWorkItemResponse,
-    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
-    LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    EmergencyStopRequest, EmergencyStopResponse, FactoryMissionContract,
+    FactoryPublicationContextResponse, FactoryWorkItemResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
     MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
     MissionBudgetRevisionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
@@ -439,6 +440,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/publication",
             get(get_pull_request_publication).post(start_pull_request_publication),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/publication-context",
+            get(get_factory_publication_context),
         )
         .route(
             "/api/corps/{corp_id}/factory/publications/{publication_id}/renew",
@@ -1817,6 +1822,33 @@ async fn get_pull_request_publication(
         publisher_token: None,
         replayed: false,
         busy,
+    }))
+}
+
+async fn get_factory_publication_context(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<FactoryPublicationContextResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let context = state
+        .store
+        .factory_publication_context(corp_id, actor_id, work_item_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("factory publication context was not found"))?;
+    Ok(Json(FactoryPublicationContextResponse {
+        work_item: context.work_item,
+        publication: context.publication,
+        source_deliverables: context.source_deliverables,
     }))
 }
 

@@ -79,6 +79,112 @@ struct PublicationPrerequisiteRequest<'a> {
 }
 
 impl PgStore {
+    pub async fn factory_publication_context(
+        &self,
+        corp_id: Uuid,
+        viewer_actor_id: Uuid,
+        work_item_id: Uuid,
+    ) -> Result<Option<FactoryPublicationContext>> {
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, corp_id, viewer_actor_id).await?;
+        let work_item = sqlx::query(
+            r#"
+            SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+                   source_project_item_id, source_repository_owner, source_repository_name,
+                   source_issue_number, source_issue_node_id, source_issue_url, source_title,
+                   source_revision, state, version, claim_owner_id, lease_expires_at, policy,
+                   mission_id, failure_detail, created_at, updated_at
+            FROM factory_work_items
+            WHERE id = $1
+              AND corp_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $3
+                    AND viewer.corp_id = factory_work_items.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            "#,
+        )
+        .bind(work_item_id)
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_factory_work_item)
+        .transpose()?;
+        let Some(work_item) = work_item else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let publication = if work_item.mission_id.is_some() {
+            let query = format!(
+                r#"
+                {PUBLICATION_SELECT}
+                JOIN missions mission ON mission.id = publication.mission_id
+                JOIN room_memberships membership ON membership.room_id = mission.room_id
+                WHERE publication.factory_work_item_id = $1
+                  AND publication.corp_id = $2
+                  AND membership.actor_id = $3
+                "#
+            );
+            sqlx::query(&query)
+                .bind(work_item_id)
+                .bind(corp_id)
+                .bind(viewer_actor_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(map_pull_request_publication)
+                .transpose()?
+        } else {
+            None
+        };
+
+        let source_deliverables = if let Some(mission_id) = work_item.mission_id {
+            sqlx::query(
+                r#"
+                SELECT deliverable.id, deliverable.corp_id, deliverable.task_id,
+                       deliverable.run_id, deliverable.artifact_id, deliverable.form,
+                       deliverable.file_name, artifact.uri, artifact.sha256,
+                       artifact.media_type, artifact.bytes, artifact.provenance_signature,
+                       deliverable.verification_sha256, deliverable.base_commit,
+                       deliverable.head_commit, deliverable.branch,
+                       deliverable.integration_state, artifact.retention_until,
+                       deliverable.created_at
+                FROM source_deliverables deliverable
+                JOIN artifacts artifact
+                  ON artifact.id = deliverable.artifact_id AND artifact.status = 'ready'
+                JOIN tasks task ON task.id = deliverable.task_id
+                JOIN missions mission ON mission.id = task.mission_id
+                JOIN room_memberships membership ON membership.room_id = mission.room_id
+                WHERE deliverable.corp_id = $1
+                  AND task.mission_id = $2
+                  AND membership.actor_id = $3
+                ORDER BY deliverable.created_at DESC, deliverable.id
+                "#,
+            )
+            .bind(corp_id)
+            .bind(mission_id)
+            .bind(viewer_actor_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(map_source_deliverable)
+            .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
+        tx.commit().await?;
+        Ok(Some(FactoryPublicationContext {
+            work_item,
+            publication,
+            source_deliverables,
+        }))
+    }
+
     pub async fn pull_request_publication_for_work_item(
         &self,
         corp_id: Uuid,
@@ -1267,7 +1373,7 @@ fn normalize_start_input(
     input.base_ref = normalize_factory_identifier(&input.base_ref, "publication base ref", 240)?;
     validate_factory_base_ref(&input.base_ref)?;
     input.branch = normalize_factory_identifier(&input.branch, "publication branch", 500)?;
-    validate_factory_base_ref(&input.branch)?;
+    validate_factory_branch_ref(&input.branch)?;
     if input.branch == input.base_ref {
         return Err(anyhow!(
             "publication branch must differ from the target base ref"
@@ -2340,5 +2446,15 @@ mod tests {
             publication_state_rank(PullRequestPublicationState::PullRequestCreated)
                 < publication_state_rank(PullRequestPublicationState::Published)
         );
+    }
+
+    #[test]
+    fn publication_branch_validation_matches_git_rejections() {
+        assert!(validate_factory_branch_ref("ecorp/issue-61-safe").is_ok());
+        assert!(validate_factory_branch_ref("ecorp/foo//bar").is_err());
+        assert!(validate_factory_branch_ref("ecorp/foo.lock").is_err());
+        assert!(validate_factory_branch_ref("ecorp/foo.lock/bar").is_err());
+        assert!(validate_factory_branch_ref("ecorp/.hidden").is_err());
+        assert!(validate_factory_branch_ref("HEAD").is_err());
     }
 }

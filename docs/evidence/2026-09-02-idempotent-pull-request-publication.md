@@ -9,7 +9,8 @@
 **Preflight and actor-handoff head:** `6f4c57c`
 **Completed-retry head:** `173e20e`
 **PR-content and deliverable-pin head:** `86472e2`
-**Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
+**Review-blocker closure head:** `5afe09f6abdd4ffa3d25f2365539463d0d51cd23`
+**Stacked base:** `e308e54382c573244b67ab7c6d28e94316f2cdd0`
 
 ## Scope
 
@@ -43,7 +44,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 73 non-documentation unit tests with no failures.
+The Rust workspace ran 78 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -55,13 +56,20 @@ The final exact-head run recorded:
 ```json
 {
   "base_branch_collision_rejected": true,
+  "invalid_git_branches_rejected_before_start": true,
   "implicit_authorization_retry_stable": true,
+  "cross_publisher_default_start_recovery": true,
   "body_file_crlf_normalized": true,
   "actor_handoff_authorization_distinct": true,
   "published_retry_after_base_move": true,
+  "exact_publication_context_lookup": true,
+  "bounded_snapshot_work_item_and_deliverable_absent": true,
+  "published_retry_outside_bounded_snapshot": true,
+  "exact_project_item_lookup": true,
+  "project_item_count_during_publication": 1003,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
+  "pull_request_head_sha": "cf3ef1d598406dca0a6e36ffe279d617f4fff745",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -120,6 +128,24 @@ After publication completed, the fake remote `main` branch advanced to another c
 publisher invocation returned the same persisted publication without remote preflight, PR creation,
 or Project mutation.
 
+The review-blocker closure run inserted 501 newer factory work items and 501 newer source
+deliverables after the selected verified result. The bounded shared snapshot no longer contained
+either requested object, while the exact publication-context endpoint returned the work item and
+deliverable and publication completed normally. After completion, the harness inserted 501 newer
+publication aggregates, proved the target publication was also outside the shared snapshot, and
+replayed the persisted published result through the same exact context.
+
+The first publisher host crashed after durable start. Recovery used a different publisher ID,
+authorization reason, and lease duration without an idempotency-key reuse conflict because the
+default key fingerprints the complete normalized request. Separate pre-start regressions passed
+`ecorp/foo//bar` and `ecorp/foo.lock`; both failed `git check-ref-format --branch`, created no
+publication row, and left the verified work item correctable.
+
+Before Project movement, the fake Project was expanded to 1,003 items with the authorized item after
+1,001 fillers. The fake CLI enforced the `item-list --limit` bound. Publication made no additional
+item-list call, loaded the exact stored node ID through GraphQL, verified its Project and Status
+field identity, and completed the one `In Progress -> In Review` transition.
+
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
 GitHub create operation refused the duplicate head, and ECorp retained `branch_pushed` without a PR
@@ -159,6 +185,34 @@ console errors. The visible publication card showed:
 Screenshot:
 
 `output/playwright/factory-publication-clean-review.png`
+
+The review-blocker closure changed only CLI, API, persistence, and deterministic test behavior; no
+web UI source changed, so the existing browser rendering remains representative.
+
+## Review-blocker closure validation
+
+On September 2, 2026, commit `5afe09f6abdd4ffa3d25f2365539463d0d51cd23`
+passed:
+
+```text
+node tools/check_migrations.mjs
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+pnpm build:web
+pnpm lint:web
+git diff --check
+tools/e2e_factory_controller.mjs
+tools/e2e_factory_publication.mjs
+```
+
+Both focused E2Es used a fresh isolated PostgreSQL database and test-owned process/artifact/worktree
+directories. Their servers, runners, web process, ports, and database were removed afterward.
+All four review threads were replied to and resolved.
+
+GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
+runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not
+a repository test failure.
 
 All test-owned processes, ports, and containers were stopped after validation. Failed-run worktrees
 were preserved according to the repository safety contract.
