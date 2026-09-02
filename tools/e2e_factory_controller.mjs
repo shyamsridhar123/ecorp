@@ -306,9 +306,12 @@ await writeFile(
   )}\n`,
 )
 
-const controlCharacterPolicyRejected = await post(
-  `/api/corps/${demo.corp_id}/factory/work-items/claim`,
+const controlCharacterPolicyResponse = await fetch(
+  `${server}/api/corps/${demo.corp_id}/factory/work-items/claim`,
   {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
     actor_id: demo.alice_actor_id,
     source_project_owner: 'acme',
     source_project_number: 7,
@@ -336,10 +339,13 @@ const controlCharacterPolicyRejected = await post(
         deploy: false,
       },
     },
+    }),
   },
 )
-assert.equal(controlCharacterPolicyRejected.response.status, 400)
-assert.match(controlCharacterPolicyRejected.body.error, /safe Git ref/)
+const controlCharacterPolicyRejected =
+  await controlCharacterPolicyResponse.json()
+assert.equal(controlCharacterPolicyResponse.status, 400)
+assert.match(controlCharacterPolicyRejected.error, /safe Git ref/)
 
 let invalidPublicationBaseRejected = false
 try {
@@ -1273,7 +1279,7 @@ const report = {
   run_status: runs[0].status,
   auto_merge: false,
   control_character_publication_base_policy_rejected:
-    controlCharacterPolicyRejected.response.status,
+    controlCharacterPolicyResponse.status,
   non_branch_publication_base_rejected_before_claim:
     invalidPublicationBaseRejected,
   queue_progression: {
