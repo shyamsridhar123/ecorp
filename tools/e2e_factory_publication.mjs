@@ -1084,6 +1084,33 @@ assert.equal(
   ),
   true,
 )
+const workItemFailureCanary = `cross-room-work-item-${nonce}`
+await psql(
+  `UPDATE factory_work_items SET failure_detail = ${sqlLiteral(workItemFailureCanary)} WHERE id = ${sqlLiteral(workItem.id)}::uuid;`,
+)
+const crossRoomPublicationContext = await fetch(
+  `${server}/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication-context?actor_id=${crossRoomActorId}`,
+)
+const crossRoomPublicationContextBody =
+  await crossRoomPublicationContext.text()
+assert.equal(crossRoomPublicationContext.status, 404)
+for (const secret of [
+  workItem.id,
+  workItem.source_issue_url,
+  workItem.source_title,
+  workItem.claim_owner_id,
+  workItemFailureCanary,
+  JSON.stringify(workItem.policy),
+]) {
+  assert.equal(
+    crossRoomPublicationContextBody.includes(secret),
+    false,
+    `cross-room publication context leaked ${secret}`,
+  )
+}
+await psql(
+  `UPDATE factory_work_items SET failure_detail = NULL WHERE id = ${sqlLiteral(workItem.id)}::uuid;`,
+)
 const guestPublicationContext = await fetch(
   `${server}/api/corps/${demo.corp_id}/factory/work-items/${workItem.id}/publication-context?actor_id=${demo.eve_actor_id}`,
 )
@@ -1787,6 +1814,8 @@ const report = {
   actor_handoff_authorization_distinct: true,
   published_retry_after_base_move: true,
   exact_publication_context_lookup: true,
+  cross_room_publication_context_denial:
+    crossRoomPublicationContext.status,
   cross_room_publication_start_rejection:
     crossRoomStartRejected.response.status,
   cross_room_publication_recovery_rejection:

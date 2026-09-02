@@ -7895,6 +7895,27 @@ fn validate_factory_base_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_factory_publication_base_ref(value: &str) -> Result<()> {
+    validate_factory_base_ref(value)?;
+    if value == "HEAD" {
+        return Ok(());
+    }
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        if branch.is_empty() {
+            return Err(anyhow!(
+                "factory publication base ref must be HEAD or a branch ref"
+            ));
+        }
+        return validate_factory_branch_ref(branch);
+    }
+    if value.starts_with("refs/") {
+        return Err(anyhow!(
+            "factory publication base ref must be HEAD or a branch ref"
+        ));
+    }
+    validate_factory_branch_ref(value)
+}
+
 fn validate_factory_branch_ref(value: &str) -> Result<()> {
     validate_factory_base_ref(value)?;
     if value == "HEAD"
@@ -8030,6 +8051,15 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         .context("factory policy snapshot must be a JSON object")?;
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
+    if let Some(publication) = policy_object.get("publication") {
+        let publication = publication
+            .as_object()
+            .context("factory publication policy must be a JSON object")?;
+        if publication.get("allowed").and_then(Value::as_bool) == Some(true) {
+            let base_ref = factory_policy_required_string(publication, "base_ref", 240)?;
+            validate_factory_publication_base_ref(&base_ref)?;
+        }
+    }
     let upgrade_required = match policy_object.get("source_commit_upgrade_required") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -9874,6 +9904,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be pinned and require a legacy upgrade")
+        );
+        assert!(
+            normalize_factory_policy(json!({
+                "source_base_ref": "HEAD",
+                "source_base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publication": {
+                    "allowed": true,
+                    "base_ref": "refs/tags/v1"
+                }
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("HEAD or a branch ref")
         );
     }
 

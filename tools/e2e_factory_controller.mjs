@@ -154,6 +154,7 @@ async function runController(
     strategy = 'single',
     githubTimeoutMs,
     sourceRepositoryPath = root,
+    publicationBaseRef = 'main',
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
     writeScope = ['**'],
@@ -171,6 +172,8 @@ async function runController(
     repository,
     '--source-repository-path',
     sourceRepositoryPath,
+    '--publication-base-ref',
+    publicationBaseRef,
     '--adapter',
     'fake-process',
     '--strategy',
@@ -302,6 +305,23 @@ await writeFile(
     2,
   )}\n`,
 )
+
+let invalidPublicationBaseRejected = false
+try {
+  await runController(demo, 9001, true, {
+    publicationBaseRef: 'refs/tags/v1',
+  })
+  assert.fail('non-branch publication base unexpectedly passed validation')
+} catch (error) {
+  assert.match(
+    String(error.stderr ?? error),
+    /publication base ref must be HEAD or a branch ref/,
+  )
+  invalidPublicationBaseRejected = true
+}
+const preValidationSnapshot = await snapshot(demo)
+assert.equal(preValidationSnapshot.snapshot.factory_work_items.length, 0)
+assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
 
 const dryRun = await runController(demo, 9001, true)
 assert.equal(dryRun.mode, 'dry_run')
@@ -1217,6 +1237,8 @@ const report = {
   mission_status: missions[0].status,
   run_status: runs[0].status,
   auto_merge: false,
+  non_branch_publication_base_rejected_before_claim:
+    invalidPublicationBaseRejected,
   queue_progression: {
     next_issue_number: nextIssue.issue_number,
     verified_items_do_not_starve_todo_work: true,

@@ -791,7 +791,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
     validate_source_base_ref(&args.source_base_ref)?;
-    validate_source_base_ref(&args.publication_base_ref)?;
+    validate_publication_base_ref(args)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
         bail!("GitHub Project owner is invalid");
     }
@@ -874,6 +874,40 @@ fn validate_source_base_ref(value: &str) -> Result<()> {
         bail!("factory source base ref is invalid");
     }
     Ok(())
+}
+
+fn validate_publication_base_ref(args: &FactoryArgs) -> Result<()> {
+    let Some(branch) = publication_base_branch(&args.publication_base_ref)? else {
+        return Ok(());
+    };
+    source_git_output(
+        &args.source_repository_path,
+        &["check-ref-format", "--branch", branch],
+    )
+    .map(|_| ())
+    .with_context(|| {
+        format!(
+            "factory publication base ref {} is not a valid Git branch",
+            args.publication_base_ref
+        )
+    })
+}
+
+fn publication_base_branch(value: &str) -> Result<Option<&str>> {
+    validate_source_base_ref(value)?;
+    if value == "HEAD" {
+        return Ok(None);
+    }
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        if branch.is_empty() {
+            bail!("factory publication base ref must be HEAD or a branch ref");
+        }
+        return Ok(Some(branch));
+    }
+    if value.starts_with("refs/") {
+        bail!("factory publication base ref must be HEAD or a branch ref");
+    }
+    Ok(Some(value))
 }
 
 fn resolve_recovery_source_base_commit(
@@ -2161,8 +2195,8 @@ mod tests {
     use super::{
         ExistingFactoryItem, acceptance_tests, blocked_dependency_numbers,
         factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        parse_github_repository_identity, sanitize_failure_detail, truncate_utf8,
-        validate_source_base_commit,
+        parse_github_repository_identity, publication_base_branch, sanitize_failure_detail,
+        truncate_utf8, validate_source_base_commit,
     };
 
     #[test]
@@ -2237,6 +2271,19 @@ Blocked by #999 outside the section.
         assert!(validate_source_base_commit(&"B".repeat(64)).is_ok());
         assert!(validate_source_base_commit(&"a".repeat(39)).is_err());
         assert!(validate_source_base_commit(&"g".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn publication_base_requires_head_or_a_branch_ref() {
+        assert_eq!(publication_base_branch("HEAD").unwrap(), None);
+        assert_eq!(publication_base_branch("main").unwrap(), Some("main"));
+        assert_eq!(
+            publication_base_branch("refs/heads/release").unwrap(),
+            Some("release")
+        );
+        assert!(publication_base_branch("refs/tags/v1").is_err());
+        assert!(publication_base_branch("refs/remotes/origin/main").is_err());
+        assert!(publication_base_branch("refs/heads/").is_err());
     }
 
     #[test]

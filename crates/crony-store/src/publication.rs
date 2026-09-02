@@ -99,6 +99,15 @@ impl PgStore {
               AND corp_id = $2
               AND EXISTS (
                   SELECT 1
+                  FROM missions mission
+                  JOIN room_memberships membership
+                    ON membership.room_id = mission.room_id
+                  WHERE mission.id = factory_work_items.mission_id
+                    AND mission.corp_id = factory_work_items.corp_id
+                    AND membership.actor_id = $3
+              )
+              AND EXISTS (
+                  SELECT 1
                   FROM actors viewer
                   WHERE viewer.id = $3
                     AND viewer.corp_id = factory_work_items.corp_id
@@ -1626,7 +1635,7 @@ async fn validate_publication_prerequisites(
         .filter(|value| !value.trim().is_empty() && value.len() <= 240)
         .context("publication policy omitted base_ref")?
         .to_owned();
-    validate_factory_base_ref(&expected_base_ref)?;
+    validate_factory_publication_base_ref(&expected_base_ref)?;
     if request.base_ref != expected_base_ref {
         return Err(anyhow!(
             "publication base ref {} does not match factory policy {}",
