@@ -467,6 +467,13 @@ const paginationIssue = {
   createdAt: '2026-09-01T14:20:00Z',
   updatedAt: '2026-09-01T14:20:00Z',
 }
+const paginationExpectedMissionTitle =
+  `GitHub #${paginationIssue.number}: ${paginationIssue.title}`
+const paginationSourceMarker = [
+  `ISSUE: #${paginationIssue.number} — ${paginationIssue.title}`,
+  `URL: ${paginationIssue.url}`,
+  `SOURCE REVISION: ${paginationIssue.updatedAt}`,
+].join('\n')
 const paginationState = {
   repository: 'shyamsridhar123/ecorp',
   project: recoveredFakeState.project,
@@ -667,19 +674,27 @@ const paginationMatchingWorkItems = paginationPostReplayLookup.items.filter(
     item.source_issue_number === paginationIssue.number,
 )
 assert.equal(paginationMatchingWorkItems.length, 1)
-const paginationMissionIds = new Set(
-  paginationMatchingWorkItems
-    .map((item) => item.mission_id)
-    .filter((missionId) => missionId !== null),
+const paginationSourceMarkedMissionIds = new Set(
+  paginationPostReplaySnapshot.snapshot.tasks
+    .filter((task) => task.objective.includes(paginationSourceMarker))
+    .map((task) => task.mission_id),
 )
 const paginationMissions = paginationPostReplaySnapshot.snapshot.missions.filter(
-  (mission) => paginationMissionIds.has(mission.id),
+  (mission) =>
+    mission.title === paginationExpectedMissionTitle ||
+    paginationSourceMarkedMissionIds.has(mission.id),
 )
 assert.equal(paginationMissions.length, 1)
+const paginationMissionIds = new Set(
+  paginationMissions.map((mission) => mission.id),
+)
 const paginationTasks = paginationPostReplaySnapshot.snapshot.tasks.filter((task) =>
   paginationMissionIds.has(task.mission_id),
 )
 assert.equal(paginationTasks.length, 1)
+assert.ok(
+  paginationTasks.every((task) => task.objective.includes(paginationSourceMarker)),
+)
 const paginationTaskIds = new Set(paginationTasks.map((task) => task.id))
 const paginationRuns = paginationPostReplaySnapshot.snapshot.runs.filter((run) =>
   paginationTaskIds.has(run.task_id),
@@ -1213,6 +1228,11 @@ const report = {
       missions: paginationMissions.length,
       tasks: paginationTasks.length,
       runs: paginationRuns.length,
+    },
+    mission_identity: {
+      expected_title: paginationExpectedMissionTitle,
+      source_marker_matched: paginationSourceMarkedMissionIds.size === 1,
+      counted_independently_of_work_item_link: true,
     },
     exactly_one_work_item: paginationMatchingWorkItems.length === 1,
     exactly_one_mission: paginationMissions.length === 1,

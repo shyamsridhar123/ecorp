@@ -17,14 +17,14 @@ work item is older than the snapshot's 500-row factory projection.
 runner, scheduler, worktree manager, fake-process child, verifier, event journal, and deterministic
 GitHub CLI boundary.
 
-Review-hardening rerun completed at `2026-09-02T00:58:57.407Z`.
+Final review-hardening rerun completed at `2026-09-02T01:46:20.857Z`.
 
 Pagination regression:
 
 - target Project item: `PVTI_FAKE_FACTORY_9020`
-- target work item: `6b71fa30-7988-4624-b073-d4ea646e2eed`
-- target mission: `15a05e65-5dd4-489b-a603-b820d052ce2c`
-- target run: `c5469812-9179-4241-a81a-a90d6b7b58d4`
+- target work item: `c0191d5e-2c6d-4ffa-b0fc-5a50f238adc7`
+- target mission: `05c6abb1-807d-4797-986f-75ba474c8843`
+- target run: `e18a5cc9-a3df-4d66-b218-81fe2bbb9ce6`
 - 501 newer historical factory work items were created after the recoverable target
 - the legacy shared snapshot returned 500 factory items and omitted the target
 - selected-item lookup returned exactly one authoritative match
@@ -35,8 +35,11 @@ Pagination regression:
 - the guest lookup was rejected with `403` without returning source metadata
 - recovery reused the exact work item, mission, and persisted policy despite changing current CLI
   lease duration from 300 to 600 seconds as well as budget and write-scope arguments
-- a fresh post-replay lookup and snapshot counted exactly one matching work item, mission, task,
-  and run, then confirmed the factory state was `verified`
+- a fresh post-replay lookup counted exactly one matching work item
+- the fresh snapshot independently found every issue-derived mission by exact deterministic title
+  or the persisted issue URL/revision source marker, without following the work item's mission link
+- those direct mission IDs contained exactly one mission, one task, and one run, and the factory
+  state was `verified`
 - no misleading policy-mismatch error or duplicate mission/run occurred
 
 The complete controller regression also retained its prior dry-run, status-sync failure, bounded
@@ -56,7 +59,9 @@ source-revalidation coverage.
 
 ## Runtime cleanup
 
-The test-owned server and runner were stopped with `tools/stop_local.ps1`. Ports `8791` and `5187`
-had no listeners afterward, and no test-owned ECorp process remained. The rerun used and then
-removed the isolated Postgres database `crony_issue67_df02_20260902_001`; the shared database was
-not modified after it reported a migration from another worktree.
+The final rerun used isolated port `8792`, source clone
+`output/issue67-source-clone-002`, and Postgres database
+`crony_issue67_df02_20260902_002` to avoid another worktree's shared runtime and Git worktree
+activity. The exact test-owned server and runner PIDs were stopped, port `8792` was verified
+closed, the isolated database was dropped, and the isolated clone was recursively removed only
+after its absolute path was verified inside this worktree's `output` directory.

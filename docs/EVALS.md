@@ -193,8 +193,10 @@ item, mission, persisted policy, and single run through the selected-Project-ite
 proves explicit lookup counts, identifier and request-count bounds, guest denial, isolation from an
 equal item ID with a conflicting policy in another Project, and recovery after the lease duration
 changes. A fresh post-replay lookup and snapshot count every matching work item, mission, task, and
-run to prove there is exactly one of each. CLI unit coverage verifies Markdown section boundaries
-for dependency and acceptance parsing. See
+run to prove there is exactly one of each. Mission discovery uses the deterministic GitHub issue
+title and persisted source marker from the fresh snapshot rather than following the work item's
+mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
+verifies Markdown section boundaries for dependency and acceptance parsing. See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
 `docs/evidence/2026-09-01-factory-pagination-safety.md`.
 
