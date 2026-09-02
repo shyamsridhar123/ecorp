@@ -16,8 +16,8 @@
 **Metadata lookup closure head:** `75bfc0de71233d1c79363c2d2c642304bda0b960`
 **URL identity closure head:** `70b287478d060fc08bafee4f33f28c393fb7c5dd`
 **Source-base and bundle head:** `e17ef45`
-**Integrated gate head:** `31acd7c4a469f3b012d22024b59c8b1ae4b48c28`
-**Stacked base:** `f7801b08b05a99e54ac8bfd7d0e650541ea2e776`
+**Integrated gate head:** `85e9e81b24884421b017d6b0409094cc49ef3940`
+**Stacked base:** `4f3b0bf97e95bdde3fb426b1ed500b939bd197e6`
 
 ## Scope
 
@@ -51,7 +51,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 90 non-documentation unit tests with no failures.
+The Rust workspace ran 92 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -89,7 +89,7 @@ The final exact-head run recorded:
   "project_field_count_during_publication": 32,
   "publication_attempts": 10,
   "pull_request_number": 41,
-  "pull_request_head_sha": "893864d95384007577109f13316f2b08d1480911",
+  "pull_request_head_sha": "3490218cbdf1c8597d7df7a0421a0d2a3afb9283",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -297,7 +297,7 @@ portable Git bundle path grouping. URL identity commit
 `70b287478d060fc08bafee4f33f28c393fb7c5dd` then passed all repository gates and fresh isolated
 controller/publication E2Es on the merged tree.
 
-The final base `f7801b08b05a99e54ac8bfd7d0e650541ea2e776` was then merged normally.
+The final base `4f3b0bf97e95bdde3fb426b1ed500b939bd197e6` was then merged normally.
 For final ordering coverage, the fake GitHub API closed PR #41 on the PR lookup immediately after
 the refreshed Project field/item reads. Publication rejected the changed durable PR, made no Project
 edit, restored the fixture, and then completed normally.
@@ -306,7 +306,7 @@ Runner coverage detached worktree `HEAD` at the verified base, generated the com
 workspace branch, bundled a unique `refs/ecorp/deliverables/*` ref, and proved the temporary ref was
 removed. The publisher validates and imports that sole bundle head while retaining compatibility
 with earlier HEAD-labeled bundles. Integrated head
-`31acd7c4a469f3b012d22024b59c8b1ae4b48c28` passed all gates and both focused E2Es.
+`85e9e81b24884421b017d6b0409094cc49ef3940` passed all gates and both focused E2Es.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not
