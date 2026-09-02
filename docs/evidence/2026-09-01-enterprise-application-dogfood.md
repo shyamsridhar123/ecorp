@@ -169,9 +169,14 @@ A local correction now:
 `node tools/e2e_budgets.mjs` passed after the correction. The late-completion mission ended after
 one failed attempt, uploaded no accepted artifact, and emitted zero `run.completed` events.
 
-The real-provider Codex lane has not yet been rerun after the usage-streaming change.
+An authenticated Codex run on September 2, 2026 then used 33,438 tokens against a one-token ceiling.
+The journal persisted usage, `stop`, command acknowledgment, and failure in that order. Run, task,
+and mission ended `failed`; no artifact, verification pass, completion event, retry, or provider
+descendant remained. The desktop and mobile UI showed one coherent failed outcome. See
+`docs/evidence/2026-09-02-real-provider-budget-stop.md`.
 
-Tracked in GitHub issue #49.
+Issue #49 is complete. The same run exposed additional provider-isolation evidence retained under
+issue #51.
 
 ## Scenario 3: Credit Exception
 
