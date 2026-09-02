@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Component, Path},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
 use crony_domain::{
-    Agent, AgentStatus, ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan,
-    TaskSecretReference, VerificationPolicy, VerifierCheck,
+    Agent, AgentStatus, DeliverableSpec, ManualVerificationGate, PlannedTask, TaskContract,
+    TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
+    repository_relative_path_is_valid, write_scope_is_valid,
 };
 
 pub const MAX_GRAPH_NODES: usize = 8;
@@ -32,6 +32,7 @@ pub struct PlanningRequest<'a> {
     pub secret_refs: &'a [TaskSecretReference],
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
+    pub deliverable: Option<&'a DeliverableSpec>,
 }
 
 pub trait ManagerStrategy: Send + Sync {
@@ -117,6 +118,9 @@ impl ManagerStrategy for SingleTaskStrategy {
         task_contract.secret_refs = request.secret_refs.to_vec();
         task_contract.model = request.preferred_model.map(str::to_owned);
         task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+        if let Some(deliverable) = request.deliverable {
+            task_contract.deliverable = Some(deliverable.clone());
+        }
         Ok(TaskGraphPlan {
             strategy: self.id().to_owned(),
             max_nodes: 1,
@@ -191,6 +195,9 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
         synthesis_contract.budget_cost_microusd = synthesis_cost_budget;
         synthesis_contract.model = synthesis_model;
         synthesis_contract.reasoning_effort = synthesis_reasoning;
+        if let Some(deliverable) = request.deliverable {
+            synthesis_contract.deliverable = Some(deliverable.clone());
+        }
         synthesis_contract.references = vec![
             "task:specialist-a".to_owned(),
             "task:specialist-b".to_owned(),
@@ -413,6 +420,7 @@ fn verification_plan(
     );
     task_contract.budget_cost_microusd = budget_cost_microusd;
     task_contract.normalize_for_adapter(&agent.adapter);
+    task_contract.deliverable = request.deliverable.cloned();
     Ok(TaskGraphPlan {
         strategy: strategy.to_owned(),
         max_nodes: 1,
@@ -497,6 +505,7 @@ fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> Tas
         secret_refs: Vec::new(),
         model: None,
         reasoning_effort: None,
+        deliverable: None,
     }
 }
 
@@ -636,6 +645,9 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
         contract.source_base_ref.as_deref(),
         contract.source_base_commit.as_deref(),
     )?;
+    if let Some(deliverable) = &contract.deliverable {
+        validate_deliverable(task_key, deliverable)?;
+    }
     if contract
         .model
         .as_ref()
@@ -664,6 +676,15 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
                 "task {task_key} contains an invalid contract entry"
             ));
         }
+    }
+    if let Some(scope) = contract
+        .write_scope
+        .iter()
+        .find(|scope| !write_scope_is_valid(scope))
+    {
+        return Err(anyhow!(
+            "task {task_key} contains invalid write scope {scope}"
+        ));
     }
     let mut environment_names = HashSet::new();
     for secret in &contract.secret_refs {
@@ -694,6 +715,22 @@ fn validate_contract(task_key: &str, contract: &TaskContract) -> Result<()> {
             || secret.resource.len() > 512
         {
             return Err(anyhow!("task {task_key} secret scope is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_deliverable(task_key: &str, deliverable: &DeliverableSpec) -> Result<()> {
+    if deliverable.paths.len() > 128 {
+        return Err(anyhow!(
+            "task {task_key} deliverable cannot contain more than 128 paths"
+        ));
+    }
+    for path in &deliverable.paths {
+        if !repository_relative_path_is_valid(path) {
+            return Err(anyhow!(
+                "task {task_key} deliverable path must be a literal repository-relative path"
+            ));
         }
     }
     Ok(())
@@ -824,14 +861,7 @@ fn validate_verification_policy(task_key: &str, policy: &VerificationPolicy) -> 
 }
 
 fn validate_relative_path(task_key: &str, value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 500
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !repository_relative_path_is_valid(value) {
         return Err(anyhow!(
             "task {task_key} verifier path must stay inside the worktree"
         ));
@@ -928,6 +958,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
         let agents = agents();
         let first = registry
@@ -964,6 +995,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
         let mut plan = registry
             .plan("parallel-specialists", &request, &agents)
@@ -1039,6 +1071,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1048,6 +1081,84 @@ mod tests {
             plan.tasks[0].contract.budget_tokens,
             DEFAULT_SINGLE_TASK_BUDGET_TOKENS
         );
+    }
+
+    #[test]
+    fn single_strategy_preserves_typed_deliverable_and_rejects_unsafe_scope() {
+        let agents = agents();
+        let registry = StrategyRegistry::new();
+        let requested = DeliverableSpec {
+            form: crony_domain::DeliverableForm::Archive,
+            commit_after_verification: true,
+            paths: vec!["src".to_owned()],
+        };
+        let plan = registry
+            .plan(
+                "single",
+                &PlanningRequest {
+                    mission_title: "export the verified application",
+                    preferred_adapter: Some("fake-process"),
+                    preferred_model: None,
+                    reasoning_effort: None,
+                    secret_refs: &[],
+                    budget_tokens: None,
+                    budget_cost_microusd: None,
+                    deliverable: Some(&requested),
+                },
+                &agents,
+            )
+            .expect("single plan");
+        assert_eq!(plan.tasks[0].contract.deliverable, Some(requested));
+
+        let unsafe_requested = DeliverableSpec {
+            paths: vec!["../escape".to_owned()],
+            ..DeliverableSpec::default()
+        };
+        assert!(
+            registry
+                .plan(
+                    "single",
+                    &PlanningRequest {
+                        mission_title: "reject unsafe export scope",
+                        preferred_adapter: Some("fake-process"),
+                        preferred_model: None,
+                        reasoning_effort: None,
+                        secret_refs: &[],
+                        budget_tokens: None,
+                        budget_cost_microusd: None,
+                        deliverable: Some(&unsafe_requested),
+                    },
+                    &agents,
+                )
+                .is_err()
+        );
+
+        let magic_requested = DeliverableSpec {
+            paths: vec![":(exclude)secret.txt".to_owned()],
+            ..DeliverableSpec::default()
+        };
+        assert!(
+            registry
+                .plan(
+                    "single",
+                    &PlanningRequest {
+                        mission_title: "reject Git pathspec magic",
+                        preferred_adapter: Some("fake-process"),
+                        preferred_model: None,
+                        reasoning_effort: None,
+                        secret_refs: &[],
+                        budget_tokens: None,
+                        budget_cost_microusd: None,
+                        deliverable: Some(&magic_requested),
+                    },
+                    &agents,
+                )
+                .is_err()
+        );
+
+        let mut invalid_scope_plan = plan;
+        invalid_scope_plan.tasks[0].contract.write_scope = vec!["src/*.rs".to_owned()];
+        assert!(validate_plan(&invalid_scope_plan, &agents).is_err());
     }
 
     #[test]
@@ -1065,6 +1176,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1101,6 +1213,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: None,
                 },
                 &agents,
             )
@@ -1123,6 +1236,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            deliverable: None,
         };
 
         let mut plan = registry

@@ -1,4 +1,5 @@
 mod adapter;
+mod deliverable;
 mod verifier;
 mod workspace;
 
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use crony_domain::VerificationPolicy;
+use crony_domain::{DeliverableSpec, VerificationPolicy};
 use crony_protocol::{
     ActiveRunClaim, ResolvedSecret, RunnerCapability, RunnerModel, RunnerToServer, ServerToRunner,
 };
@@ -21,6 +22,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -161,6 +163,8 @@ struct Assignment {
     source_base_commit: Option<String>,
     resume_workspace_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
+    write_scope: Vec<String>,
+    deliverable: Option<DeliverableSpec>,
     secrets: Vec<ResolvedSecret>,
 }
 
@@ -176,6 +180,19 @@ struct CredentialFile {
 struct ActiveRunControl {
     assignment_token: Uuid,
     control: mpsc::UnboundedSender<AdapterControl>,
+    artifact_ack: mpsc::UnboundedSender<ArtifactAck>,
+}
+
+#[derive(Debug)]
+struct ArtifactAck {
+    artifact_id: Uuid,
+    artifact_role: String,
+    sha256: String,
+}
+
+struct AssignmentChannels {
+    controls: mpsc::UnboundedReceiver<AdapterControl>,
+    artifact_acks: mpsc::UnboundedReceiver<ArtifactAck>,
 }
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
@@ -552,6 +569,20 @@ async fn run_connection(
             ServerToRunner::RegistrationRejected { reason } => {
                 return Err(anyhow!("runner registration rejected: {reason}"));
             }
+            ServerToRunner::ArtifactStored {
+                run_id,
+                artifact_id,
+                artifact_role,
+                sha256,
+            } => {
+                if let Some(active) = active_runs.get(&run_id) {
+                    let _ = active.artifact_ack.send(ArtifactAck {
+                        artifact_id,
+                        artifact_role,
+                        sha256,
+                    });
+                }
+            }
             ServerToRunner::StartRun {
                 corp_id,
                 room_id,
@@ -568,6 +599,8 @@ async fn run_connection(
                 source_base_ref,
                 source_base_commit,
                 verification_policy,
+                write_scope,
+                deliverable,
                 secrets,
             } => {
                 let assignment = Assignment {
@@ -589,6 +622,8 @@ async fn run_connection(
                     source_base_commit,
                     resume_workspace_base_commit: None,
                     verification_policy,
+                    write_scope,
+                    deliverable,
                     secrets,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
@@ -631,12 +666,14 @@ async fn run_connection(
                     continue;
                 };
                 let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                let (artifact_ack_tx, artifact_ack_rx) = mpsc::unbounded_channel::<ArtifactAck>();
                 schedule_secret_expiry(secret_ttl, control_tx.clone());
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
                         assignment_token,
                         control: control_tx,
+                        artifact_ack: artifact_ack_tx,
                     },
                 );
                 let task_workspaces = workspaces.clone();
@@ -650,7 +687,10 @@ async fn run_connection(
                         assignment.clone(),
                         adapter,
                         task_outbound.clone(),
-                        control_rx,
+                        AssignmentChannels {
+                            controls: control_rx,
+                            artifact_acks: artifact_ack_rx,
+                        },
                         None,
                     )
                     .await
@@ -686,6 +726,8 @@ async fn run_connection(
                 source_base_commit,
                 workspace_base_commit,
                 verification_policy,
+                write_scope,
+                deliverable,
                 secrets,
             } => {
                 let assignment = Assignment {
@@ -707,6 +749,8 @@ async fn run_connection(
                     source_base_commit,
                     resume_workspace_base_commit: workspace_base_commit,
                     verification_policy,
+                    write_scope,
+                    deliverable,
                     secrets,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
@@ -749,12 +793,14 @@ async fn run_connection(
                     continue;
                 };
                 let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                let (artifact_ack_tx, artifact_ack_rx) = mpsc::unbounded_channel::<ArtifactAck>();
                 schedule_secret_expiry(secret_ttl, control_tx.clone());
                 active_runs.insert(
                     assignment.run_id,
                     ActiveRunControl {
                         assignment_token,
                         control: control_tx,
+                        artifact_ack: artifact_ack_tx,
                     },
                 );
                 let task_workspaces = workspaces.clone();
@@ -768,7 +814,10 @@ async fn run_connection(
                         assignment.clone(),
                         adapter,
                         task_outbound.clone(),
-                        control_rx,
+                        AssignmentChannels {
+                            controls: control_rx,
+                            artifact_acks: artifact_ack_rx,
+                        },
                         Some(provider_session_id),
                     )
                     .await
@@ -1022,6 +1071,10 @@ impl AdapterEventSink for RunnerEventSink {
                             "sha256": artifact.sha256,
                             "bytes": artifact.bytes,
                             "media_type": artifact.media_type,
+                            "artifact_role": "provider_evidence",
+                            "file_name": artifact.path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("artifact.bin"),
                             "content_base64": BASE64.encode(bytes),
                         }),
                     )
@@ -1145,9 +1198,13 @@ async fn execute_assignment(
     assignment: Assignment,
     adapter: Arc<dyn AgentAdapter>,
     outbound: OutboundBus,
-    controls: mpsc::UnboundedReceiver<AdapterControl>,
+    channels: AssignmentChannels,
     resume_session_id: Option<String>,
 ) -> Result<()> {
+    let AssignmentChannels {
+        controls,
+        mut artifact_acks,
+    } = channels;
     validate_assignment_source(&workspaces, &assignment)?;
     let workspace = workspaces
         .prepare(
@@ -1228,6 +1285,7 @@ async fn execute_assignment(
                     &assignment,
                     &workspace,
                     &artifacts,
+                    &mut artifact_acks,
                     &summary,
                 )
                 .await;
@@ -1273,6 +1331,7 @@ async fn send_verification_events(
     assignment: &Assignment,
     workspace: &WorkspaceLease,
     artifacts: &Arc<Mutex<Vec<AdapterArtifact>>>,
+    artifact_acks: &mut mpsc::UnboundedReceiver<ArtifactAck>,
     completion_summary: &str,
 ) {
     send_run_event(
@@ -1319,12 +1378,118 @@ async fn send_verification_events(
         );
         return;
     }
+    let deliverable_linkage = if let Some(spec) = &assignment.deliverable {
+        let exported = match deliverable::export(
+            assignment.run_id,
+            spec,
+            workspace,
+            &report,
+            &artifacts,
+            &assignment.write_scope,
+        )
+        .await
+        {
+            Ok(exported) => exported,
+            Err(error) => {
+                send_run_event(
+                    outbound,
+                    runner_id,
+                    assignment,
+                    "run.failed",
+                    json!({
+                        "error": format!("verified deliverable export failed: {error:#}"),
+                    }),
+                );
+                return;
+            }
+        };
+        let deliverable_sha256 = hex::encode(sha2::Sha256::digest(&exported.bytes));
+        let upload_payload = json!({
+            "sha256": deliverable_sha256,
+            "bytes": exported.bytes.len(),
+            "media_type": exported.media_type,
+            "content_base64": BASE64.encode(&exported.bytes),
+            "file_name": exported.file_name,
+            "artifact_role": "source_deliverable",
+            "form": exported.form.as_str(),
+            "verification_sha256": exported.verification_sha256,
+            "base_commit": exported.base_commit,
+            "head_commit": exported.head_commit,
+            "branch": exported.branch,
+            "integration_state": if exported.form == crony_domain::DeliverableForm::ReviewOnlyReport {
+                "not_applicable"
+            } else {
+                "ready_for_review"
+            },
+        });
+        let mut stored = None;
+        for _ in 0..6 {
+            send_run_event(
+                outbound,
+                runner_id,
+                assignment,
+                "run.deliverable_upload",
+                upload_payload.clone(),
+            );
+            let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let ack = artifact_acks
+                        .recv()
+                        .await
+                        .context("artifact acknowledgment channel closed")?;
+                    if ack.artifact_role == "source_deliverable" && ack.sha256 == deliverable_sha256
+                    {
+                        return Ok::<Uuid, anyhow::Error>(ack.artifact_id);
+                    }
+                }
+            })
+            .await;
+            match attempt {
+                Ok(Ok(artifact_id)) => {
+                    stored = Some(artifact_id);
+                    break;
+                }
+                Ok(Err(error)) => {
+                    send_run_event(
+                        outbound,
+                        runner_id,
+                        assignment,
+                        "run.failed",
+                        json!({"error": format!("source deliverable acknowledgment failed: {error:#}")}),
+                    );
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        if stored.is_none() {
+            send_run_event(
+                outbound,
+                runner_id,
+                assignment,
+                "run.failed",
+                json!({"error": "source deliverable storage acknowledgment timed out"}),
+            );
+            return;
+        }
+        Some((exported.verification_sha256, deliverable_sha256))
+    } else {
+        None
+    };
+    let verification_payload = match deliverable_linkage {
+        Some((verification_sha256, deliverable_sha256)) => json!({
+            "summary": report.summary,
+            "verification_sha256": verification_sha256,
+            "deliverable_sha256": deliverable_sha256,
+        }),
+        None => json!({"summary": report.summary}),
+    };
     send_run_event(
         outbound,
         runner_id,
         assignment,
         "run.verification_passed",
-        json!({"summary": report.summary}),
+        verification_payload,
     );
     if let Some(gate) = report.manual_gate {
         send_run_event(

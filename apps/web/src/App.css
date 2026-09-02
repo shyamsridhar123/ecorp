@@ -927,6 +927,8 @@ select:focus-visible {
 
 .evidence-box {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   margin-top: 10px;
@@ -934,6 +936,31 @@ select:focus-visible {
   color: var(--mint);
   font: 10px/1.2 var(--mono);
   border: 1px solid var(--mint);
+}
+
+.evidence-provider {
+  color: var(--cobalt-dark);
+  border-color: var(--cobalt);
+}
+
+.evidence-source {
+  color: #244d3c;
+  border-color: var(--mint);
+  background: #edf6f2;
+}
+
+.evidence-source small {
+  flex-basis: 100%;
+}
+
+.integration-box {
+  border-color: var(--marigold);
+  background: #fff8e8;
+}
+
+.integration-box small {
+  display: block;
+  margin-top: 4px;
 }
 
 .verification-box {

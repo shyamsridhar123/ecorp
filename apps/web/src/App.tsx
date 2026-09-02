@@ -47,6 +47,11 @@ type TaskContract = {
   budget_tokens: number
   deadline_at: string | null
   escalation: string
+  deliverable: {
+    form: 'commit_branch' | 'patch' | 'archive' | 'typed_artifact_set' | 'review_only_report'
+    commit_after_verification: boolean
+    paths: string[]
+  } | null
 }
 
 type Task = {
@@ -91,6 +96,8 @@ type Run = {
   workspace_detail: string | null
   verification_status: string
   verification_summary: string | null
+  verification_sha256: string | null
+  deliverable_sha256: string | null
   status: string
   summary: string | null
   artifact_id: string | null
@@ -98,6 +105,26 @@ type Run = {
   artifact_media_type: string | null
   artifact_signature: string | null
   artifact_sha256: string | null
+}
+
+type SourceDeliverable = {
+  id: string
+  task_id: string
+  run_id: string
+  artifact_id: string
+  form: 'commit_branch' | 'patch' | 'archive' | 'typed_artifact_set' | 'review_only_report'
+  file_name: string
+  uri: string
+  sha256: string
+  media_type: string
+  bytes: number
+  provenance_signature: string
+  verification_sha256: string
+  base_commit: string
+  head_commit: string | null
+  branch: string
+  integration_state: 'not_applicable' | 'ready_for_review' | 'published' | 'integrated'
+  retention_until: string
 }
 
 type Lease = {
@@ -266,6 +293,7 @@ type SnapshotResponse = {
     queued_messages: QueuedMessage[]
     verification_evidence: VerificationEvidence[]
     verification_requests: VerificationRequest[]
+    source_deliverables: SourceDeliverable[]
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
@@ -857,6 +885,7 @@ function MissionCard({
   runs,
   agents,
   evidence,
+  deliverables,
   verificationRequests,
   actionApprovals,
   actorId,
@@ -865,6 +894,7 @@ function MissionCard({
   onLaunch,
   onResume,
   onDownloadArtifact,
+  onDownloadDeliverable,
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
@@ -873,6 +903,7 @@ function MissionCard({
   runs: Run[]
   agents: Agent[]
   evidence: VerificationEvidence[]
+  deliverables: SourceDeliverable[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
   actorId: string
@@ -881,6 +912,7 @@ function MissionCard({
   onLaunch: (mission: Mission) => Promise<void>
   onResume: (run: Run) => Promise<void>
   onDownloadArtifact: (run: Run) => Promise<void>
+  onDownloadDeliverable: (deliverable: SourceDeliverable) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
@@ -914,6 +946,9 @@ function MissionCard({
         .filter((item) => item.run_id === latestRun.id)
         .toSorted((left, right) => left.check_index - right.check_index)
     : []
+  const latestDeliverable = latestRun
+    ? deliverables.find((deliverable) => deliverable.run_id === latestRun.id)
+    : undefined
   const terminalSummary =
     latestRun && terminalRun(latestRun.status)
       ? latestRun.summary ?? latestRun.verification_summary
@@ -974,6 +1009,17 @@ function MissionCard({
                   </div>
                   <div><dt>Budget</dt><dd>{task.contract.budget_tokens.toLocaleString()} tokens</dd></div>
                   <div><dt>Write scope</dt><dd>{task.contract.write_scope.length ? task.contract.write_scope.join(', ') : 'No repository writes declared'}</dd></div>
+                  <div>
+                    <dt>Deliverable</dt>
+                    <dd>
+                      {task.contract.deliverable
+                        ? statusLabel(task.contract.deliverable.form)
+                        : 'Provider evidence only'}
+                      {task.contract.deliverable?.commit_after_verification
+                        ? ' · commit after verification'
+                        : ''}
+                    </dd>
+                  </div>
                 </dl>
                 <strong>Acceptance checks</strong>
                 <ul>
@@ -985,8 +1031,8 @@ function MissionCard({
         })}
       </div>
       {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
-        <div className="evidence-box">
-          <strong>Artifact recorded</strong>
+        <div className="evidence-box evidence-provider" data-testid="provider-evidence">
+          <strong>Provider evidence</strong>
           <span>{shortId(latestRun.artifact_sha256)}…</span>
           <button
             type="button"
@@ -999,9 +1045,28 @@ function MissionCard({
           </button>
         </div>
       ) : null}
+      {latestDeliverable ? (
+        <div className="evidence-box evidence-source" data-testid="source-deliverable">
+          <strong>Source deliverable · {statusLabel(latestDeliverable.form)}</strong>
+          <span>{latestDeliverable.file_name} · {latestDeliverable.bytes.toLocaleString()} bytes</span>
+          <small>
+            Verification {shortId(latestDeliverable.verification_sha256)}… · bytes {shortId(latestDeliverable.sha256)}…
+          </small>
+          <button
+            type="button"
+            className="artifact-download"
+            onClick={() => void onDownloadDeliverable(latestDeliverable)}
+          >
+            Download source deliverable
+          </button>
+        </div>
+      ) : null}
       {latestRun &&
       (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
-        <div className={`verification-box verification-${latestRun.verification_status}`}>
+        <div
+          className={`verification-box verification-${latestRun.verification_status}`}
+          data-testid="verification-evidence"
+        >
           <strong>{statusLabel(latestRun.verification_status)}</strong>
           <span>
             {latestEvidence.filter((item) => item.status === 'passed').length}/
@@ -1047,6 +1112,17 @@ function MissionCard({
         <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
           <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
           <strong>{latestRun.workspace_branch}</strong>
+        </div>
+      ) : null}
+      {latestDeliverable ? (
+        <div className="workspace-box integration-box" data-testid="integration-state">
+          <span>Integration · {statusLabel(latestDeliverable.integration_state)}</span>
+          <strong>
+            {latestDeliverable.head_commit
+              ? `${latestDeliverable.branch} @ ${shortId(latestDeliverable.head_commit)}`
+              : 'No publication or merge requested'}
+          </strong>
+          <small>Pull-request publication and merge require separate authorization.</small>
         </div>
       ) : null}
       {mission.status === 'ready' ? (
@@ -1365,6 +1441,9 @@ function App() {
   const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
   const [missionStrategy, setMissionStrategy] = useState('single')
   const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
+  const [missionDeliverable, setMissionDeliverable] =
+    useState<NonNullable<TaskContract['deliverable']>['form']>('archive')
+  const [commitDeliverable, setCommitDeliverable] = useState(false)
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
   const [developerMode, setDeveloperMode] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
@@ -1611,6 +1690,12 @@ function App() {
               : null,
           strategy: missionStrategy,
           budget_tokens: deterministicHarness ? null : missionBudgetTokens,
+          deliverable: {
+            form: missionDeliverable,
+            commit_after_verification:
+              commitDeliverable || missionDeliverable === 'commit_branch',
+            paths: [],
+          },
         }),
       })
       let launched: LaunchMissionResponse | null = null
@@ -1938,6 +2023,38 @@ function App() {
       link.remove()
       URL.revokeObjectURL(objectUrl)
       setAnnouncement('Verified artifact download started.')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const downloadDeliverable = async (deliverable: SourceDeliverable) => {
+    if (!selectedActor) return
+    setError(null)
+    try {
+      const token = storedAccessToken()
+      const response = await fetch(
+        `${API_URL}${deliverable.uri}?actor_id=${selectedActor.id}`,
+        {
+          headers: {
+            accept: 'application/octet-stream',
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`Source deliverable download failed with HTTP ${response.status}.`)
+      }
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = deliverable.file_name
+      document.body.append(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+      setAnnouncement('Source deliverable download started.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -2461,6 +2578,43 @@ function App() {
                 </small>
               </div>
             ) : null}
+            <div className="mission-field">
+              <label htmlFor="mission-deliverable">Portable deliverable</label>
+              <select
+                id="mission-deliverable"
+                value={missionDeliverable}
+                onChange={(event) =>
+                  setMissionDeliverable(
+                    event.target.value as NonNullable<TaskContract['deliverable']>['form'],
+                  )
+                }
+              >
+                <option value="archive">Source archive</option>
+                <option value="patch">Deterministic Git patch</option>
+                <option value="typed_artifact_set">Typed artifact set</option>
+                <option value="commit_branch">Verified commit and branch bundle</option>
+                <option value="review_only_report">Review-only report</option>
+              </select>
+              <small>
+                Source exports include tracked changes and untracked files, but never ignored
+                secret-like paths or runner internals.
+              </small>
+            </div>
+            <label className="mission-run-toggle">
+              <input
+                type="checkbox"
+                checked={commitDeliverable || missionDeliverable === 'commit_branch'}
+                disabled={missionDeliverable === 'commit_branch'}
+                onChange={(event) => setCommitDeliverable(event.target.checked)}
+              />
+              <span>
+                <strong>Commit after verification</strong>
+                <small>
+                  Creates a commit only on the isolated task branch. Publication and merge stay
+                  separate authorized effects.
+                </small>
+              </span>
+            </label>
             <label className="developer-mode-toggle">
               <input
                 type="checkbox"
@@ -2544,6 +2698,7 @@ function App() {
                     runs={runs}
                     agents={data.snapshot.agents}
                     evidence={data.snapshot.verification_evidence}
+                    deliverables={data.snapshot.source_deliverables}
                     verificationRequests={data.snapshot.verification_requests}
                     actionApprovals={data.snapshot.action_approvals}
                     actorId={selectedActor.id}
@@ -2552,6 +2707,7 @@ function App() {
                     onLaunch={launchMission}
                     onResume={resumeAgentRun}
                     onDownloadArtifact={downloadArtifact}
+                    onDownloadDeliverable={downloadDeliverable}
                     onVerificationDecision={decideVerification}
                     onActionApprovalDecision={decideActionApproval}
                   />

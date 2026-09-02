@@ -1,6 +1,6 @@
 # ECorp user and developer journey
 
-Updated: August 30, 2026
+Updated: September 2, 2026
 
 ECorp turns a repository-level outcome into isolated agent work, human decisions, and verified
 artifacts. The office is a live projection of that workflow; it is not a separate game layer or the
@@ -50,6 +50,18 @@ blank uses that provider's default.
 A mission is an outcome with a task contract, not a chat message. State the expected result and the
 evidence that should prove it.
 
+Choose the portable result before dispatch:
+
+- **Source archive** packages changed tracked and non-ignored untracked files with hashes.
+- **Git patch** produces deterministic binary patch bytes.
+- **Typed artifact set** includes typed file entries and content hashes.
+- **Verified commit and branch bundle** creates a post-verification commit only in the task
+  worktree and includes portable source bytes.
+- **Review-only report** records verification and change metadata without source content.
+
+The optional commit toggle never publishes or merges. Pull-request publication and merge are
+separate authorized effects.
+
 By default, **Plan and run mission** creates the task graph and immediately dispatches ready tasks.
 Enable **Pause after planning** when a human should inspect the generated graph before selecting
 **Dispatch mission**.
@@ -84,8 +96,9 @@ ECorp preserves the identity and resumable session metadata so future work can b
 leaving an operating-system process alive.
 
 Risky commands create durable approval records. After verification passes, the mission card exposes
-the signed artifact for download. The room and immutable activity feed preserve the collaboration
-and replay trail.
+provider evidence, verification evidence, the signed source deliverable, and integration state as
+four distinct records. Room members can download the actual deliverable without runner-host path
+access. The room and immutable activity feed preserve the collaboration and replay trail.
 
 ## The developer journey
 

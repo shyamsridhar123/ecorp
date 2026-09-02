@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use object_store::{
     ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectPath,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -217,6 +217,25 @@ impl ArtifactStore {
                 .context("artifact upload omitted media_type")?,
             &bytes,
         )?;
+        let artifact_role = payload
+            .get("artifact_role")
+            .and_then(Value::as_str)
+            .unwrap_or("provider_evidence");
+        if !matches!(artifact_role, "provider_evidence" | "source_deliverable") {
+            return Err(anyhow!("artifact role is invalid"));
+        }
+        let file_name = payload
+            .get("file_name")
+            .and_then(Value::as_str)
+            .unwrap_or("artifact.bin");
+        if !valid_artifact_file_name(file_name) {
+            return Err(anyhow!("artifact file name is invalid"));
+        }
+        let metadata = if artifact_role == "source_deliverable" {
+            source_deliverable_metadata(payload)?
+        } else {
+            json!({})
+        };
         let object_key = format!(
             "corps/{}/sha256/{}/{}",
             identity.corp_id,
@@ -239,6 +258,9 @@ impl ArtifactStore {
             sha256: actual_sha,
             media_type,
             bytes: byte_count,
+            artifact_role: artifact_role.to_owned(),
+            file_name: file_name.to_owned(),
+            metadata,
             provenance_signature: String::new(),
             retention_until,
         };
@@ -396,8 +418,29 @@ fn is_staging_key(key: &str) -> bool {
 }
 
 fn provenance_message(artifact: &StoredArtifact) -> String {
+    if artifact.artifact_role == "provider_evidence"
+        && artifact.file_name == "artifact.bin"
+        && artifact.metadata == json!({})
+    {
+        return format!(
+            "v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            artifact.id,
+            artifact.corp_id,
+            artifact.task_id,
+            artifact.run_id,
+            artifact.producer_agent_id,
+            artifact.producer_runner_id,
+            artifact.verifier,
+            artifact.object_key,
+            artifact.uri,
+            artifact.sha256,
+            artifact.media_type,
+            artifact.bytes,
+            artifact.retention_until.timestamp_micros()
+        );
+    }
     format!(
-        "v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         artifact.id,
         artifact.corp_id,
         artifact.task_id,
@@ -410,8 +453,59 @@ fn provenance_message(artifact: &StoredArtifact) -> String {
         artifact.sha256,
         artifact.media_type,
         artifact.bytes,
+        artifact.artifact_role,
+        artifact.file_name,
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&artifact.metadata).expect("artifact metadata serializes")
+        )),
         artifact.retention_until.timestamp_micros()
     )
+}
+
+fn source_deliverable_metadata(payload: &Value) -> Result<Value> {
+    let required = |name: &str| {
+        payload
+            .get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("source deliverable omitted {name}"))
+    };
+    let form = required("form")?;
+    if !matches!(
+        form,
+        "commit_branch" | "patch" | "archive" | "typed_artifact_set" | "review_only_report"
+    ) {
+        return Err(anyhow!("source deliverable form is invalid"));
+    }
+    let verification_sha256 = required("verification_sha256")?;
+    let base_commit = required("base_commit")?;
+    let head_commit = payload.get("head_commit").and_then(Value::as_str);
+    let branch = required("branch")?;
+    let integration_state = required("integration_state")?;
+    if !valid_hex(verification_sha256, 64, 64)
+        || !valid_hex(base_commit, 40, 64)
+        || head_commit.is_some_and(|value| !valid_hex(value, 40, 64))
+        || branch.is_empty()
+        || branch.len() > 512
+        || !matches!(
+            integration_state,
+            "not_applicable" | "ready_for_review" | "published" | "integrated"
+        )
+    {
+        return Err(anyhow!("source deliverable metadata is invalid"));
+    }
+    Ok(json!({
+        "form": form,
+        "verification_sha256": verification_sha256,
+        "base_commit": base_commit,
+        "head_commit": head_commit,
+        "branch": branch,
+        "integration_state": integration_state,
+    }))
+}
+
+fn valid_hex(value: &str, minimum: usize, maximum: usize) -> bool {
+    (minimum..=maximum).contains(&value.len())
+        && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 fn normalize_and_verify_media_type(declared: &str, bytes: &[u8]) -> Result<String> {
@@ -488,6 +582,13 @@ fn is_zip_container(media_type: &str) -> bool {
         || media_type.starts_with("application/vnd.oasis.opendocument.")
 }
 
+fn valid_artifact_file_name(file_name: &str) -> bool {
+    !file_name.is_empty()
+        && file_name.len() <= 255
+        && !file_name.contains(['/', '\\', '"'])
+        && !file_name.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +648,59 @@ mod tests {
         tampered.bytes += 1;
         assert!(store.read_verified(&tampered).await.is_err());
         std::fs::remove_dir_all(root).expect("remove artifact test directory");
+    }
+
+    #[tokio::test]
+    async fn source_deliverable_role_and_exact_linkage_are_signed() {
+        let root = std::env::temp_dir()
+            .join("crony-source-deliverable-tests")
+            .join(Uuid::new_v4().to_string());
+        let store = ArtifactStore::initialize(
+            "local",
+            root.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            4_096,
+            false,
+        )
+        .expect("initialize artifact store");
+        let content = br#"{"form":"archive"}"#;
+        let artifact = store
+            .ingest(
+                identity(),
+                &json!({
+                    "sha256": hex::encode(Sha256::digest(content)),
+                    "bytes": content.len(),
+                    "media_type": "application/vnd.ecorp.deliverable+json",
+                    "content_base64": BASE64.encode(content),
+                    "artifact_role": "source_deliverable",
+                    "file_name": "ecorp-source-archive.json",
+                    "form": "archive",
+                    "verification_sha256": "a".repeat(64),
+                    "base_commit": "b".repeat(40),
+                    "head_commit": Value::Null,
+                    "branch": "crony/task-test/run-test",
+                    "integration_state": "ready_for_review",
+                }),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .expect("ingest source deliverable");
+        assert_eq!(artifact.artifact_role, "source_deliverable");
+        assert_eq!(artifact.file_name, "ecorp-source-archive.json");
+        assert_eq!(
+            artifact.metadata["verification_sha256"].as_str(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let mut tampered = artifact.clone();
+        tampered.metadata["verification_sha256"] = json!("c".repeat(64));
+        assert!(store.read_verified(&tampered).await.is_err());
+        std::fs::remove_dir_all(root).expect("remove source deliverable test directory");
     }
 
     #[tokio::test]
@@ -651,6 +805,14 @@ mod tests {
         assert!(normalize_and_verify_media_type("application/json", br#"{"ok":true}"#).is_ok());
         assert!(normalize_and_verify_media_type("application/json", b"not json").is_err());
         assert!(normalize_and_verify_media_type("image/png", b"not png").is_err());
+    }
+
+    #[test]
+    fn artifact_file_names_reject_content_disposition_injection() {
+        assert!(valid_artifact_file_name("report 2026.txt"));
+        assert!(!valid_artifact_file_name(
+            "safe.txt\"; filename=\"payload.html"
+        ));
     }
 
     #[test]

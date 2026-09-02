@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 const args = new Map();
@@ -27,6 +27,7 @@ const failRun = mission.includes("[always-fail]");
 const cleanWorktree = mission.includes("[clean-worktree]");
 const ignoredWorktree = mission.includes("[ignored-worktree]");
 const verificationMatrix = mission.includes("[verification-matrix]");
+const portableDeliverable = mission.includes("[portable-deliverable]");
 const secretProbe = mission.includes("[secret-probe]");
 const approvalExpiry = mission.includes("[approval-expiry]");
 const approvalBudgetRace = mission.includes("[approval-budget-race]");
@@ -214,6 +215,21 @@ if (verificationMatrix) {
   await writeFile(
     resolve(workdir, "screenshot.png"),
     Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), Buffer.from("CRONY_SCREENSHOT")]),
+  );
+}
+
+if (portableDeliverable) {
+  const readmePath = resolve(workdir, "README.md");
+  const readme = await readFile(readmePath, "utf8");
+  await writeFile(
+    readmePath,
+    `${readme.trimEnd()}\n\nPortable deliverable fixture: tracked change.\n`,
+    "utf8",
+  );
+  await writeFile(
+    resolve(workdir, "portable-untracked.txt"),
+    "portable untracked source\n",
+    "utf8",
   );
 }
 

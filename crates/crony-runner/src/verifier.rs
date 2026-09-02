@@ -6,13 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use crony_domain::{ManualVerificationGate, VerificationPolicy, VerifierCheck};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use crate::adapter::AdapterArtifact;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerificationCheckResult {
     pub check_index: i32,
     pub kind: String,
@@ -21,7 +22,7 @@ pub struct VerificationCheckResult {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerificationReport {
     pub passed: bool,
     pub summary: String,

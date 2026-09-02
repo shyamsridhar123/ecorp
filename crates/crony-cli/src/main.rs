@@ -1,8 +1,8 @@
 mod factory;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use crony_domain::EntityLink;
+use clap::{Parser, Subcommand, ValueEnum};
+use crony_domain::{DeliverableForm, DeliverableSpec, EntityLink};
 use crony_protocol::{
     ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
     InterruptRunRequest, LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest,
@@ -51,6 +51,10 @@ enum Command {
         adapter: Option<String>,
         #[arg(long)]
         strategy: Option<String>,
+        #[arg(long, value_enum, default_value_t = DeliverableArg::Archive)]
+        deliverable: DeliverableArg,
+        #[arg(long)]
+        commit_after_verification: bool,
         title: String,
     },
     RoomMessage {
@@ -127,6 +131,27 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DeliverableArg {
+    CommitBranch,
+    Patch,
+    Archive,
+    TypedArtifactSet,
+    ReviewOnlyReport,
+}
+
+impl From<DeliverableArg> for DeliverableForm {
+    fn from(value: DeliverableArg) -> Self {
+        match value {
+            DeliverableArg::CommitBranch => Self::CommitBranch,
+            DeliverableArg::Patch => Self::Patch,
+            DeliverableArg::Archive => Self::Archive,
+            DeliverableArg::TypedArtifactSet => Self::TypedArtifactSet,
+            DeliverableArg::ReviewOnlyReport => Self::ReviewOnlyReport,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -178,6 +203,8 @@ async fn main() -> Result<()> {
             actor_id,
             adapter,
             strategy,
+            deliverable,
+            commit_after_verification,
             title,
         } => {
             request(
@@ -194,6 +221,12 @@ async fn main() -> Result<()> {
                     secret_refs: Vec::new(),
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    deliverable: Some(DeliverableSpec {
+                        form: deliverable.into(),
+                        commit_after_verification: commit_after_verification
+                            || matches!(deliverable, DeliverableArg::CommitBranch),
+                        paths: Vec::new(),
+                    }),
                 })?),
             )
             .await?

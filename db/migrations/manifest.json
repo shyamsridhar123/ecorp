@@ -110,6 +110,11 @@
       "version": 22,
       "file": "0022_run_source_identity.sql",
       "sha384": "536b7f2bbf07dbaeecd584e560087c51d85847273eeaa4db236cd00bf4995dba0987568d882ef9583c835ea3eff2db79"
+    },
+    {
+      "version": 23,
+      "file": "0023_portable_deliverables.sql",
+      "sha384": "c462161a91d362b70c908727e6b17d22d7b18242bed0dca2228ce51e62cbeac630309dfe3385f2ef3d1f328ee286e824"
     }
   ]
 }

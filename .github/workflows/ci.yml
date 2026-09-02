@@ -127,6 +127,8 @@ jobs:
         run: ./tools/e2e_smoke.ps1
       - name: Verify content-addressed artifacts, provenance, and Corp-scoped download
         run: node tools/e2e_artifacts.mjs
+      - name: Verify portable source deliverables, exact linkage, and cleanup acknowledgment
+        run: node tools/e2e_portable_deliverables.mjs
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
       - name: Verify Claude Code and OpenCode normalized lifecycle evidence
@@ -192,6 +194,7 @@ jobs:
           path: |
             output/e2e-smoke.json
             output/e2e-artifacts.json
+            output/e2e-portable-deliverables.json
             output/e2e-artifact-staging.json
             output/e2e-demo-lifecycle.json
             output/e2e-codex.json

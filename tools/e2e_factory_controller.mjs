@@ -334,6 +334,11 @@ const fencedTask = fencedState.snapshot.tasks.find(
 assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
 assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
 assert.equal(fencedTask.contract.source_base_commit, sourceBaseCommit)
+assert.deepEqual(fencedTask.contract.deliverable, {
+  form: 'commit_branch',
+  commit_after_verification: true,
+  paths: [],
+})
 
 const completed = await waitForMission(demo, first.mission_id)
 assert.equal(completed.mission.status, 'completed')
@@ -366,6 +371,20 @@ assert.equal(runs[0].status, 'completed')
 assert.equal(runs[0].source_repository, 'shyamsridhar123/ecorp')
 assert.equal(runs[0].source_base_ref, 'HEAD')
 assert.equal(runs[0].source_base_commit, sourceBaseCommit)
+const sourceDeliverables = finalState.snapshot.source_deliverables.filter(
+  (deliverable) => deliverable.run_id === runs[0].id,
+)
+assert.equal(sourceDeliverables.length, 1)
+assert.equal(sourceDeliverables[0].form, 'commit_branch')
+assert.equal(sourceDeliverables[0].integration_state, 'ready_for_review')
+assert.equal(runs[0].workspace_disposition, 'preserved')
+const factoryWorktreeHead = (
+  await execFile('git', ['rev-parse', 'HEAD'], {
+    cwd: runs[0].workspace_path,
+    windowsHide: true,
+  })
+).stdout.trim()
+assert.equal(sourceDeliverables[0].head_commit, factoryWorktreeHead)
 const fakeState = JSON.parse(await readFile(statePath, 'utf8'))
 assert.equal(fakeState.items[0].status, 'In Progress')
 assert.ok(fakeState.item_edits >= 1)
@@ -1212,6 +1231,8 @@ const report = {
   external_effect_lease_revalidated: true,
   claimed_repository_persisted_to_task: true,
   claimed_commit_persisted_to_task_and_run: true,
+  portable_deliverable_materialized: sourceDeliverables.length === 1,
+  portable_deliverable_form: sourceDeliverables[0].form,
   factory_state: factoryItems[0].state,
   claim_token_absent_from_snapshot: true,
   mission_status: missions[0].status,
