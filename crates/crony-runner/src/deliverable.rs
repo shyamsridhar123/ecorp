@@ -1108,7 +1108,9 @@ mod tests {
         );
         let bundle_path = root.join("published.bundle");
         fs::write(&bundle_path, bundle).expect("write bundle");
-        assert!(git(&root, &["bundle", "list-heads", "published.bundle"]).ends_with(" HEAD"));
+        let listed = git(&root, &["bundle", "list-heads", "published.bundle"]);
+        assert!(listed.starts_with(&head));
+        assert!(listed.contains("refs/ecorp/deliverables/"));
         fs::remove_file(bundle_path).expect("remove bundle");
         assert_eq!(git(&root, &["status", "--porcelain=v1"]), "?? provider.md");
         fs::remove_dir_all(root).expect("remove fixture");
