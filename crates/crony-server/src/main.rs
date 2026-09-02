@@ -1199,8 +1199,7 @@ async fn download_artifact(
     );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", artifact.file_name))
-            .map_err(ApiError::internal)?,
+        artifact_content_disposition(&artifact.file_name).map_err(ApiError::internal)?,
     );
     headers.insert(
         ETAG,
@@ -1219,6 +1218,34 @@ async fn download_artifact(
         HeaderValue::from_str(&artifact.artifact_role).map_err(ApiError::internal)?,
     );
     Ok(response)
+}
+
+fn artifact_content_disposition(file_name: &str) -> anyhow::Result<HeaderValue> {
+    let fallback = file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(file_name.len());
+    for &byte in file_name.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .context("build artifact Content-Disposition header")
 }
 
 #[derive(Debug, Deserialize)]
@@ -4079,7 +4106,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        apply_factory_contract, capability_satisfies_requirement, runner_requirement_mismatch,
+        apply_factory_contract, artifact_content_disposition, capability_satisfies_requirement,
+        runner_requirement_mismatch,
     };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
@@ -4255,5 +4283,15 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn artifact_content_disposition_encodes_untrusted_file_names() {
+        let value =
+            artifact_content_disposition("safe.txt\"; filename=\"payload.html").expect("header");
+        assert_eq!(
+            value.to_str().expect("header text"),
+            "attachment; filename=\"safe.txt___filename__payload.html\"; filename*=UTF-8''safe.txt%22%3B%20filename%3D%22payload.html"
+        );
     }
 }
