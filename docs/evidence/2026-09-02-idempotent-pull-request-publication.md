@@ -3,7 +3,7 @@
 **Date:** September 2, 2026  
 **Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`
 **Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
-**Final local validation head:** `02a8baa8d63279e3f1f02c96025bf2fc596c5d4d`
+**Final local validation head:** `ae2df7c50d778f0de56fcb694711044d7cfc9bec`
 **Resolved-base fix head:** `59638db`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
@@ -126,7 +126,7 @@ console errors. The visible publication card showed:
 
 Screenshot:
 
-`output/playwright/factory-publication-review-hardened.png`
+`output/playwright/factory-publication-clean-review.png`
 
 All test-owned processes, ports, and containers were stopped after validation. Failed-run worktrees
 were preserved according to the repository safety contract.
