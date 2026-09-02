@@ -165,6 +165,7 @@ type PullRequestPublication = {
   pull_request_url: string | null
   pull_request_state: string | null
   pull_request_draft: boolean | null
+  pull_request_base_ref: string | null
   pull_request_head_sha: string | null
   pull_request_head_repository_owner: string | null
   pull_request_is_cross_repository: boolean | null
@@ -682,7 +683,11 @@ function FactoryPanel({
                       <div>
                         <dt>Target</dt>
                         <dd>
-                          {publication.target_repository} ← {publication.base_ref}
+                          {publication.target_repository} · {publication.base_ref}
+                          {publication.pull_request_base_ref &&
+                          publication.pull_request_base_ref !== publication.base_ref
+                            ? ` → ${publication.pull_request_base_ref}`
+                            : ''}
                         </dd>
                       </div>
                       <div>
@@ -727,6 +732,9 @@ function FactoryPanel({
                             : 'pending'}
                           {publication.pull_request_is_cross_repository === false
                             ? ' · same repository'
+                            : ''}
+                          {publication.pull_request_base_ref
+                            ? ` · PR base ${publication.pull_request_base_ref}`
                             : ''}
                         </span>
                       </>

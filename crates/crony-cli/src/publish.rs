@@ -137,6 +137,12 @@ struct PullRequestRepositoryOwner {
     login: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRemoteBase {
+    commit: String,
+    pull_request_base_ref: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProjectView {
     id: String,
@@ -382,7 +388,15 @@ async fn execute_publication(
     let workspace = TemporaryPublisherWorkspace::create()?;
     fs::write(&workspace.bundle, &bundle).context("write portable Git bundle")?;
     fs::write(&workspace.body, plan.body.as_bytes()).context("write pull request body")?;
-    prepare_repository(&workspace, plan, &document)?;
+    let resolved_base = prepare_repository(&workspace, plan, &document)?;
+    if let Some(persisted_base) = response.publication.pull_request_base_ref.as_deref()
+        && persisted_base != resolved_base.pull_request_base_ref
+    {
+        bail!(
+            "persisted pull request base {persisted_base} no longer matches resolved base {}",
+            resolved_base.pull_request_base_ref
+        );
+    }
 
     if publication_rank(response.publication.state)
         < publication_rank(PullRequestPublicationState::BranchPushed)
@@ -397,7 +411,16 @@ async fn execute_publication(
             "branch-push",
         )
         .await?;
-        ensure_remote_base(&workspace.repository, plan, &document.base_commit)?;
+        let current_base = ensure_remote_base(&workspace.repository, plan, &document.base_commit)?;
+        if current_base != resolved_base {
+            bail!(
+                "remote publication base changed from {} at {} to {} at {}",
+                resolved_base.pull_request_base_ref,
+                resolved_base.commit,
+                current_base.pull_request_base_ref,
+                current_base.commit
+            );
+        }
         push_or_adopt_branch(&workspace.repository, plan)?;
         test_crash("after_branch_remote");
         checkpoint(
@@ -432,7 +455,12 @@ async fn execute_publication(
             "pull-request",
         )
         .await?;
-        let pull_request = create_or_adopt_pull_request(args, plan, &workspace.body)?;
+        let pull_request = create_or_adopt_pull_request(
+            args,
+            plan,
+            &resolved_base.pull_request_base_ref,
+            &workspace.body,
+        )?;
         test_crash("after_pull_request_remote");
         checkpoint(
             client,
@@ -460,9 +488,13 @@ async fn execute_publication(
         .await?;
         test_crash("after_pull_request_checkpoint");
     } else {
-        let pull_request = find_pull_request(args, plan)?
+        let pull_request = find_pull_request(args, plan, &resolved_base.pull_request_base_ref)?
             .context("persisted publication pull request no longer exists")?;
-        ensure_remote_pull_request_matches(&pull_request, plan)?;
+        ensure_remote_pull_request_matches(
+            &pull_request,
+            plan,
+            &resolved_base.pull_request_base_ref,
+        )?;
     }
 
     if response.publication.state != PullRequestPublicationState::Published {
@@ -705,7 +737,7 @@ fn prepare_repository(
     workspace: &TemporaryPublisherWorkspace,
     plan: &PublicationPlan,
     document: &CommitBranchDocument,
-) -> Result<()> {
+) -> Result<ResolvedRemoteBase> {
     source_git_output(&workspace.repository, &["init", "--bare"])?;
     let remote_url = env::var("ECORP_PUBLICATION_TEST_REMOTE_URL")
         .unwrap_or_else(|_| format!("https://github.com/{}.git", plan.target_repository));
@@ -724,6 +756,18 @@ fn prepare_repository(
             "remote base {} resolved to {}, not verified commit {}",
             plan.base_ref,
             fetched_base,
+            document.base_commit
+        );
+    }
+    let resolved_base = resolve_remote_base(&workspace.repository, &plan.base_ref)?;
+    if !resolved_base
+        .commit
+        .eq_ignore_ascii_case(&document.base_commit)
+    {
+        bail!(
+            "resolved remote base {} points to {}, not verified commit {}",
+            resolved_base.pull_request_base_ref,
+            resolved_base.commit,
             document.base_commit
         );
     }
@@ -764,23 +808,59 @@ fn prepare_repository(
         ],
     )
     .context("verify publication commit descends from the authorized base")?;
-    Ok(())
+    Ok(resolved_base)
 }
 
 fn ensure_remote_base(
     repository: &Path,
     plan: &PublicationPlan,
     expected_commit: &str,
-) -> Result<()> {
-    let reference = remote_base_reference(&plan.base_ref);
-    let actual = remote_reference_commit(repository, &reference)?
-        .with_context(|| format!("remote base reference {reference} does not exist"))?;
-    if !actual.eq_ignore_ascii_case(expected_commit) {
+) -> Result<ResolvedRemoteBase> {
+    let resolved = resolve_remote_base(repository, &plan.base_ref)?;
+    if !resolved.commit.eq_ignore_ascii_case(expected_commit) {
         bail!(
-            "remote base reference {reference} moved from verified commit {expected_commit} to {actual}"
+            "remote base {} moved from verified commit {expected_commit} to {}",
+            resolved.pull_request_base_ref,
+            resolved.commit
         );
     }
-    Ok(())
+    Ok(resolved)
+}
+
+fn resolve_remote_base(repository: &Path, base_ref: &str) -> Result<ResolvedRemoteBase> {
+    if base_ref == "HEAD" {
+        let output = source_git_output(repository, &["ls-remote", "--symref", "origin", "HEAD"])?;
+        let text = String::from_utf8(output).context("remote Git HEAD is not UTF-8")?;
+        let (symref, commit) = parse_remote_head(&text)?;
+        let target_commit = remote_reference_commit(repository, &symref)?
+            .context("remote Git HEAD symbolic target does not exist")?;
+        if target_commit != commit {
+            bail!(
+                "remote Git HEAD object {commit} does not match symbolic target {symref} at {target_commit}"
+            );
+        }
+        let pull_request_base_ref = pull_request_base_name(&symref)?;
+        return Ok(ResolvedRemoteBase {
+            commit,
+            pull_request_base_ref,
+        });
+    }
+    let reference = remote_base_reference(base_ref);
+    let commit = remote_reference_commit(repository, &reference)?
+        .with_context(|| format!("remote base reference {reference} does not exist"))?;
+    let pull_request_base_ref = pull_request_base_name(&reference)?;
+    Ok(ResolvedRemoteBase {
+        commit,
+        pull_request_base_ref,
+    })
+}
+
+fn pull_request_base_name(reference: &str) -> Result<String> {
+    reference
+        .strip_prefix("refs/heads/")
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .context("remote publication base did not resolve to a branch")
 }
 
 fn push_or_adopt_branch(repository: &Path, plan: &PublicationPlan) -> Result<()> {
@@ -888,10 +968,11 @@ fn remote_base_reference(base_ref: &str) -> String {
 fn create_or_adopt_pull_request(
     args: &FactoryPublishArgs,
     plan: &PublicationPlan,
+    pull_request_base_ref: &str,
     body_file: &Path,
 ) -> Result<PullRequestView> {
-    if let Some(existing) = find_pull_request(args, plan)? {
-        ensure_remote_pull_request_matches(&existing, plan)?;
+    if let Some(existing) = find_pull_request(args, plan, pull_request_base_ref)? {
+        ensure_remote_pull_request_matches(&existing, plan, pull_request_base_ref)?;
         return Ok(existing);
     }
     let create = gh_output(
@@ -902,7 +983,7 @@ fn create_or_adopt_pull_request(
             "--repo",
             &plan.target_repository,
             "--base",
-            &plan.base_ref,
+            pull_request_base_ref,
             "--head",
             &plan.branch,
             "--title",
@@ -912,21 +993,22 @@ fn create_or_adopt_pull_request(
         ],
     );
     if let Err(error) = create {
-        if let Some(recovered) = find_pull_request(args, plan)? {
-            ensure_remote_pull_request_matches(&recovered, plan)?;
+        if let Some(recovered) = find_pull_request(args, plan, pull_request_base_ref)? {
+            ensure_remote_pull_request_matches(&recovered, plan, pull_request_base_ref)?;
             return Ok(recovered);
         }
         return Err(error).context("create GitHub pull request");
     }
-    let created = find_pull_request(args, plan)?
+    let created = find_pull_request(args, plan, pull_request_base_ref)?
         .context("GitHub pull request creation returned success but no pull request exists")?;
-    ensure_remote_pull_request_matches(&created, plan)?;
+    ensure_remote_pull_request_matches(&created, plan, pull_request_base_ref)?;
     Ok(created)
 }
 
 fn find_pull_request(
     args: &FactoryPublishArgs,
     plan: &PublicationPlan,
+    pull_request_base_ref: &str,
 ) -> Result<Option<PullRequestView>> {
     let value = gh_json(
         &args.github_cli,
@@ -940,7 +1022,7 @@ fn find_pull_request(
             "--head",
             &plan.branch,
             "--base",
-            &plan.base_ref,
+            pull_request_base_ref,
             "--limit",
             "100",
             "--json",
@@ -953,7 +1035,7 @@ fn find_pull_request(
         .into_iter()
         .filter(|pull_request| {
             pull_request.head_ref_name == plan.branch
-                && pull_request.base_ref_name == plan.base_ref
+                && pull_request.base_ref_name == pull_request_base_ref
                 && pull_request_matches_verified_head(pull_request, plan)
         })
         .collect::<Vec<_>>();
@@ -961,7 +1043,7 @@ fn find_pull_request(
         bail!(
             "multiple verified pull requests exist for {} -> {}",
             plan.branch,
-            plan.base_ref
+            pull_request_base_ref
         );
     }
     Ok(authorized.pop())
@@ -989,10 +1071,11 @@ fn pull_request_matches_verified_head(
 fn ensure_remote_pull_request_matches(
     pull_request: &PullRequestView,
     plan: &PublicationPlan,
+    pull_request_base_ref: &str,
 ) -> Result<()> {
     if pull_request.state != "OPEN"
         || pull_request.head_ref_name != plan.branch
-        || pull_request.base_ref_name != plan.base_ref
+        || pull_request.base_ref_name != pull_request_base_ref
         || !pull_request_matches_verified_head(pull_request, plan)
         || pull_request.auto_merge_request.is_some()
     {
@@ -1416,5 +1499,10 @@ mod tests {
         );
         assert!(parse_remote_head(&format!("{commit}\tHEAD\n")).is_err());
         assert!(parse_remote_head("ref: refs/heads/main\tHEAD\n").is_err());
+        assert_eq!(
+            pull_request_base_name("refs/heads/main").expect("branch name"),
+            "main"
+        );
+        assert!(pull_request_base_name("HEAD").is_err());
     }
 }

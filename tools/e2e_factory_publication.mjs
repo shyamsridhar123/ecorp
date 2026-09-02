@@ -424,6 +424,19 @@ await execFile(
   ['--git-dir', remotePath, 'update-ref', 'refs/heads/main', sourceBaseCommit],
   { cwd: root, windowsHide: true },
 )
+await execFile(
+  'git',
+  ['--git-dir', remotePath, 'symbolic-ref', 'HEAD', 'refs/heads/main'],
+  { cwd: root, windowsHide: true },
+)
+const resolvedPublicationBase = (
+  await execFile(
+    'git',
+    ['--git-dir', remotePath, 'symbolic-ref', '--short', 'HEAD'],
+    { cwd: root, windowsHide: true },
+  )
+).stdout.trim()
+assert.equal(resolvedPublicationBase, 'main')
 
 const issueNumber = 9101
 const issue = {
@@ -546,7 +559,7 @@ const forkPullRequest = {
   state: 'OPEN',
   isDraft: false,
   headRefName: branch,
-  baseRefName: 'HEAD',
+  baseRefName: resolvedPublicationBase,
   headRefOid: 'f'.repeat(40),
   headRepositoryOwner: { login: 'untrusted-fork-owner' },
   isCrossRepository: true,
@@ -763,6 +776,10 @@ await runPublisher(demo, workItem.id, {
 publicationSnapshot = await publicationState(demo, workItem.id)
 assert.equal(publicationSnapshot.publication.state, 'pull_request_created')
 assert.equal(publicationSnapshot.publication.pull_request_number, 41)
+assert.equal(
+  publicationSnapshot.publication.pull_request_base_ref,
+  resolvedPublicationBase,
+)
 assert.equal(publicationSnapshot.publication.pull_request_head_sha, source.head_commit)
 assert.equal(
   publicationSnapshot.publication.pull_request_head_repository_owner,
@@ -1000,6 +1017,7 @@ const report = {
     publication.pull_request_number !== forkPullRequest.number,
   pull_request_create_calls: fakeState.pr_create_calls,
   publication_base_ref: publication.base_ref,
+  resolved_pull_request_base_ref: publication.pull_request_base_ref,
   remote_branch_count: remoteBranches.length,
   project_status: publication.project_status_after,
   project_after_pull_request: reviewEffectIndex > pullRequestEffectIndex,

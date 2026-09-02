@@ -636,6 +636,7 @@ pub struct PullRequestPublication {
     pub pull_request_url: Option<String>,
     pub pull_request_state: Option<String>,
     pub pull_request_draft: Option<bool>,
+    pub pull_request_base_ref: Option<String>,
     pub pull_request_head_sha: Option<String>,
     pub pull_request_head_repository_owner: Option<String>,
     pub pull_request_is_cross_repository: Option<bool>,

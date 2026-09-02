@@ -15,7 +15,8 @@ const PUBLICATION_SELECT: &str = r#"
            publication.failure_detail, publication.branch_pushed_at,
            publication.pull_request_number, publication.pull_request_node_id,
            publication.pull_request_url, publication.pull_request_state,
-           publication.pull_request_draft, publication.pull_request_head_sha,
+           publication.pull_request_draft, publication.pull_request_base_ref,
+           publication.pull_request_head_sha,
            publication.pull_request_head_repository_owner,
            publication.pull_request_is_cross_repository, publication.project_owner,
            publication.project_number, publication.project_item_id,
@@ -843,6 +844,7 @@ impl PgStore {
                         &url,
                         &state,
                         draft,
+                        &base_ref,
                         &head_sha,
                         &head_repository_owner,
                         is_cross_repository,
@@ -875,6 +877,7 @@ impl PgStore {
                         "url": url,
                         "state": state,
                         "draft": draft,
+                        "base_ref": base_ref,
                         "head_sha": head_sha,
                         "head_repository_owner": head_repository_owner,
                         "is_cross_repository": false,
@@ -890,13 +893,14 @@ impl PgStore {
                             pull_request_url = $3,
                             pull_request_state = $4,
                             pull_request_draft = $5,
-                            pull_request_head_sha = $6,
-                            pull_request_head_repository_owner = $7,
-                            pull_request_is_cross_repository = $8,
+                            pull_request_base_ref = $6,
+                            pull_request_head_sha = $7,
+                            pull_request_head_repository_owner = $8,
+                            pull_request_is_cross_repository = $9,
                             failure_detail = NULL,
-                            provenance = $9,
+                            provenance = $10,
                             updated_at = now()
-                        WHERE id = $10 AND corp_id = $11
+                        WHERE id = $11 AND corp_id = $12
                         RETURNING {}
                         "#,
                         publication_returning_columns()
@@ -906,6 +910,7 @@ impl PgStore {
                     .bind(&url)
                     .bind(&state)
                     .bind(draft)
+                    .bind(&base_ref)
                     .bind(&head_sha)
                     .bind(&head_repository_owner)
                     .bind(is_cross_repository)
@@ -940,6 +945,7 @@ impl PgStore {
                             "pull_request_url": publication.pull_request_url,
                             "pull_request_state": publication.pull_request_state,
                             "draft": publication.pull_request_draft,
+                            "base_ref": publication.pull_request_base_ref,
                             "head_sha": publication.pull_request_head_sha,
                             "head_repository_owner": publication.pull_request_head_repository_owner,
                             "is_cross_repository": publication.pull_request_is_cross_repository,
@@ -1794,6 +1800,7 @@ fn normalize_checkpoint(
                 .to_ascii_uppercase();
             let head_ref = normalize_factory_identifier(&head_ref, "pull request head ref", 500)?;
             let base_ref = normalize_factory_identifier(&base_ref, "pull request base ref", 500)?;
+            validate_factory_base_ref(&base_ref)?;
             let head_sha = head_sha.trim().to_ascii_lowercase();
             validate_factory_base_commit(&head_sha)?;
             let head_repository_owner = normalize_github_component(
@@ -1903,9 +1910,20 @@ fn validate_pull_request_identity(
             "factory publication requires an open pull request, not {state}"
         ));
     }
-    if head_ref != publication.branch || base_ref != publication.base_ref {
+    if head_ref != publication.branch {
         return Err(anyhow!(
-            "pull request head or base does not match the authorized publication target"
+            "pull request head does not match the authorized publication target"
+        ));
+    }
+    if publication.base_ref == "HEAD" {
+        if base_ref == "HEAD" || base_ref.starts_with("refs/") {
+            return Err(anyhow!(
+                "symbolic publication base HEAD must resolve to an explicit GitHub branch name"
+            ));
+        }
+    } else if base_ref != publication.base_ref.trim_start_matches("refs/heads/") {
+        return Err(anyhow!(
+            "pull request base does not match the authorized publication target"
         ));
     }
     let target_owner = publication
@@ -1941,6 +1959,7 @@ fn ensure_pull_request_identity_matches(
     url: &str,
     state: &str,
     draft: bool,
+    base_ref: &str,
     head_sha: &str,
     head_repository_owner: &str,
     is_cross_repository: bool,
@@ -1950,6 +1969,7 @@ fn ensure_pull_request_identity_matches(
         || publication.pull_request_url.as_deref() != Some(url)
         || publication.pull_request_state.as_deref() != Some(state)
         || publication.pull_request_draft != Some(draft)
+        || publication.pull_request_base_ref.as_deref() != Some(base_ref)
         || publication.pull_request_head_sha.as_deref() != Some(head_sha)
         || publication.pull_request_head_repository_owner.as_deref() != Some(head_repository_owner)
         || publication.pull_request_is_cross_repository != Some(is_cross_repository)
@@ -2069,7 +2089,8 @@ fn publication_returning_columns() -> &'static str {
         actor_id, authorization_id, authorization_snapshot, effect_key, idempotency_key,
         state, version, attempt_count, publisher_id, publisher_lease_expires_at,
         failure_detail, branch_pushed_at, pull_request_number, pull_request_node_id,
-        pull_request_url, pull_request_state, pull_request_draft, pull_request_head_sha,
+        pull_request_url, pull_request_state, pull_request_draft, pull_request_base_ref,
+        pull_request_head_sha,
         pull_request_head_repository_owner, pull_request_is_cross_repository, project_owner,
         project_number, project_item_id, project_status_before, project_status_after,
         project_status_updated_at, auto_merge_enabled, merge_authorized,
