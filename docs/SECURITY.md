@@ -116,12 +116,20 @@ no-progress events feed an auditable circuit breaker; ordinary human conversatio
 Mission budget recovery is a dedicated owner/admin operation, not a resume parameter. Original
 limits and consumed usage are never reset. Proposal and decision requests are Corp-scoped,
 role-gated, versioned, and exactly idempotent; approval rechecks the current mission limits and
-usage under lock before changing authority.
+usage under lock before changing authority. Current mission-room membership is required for new
+operations and idempotent replay, with the membership row protected against concurrent removal.
 
 Finish-scope recovery cannot widen the task budget, write boundary, or verifier policy. Resume
-rejects exhausted authority before provider dispatch and clamps the new run to remaining mission
-and task limits. A `stop` breaker cannot be revised away or resumed. Shared snapshots expose
-revision rationale and decisions for audit but no runner assignment or fencing token.
+scope paths reject absolute paths, traversal components, drive prefixes, backslashes, and
+unsupported wildcard shapes before containment. The finish task must be the latest suspended task,
+and approval fails if its contract or verifier policy changed after proposal.
+
+Resume rejects exhausted mission, requester rolling, or Corp rolling authority before provider
+dispatch and clamps the new run to all remaining limits. It accepts only the latest run in a
+serialized provider-workspace lineage; any `stop` in that lineage permanently fences its
+ancestors. Shared snapshots expose revision rationale and decisions for audit but no runner
+assignment or fencing token. Browser-generated proposal and decision keys remain stable across a
+lost response so retry replays one committed operation.
 
 Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
 declared media type in memory, then performs authoritative assignment, task, budget, and breaker

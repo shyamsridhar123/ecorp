@@ -134,12 +134,22 @@ Only one revision can be pending. Proposal and approval both lock and revalidate
 latest run, active-run set, current budget, and cumulative usage. Limits never decrease and the
 approved ceiling must still exceed all consumed usage. An optional finish scope targets one
 unfinished task, may reduce its remaining token/cost budget and write scope, and must retain the
-existing verifier policy.
+existing verifier policy. The target must be the task from the latest suspended run. Approval
+compares the task contract and verifier policy to the proposal snapshot before applying it, so an
+intervening change cannot be overwritten.
 
 Resume rejects exhausted mission authority before creating a run. An approved recovery creates the
 new run in the same provider session and preserved worktree, with token/cost limits clamped to the
-smaller of the revised task contract and remaining mission authority. A source run at `stop` is
-never recoverable through revision or resume. See ADR 0023.
+smallest of the revised task contract and remaining mission, requester rolling-24-hour, and Corp
+rolling-24-hour authority. Usage updates, policy changes, and resume admission share advisory
+budget-scope locks. Resume also serializes by provider-workspace lineage, requires the selected
+source to be the latest lineage run, and rejects the entire lineage after any descendant reaches
+`stop`.
+
+Proposal, replay, decision, and decision replay require current membership in the mission room and
+hold a key-share lock on that membership through the transaction. Browser proposal and decision
+keys remain stable after a lost response, allowing the committed result to replay rather than
+creating conflicting authority. See ADR 0023.
 
 ## Current vertical slice
 

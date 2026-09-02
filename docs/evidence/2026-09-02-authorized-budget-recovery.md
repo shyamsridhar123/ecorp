@@ -7,6 +7,9 @@
 **Integrated publication base:** `bef6774851c79a1cd8a773883b9c5b090318b673`
 **Cross-scenario reset isolation:** `3a3702e`
 **Full repository gate head:** `70b615e416add32ca64da9107983bd4a8caef707`
+**Authority and retry hardening:** `2231c8d723fc7dd9dbedcc1c16cb9162c0b6dbaa`
+**Rolling-budget and lineage hardening:** `91349215f07356dc6319f26aaefb48930363c720`
+**Integrated publication room-scope head:** `c80c36a4e26d32d7fb236f19edaefc1102f1d1c7`
 
 ## Scope
 
@@ -39,7 +42,9 @@ POST /api/corps/{corp_id}/runs/{run_id}/resume
 
 Both revision endpoints require `Permission::Manage`, which is limited to owners and admins.
 Proposal and approval revalidate mission status, active runs, current ceiling, cumulative usage,
-latest breaker state, and optional finish-scope bounds under transaction locks.
+latest breaker state, mission-room membership, and optional finish-scope bounds under transaction
+locks. Approval also compares the current task contract and verifier policy to the proposal
+snapshot.
 
 ## Deterministic recovery E2E
 
@@ -80,7 +85,25 @@ The negative path recorded:
 ```
 
 The revised run exceeded its authorized resume limit, reached monotonic `stop`, and could not
-publish an artifact or accepted completion.
+publish an artifact or accepted completion. Retrying its older suspended ancestor was rejected
+because the shared provider-workspace lineage contained the stopped descendant.
+
+Additional review-hardening cases recorded:
+
+```json
+{
+  "actor_resume_rejected_before_run": true,
+  "corp_resume_rejected_before_run": true,
+  "stale_contract_approval_rejected": true,
+  "proposal_replay_after_room_removal_rejected": true,
+  "decision_after_room_removal_rejected": true,
+  "stopped_lineage_ancestor_resume_rejected": true
+}
+```
+
+Requester and Corp rolling ceilings are recomputed before run creation and participate in the
+clamped resume limit. Usage events, policy updates, and resume admission share advisory locks.
+Finish-scope paths reject traversal, absolute/drive paths, backslashes, and unsupported globs.
 
 ## Cross-feature isolation
 
@@ -109,6 +132,11 @@ The React app ran against the live server at the integrated branch. Chromium exe
 A separate stop-stage fixture rendered **Stop-stage run cannot resume** and directed the operator to
 create a new bounded mission from preserved evidence rather than overriding the breaker.
 
+The browser retry lane disconnected realtime delivery, allowed the server to commit a proposal,
+dropped the HTTP response, and retried from the still-open form. The stable proposal key returned
+the one pending revision. The same response-loss sequence on approval returned the same version-2
+approved revision and approver; no duplicate row or decision was created.
+
 Desktop Chromium at 1,440 pixels and mobile Chromium at 390 pixels both had zero console/page
 errors and no horizontal overflow.
 
@@ -132,6 +160,12 @@ git diff --check
 tools/e2e_budget_revision.mjs
 tools/e2e_factory_publication.mjs
 ```
+
+On the integrated `c80c36a4e26d32d7fb236f19edaefc1102f1d1c7` head, the expanded budget
+suite ran immediately before the expanded publication suite on the same rebuilt binaries. Budget
+recovery passed all rolling-budget, room, stale-contract, path, and lineage cases. Publication then
+passed start/recovery/status room isolation and membership revocation immediately before branch,
+pull-request, and Project effects, while retaining every prior publication invariant.
 
 The exact committed head `70b615e416add32ca64da9107983bd4a8caef707` then passed the complete
 repository-required sequence:

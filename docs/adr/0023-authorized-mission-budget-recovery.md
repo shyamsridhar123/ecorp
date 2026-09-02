@@ -20,6 +20,7 @@ Budget recovery is a dedicated, durable `mission_budget_revisions` aggregate:
 
 - only Corp owners and admins may propose or decide;
 - proposal and decision have separate exact idempotency keys;
+- browser retries retain those keys until the committed proposal or decision is observed;
 - every row records current and proposed limits, usage at proposal, rationale, proposer, status,
   version, decider, decision note, and timestamps;
 - only one revision may be pending for a mission;
@@ -28,18 +29,28 @@ Budget recovery is a dedicated, durable `mission_budget_revisions` aggregate:
 - proposal and approval both reject active runs, completed missions, stale budgets, and any latest
   run that is not a resumable `suspend`.
 
+New operations and idempotent replay require the owner/admin to remain a member of the mission
+room. The membership row is locked through the transaction.
+
 A proposal may include a bounded finish-scope replacement for one unfinished task. It may change
 the objective, expected output, acceptance checks, write paths, and remaining task budget, but it
 cannot widen the previous write scope, increase the task budget, or replace the verifier policy.
-The previous and replacement contracts and verifier policies are retained with the revision.
+Paths are normalized repository-relative values before containment. The target must be the task
+from the latest suspended run. The previous and replacement contracts and verifier policies are
+retained with the revision, and approval rejects any intervening change.
 
 Approval atomically updates the mission ceiling and optional task contract after rechecking current
 usage and authority under the same transaction lock. Rejection preserves the previous limits.
 
 Resume remains a separate operator effect. Before a new run exists, the server rejects a source run
-at `stop` and rejects any mission with no remaining token or cost authority. An accepted resume
-reuses the exact provider session and preserved worktree and clamps its run limits to the smaller of
-the task contract and remaining mission authority.
+at `stop` and rejects any mission, requester rolling window, or Corp rolling window with no
+remaining token or cost authority. Usage updates, policy changes, and resume admission serialize on
+the same budget-scope locks. An accepted resume reuses the exact provider session and preserved
+worktree and clamps its run limits to every remaining scope.
+
+Resume also serializes by provider-workspace lineage. The source must be the latest lineage run,
+and any descendant at `stop` permanently prevents an older suspended ancestor from reopening the
+same session or worktree.
 
 The operations UI displays consumed, original, current, and remaining token/cost values plus the
 approving actor. Exhausted resume is disabled with actionable guidance. Owner/admin proposal and

@@ -114,8 +114,12 @@ exemption. `tools/e2e_budget_revision.mjs` proves owner/admin proposal and decis
 member rejection, exact proposal/decision replay, rejected recovery, one-pending-revision
 enforcement, bounded finish-scope replacement, pre-dispatch exhausted-budget rejection,
 same-session/worktree resume under the remaining authorized ceiling, and a second overrun that
-reaches terminal `stop` without artifact or accepted completion. Cross-run fan-out for aggregate
-limits remains open in #56. See `docs/evidence/2026-08-30-approval-and-budget-validation.md` and
+reaches terminal `stop` without artifact or accepted completion. Its review-hardening cases also
+prove actor and Corp rolling ceilings reject resume before run creation, a stopped descendant
+fences resume through an older suspended ancestor, room removal blocks proposal/decision replay, a
+changed task contract blocks stale approval, and unsafe finish-scope paths fail closed.
+Cross-run fan-out for already active runs remains open in #56. See
+`docs/evidence/2026-08-30-approval-and-budget-validation.md` and
 `docs/evidence/2026-09-02-authorized-budget-recovery.md`.
 
 `tests/scenarios/v1.jsonl` is a versioned 100-scenario corpus. `tools/run_evals.mjs` keeps
