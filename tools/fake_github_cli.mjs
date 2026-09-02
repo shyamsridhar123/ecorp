@@ -114,6 +114,9 @@ if (args[0] === 'project' && args[1] === 'item-list') {
       item_id: item.id,
       status: status.name,
       pull_request_count: (state.pull_requests ?? []).length,
+      target_pull_request_count: (state.pull_requests ?? []).filter(
+        (pullRequest) => pullRequest.isCrossRepository === false,
+      ).length,
     },
   ]
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
@@ -165,6 +168,8 @@ if (args[0] === 'project' && args[1] === 'item-list') {
     (pullRequest) =>
       pullRequest.headRefName === head &&
       pullRequest.baseRefName === base &&
+      pullRequest.isCrossRepository === false &&
+      pullRequest.headRepositoryOwner?.login === repository.split('/')[0] &&
       pullRequest.state === 'OPEN',
   )
   if (existing) {
@@ -183,9 +188,15 @@ if (args[0] === 'project' && args[1] === 'item-list') {
     isDraft: false,
     headRefName: head,
     baseRefName: base,
+    headRefOid: state.branch_heads?.[head],
+    headRepositoryOwner: { login: repository.split('/')[0] },
+    isCrossRepository: false,
     autoMergeRequest: null,
     title,
     body,
+  }
+  if (!pullRequest.headRefOid) {
+    fail(`fake GitHub has no target-repository head oid for ${head}`)
   }
   state.next_pr_number = number + 1
   state.pr_create_calls = (state.pr_create_calls ?? 0) + 1

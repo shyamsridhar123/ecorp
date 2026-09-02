@@ -165,6 +165,9 @@ type PullRequestPublication = {
   pull_request_url: string | null
   pull_request_state: string | null
   pull_request_draft: boolean | null
+  pull_request_head_sha: string | null
+  pull_request_head_repository_owner: string | null
+  pull_request_is_cross_repository: boolean | null
   project_owner: string
   project_number: number
   project_item_id: string
@@ -707,15 +710,26 @@ function FactoryPanel({
                       <p>{publication.authorization_snapshot.reason}</p>
                     ) : null}
                     {publication.pull_request_url ? (
-                      <a
-                        className="publication-link"
-                        href={publication.pull_request_url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Pull request #{publication.pull_request_number} ·{' '}
-                        {publication.pull_request_draft ? 'draft' : 'open for review'}
-                      </a>
+                      <>
+                        <a
+                          className="publication-link"
+                          href={publication.pull_request_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Pull request #{publication.pull_request_number} ·{' '}
+                          {publication.pull_request_draft ? 'draft' : 'open for review'}
+                        </a>
+                        <span className="publication-pending">
+                          Verified head {publication.pull_request_head_repository_owner} @{' '}
+                          {publication.pull_request_head_sha
+                            ? shortId(publication.pull_request_head_sha)
+                            : 'pending'}
+                          {publication.pull_request_is_cross_repository === false
+                            ? ' · same repository'
+                            : ''}
+                        </span>
+                      </>
                     ) : (
                       <span className="publication-pending">Pull request not created yet</span>
                     )}

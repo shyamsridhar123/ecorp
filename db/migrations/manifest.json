@@ -120,6 +120,11 @@
       "version": 24,
       "file": "0024_pull_request_publications.sql",
       "sha384": "162cfe2ea1c86bb3e2b9f8b42c2dd46390e18b7ab70e82e3504998cfdef7848487591a16051a64ff3560a0e335000a07"
+    },
+    {
+      "version": 25,
+      "file": "0025_pull_request_head_identity.sql",
+      "sha384": "b3c3d843e6806aabc365792b25dd844b3b1434343f3253239f9f9bcc4514f35eb2629e952ffd56b69c888ac58e27ea75"
     }
   ]
 }

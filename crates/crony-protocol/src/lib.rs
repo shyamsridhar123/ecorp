@@ -514,6 +514,9 @@ pub enum PullRequestPublicationCheckpoint {
         draft: bool,
         head_ref: String,
         base_ref: String,
+        head_sha: String,
+        head_repository_owner: String,
+        is_cross_repository: bool,
         auto_merge_enabled: bool,
     },
     Published {

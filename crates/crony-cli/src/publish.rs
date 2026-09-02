@@ -122,8 +122,19 @@ struct PullRequestView {
     head_ref_name: String,
     #[serde(rename = "baseRefName")]
     base_ref_name: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(rename = "headRepositoryOwner")]
+    head_repository_owner: PullRequestRepositoryOwner,
+    #[serde(rename = "isCrossRepository")]
+    is_cross_repository: bool,
     #[serde(rename = "autoMergeRequest")]
     auto_merge_request: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestRepositoryOwner {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +451,9 @@ async fn execute_publication(
                 "draft": pull_request.is_draft,
                 "head_ref": pull_request.head_ref_name,
                 "base_ref": pull_request.base_ref_name,
+                "head_sha": pull_request.head_ref_oid,
+                "head_repository_owner": pull_request.head_repository_owner.login,
+                "is_cross_repository": pull_request.is_cross_repository,
                 "auto_merge_enabled": pull_request.auto_merge_request.is_some()
             }),
         )
@@ -809,6 +823,19 @@ fn ensure_remote_branch(repository: &Path, plan: &PublicationPlan) -> Result<()>
 }
 
 fn remote_reference_commit(repository: &Path, reference: &str) -> Result<Option<String>> {
+    if reference == "HEAD" {
+        let output = source_git_output(repository, &["ls-remote", "--symref", "origin", "HEAD"])?;
+        let text = String::from_utf8(output).context("remote Git HEAD is not UTF-8")?;
+        let (symref, commit) = parse_remote_head(&text)?;
+        let target_commit = remote_reference_commit(repository, &symref)?
+            .context("remote Git HEAD symbolic target does not exist")?;
+        if target_commit != commit {
+            bail!(
+                "remote Git HEAD object {commit} does not match symbolic target {symref} at {target_commit}"
+            );
+        }
+        return Ok(Some(commit));
+    }
     let output = source_git_output(repository, &["ls-remote", "--refs", "origin", reference])?;
     let text = String::from_utf8(output).context("remote Git reference is not UTF-8")?;
     let mut matches = text
@@ -820,6 +847,34 @@ fn remote_reference_commit(repository: &Path, reference: &str) -> Result<Option<
         bail!("remote Git reference query returned multiple matches for {reference}");
     }
     Ok(first)
+}
+
+fn parse_remote_head(output: &str) -> Result<(String, String)> {
+    let mut symref = None;
+    let mut commit = None;
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let first = fields.next().unwrap_or_default();
+        let second = fields.next().unwrap_or_default();
+        let third = fields.next();
+        if first == "ref:" && second.starts_with("refs/heads/") && third == Some("HEAD") {
+            if symref.replace(second.to_owned()).is_some() {
+                bail!("remote Git HEAD advertised multiple symbolic targets");
+            }
+        } else if second == "HEAD"
+            && matches!(first.len(), 40 | 64)
+            && first.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && commit.replace(first.to_ascii_lowercase()).is_some()
+        {
+            bail!("remote Git HEAD advertised multiple object ids");
+        }
+    }
+    let symref = symref.context("remote Git HEAD omitted its symbolic branch target")?;
+    let commit = commit.context("remote Git HEAD omitted its object id")?;
+    if symref == "refs/heads/HEAD" {
+        bail!("remote Git HEAD advertised an invalid symbolic target");
+    }
+    Ok((symref, commit))
 }
 
 fn remote_base_reference(base_ref: &str) -> String {
@@ -889,22 +944,46 @@ fn find_pull_request(
             "--limit",
             "100",
             "--json",
-            "number,id,url,state,isDraft,headRefName,baseRefName,autoMergeRequest",
+            "number,id,url,state,isDraft,headRefName,baseRefName,headRefOid,headRepositoryOwner,isCrossRepository,autoMergeRequest",
         ],
     )?;
-    let mut pull_requests: Vec<PullRequestView> =
+    let pull_requests: Vec<PullRequestView> =
         serde_json::from_value(value).context("decode GitHub pull request list")?;
-    pull_requests.retain(|pull_request| {
-        pull_request.head_ref_name == plan.branch && pull_request.base_ref_name == plan.base_ref
-    });
-    if pull_requests.len() > 1 {
+    let mut authorized = pull_requests
+        .into_iter()
+        .filter(|pull_request| {
+            pull_request.head_ref_name == plan.branch
+                && pull_request.base_ref_name == plan.base_ref
+                && pull_request_matches_verified_head(pull_request, plan)
+        })
+        .collect::<Vec<_>>();
+    if authorized.len() > 1 {
         bail!(
-            "multiple pull requests exist for {} -> {}",
+            "multiple verified pull requests exist for {} -> {}",
             plan.branch,
             plan.base_ref
         );
     }
-    Ok(pull_requests.pop())
+    Ok(authorized.pop())
+}
+
+fn pull_request_matches_verified_head(
+    pull_request: &PullRequestView,
+    plan: &PublicationPlan,
+) -> bool {
+    let target_owner = plan
+        .target_repository
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .unwrap_or_default();
+    !pull_request.is_cross_repository
+        && pull_request
+            .head_repository_owner
+            .login
+            .eq_ignore_ascii_case(target_owner)
+        && pull_request
+            .head_ref_oid
+            .eq_ignore_ascii_case(&plan.commit_sha)
 }
 
 fn ensure_remote_pull_request_matches(
@@ -914,6 +993,7 @@ fn ensure_remote_pull_request_matches(
     if pull_request.state != "OPEN"
         || pull_request.head_ref_name != plan.branch
         || pull_request.base_ref_name != plan.base_ref
+        || !pull_request_matches_verified_head(pull_request, plan)
         || pull_request.auto_merge_request.is_some()
     {
         bail!("GitHub pull request does not match the authorized non-merging publication");
@@ -1324,5 +1404,17 @@ mod tests {
             remote_base_reference("refs/heads/release"),
             "refs/heads/release"
         );
+    }
+
+    #[test]
+    fn remote_head_requires_one_symbolic_branch_and_object() {
+        let commit = "a".repeat(40);
+        let output = format!("ref: refs/heads/main\tHEAD\n{commit}\tHEAD\n");
+        assert_eq!(
+            parse_remote_head(&output).expect("parse HEAD"),
+            ("refs/heads/main".to_owned(), commit.clone())
+        );
+        assert!(parse_remote_head(&format!("{commit}\tHEAD\n")).is_err());
+        assert!(parse_remote_head("ref: refs/heads/main\tHEAD\n").is_err());
     }
 }

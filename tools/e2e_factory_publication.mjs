@@ -114,7 +114,7 @@ async function runController(demo, issueNumber) {
       '--source-base-ref',
       'HEAD',
       '--publication-base-ref',
-      'main',
+      'HEAD',
       '--adapter',
       'fake-process',
       '--strategy',
@@ -349,6 +349,61 @@ async function publicationState(demo, workItemId) {
   }
 }
 
+function publicationRenewPath(demo, publicationId) {
+  return `/api/corps/${demo.corp_id}/factory/publications/${publicationId}/renew`
+}
+
+function publicationCheckpointPath(demo, publicationId) {
+  return `/api/corps/${demo.corp_id}/factory/publications/${publicationId}/checkpoint`
+}
+
+async function renewPublicationAttempt(
+  demo,
+  publication,
+  publisherToken,
+  idempotencyKey,
+) {
+  return post(publicationRenewPath(demo, publication.id), {
+    actor_id: demo.alice_actor_id,
+    publisher_token: publisherToken,
+    expected_version: publication.version,
+    idempotency_key: idempotencyKey,
+    lease_seconds: 10,
+  })
+}
+
+async function failPublicationAttempt(
+  demo,
+  publication,
+  publisherToken,
+  idempotencyKey,
+  detail,
+) {
+  return postOk(publicationCheckpointPath(demo, publication.id), {
+    actor_id: demo.alice_actor_id,
+    publisher_token: publisherToken,
+    expected_version: publication.version,
+    idempotency_key: idempotencyKey,
+    checkpoint: {
+      kind: 'failed',
+      failure_detail: detail,
+    },
+  })
+}
+
+async function remoteBranchExists(branch) {
+  try {
+    await execFile(
+      'git',
+      ['--git-dir', remotePath, 'show-ref', '--verify', `refs/heads/${branch}`],
+      { cwd: root, windowsHide: true },
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function waitForPublicationLeaseExpiry(demo, workItemId) {
   const current = await publicationState(demo, workItemId)
   const expiry = Date.parse(
@@ -484,11 +539,30 @@ Closes #${issueNumber}
 
 Auto-merge, merge, and deployment are not authorized by this publication.`
 const effectKey = `github-pr:${workItem.id}:${source.id}:shyamsridhar123/ecorp:${branch}`
+const forkPullRequest = {
+  number: 7,
+  id: 'PR_FAKE_FORK_7',
+  url: 'https://github.com/shyamsridhar123/ecorp/pull/7',
+  state: 'OPEN',
+  isDraft: false,
+  headRefName: branch,
+  baseRefName: 'HEAD',
+  headRefOid: 'f'.repeat(40),
+  headRepositoryOwner: { login: 'untrusted-fork-owner' },
+  isCrossRepository: true,
+  autoMergeRequest: null,
+  title: 'Untrusted same-name fork pull request',
+  body: 'This pull request must never be adopted.',
+}
+await setFakeState({
+  branch_heads: { [branch]: source.head_commit },
+  pull_requests: [forkPullRequest],
+})
 const publicationRequest = {
   actor_id: demo.alice_actor_id,
   source_deliverable_id: source.id,
   target_repository: 'shyamsridhar123/ecorp',
-  base_ref: 'main',
+  base_ref: 'HEAD',
   branch,
   title: issue.title,
   body,
@@ -571,6 +645,49 @@ await psql(
   `UPDATE runs SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]} WHERE id = ${sqlLiteral(run.id)}::uuid;`,
 )
 
+const initialAttempt = await postOk(publicationPath, {
+  ...publicationRequest,
+  idempotency_key: `${effectKey}:start:${demo.alice_actor_id}`,
+})
+assert.ok(initialAttempt.publisher_token)
+await psql(
+  `UPDATE actors SET role = 'admin' WHERE id = ${sqlLiteral(demo.alice_actor_id)}::uuid;`,
+)
+const roleRenewRejected = await renewPublicationAttempt(
+  demo,
+  initialAttempt.publication,
+  initialAttempt.publisher_token,
+  `${effectKey}:renew-role-rejected`,
+)
+assert.equal(roleRenewRejected.response.status, 400)
+assert.match(roleRenewRejected.body.error, /authorization role changed/)
+assert.equal(await remoteBranchExists(branch), false)
+await psql(
+  `UPDATE actors SET role = 'owner' WHERE id = ${sqlLiteral(demo.alice_actor_id)}::uuid;`,
+)
+await psql(
+  `UPDATE runs SET breaker_stage = 'suspend' WHERE id = ${sqlLiteral(run.id)}::uuid;`,
+)
+const postStartBreakerRejected = await renewPublicationAttempt(
+  demo,
+  initialAttempt.publication,
+  initialAttempt.publisher_token,
+  `${effectKey}:renew-breaker-rejected`,
+)
+assert.equal(postStartBreakerRejected.response.status, 400)
+assert.match(postStartBreakerRejected.body.error, /circuit breaker/)
+assert.equal(await remoteBranchExists(branch), false)
+await psql(
+  `UPDATE runs SET breaker_stage = ${sqlLiteral(breakerBefore)} WHERE id = ${sqlLiteral(run.id)}::uuid;`,
+)
+await failPublicationAttempt(
+  demo,
+  initialAttempt.publication,
+  initialAttempt.publisher_token,
+  `${effectKey}:release-initial-authority-test`,
+  'Release the authority-revocation test attempt.',
+)
+
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_branch_remote',
   expectCrash: true,
@@ -589,6 +706,108 @@ assert.equal(publicationSnapshot.publication.branch_pushed_at, null)
 
 const restartedServerPid = await restartLocalServer()
 await waitForPublicationLeaseExpiry(demo, workItem.id)
+const projectAuthorityAttempt = await postOk(publicationPath, {
+  ...publicationRequest,
+  idempotency_key: `${effectKey}:project-authority-attempt`,
+})
+assert.ok(projectAuthorityAttempt.publisher_token)
+assert.equal(
+  Number(
+    await psql(
+      `SELECT COUNT(*) FROM corp_budget_policies WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
+    ),
+  ),
+  0,
+)
+await psql(`
+  INSERT INTO corp_budget_policies
+    (corp_id, actor_tokens_per_24h, actor_cost_microusd_per_24h,
+     corp_tokens_per_24h, corp_cost_microusd_per_24h,
+     no_progress_event_limit, repeated_tool_limit)
+  VALUES
+    (${sqlLiteral(demo.corp_id)}::uuid, 500000, 10000000, 1, 100000000, 8, 5);
+  UPDATE runs
+  SET input_tokens = 1, output_tokens = 0
+  WHERE id = ${sqlLiteral(run.id)}::uuid;
+`)
+const projectCorpBudgetRejected = await renewPublicationAttempt(
+  demo,
+  projectAuthorityAttempt.publication,
+  projectAuthorityAttempt.publisher_token,
+  `${effectKey}:project-corp-budget-rejected`,
+)
+assert.equal(projectCorpBudgetRejected.response.status, 400)
+assert.match(projectCorpBudgetRejected.body.error, /budget|hard breaker/)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+await psql(`
+  UPDATE runs
+  SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]}
+  WHERE id = ${sqlLiteral(run.id)}::uuid;
+  DELETE FROM corp_budget_policies
+  WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;
+`)
+await failPublicationAttempt(
+  demo,
+  projectAuthorityAttempt.publication,
+  projectAuthorityAttempt.publisher_token,
+  `${effectKey}:release-project-authority-test`,
+  'Release the Project authority-revocation test attempt.',
+)
+
+await runPublisher(demo, workItem.id, {
+  crashAfter: 'after_branch_checkpoint',
+  expectCrash: true,
+})
+publicationSnapshot = await publicationState(demo, workItem.id)
+assert.equal(publicationSnapshot.publication.state, 'branch_pushed')
+let fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.pull_requests.filter(
+    (pullRequest) => pullRequest.isCrossRepository === false,
+  ).length,
+  0,
+)
+
+await waitForPublicationLeaseExpiry(demo, workItem.id)
+const pullRequestAuthorityAttempt = await postOk(publicationPath, {
+  ...publicationRequest,
+  idempotency_key: `${effectKey}:pull-request-authority-attempt`,
+})
+assert.ok(pullRequestAuthorityAttempt.publisher_token)
+await psql(
+  `UPDATE runs SET input_tokens = budget_tokens_limit, output_tokens = 0 WHERE id = ${sqlLiteral(run.id)}::uuid;`,
+)
+const pullRequestBudgetRejected = await renewPublicationAttempt(
+  demo,
+  pullRequestAuthorityAttempt.publication,
+  pullRequestAuthorityAttempt.publisher_token,
+  `${effectKey}:pull-request-budget-rejected`,
+)
+assert.equal(pullRequestBudgetRejected.response.status, 400)
+assert.match(pullRequestBudgetRejected.body.error, /budget|hard breaker/)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.pull_requests.filter(
+    (pullRequest) => pullRequest.isCrossRepository === false,
+  ).length,
+  0,
+)
+await psql(
+  `UPDATE runs SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]} WHERE id = ${sqlLiteral(run.id)}::uuid;`,
+)
+await failPublicationAttempt(
+  demo,
+  pullRequestAuthorityAttempt.publication,
+  pullRequestAuthorityAttempt.publisher_token,
+  `${effectKey}:release-pull-request-authority-test`,
+  'Release the pull-request authority-revocation test attempt.',
+)
+
 await setFakeState({ fail_pr_create_after_success: true })
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_pull_request_checkpoint',
@@ -597,10 +816,26 @@ await runPublisher(demo, workItem.id, {
 publicationSnapshot = await publicationState(demo, workItem.id)
 assert.equal(publicationSnapshot.publication.state, 'pull_request_created')
 assert.equal(publicationSnapshot.publication.pull_request_number, 41)
-let fakeState = JSON.parse(await readFile(statePath, 'utf8'))
-assert.equal(fakeState.pull_requests.length, 1)
+assert.equal(publicationSnapshot.publication.pull_request_head_sha, source.head_commit)
+assert.equal(
+  publicationSnapshot.publication.pull_request_head_repository_owner,
+  'shyamsridhar123',
+)
+assert.equal(
+  publicationSnapshot.publication.pull_request_is_cross_repository,
+  false,
+)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(fakeState.pull_requests.length, 2)
 assert.equal(fakeState.pr_create_calls, 1)
 assert.equal(fakeState.pr_create_external_success_failures, 1)
+const authorizedPullRequest = fakeState.pull_requests.find(
+  (pullRequest) => pullRequest.isCrossRepository === false,
+)
+assert.equal(authorizedPullRequest.number, 41)
+assert.equal(authorizedPullRequest.headRefOid, source.head_commit)
+assert.equal(authorizedPullRequest.headRepositoryOwner.login, 'shyamsridhar123')
+assert.notEqual(publicationSnapshot.publication.pull_request_number, forkPullRequest.number)
 assert.equal(
   fakeState.items.find((item) => item.id === workItem.source_project_item_id)
     .status,
@@ -638,9 +873,12 @@ const finalSnapshot = await snapshot(demo)
 const publication = finalSnapshot.snapshot.pull_request_publications.find(
   (item) => item.factory_work_item_id === workItem.id,
 )
-assert.equal(publication.state, 'published')
-assert.equal(publication.pull_request_number, 41)
-assert.equal(publication.pull_request_url, fakeState.pull_requests[0].url)
+  assert.equal(publication.state, 'published')
+  assert.equal(publication.pull_request_number, 41)
+  assert.equal(publication.pull_request_url, authorizedPullRequest.url)
+  assert.equal(publication.pull_request_head_sha, source.head_commit)
+  assert.equal(publication.pull_request_head_repository_owner, 'shyamsridhar123')
+  assert.equal(publication.pull_request_is_cross_repository, false)
 assert.equal(publication.project_status_after, 'In Review')
 assert.equal(publication.auto_merge_enabled, false)
 assert.equal(publication.merge_authorized, false)
@@ -660,7 +898,7 @@ assert.equal(
 const attempts = finalSnapshot.snapshot.pull_request_publication_attempts
   .filter((attempt) => attempt.publication_id === publication.id)
   .sort((left, right) => left.attempt - right.attempt)
-assert.ok(attempts.length >= 4)
+assert.ok(attempts.length >= 7)
 assert.equal(attempts.at(-1).state, 'published')
 assert.ok(attempts.some((attempt) => attempt.state === 'abandoned'))
 assert.equal(
@@ -671,7 +909,13 @@ assert.equal(
 )
 
 fakeState = JSON.parse(await readFile(statePath, 'utf8'))
-assert.equal(fakeState.pull_requests.length, 1)
+assert.equal(fakeState.pull_requests.length, 2)
+assert.equal(
+  fakeState.pull_requests.filter(
+    (pullRequest) => pullRequest.isCrossRepository === false,
+  ).length,
+  1,
+)
 assert.equal(fakeState.pr_create_calls, 1)
 const reviewEffectIndex = fakeState.effect_log.findIndex(
   (effect) => effect.kind === 'project_status' && effect.status === 'In Review',
@@ -682,8 +926,8 @@ const pullRequestEffectIndex = fakeState.effect_log.findIndex(
 assert.ok(pullRequestEffectIndex >= 0)
 assert.ok(reviewEffectIndex > pullRequestEffectIndex)
 assert.ok(
-  fakeState.effect_log[reviewEffectIndex].pull_request_count >= 1,
-  'Project entered review before the pull request existed',
+  fakeState.effect_log[reviewEffectIndex].target_pull_request_count >= 1,
+  'Project entered review before the verified target-repository pull request existed',
 )
 
 const remoteBranches = (
@@ -749,7 +993,13 @@ const report = {
   publication_attempts: attempts.length,
   pull_request_number: publication.pull_request_number,
   pull_request_url: publication.pull_request_url,
+  pull_request_head_sha: publication.pull_request_head_sha,
+  pull_request_head_repository_owner:
+    publication.pull_request_head_repository_owner,
+  fork_pull_request_rejected:
+    publication.pull_request_number !== forkPullRequest.number,
   pull_request_create_calls: fakeState.pr_create_calls,
+  publication_base_ref: publication.base_ref,
   remote_branch_count: remoteBranches.length,
   project_status: publication.project_status_after,
   project_after_pull_request: reviewEffectIndex > pullRequestEffectIndex,
@@ -759,6 +1009,13 @@ const report = {
   corp_rejection: corpRejected.response.status,
   budget_rejection: budgetRejected.response.status,
   breaker_rejection: breakerRejected.response.status,
+  post_start_role_renewal_rejection: roleRenewRejected.response.status,
+  post_start_breaker_renewal_rejection:
+    postStartBreakerRejected.response.status,
+  pre_pull_request_budget_renewal_rejection:
+    pullRequestBudgetRejected.response.status,
+  pre_project_corp_budget_renewal_rejection:
+    projectCorpBudgetRejected.response.status,
   credential_non_disclosure: !durableText.includes(publisherToken),
   auto_merge: publication.auto_merge_enabled,
   merge_authorized: publication.merge_authorized,

@@ -15,7 +15,9 @@ const PUBLICATION_SELECT: &str = r#"
            publication.failure_detail, publication.branch_pushed_at,
            publication.pull_request_number, publication.pull_request_node_id,
            publication.pull_request_url, publication.pull_request_state,
-           publication.pull_request_draft, publication.project_owner,
+           publication.pull_request_draft, publication.pull_request_head_sha,
+           publication.pull_request_head_repository_owner,
+           publication.pull_request_is_cross_repository, publication.project_owner,
            publication.project_number, publication.project_item_id,
            publication.project_status_before, publication.project_status_after,
            publication.project_status_updated_at, publication.auto_merge_enabled,
@@ -63,6 +65,16 @@ struct PublicationPrerequisites {
     task_ids: Vec<Uuid>,
     run_ids: Vec<Uuid>,
     evidence_ids: Vec<Uuid>,
+}
+
+struct PublicationPrerequisiteRequest<'a> {
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    source_deliverable_id: Uuid,
+    target_repository: &'a str,
+    base_ref: &'a str,
+    branch: &'a str,
+    body: &'a str,
 }
 
 impl PgStore {
@@ -185,7 +197,12 @@ impl PgStore {
                     busy: false,
                 });
             }
-            validate_publication_prerequisites(&mut tx, &normalized, Some(&publication)).await?;
+            validate_publication_prerequisites(
+                &mut tx,
+                &PublicationPrerequisiteRequest::from_start(&normalized),
+                true,
+            )
+            .await?;
             if publication
                 .publisher_lease_expires_at
                 .is_some_and(|expiry| expiry > now)
@@ -296,7 +313,12 @@ impl PgStore {
             });
         }
 
-        let prerequisites = validate_publication_prerequisites(&mut tx, &normalized, None).await?;
+        let prerequisites = validate_publication_prerequisites(
+            &mut tx,
+            &PublicationPrerequisiteRequest::from_start(&normalized),
+            false,
+        )
+        .await?;
         let publication_id = Uuid::new_v4();
         let publisher_token = Uuid::new_v4();
         let authorization = publication_authorization(&normalized, now);
@@ -544,9 +566,10 @@ impl PgStore {
                 &operation_request,
             )?;
             let (publication, current_token) =
-                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, true)
                     .await?
                     .context("idempotent publication renewal references a missing publication")?;
+            revalidate_publication_authority_tx(&mut tx, &publication, input.actor_id).await?;
             let publisher_token =
                 replayable_publication_token(&publication, current_token, &operation, now);
             tx.commit().await?;
@@ -572,6 +595,7 @@ impl PgStore {
             now,
         )
         .await?;
+        revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
         let row = sqlx::query(&format!(
             r#"
             UPDATE pull_request_publications publication
@@ -791,6 +815,9 @@ impl PgStore {
                 draft,
                 head_ref,
                 base_ref,
+                head_sha,
+                head_repository_owner,
+                is_cross_repository,
                 auto_merge_enabled,
             } => {
                 validate_pull_request_identity(
@@ -801,13 +828,24 @@ impl PgStore {
                     &state,
                     &head_ref,
                     &base_ref,
+                    &head_sha,
+                    &head_repository_owner,
+                    is_cross_repository,
                     auto_merge_enabled,
                 )?;
                 if publication_state_rank(current.state)
                     >= publication_state_rank(PullRequestPublicationState::PullRequestCreated)
                 {
                     ensure_pull_request_identity_matches(
-                        &current, number, &node_id, &url, &state, draft,
+                        &current,
+                        number,
+                        &node_id,
+                        &url,
+                        &state,
+                        draft,
+                        &head_sha,
+                        &head_repository_owner,
+                        is_cross_repository,
                     )?;
                     record_publication_operation_tx(
                         &mut tx,
@@ -837,6 +875,9 @@ impl PgStore {
                         "url": url,
                         "state": state,
                         "draft": draft,
+                        "head_sha": head_sha,
+                        "head_repository_owner": head_repository_owner,
+                        "is_cross_repository": false,
                         "auto_merge": false
                     });
                     let row = sqlx::query(&format!(
@@ -849,10 +890,13 @@ impl PgStore {
                             pull_request_url = $3,
                             pull_request_state = $4,
                             pull_request_draft = $5,
+                            pull_request_head_sha = $6,
+                            pull_request_head_repository_owner = $7,
+                            pull_request_is_cross_repository = $8,
                             failure_detail = NULL,
-                            provenance = $6,
+                            provenance = $9,
                             updated_at = now()
-                        WHERE id = $7 AND corp_id = $8
+                        WHERE id = $10 AND corp_id = $11
                         RETURNING {}
                         "#,
                         publication_returning_columns()
@@ -862,6 +906,9 @@ impl PgStore {
                     .bind(&url)
                     .bind(&state)
                     .bind(draft)
+                    .bind(&head_sha)
+                    .bind(&head_repository_owner)
+                    .bind(is_cross_repository)
                     .bind(provenance)
                     .bind(current.id)
                     .bind(input.corp_id)
@@ -893,6 +940,9 @@ impl PgStore {
                             "pull_request_url": publication.pull_request_url,
                             "pull_request_state": publication.pull_request_state,
                             "draft": publication.pull_request_draft,
+                            "head_sha": publication.pull_request_head_sha,
+                            "head_repository_owner": publication.pull_request_head_repository_owner,
+                            "is_cross_repository": publication.pull_request_is_cross_repository,
                             "auto_merge": false,
                             "attempt": publication.attempt_count
                         }),
@@ -1309,20 +1359,101 @@ async fn ensure_actor_role_tx(
     Ok(())
 }
 
+impl<'a> PublicationPrerequisiteRequest<'a> {
+    fn from_start(input: &'a StartPullRequestPublicationInput) -> Self {
+        Self {
+            corp_id: input.corp_id,
+            work_item_id: input.work_item_id,
+            source_deliverable_id: input.source_deliverable_id,
+            target_repository: &input.target_repository,
+            base_ref: &input.base_ref,
+            branch: &input.branch,
+            body: &input.body,
+        }
+    }
+
+    fn from_publication(publication: &'a PullRequestPublication) -> Self {
+        Self {
+            corp_id: publication.corp_id,
+            work_item_id: publication.factory_work_item_id,
+            source_deliverable_id: publication.source_deliverable_id,
+            target_repository: &publication.target_repository,
+            base_ref: &publication.base_ref,
+            branch: &publication.branch,
+            body: &publication.body,
+        }
+    }
+}
+
+async fn revalidate_publication_authority_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    publication: &PullRequestPublication,
+    actor_id: Uuid,
+) -> Result<()> {
+    let expected_role: String = sqlx::query_scalar(
+        r#"
+        SELECT authorization_snapshot->>'actor_role'
+        FROM pull_request_publication_attempts
+        WHERE publication_id = $1
+          AND corp_id = $2
+          AND attempt = $3
+          AND actor_id = $4
+          AND state = 'running'
+        "#,
+    )
+    .bind(publication.id)
+    .bind(publication.corp_id)
+    .bind(publication.attempt_count)
+    .bind(actor_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("active publication attempt omitted its authorization role")?;
+    ensure_actor_role_tx(tx, publication.corp_id, actor_id, &expected_role).await?;
+    let prerequisites = validate_publication_prerequisites(
+        tx,
+        &PublicationPrerequisiteRequest::from_publication(publication),
+        true,
+    )
+    .await?;
+    let provenance_deliverable_sha = publication
+        .provenance
+        .pointer("/deliverable/sha256")
+        .and_then(Value::as_str);
+    let provenance_verification_sha = publication
+        .provenance
+        .get("verification_sha256")
+        .and_then(Value::as_str);
+    if prerequisites.work_item.id != publication.factory_work_item_id
+        || prerequisites.mission_id != publication.mission_id
+        || prerequisites.artifact_id != publication.artifact_id
+        || prerequisites.task_id != publication.task_id
+        || prerequisites.run_id != publication.run_id
+        || prerequisites.commit_sha != publication.commit_sha
+        || provenance_deliverable_sha != Some(prerequisites.deliverable_sha256.as_str())
+        || provenance_verification_sha != Some(prerequisites.verification_sha256.as_str())
+    {
+        return Err(anyhow!(
+            "conflict: publication authority no longer matches its verified provenance"
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_publication_prerequisites(
     tx: &mut Transaction<'_, Postgres>,
-    input: &StartPullRequestPublicationInput,
-    existing: Option<&PullRequestPublication>,
+    request: &PublicationPrerequisiteRequest<'_>,
+    existing: bool,
 ) -> Result<PublicationPrerequisites> {
-    let (work_item, _) = factory_work_item_tx(tx, input.corp_id, input.work_item_id, true)
+    let (work_item, _) = factory_work_item_tx(tx, request.corp_id, request.work_item_id, true)
         .await?
         .context("factory work item not found")?;
-    let allowed_state = match existing {
-        Some(_) => matches!(
+    let allowed_state = if existing {
+        matches!(
             work_item.state,
             FactoryWorkItemState::Publishing | FactoryWorkItemState::Verified
-        ),
-        None => work_item.state == FactoryWorkItemState::Verified,
+        )
+    } else {
+        work_item.state == FactoryWorkItemState::Verified
     };
     if !allowed_state {
         return Err(anyhow!(
@@ -1333,7 +1464,7 @@ async fn validate_publication_prerequisites(
     let mission_id = work_item
         .mission_id
         .context("verified factory work item has no mission")?;
-    ensure_factory_mission_verified_tx(tx, input.corp_id, mission_id).await?;
+    ensure_factory_mission_verified_tx(tx, request.corp_id, mission_id).await?;
     let policy = work_item
         .policy
         .as_object()
@@ -1359,7 +1490,7 @@ async fn validate_publication_prerequisites(
     if !target_allowlist
         .iter()
         .filter_map(Value::as_str)
-        .any(|repository| repository.eq_ignore_ascii_case(&input.target_repository))
+        .any(|repository| repository.eq_ignore_ascii_case(request.target_repository))
     {
         return Err(anyhow!(
             "publication target repository is outside the factory policy allowlist"
@@ -1369,7 +1500,7 @@ async fn validate_publication_prerequisites(
         "{}/{}",
         work_item.source_repository_owner, work_item.source_repository_name
     );
-    if input.target_repository != expected_repository {
+    if request.target_repository != expected_repository {
         return Err(anyhow!(
             "publication target repository must match the claimed source repository"
         ));
@@ -1381,10 +1512,10 @@ async fn validate_publication_prerequisites(
         .context("publication policy omitted base_ref")?
         .to_owned();
     validate_factory_base_ref(&expected_base_ref)?;
-    if input.base_ref != expected_base_ref {
+    if request.base_ref != expected_base_ref {
         return Err(anyhow!(
             "publication base ref {} does not match factory policy {}",
-            input.base_ref,
+            request.base_ref,
             expected_base_ref
         ));
     }
@@ -1395,7 +1526,7 @@ async fn validate_publication_prerequisites(
         .get("branch_prefix")
         .and_then(Value::as_str)
         .unwrap_or("ecorp/");
-    if !input.branch.starts_with(branch_prefix) {
+    if !request.branch.starts_with(branch_prefix) {
         return Err(anyhow!(
             "publication branch must start with the authorized prefix {branch_prefix}"
         ));
@@ -1412,7 +1543,7 @@ async fn validate_publication_prerequisites(
         .filter(|value| !value.trim().is_empty())
         .context("publication policy omitted status_before")?
         .to_owned();
-    if !input.body.contains(&work_item.source_issue_url) {
+    if !request.body.contains(&work_item.source_issue_url) {
         return Err(anyhow!(
             "pull request body must link the claimed source issue URL"
         ));
@@ -1452,8 +1583,8 @@ async fn validate_publication_prerequisites(
         FOR UPDATE OF deliverable, artifact, run, task, mission
         "#,
     )
-    .bind(input.source_deliverable_id)
-    .bind(input.corp_id)
+    .bind(request.source_deliverable_id)
+    .bind(request.corp_id)
     .bind(mission_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -1513,7 +1644,7 @@ async fn validate_publication_prerequisites(
     let selected_run_id: Uuid = row.get("run_id");
     ensure_run_not_hard_blocked_tx(
         tx,
-        input.corp_id,
+        request.corp_id,
         selected_run_id,
         row.get::<String, _>("breaker_stage").as_str(),
         "pull-request publication",
@@ -1523,7 +1654,7 @@ async fn validate_publication_prerequisites(
     let task_ids = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM tasks WHERE corp_id = $1 AND mission_id = $2 ORDER BY created_at, id",
     )
-    .bind(input.corp_id)
+    .bind(request.corp_id)
     .bind(mission_id)
     .fetch_all(&mut **tx)
     .await?;
@@ -1537,7 +1668,7 @@ async fn validate_publication_prerequisites(
         FOR UPDATE OF run
         "#,
     )
-    .bind(input.corp_id)
+    .bind(request.corp_id)
     .bind(mission_id)
     .fetch_all(&mut **tx)
     .await?;
@@ -1547,7 +1678,7 @@ async fn validate_publication_prerequisites(
         let breaker_stage: String = run.get("breaker_stage");
         ensure_run_not_hard_blocked_tx(
             tx,
-            input.corp_id,
+            request.corp_id,
             run_id,
             &breaker_stage,
             "pull-request publication",
@@ -1566,7 +1697,7 @@ async fn validate_publication_prerequisites(
         ORDER BY evidence.created_at, evidence.check_index, evidence.id
         "#,
     )
-    .bind(input.corp_id)
+    .bind(request.corp_id)
     .bind(mission_id)
     .fetch_all(&mut **tx)
     .await?;
@@ -1649,6 +1780,9 @@ fn normalize_checkpoint(
             draft,
             head_ref,
             base_ref,
+            head_sha,
+            head_repository_owner,
+            is_cross_repository,
             auto_merge_enabled,
         } => {
             if number <= 0 {
@@ -1660,6 +1794,13 @@ fn normalize_checkpoint(
                 .to_ascii_uppercase();
             let head_ref = normalize_factory_identifier(&head_ref, "pull request head ref", 500)?;
             let base_ref = normalize_factory_identifier(&base_ref, "pull request base ref", 500)?;
+            let head_sha = head_sha.trim().to_ascii_lowercase();
+            validate_factory_base_commit(&head_sha)?;
+            let head_repository_owner = normalize_github_component(
+                &head_repository_owner,
+                "pull request head repository owner",
+                100,
+            )?;
             let normalized = PullRequestPublicationCheckpointInput::PullRequestCreated {
                 number,
                 node_id: node_id.clone(),
@@ -1668,6 +1809,9 @@ fn normalize_checkpoint(
                 draft,
                 head_ref: head_ref.clone(),
                 base_ref: base_ref.clone(),
+                head_sha: head_sha.clone(),
+                head_repository_owner: head_repository_owner.clone(),
+                is_cross_repository,
                 auto_merge_enabled,
             };
             Ok((
@@ -1682,6 +1826,9 @@ fn normalize_checkpoint(
                     "draft": draft,
                     "head_ref": head_ref,
                     "base_ref": base_ref,
+                    "head_sha": head_sha,
+                    "head_repository_owner": head_repository_owner,
+                    "is_cross_repository": is_cross_repository,
                     "auto_merge_enabled": auto_merge_enabled
                 }),
             ))
@@ -1741,6 +1888,9 @@ fn validate_pull_request_identity(
     state: &str,
     head_ref: &str,
     base_ref: &str,
+    head_sha: &str,
+    head_repository_owner: &str,
+    is_cross_repository: bool,
     auto_merge_enabled: bool,
 ) -> Result<()> {
     if auto_merge_enabled {
@@ -1758,6 +1908,19 @@ fn validate_pull_request_identity(
             "pull request head or base does not match the authorized publication target"
         ));
     }
+    let target_owner = publication
+        .target_repository
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .context("publication target repository omitted owner")?;
+    if is_cross_repository
+        || !head_repository_owner.eq_ignore_ascii_case(target_owner)
+        || !head_sha.eq_ignore_ascii_case(&publication.commit_sha)
+    {
+        return Err(anyhow!(
+            "pull request head repository or commit does not match the verified publication target"
+        ));
+    }
     let expected_url = format!(
         "https://github.com/{}/pull/{number}",
         publication.target_repository
@@ -1770,6 +1933,7 @@ fn validate_pull_request_identity(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_pull_request_identity_matches(
     publication: &PullRequestPublication,
     number: i64,
@@ -1777,12 +1941,18 @@ fn ensure_pull_request_identity_matches(
     url: &str,
     state: &str,
     draft: bool,
+    head_sha: &str,
+    head_repository_owner: &str,
+    is_cross_repository: bool,
 ) -> Result<()> {
     if publication.pull_request_number != Some(number)
         || publication.pull_request_node_id.as_deref() != Some(node_id)
         || publication.pull_request_url.as_deref() != Some(url)
         || publication.pull_request_state.as_deref() != Some(state)
         || publication.pull_request_draft != Some(draft)
+        || publication.pull_request_head_sha.as_deref() != Some(head_sha)
+        || publication.pull_request_head_repository_owner.as_deref() != Some(head_repository_owner)
+        || publication.pull_request_is_cross_repository != Some(is_cross_repository)
     {
         return Err(anyhow!(
             "conflict: pull request identity does not match the durable publication"
@@ -1899,7 +2069,8 @@ fn publication_returning_columns() -> &'static str {
         actor_id, authorization_id, authorization_snapshot, effect_key, idempotency_key,
         state, version, attempt_count, publisher_id, publisher_lease_expires_at,
         failure_detail, branch_pushed_at, pull_request_number, pull_request_node_id,
-        pull_request_url, pull_request_state, pull_request_draft, project_owner,
+        pull_request_url, pull_request_state, pull_request_draft, pull_request_head_sha,
+        pull_request_head_repository_owner, pull_request_is_cross_repository, project_owner,
         project_number, project_item_id, project_status_before, project_status_after,
         project_status_updated_at, auto_merge_enabled, merge_authorized,
         deployment_authorized, provenance, created_at, updated_at

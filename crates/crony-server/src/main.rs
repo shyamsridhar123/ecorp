@@ -1794,6 +1794,9 @@ async fn record_pull_request_publication_checkpoint(
             draft,
             head_ref,
             base_ref,
+            head_sha,
+            head_repository_owner,
+            is_cross_repository,
             auto_merge_enabled,
         } => PullRequestPublicationCheckpointInput::PullRequestCreated {
             number,
@@ -1803,6 +1806,9 @@ async fn record_pull_request_publication_checkpoint(
             draft,
             head_ref,
             base_ref,
+            head_sha,
+            head_repository_owner,
+            is_cross_repository,
             auto_merge_enabled,
         },
         PullRequestPublicationCheckpoint::Published {
