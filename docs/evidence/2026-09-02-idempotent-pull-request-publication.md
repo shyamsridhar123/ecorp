@@ -10,6 +10,7 @@
 **Completed-retry head:** `173e20e`
 **PR-content and deliverable-pin head:** `86472e2`
 **Review-blocker closure head:** `5afe09f6abdd4ffa3d25f2365539463d0d51cd23`
+**Room-membership closure head:** `b631bd9e2f0ad8321631c046b38a549da64fec6e`
 **Stacked base:** `e308e54382c573244b67ab7c6d28e94316f2cdd0`
 
 ## Scope
@@ -63,13 +64,19 @@ The final exact-head run recorded:
   "actor_handoff_authorization_distinct": true,
   "published_retry_after_base_move": true,
   "exact_publication_context_lookup": true,
+  "cross_room_publication_start_rejection": 403,
+  "cross_room_publication_recovery_rejection": 403,
+  "cross_room_publication_status_denial": 404,
+  "pre_branch_room_membership_renewal_rejection": 403,
+  "pre_pull_request_room_membership_renewal_rejection": 403,
+  "pre_project_room_membership_renewal_rejection": 403,
   "bounded_snapshot_work_item_and_deliverable_absent": true,
   "published_retry_outside_bounded_snapshot": true,
   "exact_project_item_lookup": true,
   "project_item_count_during_publication": 1003,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "cf3ef1d598406dca0a6e36ffe279d617f4fff745",
+  "pull_request_head_sha": "4ecbd945a92e97b2cbb6f8d17155d1d298d29988",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -146,6 +153,18 @@ Before Project movement, the fake Project was expanded to 1,003 items with the a
 item-list call, loaded the exact stored node ID through GraphQL, verified its Project and Status
 field identity, and completed the one `In Progress -> In Review` transition.
 
+A same-Corp manager fixture was created in a separate room with no membership in the publication
+mission room. A direct start and an expired-lease recovery both returned `403`. While an authorized
+publisher attempt was active, the fixture requested exact publication status by the known work-item
+UUID; the endpoint returned `404`, and its response omitted the pull-request body, authorization
+reason and ID, publisher ID, and a persisted failure-detail canary.
+
+The authorized publisher was then removed from the mission room after attempt start at each external
+effect boundary. The pre-branch, pre-pull-request, and pre-Project renewals all returned `403`.
+The remote branch remained absent in the first case, no target-repository pull request existed in the
+second, and the Project item stayed `In Progress` in the third. Membership was restored only after
+each denial so the rest of the recovery harness could continue.
+
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
 GitHub create operation refused the duplicate head, and ECorp retained `branch_pushed` without a PR
@@ -209,6 +228,10 @@ tools/e2e_factory_publication.mjs
 Both focused E2Es used a fresh isolated PostgreSQL database and test-owned process/artifact/worktree
 directories. Their servers, runners, web process, ports, and database were removed afterward.
 All four review threads were replied to and resolved.
+
+The later room-membership implementation commit
+`b631bd9e2f0ad8321631c046b38a549da64fec6e` passed the same repository gates plus fresh isolated
+controller and publication E2Es. No web UI source changed.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not

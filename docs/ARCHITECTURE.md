@@ -481,7 +481,9 @@ tokens; tokens never enter snapshots or events.
 Publisher planning does not use the bounded browser snapshot as an index. An exact Corp-authorized
 publication-context read loads the requested work item, its durable publication, and every source
 deliverable for the linked bounded mission. This keeps initial publication and restart recovery
-available after newer history has displaced any of those objects from shared snapshot limits.
+available after newer history has displaced any of those objects from shared snapshot limits. Both
+that context and the exact publication-status read join through the viewer's current mission-room
+membership.
 
 The trusted publisher downloads the signed deliverable and imports its embedded Git bundle into a
 temporary bare repository. It verifies the bundle digest, source branch provenance, exact commit,
@@ -507,7 +509,9 @@ ADR 0022.
 
 Every pre-effect lease renewal locks the publication and revalidates the current attempt actor's
 persisted role plus current mission, verifier, deliverable, policy, run, requester, Corp-budget, and
-hard-breaker authority before extending the lease.
+hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
+recovery, and every renewal also require the acting publisher to remain a current member of the
+mission room.
 Default start idempotency keys fingerprint the complete normalized invocation, so equal calls remain
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
 recovery key instead of conflicting with an earlier operation request.

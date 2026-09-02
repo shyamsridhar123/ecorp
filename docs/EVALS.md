@@ -287,5 +287,8 @@ then publishes and replays the completed result through the exact publication co
 changes publisher ID, authorization reason, and lease duration; invalid `ecorp/foo//bar` and
 `ecorp/foo.lock` branches fail before durable start. The Project regression places the authorized
 item after 1,001 fillers and proves publication uses exact GraphQL node lookup without another
-bounded item-list read. See
+bounded item-list read. A separate same-Corp manager belongs only to another room: start and
+recovery return `403`, exact publication status returns `404` without sensitive fields, and removing
+the active publisher from the mission room makes each pre-branch, pre-PR, and pre-Project renewal
+return `403` before its external effect. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
