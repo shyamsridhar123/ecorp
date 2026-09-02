@@ -115,6 +115,11 @@
       "version": 23,
       "file": "0023_portable_deliverables.sql",
       "sha384": "c462161a91d362b70c908727e6b17d22d7b18242bed0dca2228ce51e62cbeac630309dfe3385f2ef3d1f328ee286e824"
+    },
+    {
+      "version": 24,
+      "file": "0024_pull_request_publications.sql",
+      "sha384": "a2545deb96a1cb24d027fabf107364db964089119c440d6ce237d6de9c9a557822a942a81201a08070ce6ab132ce2a64"
     }
   ]
 }

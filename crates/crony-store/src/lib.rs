@@ -1113,6 +1113,14 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM pull_request_publication_attempts WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pull_request_publications WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM factory_work_items WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -9001,6 +9009,75 @@ fn map_source_deliverable(row: sqlx::postgres::PgRow) -> Result<SourceDeliverabl
     })
 }
 
+fn map_pull_request_publication(
+    row: sqlx::postgres::PgRow,
+) -> Result<PullRequestPublication> {
+    Ok(PullRequestPublication {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        factory_work_item_id: row.get("factory_work_item_id"),
+        mission_id: row.get("mission_id"),
+        source_deliverable_id: row.get("source_deliverable_id"),
+        artifact_id: row.get("artifact_id"),
+        task_id: row.get("task_id"),
+        run_id: row.get("run_id"),
+        source_issue_number: row.get("source_issue_number"),
+        source_issue_url: row.get("source_issue_url"),
+        target_repository: row.get("target_repository"),
+        base_ref: row.get("base_ref"),
+        branch: row.get("branch"),
+        commit_sha: row.get("commit_sha"),
+        title: row.get("title"),
+        body: row.get("body"),
+        actor_id: row.get("actor_id"),
+        authorization_id: row.get("authorization_id"),
+        authorization: row.get("authorization"),
+        effect_key: row.get("effect_key"),
+        idempotency_key: row.get("idempotency_key"),
+        state: parse_pull_request_publication_state(row.get::<String, _>("state").as_str())?,
+        version: row.get("version"),
+        attempt_count: row.get("attempt_count"),
+        publisher_id: row.get("publisher_id"),
+        publisher_lease_expires_at: row.get("publisher_lease_expires_at"),
+        failure_detail: row.get("failure_detail"),
+        branch_pushed_at: row.get("branch_pushed_at"),
+        pull_request_number: row.get("pull_request_number"),
+        pull_request_node_id: row.get("pull_request_node_id"),
+        pull_request_url: row.get("pull_request_url"),
+        pull_request_state: row.get("pull_request_state"),
+        pull_request_draft: row.get("pull_request_draft"),
+        project_owner: row.get("project_owner"),
+        project_number: row.get("project_number"),
+        project_item_id: row.get("project_item_id"),
+        project_status_before: row.get("project_status_before"),
+        project_status_after: row.get("project_status_after"),
+        project_status_updated_at: row.get("project_status_updated_at"),
+        auto_merge_enabled: row.get("auto_merge_enabled"),
+        merge_authorized: row.get("merge_authorized"),
+        deployment_authorized: row.get("deployment_authorized"),
+        provenance: row.get("provenance"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_pull_request_publication_attempt(
+    row: sqlx::postgres::PgRow,
+) -> PullRequestPublicationAttempt {
+    PullRequestPublicationAttempt {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        publication_id: row.get("publication_id"),
+        attempt: row.get("attempt"),
+        actor_id: row.get("actor_id"),
+        publisher_id: row.get("publisher_id"),
+        state: row.get("state"),
+        failure_detail: row.get("failure_detail"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+    }
+}
+
 fn map_action_approval(row: sqlx::postgres::PgRow) -> ActionApproval {
     ActionApproval {
         id: row.get("id"),
@@ -9199,6 +9276,17 @@ fn parse_factory_work_item_state(value: &str) -> Result<FactoryWorkItemState> {
         "failed" => Ok(FactoryWorkItemState::Failed),
         "cancelled" => Ok(FactoryWorkItemState::Cancelled),
         other => Err(anyhow!("unknown factory work-item state {other}")),
+    }
+}
+
+fn parse_pull_request_publication_state(value: &str) -> Result<PullRequestPublicationState> {
+    match value {
+        "requested" => Ok(PullRequestPublicationState::Requested),
+        "publishing" => Ok(PullRequestPublicationState::Publishing),
+        "branch_pushed" => Ok(PullRequestPublicationState::BranchPushed),
+        "pull_request_created" => Ok(PullRequestPublicationState::PullRequestCreated),
+        "published" => Ok(PullRequestPublicationState::Published),
+        other => Err(anyhow!("unknown pull-request publication state {other}")),
     }
 }
 
