@@ -177,3 +177,42 @@ GitHub Actions is unavailable because the account has exhausted its hosted-runne
 month. Those zero-step billing failures are not treated as product validation or as a landing
 blocker. Landing uses the complete local gate, focused E2Es, browser evidence, and clean review
 threads; auto-merge remains disabled.
+
+## Factory-default and path-grammar review closure — September 2, 2026
+
+Commit `5d6e9e14873b562848b0a2e159b9fc28bd85196a` closes four additional
+exact-head review findings:
+
+- governed factory materialization now requests a verified `commit_branch` deliverable by default,
+  including parallel synthesis and deterministic verification strategies;
+- one shared domain grammar validates repository-relative paths and write scopes in the factory
+  CLI, server planner, store policy boundary, and runner before dispatch or export;
+- Git commands set `GIT_LITERAL_PATHSPECS=1`, and colon pathspec magic such as
+  `:(exclude)secret.txt` is rejected before staging;
+- nested `.kube`, `.docker`, `.gnupg`, and `.password-store` directories join the existing
+  credential-directory denylist; and
+- temporary export paths are grouped so the warning-free clippy gate remains stable as the
+  commit/branch bundle path evolves.
+
+The fresh factory-controller E2E proved the primary governed path now creates exactly one portable
+source deliverable:
+
+- factory work item `94b56dee-80ec-42ea-b98f-a2c336a1aadf`
+- mission `4933f472-622a-4d19-838b-2d8ea1ce77ac`
+- run `ff547bd1-b940-42bb-a87a-ddb50cf34714`
+- source deliverable form `commit_branch`
+- integration state `ready_for_review`
+- factory state `verified`
+- mission and run status `completed`
+
+The same controller run retained its dry-run, fencing, replay, pagination, timeout, terminal
+failure, verifier failure, independent-review, repository-routing, and source-revalidation
+regressions. A subsequent portable-deliverable E2E recorded archive
+`de04311c-809c-418f-9703-4d345c96363e`, bounded commit
+`cf0038c8e671a151ccc59bf1aafac6e975d5bc95`, retained-before-cleanup ordering `true`, and
+unauthorized download HTTP `404`. The artifact regression also passed.
+
+The complete local repository gate passed with 23 immutable migrations, formatting, warning-free
+workspace clippy, all 75 Rust tests, production web build, web lint, Node syntax validation, and
+`git diff --check`. The isolated PostgreSQL/server/runner topology used ports `55435` and `8893`;
+its process tree and container were removed, and ports `55435`, `8893`, and `5289` were closed.
