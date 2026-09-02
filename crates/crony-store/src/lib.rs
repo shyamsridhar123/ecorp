@@ -1095,6 +1095,10 @@ impl PgStore {
         let corp_id = parse_id(DEMO_CORP_ID)?;
         let mut tx = self.pool.begin().await?;
         lock_demo_tx(&mut tx).await?;
+        sqlx::query("DELETE FROM corp_budget_policies WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM control_leases WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
