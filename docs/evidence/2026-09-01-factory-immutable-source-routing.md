@@ -82,6 +82,28 @@ Unmaterialized legacy claim:
 - run `ddd0dbbf-d6bd-4a4d-ad7d-a2fbf3bbefe3`
 - final factory state `verified`
 
+### September 2 review hardening
+
+The current-head rerun at `bddba44dfabc756b887fa9d4f0a6d04e2c581e8c` closed two P1 recovery
+gaps found during pre-landing review:
+
+- a new claim with `source_base_ref` but no immutable commit was rejected, and no factory work item
+  was created
+- only records carrying the migration-owned `source_commit_upgrade_required=true` marker could
+  enter legacy recovery
+- recovery with requested ref `main` against persisted ref `HEAD` failed before the policy or audit
+  journal changed
+- recovery with the matching persisted ref emitted exactly one `factory.source_commit_pinned`
+  event and completed one verified mission
+
+The rerun produced derivable work item `b87a0a24-9c99-4f92-8d88-b56c067d104a` and migrated
+unmaterialized work item `181f3d00-204e-4c61-9621-49ebb1103691`. The latter completed as mission
+`eb28c5df-38d7-4910-b26f-d5536b9fa329` and run
+`af5e5569-5139-4e2e-a759-0823ba1fdf8b`.
+
+The complete claims, immutable-routing, and controller E2Es then passed on the same head. The
+test-owned stack stopped cleanly, and ports `8791` and `5187` were closed.
+
 ## Factory regression evidence
 
 `node tools/e2e_factory_controller.mjs` passed its complete deterministic controller suite.

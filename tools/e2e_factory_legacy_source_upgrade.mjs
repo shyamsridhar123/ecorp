@@ -190,7 +190,7 @@ async function materializeAndRun(demo, claim, issueNumber) {
   return { materialized, launch, terminal }
 }
 
-async function runController(demo, issueNumber) {
+async function runController(demo, issueNumber, sourceBaseRef = 'HEAD') {
   const { stdout } = await execFile(
     cliBinary,
     [
@@ -206,7 +206,7 @@ async function runController(demo, issueNumber) {
       '--source-repository-path',
       root,
       '--source-base-ref',
-      'HEAD',
+      sourceBaseRef,
       '--adapter',
       'fake-process',
       '--strategy',
@@ -245,6 +245,35 @@ const demo = await post('/api/demo/reset', {})
 const nonce = crypto.randomUUID().replaceAll('-', '').slice(0, 10)
 
 const derivableIssue = 90_000 + Math.floor(Math.random() * 4_000)
+const rejectedLegacyIssue = derivableIssue + 2
+const rejectedLegacyProjectItemId = `PVTI_LEGACY_REJECTED_${nonce}`
+let rejectedLegacyClaimError
+try {
+  await post(
+    `/api/corps/${demo.corp_id}/factory/work-items/claim`,
+    claimRequest(
+      demo,
+      rejectedLegacyIssue,
+      rejectedLegacyProjectItemId,
+      '2026-09-02T00:02:00Z',
+      null,
+    ),
+  )
+} catch (error) {
+  rejectedLegacyClaimError = error
+}
+assert.match(
+  rejectedLegacyClaimError?.message ?? '',
+  /source_base_commit/,
+  'new commit-less factory claim was accepted',
+)
+assert.equal(
+  (await snapshot(demo)).snapshot.factory_work_items.some(
+    (item) => item.source_project_item_id === rejectedLegacyProjectItemId,
+  ),
+  false,
+)
+
 const derivableProjectItemId = `PVTI_LEGACY_DERIVABLE_${nonce}`
 const derivableClaim = await post(
   `/api/corps/${demo.corp_id}/factory/work-items/claim`,
@@ -272,14 +301,14 @@ const upgradeClaim = await post(
     upgradeIssue,
     upgradeProjectItemId,
     upgradeRevision,
-    null,
+    sourceBaseCommit,
   ),
 )
 
 await psql(`
 UPDATE factory_work_items
 SET policy = policy - 'source_base_commit' - 'source_commit_upgrade_required'
-WHERE id = '${derivableClaim.work_item.id}';
+WHERE id IN ('${derivableClaim.work_item.id}', '${upgradeClaim.work_item.id}');
 UPDATE tasks
 SET contract = contract - 'source_base_commit'
 WHERE mission_id = '${derivable.materialized.mission_id}';
@@ -375,6 +404,31 @@ await writeFile(
   )}\n`,
 )
 
+let mismatchedRefError
+try {
+  await runController(demo, upgradeIssue, 'main')
+} catch (error) {
+  mismatchedRefError = error
+}
+assert.match(
+  mismatchedRefError?.message ?? '',
+  /persisted policy requires HEAD, controller requested main/,
+)
+const afterMismatchedRef = await snapshot(demo)
+const stillPendingUpgrade = afterMismatchedRef.snapshot.factory_work_items.find(
+  (item) => item.id === upgradeClaim.work_item.id,
+)
+assert.equal(stillPendingUpgrade.policy.source_base_commit, undefined)
+assert.equal(stillPendingUpgrade.policy.source_commit_upgrade_required, true)
+assert.equal(
+  afterMismatchedRef.snapshot.events.some(
+    (event) =>
+      event.aggregate_id === upgradeClaim.work_item.id &&
+      event.type === 'factory.source_commit_pinned',
+  ),
+  false,
+)
+
 const upgraded = await runController(demo, upgradeIssue)
 assert.equal(upgraded.legacy_source_commit_upgraded, true)
 const upgradedTerminal = await waitForMission(demo, upgraded.mission_id)
@@ -406,6 +460,10 @@ assert.equal(upgradeEvents.length, 1)
 const report = {
   checked_at: new Date().toISOString(),
   source_base_commit: sourceBaseCommit,
+  intake_rejection: {
+    commitless_claim_rejected: true,
+    work_item_created: false,
+  },
   derivable_legacy_run: {
     work_item_id: derivableClaim.work_item.id,
     mission_id: derivable.materialized.mission_id,
@@ -417,6 +475,8 @@ const report = {
   unmaterialized_legacy_claim: {
     work_item_id: upgradeClaim.work_item.id,
     migration_marked_upgrade_required: true,
+    mismatched_source_ref_rejected: true,
+    persisted_source_ref: 'HEAD',
     explicit_upgrade_applied: upgraded.legacy_source_commit_upgraded,
     audit_event_count: upgradeEvents.length,
     mission_id: upgraded.mission_id,
