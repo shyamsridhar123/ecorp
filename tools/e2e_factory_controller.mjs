@@ -154,6 +154,7 @@ async function runController(
     strategy = 'single',
     githubTimeoutMs,
     sourceRepositoryPath = root,
+    sourceBaseRef = 'HEAD',
     publicationBaseRef,
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
@@ -172,6 +173,8 @@ async function runController(
     repository,
     '--source-repository-path',
     sourceRepositoryPath,
+    '--source-base-ref',
+    sourceBaseRef,
     '--adapter',
     'fake-process',
     '--strategy',
@@ -364,6 +367,21 @@ try {
 const preValidationSnapshot = await snapshot(demo)
 assert.equal(preValidationSnapshot.snapshot.factory_work_items.length, 0)
 assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
+
+const releaseSourceRepository = await createSourceFixture(
+  'shyamsridhar123/ecorp',
+)
+await execFile('git', ['branch', 'release', 'HEAD'], {
+  cwd: releaseSourceRepository,
+  windowsHide: true,
+})
+const releaseDryRun = await runController(demo, 9001, true, {
+  sourceRepositoryPath: releaseSourceRepository,
+  sourceBaseRef: 'release',
+})
+assert.equal(releaseDryRun.source_base_ref, 'release')
+assert.equal(releaseDryRun.publication_base_ref, 'release')
+await rm(releaseSourceRepository, { recursive: true, force: true })
 
 const dryRun = await runController(demo, 9001, true)
 assert.equal(dryRun.mode, 'dry_run')
@@ -1302,6 +1320,8 @@ const report = {
   run_status: runs[0].status,
   auto_merge: false,
   default_publication_base_ref: factoryItems[0].policy.publication.base_ref,
+  selected_source_publication_base_ref:
+    releaseDryRun.publication_base_ref,
   control_character_publication_base_policy_rejected:
     controlCharacterPolicyResponse.status,
   non_branch_publication_base_rejected_before_claim:

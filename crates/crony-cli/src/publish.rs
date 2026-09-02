@@ -845,7 +845,9 @@ fn prepare_repository(
     )
     .context("verify portable Git bundle prerequisites")?;
     let import_ref = "refs/heads/ecorp-import";
-    let refspec = format!("HEAD:{import_ref}");
+    let bundle_head =
+        portable_bundle_head(&workspace.repository, &workspace.bundle, &plan.commit_sha)?;
+    let refspec = format!("{bundle_head}:{import_ref}");
     source_git_output(
         &workspace.repository,
         &[
@@ -877,6 +879,38 @@ fn prepare_repository(
     )
     .context("verify publication commit descends from the authorized base")?;
     Ok(resolved_base)
+}
+
+fn portable_bundle_head(repository: &Path, bundle: &Path, expected_commit: &str) -> Result<String> {
+    let output = source_git_output(repository, &["bundle", "list-heads", path_text(bundle)?])?;
+    let output = String::from_utf8(output).context("portable Git bundle heads are not UTF-8")?;
+    parse_portable_bundle_head(&output, expected_commit)
+}
+
+fn parse_portable_bundle_head(output: &str, expected_commit: &str) -> Result<String> {
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    let line = lines
+        .next()
+        .context("portable Git bundle omitted its head")?;
+    if lines.next().is_some() {
+        bail!("portable Git bundle exposed multiple heads");
+    }
+    let mut fields = line.split_whitespace();
+    let commit = fields.next().unwrap_or_default();
+    let reference = fields.next().unwrap_or_default();
+    if fields.next().is_some() || !commit.eq_ignore_ascii_case(expected_commit) {
+        bail!("portable Git bundle head does not match the verified publication commit");
+    }
+    let valid_reference = reference == "HEAD"
+        || reference
+            .strip_prefix("refs/ecorp/deliverables/")
+            .is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+    if !valid_reference {
+        bail!("portable Git bundle exposed an unauthorized head reference");
+    }
+    Ok(reference.to_owned())
 }
 
 fn preflight_publication_target(plan: &PublicationPlan) -> Result<()> {
@@ -1838,6 +1872,34 @@ mod tests {
             "main"
         );
         assert!(pull_request_base_name("HEAD").is_err());
+    }
+
+    #[test]
+    fn portable_bundle_head_is_single_exact_and_bounded() {
+        let commit = "a".repeat(40);
+        assert_eq!(
+            parse_portable_bundle_head(
+                &format!("{commit} refs/ecorp/deliverables/0123456789abcdef0123456789abcdef\n"),
+                &commit
+            )
+            .expect("temporary bundle ref"),
+            "refs/ecorp/deliverables/0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            parse_portable_bundle_head(&format!("{commit} HEAD\n"), &commit)
+                .expect("legacy HEAD bundle"),
+            "HEAD"
+        );
+        assert!(
+            parse_portable_bundle_head(&format!("{commit} refs/heads/main\n"), &commit).is_err()
+        );
+        assert!(
+            parse_portable_bundle_head(
+                &format!("{commit} HEAD\n{commit} refs/heads/other\n"),
+                &commit
+            )
+            .is_err()
+        );
     }
 
     #[test]
