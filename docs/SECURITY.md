@@ -155,6 +155,11 @@ mission, requester, Corp-budget, and hard-breaker authority. Pull-request adopti
 GitHub PR commands receive that verified branch name rather than the literal `HEAD`, and the
 resolved PR base is retained separately from the authorized symbolic base.
 
+PR adoption also requires the exact authorized title and body. A collaborator-created PR with the
+right branch and SHA but altered content is ignored and cannot advance Project state. Publication
+retries remain pinned to the persisted deliverable ID even when the mission contains other
+merge-ready outputs.
+
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before
 push, so publication cannot mutate the default branch as a substitute for merge authorization.

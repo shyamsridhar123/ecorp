@@ -274,4 +274,7 @@ files canonicalize before idempotency comparison. The base-collision case leaves
 publication and accepts a corrected branch afterward, while a second manager's recovery attempt
 receives a distinct actor-bound authorization identity. A completed-publication retry also returns
 the persisted result after the remote base advances, without another PR or Project mutation. See
+The same harness injects an exact same-repository/SHA PR with an unauthorized title/body and proves
+it is rejected before Project movement. Unit coverage pins retries to the persisted deliverable when
+multiple mission deliverables are otherwise eligible. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

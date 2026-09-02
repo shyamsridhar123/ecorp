@@ -51,7 +51,8 @@ source deliverable or preserved worktree.
 
 Pull-request adoption additionally requires the head to be in the target repository, not a fork,
 and to resolve to the exact verified commit. The head repository owner, cross-repository flag, and
-head object ID are persisted with the PR identity and checked again by the server.
+head object ID are persisted with the PR identity and checked again by the server. The remote PR
+title and body must also exactly match the authorized publication content.
 
 Every publisher-lease renewal revalidates the current attempt actor against its authorization-role
 snapshot and reruns mission, verifier, deliverable, policy, run, requester, Corp-budget, and hard
@@ -72,7 +73,8 @@ request is constructed.
 
 If the authorized snapshot already contains a durable `published` publication, duplicate calls
 return that result before consulting the mutable remote base. Completed publication recovery never
-requires the original base branch to remain unchanged.
+requires the original base branch to remain unchanged. Once any publication exists, retries default
+to its persisted source deliverable rather than reselecting among other mission deliverables.
 
 Publication does not call GitHub merge APIs, enable auto-merge, deploy, or authorize those effects.
 

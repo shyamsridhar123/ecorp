@@ -8,6 +8,7 @@
 **Retry and base-branch guard head:** `aa55790`
 **Preflight and actor-handoff head:** `6f4c57c`
 **Completed-retry head:** `173e20e`
+**PR-content and deliverable-pin head:** `86472e2`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -58,11 +59,12 @@ The final exact-head run recorded:
   "body_file_crlf_normalized": true,
   "actor_handoff_authorization_distinct": true,
   "published_retry_after_base_move": true,
-  "publication_attempts": 8,
+  "publication_attempts": 9,
   "pull_request_number": 41,
   "pull_request_head_sha": "da8b2c6144334af7f4f5f44be746bb2f5c5b2370",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
+  "unauthorized_pr_content_rejected": true,
   "pull_request_create_calls": 1,
   "publication_base_ref": "HEAD",
   "resolved_pull_request_base_ref": "main",
@@ -117,6 +119,12 @@ returned to member afterward and Alice completed the remaining recovery path.
 After publication completed, the fake remote `main` branch advanced to another commit. A duplicate
 publisher invocation returned the same persisted publication without remote preflight, PR creation,
 or Project mutation.
+
+Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
+request whose title and body differed from the persisted plan. The publisher ignored it, the fake
+GitHub create operation refused the duplicate head, and ECorp retained `branch_pushed` without a PR
+or Project transition. Removing the unauthorized PR allowed one exact authorized PR to be created.
+Retry selection is pinned to the publication's persisted deliverable ID.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was
