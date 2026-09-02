@@ -44,6 +44,11 @@ struct ArchivedChange {
     content_base64: Option<String>,
 }
 
+struct TemporaryExportPaths<'a> {
+    index: &'a Path,
+    bundle: &'a Path,
+}
+
 pub async fn export(
     run_id: Uuid,
     spec: &DeliverableSpec,
@@ -68,6 +73,10 @@ pub async fn export(
     let _ = tokio::fs::remove_file(&temporary_index).await;
     let _ = tokio::fs::remove_file(&temporary_bundle).await;
 
+    let temporary_paths = TemporaryExportPaths {
+        index: &temporary_index,
+        bundle: &temporary_bundle,
+    };
     let result = export_with_index(
         spec,
         workspace,
@@ -75,8 +84,7 @@ pub async fn export(
         report,
         provider_artifacts,
         write_scope,
-        &temporary_index,
-        &temporary_bundle,
+        &temporary_paths,
     )
     .await;
     let _ = tokio::fs::remove_file(&temporary_index).await;
@@ -91,12 +99,11 @@ async fn export_with_index(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
-    temporary_index: &Path,
-    temporary_bundle: &Path,
+    temporary_paths: &TemporaryExportPaths<'_>,
 ) -> Result<ExportedDeliverable> {
     git_success(
         workspace_root,
-        temporary_index,
+        temporary_paths.index,
         &[
             OsString::from("read-tree"),
             OsString::from(&workspace.base_commit),
@@ -117,7 +124,7 @@ async fn export_with_index(
             add_args.push(OsString::from(path));
         }
     }
-    git_success(workspace_root, temporary_index, &add_args).await?;
+    git_success(workspace_root, temporary_paths.index, &add_args).await?;
 
     for artifact in provider_artifacts {
         let Ok(artifact_path) = tokio::fs::canonicalize(&artifact.path).await else {
@@ -129,7 +136,7 @@ async fn export_with_index(
         let relative = portable_path(path)?;
         git_success(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             &[
                 OsString::from("reset"),
                 OsString::from("-q"),
@@ -141,9 +148,14 @@ async fn export_with_index(
         .await?;
     }
 
-    let changes = changed_paths(workspace_root, temporary_index, &workspace.base_commit).await?;
+    let changes = changed_paths(
+        workspace_root,
+        temporary_paths.index,
+        &workspace.base_commit,
+    )
+    .await?;
     reject_out_of_scope_changes(&changes, write_scope)?;
-    reject_unsafe_changes(workspace_root, temporary_index, &changes).await?;
+    reject_unsafe_changes(workspace_root, temporary_paths.index, &changes).await?;
     let verification_bytes =
         serde_json::to_vec(report).context("serialize verification report for linkage")?;
     let verification_sha256 = hex::encode(Sha256::digest(&verification_bytes));
@@ -153,7 +165,7 @@ async fn export_with_index(
     let head_commit = if should_commit {
         commit_index(
             workspace_root,
-            temporary_index,
+            temporary_paths.index,
             workspace,
             &verification_sha256,
             &changes,
@@ -165,7 +177,7 @@ async fn export_with_index(
 
     let patch = git_output(
         workspace_root,
-        temporary_index,
+        temporary_paths.index,
         &[
             OsString::from("diff"),
             OsString::from("--cached"),
@@ -185,8 +197,8 @@ async fn export_with_index(
         Some(
             create_git_bundle(
                 workspace_root,
-                temporary_index,
-                temporary_bundle,
+                temporary_paths.index,
+                temporary_paths.bundle,
                 &workspace.branch,
                 &workspace.base_commit,
                 head_commit,
@@ -213,8 +225,13 @@ async fn export_with_index(
                     | DeliverableForm::TypedArtifactSet
                     | DeliverableForm::CommitBranch
             );
-            let archived =
-                archive_changes(workspace_root, temporary_index, &changes, include_content).await?;
+            let archived = archive_changes(
+                workspace_root,
+                temporary_paths.index,
+                &changes,
+                include_content,
+            )
+            .await?;
             let document = json!({
                 "schema_version": 1,
                 "form": form.as_str(),
