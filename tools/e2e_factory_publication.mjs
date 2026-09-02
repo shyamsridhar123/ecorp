@@ -163,6 +163,7 @@ async function runPublisher(
     omitAuthorizationId = false,
     actorId = demo.alice_actor_id,
     sourceDeliverableId,
+    title,
     publisherId = 'trusted-publication-e2e',
     authorizationReason =
       'Publication E2E authorizes review-only branch and pull request creation.',
@@ -191,6 +192,7 @@ async function runPublisher(
   if (sourceDeliverableId) {
     args.push('--source-deliverable-id', sourceDeliverableId)
   }
+  if (title) args.push('--title', title)
   if (idempotencyKey) args.push('--idempotency-key', idempotencyKey)
   if (branch) args.push('--branch', branch)
   if (bodyFile) args.push('--body-file', bodyFile)
@@ -977,14 +979,16 @@ assert.equal(
   'verified',
 )
 const collisionRecoveryBranch = `main-safe-${collisionSource.head_commit.slice(0, 12)}`
+const collisionCustomTitle = `Collision recovery ${nonce}`
 await runPublisher(demo, collisionWorkItem.id, {
   branch: collisionRecoveryBranch,
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
+  title: `  ${collisionCustomTitle}  `,
   publisherId: 'trusted-publication-host-a',
   authorizationReason: 'Host A authorizes the first recoverable publication attempt.',
   leaseSeconds: 5,
-  crashAfter: 'after_start',
+  crashAfter: 'after_plan_validation',
   expectCrash: true,
 })
 const collisionRestartedServerPid = await restartLocalServer()
@@ -1014,6 +1018,7 @@ const collisionPublication = (await snapshot(demo)).snapshot.pull_request_public
   (publication) => publication.factory_work_item_id === collisionWorkItem.id,
 )
 assert.equal(collisionPublication.branch, collisionRecoveryBranch)
+assert.equal(collisionPublication.title, collisionCustomTitle)
 assert.equal(collisionPublication.publisher_id, 'trusted-publication-host-b')
 assert.equal(collisionPublication.attempt_count, 2)
 assert.equal(
@@ -1772,6 +1777,7 @@ const report = {
   checked_at: new Date().toISOString(),
   base_branch_collision_rejected: remoteMainAfter === remoteMainBefore,
   invalid_git_branches_rejected_before_start: true,
+  custom_title_normalized: collisionPublication.title === collisionCustomTitle,
   implicit_authorization_retry_stable: true,
   cross_publisher_default_start_recovery:
     collisionPublication.publisher_id === 'trusted-publication-host-b' &&

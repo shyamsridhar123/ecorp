@@ -414,6 +414,7 @@ async fn execute_publication(
     publisher_token: Uuid,
 ) -> Result<()> {
     ensure_publication_matches_plan(&response.publication, plan)?;
+    test_crash("after_plan_validation");
     renew_publication(
         client,
         server,
@@ -1349,6 +1350,7 @@ fn publication_plan(args: &FactoryPublishArgs, context: &Value) -> Result<Public
         .map(str::to_owned)
         .or_else(|| args.title.clone())
         .unwrap_or_else(|| value_string(work_item, "/source_title").unwrap_or_default());
+    let title = normalize_publication_title(&title)?;
     let issue_url = value_string(work_item, "/source_issue_url")?;
     let body = if let Some(body) = existing_publication
         .and_then(|publication| publication.get("body"))
@@ -1484,6 +1486,20 @@ fn normalize_publication_body(value: &str) -> Result<String> {
     }
     if value.contains('\0') {
         bail!("pull request body cannot contain NUL bytes");
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_publication_title(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("pull request title cannot be empty");
+    }
+    if value.len() > 256 {
+        bail!("pull request title cannot exceed 256 bytes");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("pull request title cannot contain control characters");
     }
     Ok(value.to_owned())
 }
@@ -1738,6 +1754,13 @@ mod tests {
             normalize_publication_body("line one\r\nline two\r\n").expect("normalize"),
             "line one\nline two"
         );
+        assert_eq!(
+            normalize_publication_title("  Review title  ").expect("normalize title"),
+            "Review title"
+        );
+        assert!(normalize_publication_title("   ").is_err());
+        assert!(normalize_publication_title("bad\ntitle").is_err());
+        assert!(normalize_publication_title(&"x".repeat(257)).is_err());
         let actor = Uuid::new_v4();
         let first = stable_authorization_id(actor, "effect");
         assert_eq!(first, stable_authorization_id(actor, "effect"));
