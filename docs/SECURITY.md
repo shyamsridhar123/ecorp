@@ -141,6 +141,8 @@ rechecks the current attempt actor against its persisted role snapshot and rerun
 mission, requester, Corp-budget, and hard-breaker authority. Pull-request adoption requires
 `isCrossRepository = false`, the target repository owner, and the exact verified head SHA. Remote
 `HEAD` is accepted only when its symbolic branch target exists and advertises the same object ID.
+GitHub PR commands receive that verified branch name rather than the literal `HEAD`, and the
+resolved PR base is retained separately from the authorized symbolic base.
 
 ## Required production boundaries
 

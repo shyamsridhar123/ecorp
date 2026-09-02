@@ -4,6 +4,7 @@
 **Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`
 **Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`
 **Final local validation head:** `02a8baa8d63279e3f1f02c96025bf2fc596c5d4d`
+**Resolved-base fix head:** `59638db`
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -15,7 +16,7 @@ It does not merge, enable auto-merge, deploy, or claim a live GitHub pull reques
 
 ## Fresh-database and repository gates
 
-A new PostgreSQL 16 database applied all 25 migrations. Migration 0024 created:
+A new PostgreSQL 16 database applied all 26 migrations. Migration 0024 created:
 
 - `pull_request_publications`
 - `pull_request_publication_attempts`
@@ -24,6 +25,7 @@ A new PostgreSQL 16 database applied all 25 migrations. Migration 0024 created:
 Authorization JSON is stored only in the explicit `authorization_snapshot` columns.
 Migration 0025 adds the exact pull-request head SHA, head repository owner, and cross-repository
 identity needed to reject same-named fork pull requests.
+Migration 0026 stores the actual GitHub PR base separately from the authorized symbolic base.
 
 The exact implementation head passed:
 
@@ -55,6 +57,7 @@ The final exact-head run recorded:
   "fork_pull_request_rejected": true,
   "pull_request_create_calls": 1,
   "publication_base_ref": "HEAD",
+  "resolved_pull_request_base_ref": "main",
   "remote_branch_count": 1,
   "project_status": "In Review",
   "project_after_pull_request": true,
@@ -85,7 +88,8 @@ The attempt sequence covered:
 
 The hardened run also seeded an open same-named fork PR with a different owner and head SHA. The
 publisher ignored it, created one same-repository PR, and persisted the exact verified head. It used
-the accepted `HEAD` base and verified both the symbolic target and object ID. After publication
+the accepted `HEAD` policy base, verified both the symbolic target and object ID, and used/persisted
+the resolved `main` branch for GitHub PR operations. After publication
 start, changing the owner to another still-publish-capable role, raising a hard breaker, exhausting
 the selected run budget, and exhausting the Corp aggregate budget each caused the next lease
 renewal to fail before branch, PR, or Project effects.

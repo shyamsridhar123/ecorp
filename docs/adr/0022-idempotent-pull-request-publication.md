@@ -60,7 +60,8 @@ authority after a later demotion, budget exhaustion, policy change, or breaker t
 
 When policy uses `HEAD` as the publication base, the publisher resolves the remote symbolic HEAD,
 requires a branch target, and verifies that the advertised HEAD object equals the explicit target
-ref object before any push.
+ref object before any push. The authorized symbolic input remains `HEAD`, while the resolved branch
+name is used for GitHub PR lookup/creation and persisted as the actual pull-request base.
 
 Publication does not call GitHub merge APIs, enable auto-merge, deploy, or authorize those effects.
 

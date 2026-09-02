@@ -476,7 +476,8 @@ branches are never force-pushed.
 An adopted pull request must report the exact verified `headRefOid`, the target repository owner,
 and `isCrossRepository = false`; a same-named branch from a fork is ignored and cannot advance
 durable publication state. A symbolic `HEAD` base is resolved without `--refs`, then cross-checked
-against its advertised explicit branch target.
+against its advertised explicit branch target. ECorp preserves `HEAD` as the authorized policy base
+but passes and persists the resolved branch name, such as `main`, as the actual GitHub PR base.
 
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed
