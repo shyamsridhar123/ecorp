@@ -473,12 +473,21 @@ authorized base ancestry, and current remote base before adopting or pushing the
 matching branches and pull requests are recovered; conflicting remote identities fail closed and
 branches are never force-pushed.
 
+An adopted pull request must report the exact verified `headRefOid`, the target repository owner,
+and `isCrossRepository = false`; a same-named branch from a fork is ignored and cannot advance
+durable publication state. A symbolic `HEAD` base is resolved without `--refs`, then cross-checked
+against its advertised explicit branch target.
+
 The state sequence is `publishing -> branch_pushed -> pull_request_created -> published`. A
 checkpoint can be replayed after duplicate delivery, process restart, or external success followed
 by local failure. Project status is not changed until the pull-request identity is durable, and the
 final transaction moves the factory item to `published` and the source deliverable to integration
 state `published`. Auto-merge, merge, and deployment remain false and separately unauthorized. See
 ADR 0022.
+
+Every pre-effect lease renewal locks the publication and revalidates the current attempt actor's
+persisted role plus current mission, verifier, deliverable, policy, run, requester, Corp-budget, and
+hard-breaker authority before extending the lease.
 
 ## Near-term architecture work
 

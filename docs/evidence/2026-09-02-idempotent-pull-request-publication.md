@@ -1,7 +1,8 @@
 # Idempotent pull-request publication validation
 
 **Date:** September 2, 2026  
-**Implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`  
+**Initial implementation head:** `988434ef348f21e7d68400418beace9faa4cfb0d`  
+**Review-hardening head:** `e9eaf24d23d8a10c0c80d076d96e91068b61a113`  
 **Stacked base:** `be0560f7e8f39dc70973c762890b88edbe5c2210`
 
 ## Scope
@@ -13,13 +14,15 @@ It does not merge, enable auto-merge, deploy, or claim a live GitHub pull reques
 
 ## Fresh-database and repository gates
 
-A new PostgreSQL 16 database applied all 24 migrations. Migration 0024 created:
+A new PostgreSQL 16 database applied all 25 migrations. Migration 0024 created:
 
 - `pull_request_publications`
 - `pull_request_publication_attempts`
 - `pull_request_publication_operations`
 
 Authorization JSON is stored only in the explicit `authorization_snapshot` columns.
+Migration 0025 adds the exact pull-request head SHA, head repository owner, and cross-repository
+identity needed to reject same-named fork pull requests.
 
 The exact implementation head passed:
 
@@ -44,9 +47,13 @@ The final exact-head run recorded:
 
 ```json
 {
-  "publication_attempts": 4,
+  "publication_attempts": 8,
   "pull_request_number": 41,
+  "pull_request_head_sha": "d1f389edee02e9f009b6a3c24c9d975efd9da1d2",
+  "pull_request_head_repository_owner": "shyamsridhar123",
+  "fork_pull_request_rejected": true,
   "pull_request_create_calls": 1,
+  "publication_base_ref": "HEAD",
   "remote_branch_count": 1,
   "project_status": "In Review",
   "project_after_pull_request": true,
@@ -55,6 +62,10 @@ The final exact-head run recorded:
   "corp_rejection": 403,
   "budget_rejection": 400,
   "breaker_rejection": 400,
+  "post_start_role_renewal_rejection": 400,
+  "post_start_breaker_renewal_rejection": 400,
+  "pre_pull_request_budget_renewal_rejection": 400,
+  "pre_project_corp_budget_renewal_rejection": 400,
   "credential_non_disclosure": true,
   "auto_merge": false,
   "merge_authorized": false,
@@ -70,6 +81,13 @@ The attempt sequence covered:
 4. recovery and durable pull-request identity;
 5. Project transition followed by another publisher crash;
 6. concurrent duplicate recovery calls converging on the same publication and pull request.
+
+The hardened run also seeded an open same-named fork PR with a different owner and head SHA. The
+publisher ignored it, created one same-repository PR, and persisted the exact verified head. It used
+the accepted `HEAD` base and verified both the symbolic target and object ID. After publication
+start, changing the owner to another still-publish-capable role, raising a hard breaker, exhausting
+the selected run budget, and exhausting the Corp aggregate budget each caused the next lease
+renewal to fail before branch, PR, or Project effects.
 
 The fake GitHub effect log proves the `In Review` transition occurred after a pull request existed.
 The persisted factory item and source deliverable ended as `published`. The credential canary was

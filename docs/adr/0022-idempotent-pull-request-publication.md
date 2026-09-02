@@ -49,6 +49,19 @@ remote branch, pull request, and Project status, adopts matching external succes
 conflicting identity. Expired attempts are retained as abandoned evidence. Failures never remove the
 source deliverable or preserved worktree.
 
+Pull-request adoption additionally requires the head to be in the target repository, not a fork,
+and to resolve to the exact verified commit. The head repository owner, cross-repository flag, and
+head object ID are persisted with the PR identity and checked again by the server.
+
+Every publisher-lease renewal revalidates the current attempt actor against its authorization-role
+snapshot and reruns mission, verifier, deliverable, policy, run, requester, Corp-budget, and hard
+breaker checks in the same transaction before extending authority. A valid start does not preserve
+authority after a later demotion, budget exhaustion, policy change, or breaker transition.
+
+When policy uses `HEAD` as the publication base, the publisher resolves the remote symbolic HEAD,
+requires a branch target, and verifies that the advertised HEAD object equals the explicit target
+ref object before any push.
+
 Publication does not call GitHub merge APIs, enable auto-merge, deploy, or authorize those effects.
 
 ## Consequences

@@ -706,59 +706,6 @@ assert.equal(publicationSnapshot.publication.branch_pushed_at, null)
 
 const restartedServerPid = await restartLocalServer()
 await waitForPublicationLeaseExpiry(demo, workItem.id)
-const projectAuthorityAttempt = await postOk(publicationPath, {
-  ...publicationRequest,
-  idempotency_key: `${effectKey}:project-authority-attempt`,
-})
-assert.ok(projectAuthorityAttempt.publisher_token)
-assert.equal(
-  Number(
-    await psql(
-      `SELECT COUNT(*) FROM corp_budget_policies WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
-    ),
-  ),
-  0,
-)
-await psql(`
-  INSERT INTO corp_budget_policies
-    (corp_id, actor_tokens_per_24h, actor_cost_microusd_per_24h,
-     corp_tokens_per_24h, corp_cost_microusd_per_24h,
-     no_progress_event_limit, repeated_tool_limit)
-  VALUES
-    (${sqlLiteral(demo.corp_id)}::uuid, 500000, 10000000, 1, 100000000, 8, 5);
-  UPDATE runs
-  SET input_tokens = 1, output_tokens = 0
-  WHERE id = ${sqlLiteral(run.id)}::uuid;
-`)
-const projectCorpBudgetRejected = await renewPublicationAttempt(
-  demo,
-  projectAuthorityAttempt.publication,
-  projectAuthorityAttempt.publisher_token,
-  `${effectKey}:project-corp-budget-rejected`,
-)
-assert.equal(projectCorpBudgetRejected.response.status, 400)
-assert.match(projectCorpBudgetRejected.body.error, /budget|hard breaker/)
-fakeState = JSON.parse(await readFile(statePath, 'utf8'))
-assert.equal(
-  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
-    .status,
-  'In Progress',
-)
-await psql(`
-  UPDATE runs
-  SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]}
-  WHERE id = ${sqlLiteral(run.id)}::uuid;
-  DELETE FROM corp_budget_policies
-  WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;
-`)
-await failPublicationAttempt(
-  demo,
-  projectAuthorityAttempt.publication,
-  projectAuthorityAttempt.publisher_token,
-  `${effectKey}:release-project-authority-test`,
-  'Release the Project authority-revocation test attempt.',
-)
-
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_branch_checkpoint',
   expectCrash: true,
@@ -843,6 +790,59 @@ assert.equal(
 )
 
 await waitForPublicationLeaseExpiry(demo, workItem.id)
+const projectAuthorityAttempt = await postOk(publicationPath, {
+  ...publicationRequest,
+  idempotency_key: `${effectKey}:project-authority-attempt`,
+})
+assert.ok(projectAuthorityAttempt.publisher_token)
+assert.equal(
+  Number(
+    await psql(
+      `SELECT COUNT(*) FROM corp_budget_policies WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;`,
+    ),
+  ),
+  0,
+)
+await psql(`
+  INSERT INTO corp_budget_policies
+    (corp_id, actor_tokens_per_24h, actor_cost_microusd_per_24h,
+     corp_tokens_per_24h, corp_cost_microusd_per_24h,
+     no_progress_event_limit, repeated_tool_limit)
+  VALUES
+    (${sqlLiteral(demo.corp_id)}::uuid, 500000, 10000000, 1, 100000000, 8, 5);
+  UPDATE runs
+  SET input_tokens = 1, output_tokens = 0
+  WHERE id = ${sqlLiteral(run.id)}::uuid;
+`)
+const projectCorpBudgetRejected = await renewPublicationAttempt(
+  demo,
+  projectAuthorityAttempt.publication,
+  projectAuthorityAttempt.publisher_token,
+  `${effectKey}:project-corp-budget-rejected`,
+)
+assert.equal(projectCorpBudgetRejected.response.status, 400)
+assert.match(projectCorpBudgetRejected.body.error, /budget|hard breaker/)
+fakeState = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(
+  fakeState.items.find((item) => item.id === workItem.source_project_item_id)
+    .status,
+  'In Progress',
+)
+await psql(`
+  UPDATE runs
+  SET input_tokens = ${usageBefore[0]}, output_tokens = ${usageBefore[1]}
+  WHERE id = ${sqlLiteral(run.id)}::uuid;
+  DELETE FROM corp_budget_policies
+  WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid;
+`)
+await failPublicationAttempt(
+  demo,
+  projectAuthorityAttempt.publication,
+  projectAuthorityAttempt.publisher_token,
+  `${effectKey}:release-project-authority-test`,
+  'Release the Project authority-revocation test attempt.',
+)
+
 await runPublisher(demo, workItem.id, {
   crashAfter: 'after_project_remote',
   expectCrash: true,

@@ -136,6 +136,12 @@ pull requests, and records the pull-request identity before changing Project sta
 restart, timeout, and external-success/local-failure recovery adopt only matching remote effects.
 The database constrains auto-merge, merge authorization, and deployment authorization to false.
 
+Before every branch push, pull-request creation, and Project mutation, lease renewal transactionally
+rechecks the current attempt actor against its persisted role snapshot and reruns current run,
+mission, requester, Corp-budget, and hard-breaker authority. Pull-request adoption requires
+`isCrossRepository = false`, the target repository owner, and the exact verified head SHA. Remote
+`HEAD` is accepted only when its symbolic branch target exists and advertises the same object ID.
+
 ## Required production boundaries
 
 - Every persistent object is scoped to a Corp.

@@ -254,5 +254,7 @@ bundle, bare Git remote, and deterministic fake GitHub API. It proves policy, ro
 and breaker rejection; branch-push recovery after a publisher crash and server restart; pull-request
 adoption after external success plus local failure; Project-status recovery after another crash;
 duplicate concurrent publication convergence; credential non-disclosure; exactly one branch and
-pull request; and the required pull-request-before-review ordering. See
+pull request; same-named fork rejection; exact PR-head SHA binding; symbolic `HEAD` verification;
+post-start role, breaker, run-budget, and Corp-budget revocation; and the required
+pull-request-before-review ordering. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
