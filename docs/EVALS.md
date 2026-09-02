@@ -294,5 +294,7 @@ return `403` before its external effect. A whitespace-padded custom pull-request
 before start and idempotency, reaches post-plan validation, and recovers with the exact persisted
 title. The cross-room context read also returns `404` without work-item source/policy/failure data,
 and the controller rejects `refs/tags/v1` as a publication base before Project reads or durable
-claim. See
+claim. A direct control-character base policy returns `400`; a mixed-case target repository
+canonicalizes before plan validation; and a Project with 32 fields, with Status after the default
+30-field page, completes through exact Status-field GraphQL lookup. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.

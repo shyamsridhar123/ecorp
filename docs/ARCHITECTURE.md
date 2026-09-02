@@ -499,6 +499,8 @@ against its advertised explicit branch target. ECorp preserves `HEAD` as the aut
 but passes and persists the resolved branch name, such as `main`, as the actual GitHub PR base.
 Project status reads query the known Project item node ID directly and verify its Project and Status
 field identity; a bounded Project item listing is never used to prove that the item disappeared.
+The Status field and its options are queried directly by name from the known Project node, so
+field-list pagination cannot hide it.
 Factory policy accepts publication bases only as symbolic `HEAD`, a short branch name, or an
 explicit `refs/heads/*` branch. Tags, remote-tracking refs, and invalid Git branch names fail before
 the controller reads candidates or claims a work item, and the store repeats the policy check.
@@ -519,7 +521,8 @@ Default start idempotency keys fingerprint the complete normalized invocation, s
 stable while publisher-host, authorization-reason, or lease changes automatically receive a distinct
 recovery key instead of conflicting with an earlier operation request. Custom pull-request titles
 and body files use the server's trim, size, control-character, and newline rules before that
-fingerprint or durable start is constructed.
+fingerprint or durable start is constructed. Target repository owner/name components are likewise
+validated and lowercased before plan construction.
 
 ## Near-term architecture work
 

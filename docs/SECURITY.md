@@ -175,12 +175,16 @@ suffixes. Default start keys hash the complete normalized request, including pub
 authorization reason, and lease duration, so changed recovery authority cannot reuse a request key
 whose persisted operation has different fields. CLI-provided titles and bodies are normalized with
 the same bounds and control-character rules as the server before plan comparison and idempotency.
+Repository owner/name inputs are trimmed, validated, and lowercased at the same boundary.
 
 GitHub Project status is read from the exact stored Project item node ID. The publisher verifies the
 returned Project ID, owner, number, item ID, Status field ID, and field type before any mutation, so
 truncated item listings cannot turn a present item into an apparent disappearance.
+The Status field definition and option IDs come from an exact GraphQL lookup on the known Project
+node rather than the first page of `field-list`.
 Publication base policy is branch-only: the controller and store accept `HEAD`, short branch names,
-or `refs/heads/*`, while rejecting tags and remote-tracking refs before durable claim.
+or `refs/heads/*`, while rejecting tags, remote-tracking refs, invalid branch shapes, and control
+characters before durable claim.
 
 The resolved PR base can never also be the publication head branch. A read-only remote preflight
 rejects that configuration before the server persists a publication, and the guard repeats before

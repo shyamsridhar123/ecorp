@@ -13,7 +13,9 @@
 **Room-membership closure head:** `b631bd9e2f0ad8321631c046b38a549da64fec6e`
 **Title-normalization closure head:** `ba20a8347a67c1e1ab6e4b188ad3602b131654c1`
 **Context and base-ref closure head:** `7e8f13f24e5a3f4e923695b2ac00d369a99e15f7`
-**Stacked base:** `e308e54382c573244b67ab7c6d28e94316f2cdd0`
+**Metadata lookup closure head:** `75bfc0de71233d1c79363c2d2c642304bda0b960`
+**Integrated gate head:** `41b6fc568a3112bda8115fc22c37b5dd63b91f99`
+**Stacked base:** `7d151e1914d522a2c691e320f6b909918b3ad731`
 
 ## Scope
 
@@ -47,7 +49,7 @@ pnpm lint:web
 git diff --check
 ```
 
-The Rust workspace ran 79 non-documentation unit tests with no failures.
+The Rust workspace ran 83 non-documentation unit tests with no failures.
 
 ## Deterministic publication E2E
 
@@ -61,6 +63,7 @@ The final exact-head run recorded:
   "base_branch_collision_rejected": true,
   "invalid_git_branches_rejected_before_start": true,
   "custom_title_normalized": true,
+  "mixed_case_repository_normalized": true,
   "implicit_authorization_retry_stable": true,
   "cross_publisher_default_start_recovery": true,
   "body_file_crlf_normalized": true,
@@ -77,10 +80,12 @@ The final exact-head run recorded:
   "bounded_snapshot_work_item_and_deliverable_absent": true,
   "published_retry_outside_bounded_snapshot": true,
   "exact_project_item_lookup": true,
+  "exact_project_field_lookup": true,
   "project_item_count_during_publication": 1003,
+  "project_field_count_during_publication": 32,
   "publication_attempts": 9,
   "pull_request_number": 41,
-  "pull_request_head_sha": "5dcf53dcf8d2b97733a8f5dbda5e9f0fee2f320f",
+  "pull_request_head_sha": "54734ce96b23904216d8053d619f690ebc0c3cb8",
   "pull_request_head_repository_owner": "shyamsridhar123",
   "fork_pull_request_rejected": true,
   "unauthorized_pr_content_rejected": true,
@@ -157,6 +162,10 @@ Before Project movement, the fake Project was expanded to 1,003 items with the a
 item-list call, loaded the exact stored node ID through GraphQL, verified its Project and Status
 field identity, and completed the one `In Progress -> In Review` transition.
 
+The Project also exposed 32 fields with Status ordered after 31 fillers. The fake CLI enforced the
+30-field default for `field-list`; publication made no additional field-list call, queried Status
+directly by name from the exact Project node, and used its complete single-select option set.
+
 A same-Corp manager fixture was created in a separate room with no membership in the publication
 mission room. A direct start and an expired-lease recovery both returned `403`. While an authorized
 publisher attempt was active, the fixture requested exact publication status by the known work-item
@@ -177,7 +186,9 @@ each denial so the rest of the recovery harness could continue.
 The collision-recovery fixture supplied a pull-request title with leading and trailing whitespace.
 The CLI normalized it before deriving the start idempotency key and before sending the durable
 request, then reached a test crash immediately after exact plan validation. Recovery retained the
-trimmed title and created no remote pull request or Project mutation for that fixture.
+trimmed title and created no remote pull request or Project mutation for that fixture. The same
+invocation supplied `ShyamSridhar123/ECorp`; the plan and durable publication both retained the
+canonical `shyamsridhar123/ecorp`.
 
 Before authorized PR creation, the harness injected a same-repository, same-branch, exact-SHA pull
 request whose title and body differed from the persisted plan. The publisher ignored it, the fake
@@ -256,6 +267,16 @@ The context/base-ref implementation commit
 runs of both focused E2Es. The controller report recorded
 `non_branch_publication_base_rejected_before_claim: true`; the invalid `refs/tags/v1` invocation
 created no factory work item and made no Project mutation.
+
+The metadata implementation commit `75bfc0de71233d1c79363c2d2c642304bda0b960`
+added exact Status-field lookup, target repository canonicalization, and control-character ref
+rejection. The controller report recorded
+`control_character_publication_base_policy_rejected: 400`.
+
+After normally merging stacked base `7d151e1914d522a2c691e320f6b909918b3ad731`,
+clippy exposed the new deliverable helper's eighth argument. Commit
+`41b6fc568a3112bda8115fc22c37b5dd63b91f99` grouped its temporary paths without changing
+behavior. Full gates and fresh exact-head controller/publication E2Es then passed.
 
 GitHub Actions run `33618313806` could not start any of its six jobs. Every job had zero steps,
 runner ID `0`, and the account payment/spending-limit annotation. This is an external CI block, not
