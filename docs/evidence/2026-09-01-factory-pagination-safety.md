@@ -17,14 +17,14 @@ work item is older than the snapshot's 500-row factory projection.
 runner, scheduler, worktree manager, fake-process child, verifier, event journal, and deterministic
 GitHub CLI boundary.
 
-Final review-hardening rerun completed at `2026-09-02T01:46:20.857Z`.
+Final standard-port review-hardening rerun completed at `2026-09-02T01:53:48.026Z`.
 
 Pagination regression:
 
 - target Project item: `PVTI_FAKE_FACTORY_9020`
-- target work item: `c0191d5e-2c6d-4ffa-b0fc-5a50f238adc7`
-- target mission: `05c6abb1-807d-4797-986f-75ba474c8843`
-- target run: `e18a5cc9-a3df-4d66-b218-81fe2bbb9ce6`
+- target work item: `0980ed8d-9696-488e-b3d3-155856eddf45`
+- target mission: `09618fab-2391-4f24-93c9-8a9fa3f3c727`
+- target run: `80385961-bd64-4a70-b1b0-bbb6d33d8257`
 - 501 newer historical factory work items were created after the recoverable target
 - the legacy shared snapshot returned 500 factory items and omitted the target
 - selected-item lookup returned exactly one authoritative match
@@ -59,9 +59,7 @@ source-revalidation coverage.
 
 ## Runtime cleanup
 
-The final rerun used isolated port `8792`, source clone
-`output/issue67-source-clone-002`, and Postgres database
-`crony_issue67_df02_20260902_002` to avoid another worktree's shared runtime and Git worktree
-activity. The exact test-owned server and runner PIDs were stopped, port `8792` was verified
-closed, the isolated database was dropped, and the isolated clone was recursively removed only
-after its absolute path was verified inside this worktree's `output` directory.
+After the other worktree released the shared runtime, the final rerun used the standard local
+server and web ports `8791` and `5187` with isolated Postgres database
+`crony_issue67_df02_20260902_003`. `tools/stop_local.ps1` stopped the seven test-owned processes,
+both ports were verified closed, and the isolated database was dropped.
