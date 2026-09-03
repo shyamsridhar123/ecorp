@@ -48,12 +48,28 @@ Set-Location ..\ecorp-issue-123
 Replace `123` with the issue number. If the work is intentionally stacked, replace `origin/main`
 with the recorded parent branch only after coordinating the landing order.
 
-## Run locally
+## Run your own contributor dark factory
+
+A contributor clone contains the ECorp dark-factory implementation. OpenAI Symphony inspired parts
+of the operating model, but Symphony is not an ECorp dependency and does not need to be installed.
+Each contributor runs a local ECorp server and runner, supplies their own provider identity, and
+uses a private runner workspace while coordinating work through the shared Project #3.
 
 Prerequisites are Git, Windows PowerShell, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
-Compose, and GitHub CLI for live GitHub operations.
+Compose, GitHub CLI authenticated for the repository and Project #3, and any provider entitlement
+required for real-agent work.
+
+Clone ECorp and give the runner an execution root that is separate from the configured source
+checkout:
 
 ```powershell
+git clone https://github.com/shyamsridhar123/ecorp.git
+Set-Location ecorp
+
+$env:CRONY_SOURCE_REPOSITORY = (Get-Location).Path
+$env:CRONY_SOURCE_BASE_REF = 'HEAD'
+$env:CRONY_RUNNER_WORKSPACE = Join-Path $env:USERPROFILE '.ecorp\runner-workspaces'
+
 ./tools/start_local.ps1
 Invoke-RestMethod http://127.0.0.1:8791/health
 Invoke-WebRequest http://127.0.0.1:5187
@@ -62,7 +78,59 @@ Invoke-WebRequest http://127.0.0.1:5187
 ```
 
 The server owns authoritative organizational state. The outbound runner owns provider processes and
-isolated worktrees. Closing a browser or desktop client must not terminate a run.
+isolated worktrees. Closing a browser or desktop client must not terminate a run. Do not share the
+runner workspace, credential directory, provider state directory, or local database with another
+contributor. Contributors running on the same machine must also coordinate the stack's ports and
+shared development Compose database.
+
+### Use GitHub Copilot
+
+ECorp's `github-copilot` adapter uses the official GitHub Copilot SDK. By default, the runner uses
+the contributor's logged-in GitHub identity:
+
+```powershell
+gh auth status
+$env:CRONY_COPILOT_USE_LOGGED_IN_USER = 'true'
+./tools/start_local.ps1
+```
+
+The account and organization policy must allow GitHub Copilot. The runner discovers the models and
+reasoning levels actually available to that account; do not hard-code a globally advertised model
+that the runner does not expose.
+
+A trusted host may instead provide a token through a file outside the repository and runner
+workspace:
+
+```powershell
+$env:CRONY_COPILOT_GITHUB_TOKEN_FILE = 'C:\secure\ecorp\copilot.token'
+./tools/start_local.ps1
+```
+
+Never place the token value in a prompt, command argument, log, issue, worktree, or committed file.
+Do not share one contributor's Copilot identity with another contributor or with a producing agent.
+
+GitHub Copilot is the recommended real-provider path for contributor factory work. External CLI
+providers can have different isolation and process-lifecycle assurance; check current Project #3
+issues before treating them as equivalent.
+
+### Coordinate independent factories
+
+Personal factory hosts do not create personal backlogs. Every contributor must use the same Project
+#3 issue, status, revision, dependency, and `factory:ready` contract:
+
+- run only open `Todo` issues that are explicitly labeled `factory:ready`;
+- let the controller claim and revalidate the Project item before dispatch;
+- use a unique, bounded write scope and avoid another active issue's paths;
+- stop if the Project status, issue revision, dependency state, source commit, or policy changes;
+- require persisted verifier evidence and independent review before publication; and
+- never use `docs/BACKLOG.md` as a second queue.
+
+Separate local servers may race for the same issue. The GitHub Project transition and source
+revalidation are the cross-machine fence; never bypass them with a manually launched agent.
+
+For a shared remote ECorp deployment instead of independent local factories, configure production
+OIDC, Corp membership, runner enrollment, private artifact storage, and the other production
+boundaries in the architecture and security guides.
 
 ## Validate before publishing
 
