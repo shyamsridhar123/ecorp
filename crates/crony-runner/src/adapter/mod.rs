@@ -2,6 +2,7 @@ mod codex;
 mod copilot;
 mod external;
 mod fake;
+mod permission;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
