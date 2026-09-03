@@ -1,55 +1,47 @@
 <div align="center">
 
-<h1>ECorp</h1>
-
-<p><strong>Run a governed AI crew on your repository.</strong></p>
-
-<p>Turn one mission into parallel agent work, human approvals, verified deliverables, and a review-ready pull request.</p>
-
-<p>
-<a href="#start-locally">Start locally</a> |
-<a href="#how-ecorp-runs-a-mission">Follow a mission</a> |
-<a href="#bring-your-agents">Choose a provider</a> |
-<a href="#documentation">Read the docs</a>
-</p>
-
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="./docs/assets/readme/ecorp-arcade-hero-static.png">
-  <img src="./docs/assets/readme/ecorp-arcade-hero.gif" width="1200" alt="Pixel-art ECorp control floor where two human operators direct AI agents through the ECorp server, a durable runner, an isolated Git worktree, an approval gate, verification, and pull request publication.">
+  <img src="./docs/assets/readme/ecorp-arcade-hero.gif" width="1280" alt="ECorp arcade command center showing the live multiplayer control floor, active agent crew, operational score rail, and the plan, run, approve, verify, publish mission path.">
 </picture>
 
-<p><sub><a href="./docs/assets/readme/ecorp-arcade-hero-static.png">Open the static hero image</a> for reduced-motion viewing.</sub></p>
+<h1>Turn your repository into a live AI company.</h1>
+
+<p><strong>Agents take the floor. Humans hold the keys. Evidence unlocks the pull request.</strong></p>
+
+<p>Dispatch GitHub Copilot, OpenAI Codex, Claude Code, and OpenCode into isolated worktrees. Watch the crew split the mission, work in parallel, ask for authority, prove the result, and publish the exact source that passed.</p>
+
+<p>
+<a href="#start-locally"><strong>PRESS START</strong></a> |
+<a href="#press-start-on-real-work">WATCH THE MISSION</a> |
+<a href="#bring-your-agents">CHOOSE THE CREW</a> |
+<a href="docs/SECURITY.md">TRUST MODEL</a>
+</p>
+
+<p><sub><a href="./docs/assets/readme/ecorp-arcade-hero-static.png">Static hero</a> for reduced-motion viewing.</sub></p>
 
 </div>
 
-ECorp is a multiplayer command center for repository work. Humans define the contract, agents execute on trusted runners, and evidence decides what can ship.
+Not another agent chat. Not agent theater. ECorp is the durable execution plane behind the arcade: multiplayer control, real provider sessions, human authority, and receipts for every mission.
 
-## How ECorp runs a mission
+## Press START on real work
 
-1. **Set the contract.** Define the outcome, references, write scope, provider, model, budget, and verifier policy.
-2. **Plan the crew.** Run one focused worker or two independent specialists followed by dependency-gated synthesis.
-3. **Work in isolation.** Every write-capable run receives a dedicated branch and linked Git worktree. The runner survives every UI client.
-4. **Operate together.** Multiple humans share live state while one controller holds the steering lease. Others can queue direction, review the run, or issue a permitted emergency stop.
-5. **Accept proof.** Files, commands, tests, schemas, screenshots, human approval, and independent review can block completion.
-6. **Publish deliberately.** Export a patch, archive, typed artifact set, commit and branch bundle, or review report. An authorized publisher can turn the exact verified branch into one recoverable pull request.
+1. **Drop the mission.** Define the outcome, references, write scope, provider, model, budget, and verifier policy.
+2. **Build the crew.** Send one focused worker or unleash two independent specialists followed by dependency-gated synthesis.
+3. **Light up isolated worktrees.** Every write-capable run gets its own branch and linked workspace. Parallel agents never pile into the configured source checkout.
+4. **Keep human hands on the controls.** Watch live state, steer the active session, queue direction, review the run, or hit an audited emergency stop.
+5. **Make proof mandatory.** Files, commands, tests, schemas, screenshots, human approval, and independent review can all block completion.
+6. **Launch the verified pull request.** Export the exact patch, archive, typed artifact set, commit and branch bundle, or review report that passed. An authorized publisher opens one recoverable PR from that result.
 
 Publication never enables auto-merge and does not merge or deploy.
 
-## What the control floor controls
+## The arcade is operational
 
-| On screen | Operational truth |
-| --- | --- |
-| **Sprite office** | Crew movement and state come from real server, runner, and provider events. The floor is a projection, not the system of record. |
-| **Mission room** | Specifications, messages, task graphs, approvals, decisions, budgets, and audit events persist in Postgres. |
-| **Runner cabinet** | An outbound-connected daemon owns provider processes, worktrees, verification, and artifact collection. The server never executes agent shell commands. |
-| **Review gate** | A run cannot emit accepted completion until its persisted verifier policy passes. |
-| **Publication lane** | Verified factory results can be pushed to a bounded branch and opened as an idempotent pull request after explicit authorization. |
+The floor is not decorative animation. Every sprite, cabinet, alert, approval, and score reflects authoritative server, runner, provider, and verification state.
 
-<p align="center">
-  <img src="./docs/assets/readme/ecorp-mission-loop.svg" width="840" alt="Governed ECorp mission loop: two operators steer and authorize through the control plane; a durable runner works in an isolated Git worktree; human approval and evidence checks gate pull request publication; durable state and audit events return to the operators.">
-</p>
-
-Closing the browser or desktop client does not terminate an active run.
+- **State survives the screen.** Missions, messages, task graphs, budgets, approvals, and audit events persist in Postgres. Closing the browser or desktop client does not terminate the run.
+- **Work stays off the source checkout.** An outbound-connected runner owns provider processes, isolated worktrees, verification, and artifact collection. The server never executes agent shell commands.
+- **Proof opens the exit.** A run cannot emit accepted completion until its persisted verifier policy passes. Verified factory results can then enter the separately authorized publication lane.
 
 ## Bring your agents
 
