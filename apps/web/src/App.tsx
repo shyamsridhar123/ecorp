@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, FormEvent } from 'react'
 import './App.css'
 import './Arcade.css'
+import './Cabinet.css'
 
 type Actor = {
   id: string
@@ -439,6 +440,8 @@ type BrowserSocketMessage =
   | { type: 'ready'; corp_id: string; replayed_through: number }
   | { type: 'event'; event: DomainEvent }
 
+type WorkspaceView = 'floor' | 'factory' | 'missions' | 'room' | 'activity'
+
 type RunnerModel = {
   id: string
   name: string
@@ -553,6 +556,71 @@ const DETERMINISTIC_HARNESS_STRATEGIES = [
   'human-approval',
   'independent-review',
 ] as const
+
+const WORKSPACE_VIEWS: {
+  id: WorkspaceView
+  code: string
+  label: string
+  description: string
+}[] = [
+  {
+    id: 'floor',
+    code: '01',
+    label: 'Control floor',
+    description: 'Watch the live crew, take control, and steer active work.',
+  },
+  {
+    id: 'factory',
+    code: '02',
+    label: 'Factory',
+    description: 'Track governed GitHub issue intake and publication state.',
+  },
+  {
+    id: 'missions',
+    code: '03',
+    label: 'Missions',
+    description: 'Authorize one mission, inspect its contract, and decide the next move.',
+  },
+  {
+    id: 'room',
+    code: '04',
+    label: 'Comms',
+    description: 'Coordinate through durable, attributable room messages.',
+  },
+  {
+    id: 'activity',
+    code: '05',
+    label: 'Audit',
+    description: 'Inspect the immutable event trail and pending risk decisions.',
+  },
+]
+
+function workspaceViewFromHash(hash: string): WorkspaceView {
+  const candidate = hash.replace(/^#/, '') as WorkspaceView
+  return WORKSPACE_VIEWS.some((view) => view.id === candidate) ? candidate : 'floor'
+}
+
+function revealEntityTarget(kind: EntityLink['kind'] | 'room', id: string): boolean {
+  const target = document.querySelector<HTMLElement>(
+    `[data-${kind}-id="${CSS.escape(id)}"]`,
+  )
+  if (!target) return false
+
+  if (target instanceof HTMLDetailsElement) target.open = true
+  let ancestor = target.parentElement?.closest('details')
+  while (ancestor) {
+    ancestor.open = true
+    ancestor = ancestor.parentElement?.closest('details')
+  }
+
+  const focusTarget =
+    target instanceof HTMLDetailsElement
+      ? target.querySelector<HTMLElement>(':scope > summary') ?? target
+      : target
+  focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  focusTarget.focus({ preventScroll: true })
+  return true
+}
 
 function usesDeterministicHarness(strategy: string): boolean {
   return DETERMINISTIC_HARNESS_STRATEGIES.includes(
@@ -1369,15 +1437,31 @@ function FactoryPanel({
   const active = items.filter(
     (item) => !['published', 'failed', 'cancelled'].includes(item.state),
   )
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(
+    () => items[0]?.id ?? null,
+  )
+  const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
+  const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
+  const selectedPublication = publications.find(
+    (candidate) => candidate.factory_work_item_id === selected?.id,
+  )
+  const selectedAttempts = publicationAttempts
+    .filter((attempt) => attempt.publication_id === selectedPublication?.id)
+    .sort((left, right) => right.attempt - left.attempt)
+
   return (
-    <section className="factory-panel panel" id="factory" data-testid="factory-panel">
+    <section
+      className="factory-panel panel"
+      id="factory"
+      data-testid="factory-panel"
+      tabIndex={-1}
+    >
       <div className="panel-heading factory-heading">
         <div>
           <span className="section-code">DARK FACTORY / 02</span>
           <h2>Governed issue intake</h2>
           <p>
-            GitHub Project work is claimed once, fenced, linked to one mission, and advanced by
-            durable evidence, not labels alone.
+            GitHub work enters one fenced lane, becomes one mission, and advances only on evidence.
           </p>
         </div>
         <div className="operations-summary">
@@ -1386,153 +1470,209 @@ function FactoryPanel({
           <span>auto-merge off</span>
         </div>
       </div>
-      <div className="factory-list">
+      <div className="factory-console">
         {items.length ? (
-          items.map((item) => {
-            const mission = missions.find((candidate) => candidate.id === item.mission_id)
-            const publication = publications.find(
-              (candidate) => candidate.factory_work_item_id === item.id,
-            )
-            const attempts = publicationAttempts
-              .filter((attempt) => attempt.publication_id === publication?.id)
-              .sort((left, right) => right.attempt - left.attempt)
-            return (
-              <article className="factory-card" key={item.id}>
-                <div className="factory-card-top">
-                  <span className="factory-source">
-                    GitHub issue #{item.source_issue_number}
-                  </span>
-                  <span className={`status-chip status-chip-${stateTone(item.state)}`}>
-                    {statusLabel(item.state)}
-                  </span>
-                </div>
-                <h3>
-                  <a href={item.source_issue_url} target="_blank" rel="noreferrer">
-                    {item.source_title}
-                  </a>
-                </h3>
-                <dl>
-                  <div>
-                    <dt>Project</dt>
-                    <dd>
-                      {item.source_project_owner} / #{item.source_project_number}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Mission</dt>
-                    <dd>{mission ? shortId(mission.id) : 'Not materialized'}</dd>
-                  </div>
-                  <div>
-                    <dt>Controller</dt>
-                    <dd>{shortId(item.claim_owner_id)}</dd>
-                  </div>
-                  <div>
-                    <dt>Lease</dt>
-                    <dd>{time(item.lease_expires_at)}</dd>
-                  </div>
-                </dl>
-                {item.failure_detail ? (
-                  <p className="factory-failure">{item.failure_detail}</p>
-                ) : null}
-                {publication ? (
-                  <div className="publication-proof" data-testid="factory-publication">
-                    <div className="publication-proof-heading">
-                      <strong>Verified pull-request publication</strong>
-                      <span
-                        className={`status-chip status-chip-${
-                          publication.state === 'published'
-                            ? 'completed'
-                            : publication.failure_detail
-                              ? 'failed'
-                              : 'running'
-                        }`}
-                      >
-                        {statusLabel(publication.state)}
+          <>
+            <nav className="factory-queue" aria-label="Factory work items">
+              <div className="factory-queue-label">
+                <span>Issue queue</span>
+                <strong>{items.length.toString().padStart(2, '0')}</strong>
+              </div>
+              {items.map((item, index) => {
+                const mission = missions.find((candidate) => candidate.id === item.mission_id)
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={selected?.id === item.id ? 'factory-queue-active' : ''}
+                    aria-pressed={selected?.id === item.id}
+                    aria-controls="factory-workbench"
+                    data-status={stateTone(item.state)}
+                    onClick={() => setSelectedItemId(item.id)}
+                  >
+                    <span className="factory-queue-index">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                    <span className="factory-queue-copy">
+                      <small>
+                        GitHub #{item.source_issue_number} · {statusLabel(item.state)}
+                      </small>
+                      <strong>{item.source_title}</strong>
+                      <span>{mission ? `Mission ${shortId(mission.id)}` : 'Mission pending'}</span>
+                    </span>
+                  </button>
+                )
+              })}
+            </nav>
+
+            <div className="factory-workbench" id="factory-workbench">
+              {selected ? (
+                <article
+                  className="factory-dossier-stage"
+                  data-factory-item-id={selected.id}
+                  tabIndex={-1}
+                >
+                  <div className="factory-dossier-top">
+                    <div>
+                      <span className="factory-source">
+                        GitHub issue #{selected.source_issue_number}
                       </span>
+                      <small>
+                        {selected.source_repository_owner}/{selected.source_repository_name}
+                      </small>
                     </div>
-                    <dl>
-                      <div>
-                        <dt>Target</dt>
-                        <dd>
-                          {publication.target_repository} · {publication.base_ref}
-                          {publication.pull_request_base_ref &&
-                          publication.pull_request_base_ref !== publication.base_ref
-                            ? ` → ${publication.pull_request_base_ref}`
-                            : ''}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Branch</dt>
-                        <dd>
-                          {publication.branch} @ {shortId(publication.commit_sha)}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Authorization</dt>
-                        <dd>
-                          {publication.authorization_snapshot.actor_role ?? 'authorized'} ·{' '}
-                          {shortId(publication.actor_id)}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Attempts</dt>
-                        <dd>
-                          {publication.attempt_count}
-                          {attempts[0] ? ` · latest ${statusLabel(attempts[0].state)}` : ''}
-                        </dd>
-                      </div>
-                    </dl>
-                    {publication.authorization_snapshot.reason ? (
-                      <p>{publication.authorization_snapshot.reason}</p>
-                    ) : null}
-                    {publication.pull_request_url ? (
-                      <>
-                        <a
-                          className="publication-link"
-                          href={publication.pull_request_url}
-                          target="_blank"
-                          rel="noreferrer"
+                    <span className={`status-chip status-chip-${stateTone(selected.state)}`}>
+                      {statusLabel(selected.state)}
+                    </span>
+                  </div>
+                  <h3>
+                    <a href={selected.source_issue_url} target="_blank" rel="noreferrer">
+                      {selected.source_title}
+                    </a>
+                  </h3>
+
+                  {selected.failure_detail ? (
+                    <section className="factory-failure-dossier" aria-label="Factory failure detail">
+                      <span>Failure record</span>
+                      <p>{selected.failure_detail}</p>
+                    </section>
+                  ) : (
+                    <p className="factory-dossier-summary">
+                      This work item is fenced to one controller, one source revision, and one
+                      evidence-gated mission.
+                    </p>
+                  )}
+
+                  <dl className="factory-facts">
+                    <div>
+                      <dt>Project</dt>
+                      <dd>
+                        {selected.source_project_owner} / #{selected.source_project_number}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Mission</dt>
+                      <dd>{selectedMission ? shortId(selectedMission.id) : 'Not materialized'}</dd>
+                    </div>
+                    <div>
+                      <dt>Controller</dt>
+                      <dd>{shortId(selected.claim_owner_id)}</dd>
+                    </div>
+                    <div>
+                      <dt>Lease</dt>
+                      <dd>{time(selected.lease_expires_at)}</dd>
+                    </div>
+                  </dl>
+
+                  {selectedPublication ? (
+                    <div className="publication-proof" data-testid="factory-publication">
+                      <div className="publication-proof-heading">
+                        <strong>Verified pull-request publication</strong>
+                        <span
+                          className={`status-chip status-chip-${
+                            selectedPublication.state === 'published'
+                              ? 'completed'
+                              : selectedPublication.failure_detail
+                                ? 'failed'
+                                : 'running'
+                          }`}
                         >
-                          Pull request #{publication.pull_request_number} ·{' '}
-                          {publication.pull_request_draft ? 'draft' : 'open for review'}
-                        </a>
-                        <span className="publication-pending">
-                          Verified head {publication.pull_request_head_repository_owner} @{' '}
-                          {publication.pull_request_head_sha
-                            ? shortId(publication.pull_request_head_sha)
-                            : 'pending'}
-                          {publication.pull_request_is_cross_repository === false
-                            ? ' · same repository'
-                            : ''}
-                          {publication.pull_request_base_ref
-                            ? ` · PR base ${publication.pull_request_base_ref}`
+                          {statusLabel(selectedPublication.state)}
+                        </span>
+                      </div>
+                      <dl>
+                        <div>
+                          <dt>Target</dt>
+                          <dd>
+                            {selectedPublication.target_repository} · {selectedPublication.base_ref}
+                            {selectedPublication.pull_request_base_ref &&
+                            selectedPublication.pull_request_base_ref !== selectedPublication.base_ref
+                              ? ` → ${selectedPublication.pull_request_base_ref}`
+                              : ''}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Branch</dt>
+                          <dd>
+                            {selectedPublication.branch} @ {shortId(selectedPublication.commit_sha)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Authorization</dt>
+                          <dd>
+                            {selectedPublication.authorization_snapshot.actor_role ?? 'authorized'} ·{' '}
+                            {shortId(selectedPublication.actor_id)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Attempts</dt>
+                          <dd>
+                            {selectedPublication.attempt_count}
+                            {selectedAttempts[0]
+                              ? ` · latest ${statusLabel(selectedAttempts[0].state)}`
+                              : ''}
+                          </dd>
+                        </div>
+                      </dl>
+                      {selectedPublication.authorization_snapshot.reason ? (
+                        <p>{selectedPublication.authorization_snapshot.reason}</p>
+                      ) : null}
+                      {selectedPublication.pull_request_url ? (
+                        <>
+                          <a
+                            className="publication-link"
+                            href={selectedPublication.pull_request_url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Pull request #{selectedPublication.pull_request_number} ·{' '}
+                            {selectedPublication.pull_request_draft ? 'draft' : 'open for review'}
+                          </a>
+                          <span className="publication-pending">
+                            Verified head {selectedPublication.pull_request_head_repository_owner} @{' '}
+                            {selectedPublication.pull_request_head_sha
+                              ? shortId(selectedPublication.pull_request_head_sha)
+                              : 'pending'}
+                            {selectedPublication.pull_request_is_cross_repository === false
+                              ? ' · same repository'
+                              : ''}
+                            {selectedPublication.pull_request_base_ref
+                              ? ` · PR base ${selectedPublication.pull_request_base_ref}`
+                              : ''}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="publication-pending">Pull request not created yet</span>
+                      )}
+                      <footer>
+                        <span>
+                          Project {selectedPublication.project_status_before}
+                          {selectedPublication.project_status_after
+                            ? ` → ${selectedPublication.project_status_after}`
                             : ''}
                         </span>
-                      </>
-                    ) : (
-                      <span className="publication-pending">Pull request not created yet</span>
-                    )}
-                    <footer>
-                      <span>
-                        Project {publication.project_status_before}
-                        {publication.project_status_after
-                          ? ` → ${publication.project_status_after}`
-                          : ''}
-                      </span>
-                      <span>auto-merge off · merge/deploy unauthorized</span>
-                    </footer>
-                    {publication.failure_detail ? (
-                      <p className="factory-failure">{publication.failure_detail}</p>
-                    ) : null}
-                  </div>
-                ) : null}
-                <footer>
-                  <span>rev {item.source_revision}</span>
-                  <span>v{item.version}</span>
-                </footer>
-              </article>
-            )
-          })
+                        <span>auto-merge off · merge/deploy unauthorized</span>
+                      </footer>
+                      {selectedPublication.failure_detail ? (
+                        <p className="factory-failure">{selectedPublication.failure_detail}</p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="factory-publication-empty">
+                      <span>Publication bay</span>
+                      <strong>No pull request yet</strong>
+                      <p>Publication unlocks only after the mission and its evidence are verified.</p>
+                    </div>
+                  )}
+
+                  <footer className="factory-dossier-footer">
+                    <span>Source rev {selected.source_revision}</span>
+                    <span>Record v{selected.version}</span>
+                  </footer>
+                </article>
+              ) : null}
+            </div>
+          </>
         ) : (
           <div className="empty-state">
             <strong>No factory work claimed</strong>
@@ -1598,7 +1738,7 @@ function OfficeFloor({
         <span>Operator bay</span>
         <i />
       </div>
-      {liveAgents.map((agent) => {
+      {agents.map((agent) => {
         const index = agents.findIndex((candidate) => candidate.id === agent.id)
         const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
         const destination =
@@ -1607,8 +1747,10 @@ function OfficeFloor({
             : agent.status === 'reviewing'
               ? { x: 51 + (index % 2) * 8, y: 23 }
               : agent.status === 'offline'
-                ? { x: 6, y: 82 }
-                : home
+                ? { x: 7 + (index % 2) * 5, y: 82 - (index % 3) * 4 }
+                : agent.status === 'idle'
+                  ? { x: 20 + (index % 6) * 12, y: 77 }
+                  : home
         const style = {
           '--agent-x': `${destination.x}%`,
           '--agent-y': `${destination.y}%`,
@@ -2625,7 +2767,15 @@ function MissionCard({
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
-      {mission.description ? <p className="mission-description">{mission.description}</p> : null}
+      {mission.description ? (
+        <details className="mission-dossier mission-briefing">
+          <summary>
+            <span>Mission briefing</span>
+            <small>Open full specification</small>
+          </summary>
+          <p className="mission-description">{mission.description}</p>
+        </details>
+      ) : null}
       <div className="mission-chip-row">
         <div className="strategy-chip">{statusLabel(mission.strategy)}</div>
         <div className="contract-version-chip">Specification v{mission.specification_version}</div>
@@ -2640,25 +2790,46 @@ function MissionCard({
           <dd>{activeRuns ? `${activeRuns} active` : `${runs.length} attempts`}</dd>
         </div>
       </dl>
-      <BudgetRevisionPanel
-        mission={mission}
-        tasks={tasks}
-        runs={runs}
-        revisions={revisions}
-        actors={actors}
-        actorRole={actorRole}
-        busy={busy}
-        resumableRun={resumableRun}
-        onPropose={onProposeBudgetRevision}
-        onDecision={onBudgetRevisionDecision}
-      />
-      <div className="task-graph-list">
+      <details
+        className="mission-dossier"
+        open={resumeBudgetBlocked || Boolean(pendingBudgetRevision)}
+      >
+        <summary>
+          <span>Budget authority</span>
+          <small>
+            {consumedTokens.toLocaleString()} of {mission.budget_tokens.toLocaleString()} tokens
+          </small>
+        </summary>
+        <BudgetRevisionPanel
+          mission={mission}
+          tasks={tasks}
+          runs={runs}
+          revisions={revisions}
+          actors={actors}
+          actorRole={actorRole}
+          busy={busy}
+          resumableRun={resumableRun}
+          onPropose={onProposeBudgetRevision}
+          onDecision={onBudgetRevisionDecision}
+        />
+      </details>
+      <details className="mission-dossier mission-task-dossier">
+        <summary>
+          <span>Task graph</span>
+          <small>{completedTasks}/{tasks.length} complete</small>
+        </summary>
+        <div className="task-graph-list">
         {orderedTasks.map((task) => {
           const assignedAgent = agents.find((agent) => agent.id === task.assigned_agent_id)
           const dependencies = task.depends_on
             .map((dependencyId) => taskById.get(dependencyId)?.plan_key ?? shortId(dependencyId))
           return (
-            <details className="task-graph-item" key={task.id} data-task-id={task.id}>
+            <details
+              className="task-graph-item"
+              key={task.id}
+              data-task-id={task.id}
+              tabIndex={-1}
+            >
               <summary className="task-graph-row">
                 <span>{task.plan_key}</span>
                 <strong>{statusLabel(task.status)}</strong>
@@ -2766,8 +2937,13 @@ function MissionCard({
           </ol>
         </details>
       ) : null}
+      </details>
       {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
-        <div className="evidence-box evidence-provider" data-testid="provider-evidence">
+        <div
+          className="evidence-box evidence-provider"
+          data-testid="provider-evidence"
+          data-artifact-id={latestRun.artifact_id}
+        >
           <strong>Provider evidence</strong>
           <span>{shortId(latestRun.artifact_sha256)}…</span>
           <button
@@ -2799,15 +2975,18 @@ function MissionCard({
       ) : null}
       {latestRun &&
       (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
-        <div
+        <details
           className={`verification-box verification-${latestRun.verification_status}`}
           data-testid="verification-evidence"
+          open={latestRun.verification_status === 'failed'}
         >
-          <strong>{statusLabel(latestRun.verification_status)}</strong>
-          <span>
-            {latestEvidence.filter((item) => item.status === 'passed').length}/
-            {latestEvidence.length} checks passed
-          </span>
+          <summary>
+            <strong>{statusLabel(latestRun.verification_status)}</strong>
+            <span>
+              {latestEvidence.filter((item) => item.status === 'passed').length}/
+              {latestEvidence.length} checks passed
+            </span>
+          </summary>
           {latestEvidence.length ? (
             <ol className="evidence-checks">
               {latestEvidence.map((item) => (
@@ -2819,7 +2998,7 @@ function MissionCard({
               ))}
             </ol>
           ) : null}
-        </div>
+        </details>
       ) : null}
       {latestRun && terminalRun(latestRun.status) ? (
         <div className={`terminal-summary terminal-${latestRun.status}`}>
@@ -3017,6 +3196,7 @@ function RoomPanel({
   tasks,
   runs,
   onPost,
+  onNavigateLink,
 }: {
   room: { id: string; name: string; purpose: string } | undefined
   messages: RoomMessage[]
@@ -3032,6 +3212,7 @@ function RoomPanel({
     mentions: string[]
     link: EntityLink | null
   }) => Promise<void>
+  onNavigateLink: (link: EntityLink) => void
 }) {
   const [body, setBody] = useState('')
   const [replyToId, setReplyToId] = useState<string | null>(null)
@@ -3039,7 +3220,7 @@ function RoomPanel({
 
   if (!room) {
     return (
-      <section className="room-panel panel" id="room">
+      <section className="room-panel panel" id="room" tabIndex={-1}>
         <div className="panel-heading">
           <div>
             <span className="section-code">SECURE COMMS / 03</span>
@@ -3103,7 +3284,12 @@ function RoomPanel({
   }
 
   return (
-    <section className="room-panel panel" id="room" data-room-id={room.id}>
+    <section
+      className="room-panel panel"
+      id="room"
+      data-room-id={room.id}
+      tabIndex={-1}
+    >
       <div className="panel-heading">
         <div>
           <span className="section-code">SECURE COMMS / 03</span>
@@ -3143,13 +3329,7 @@ function RoomPanel({
                         <button
                           type="button"
                           className="entity-link"
-                          onClick={() => {
-                            const target = document.querySelector<HTMLElement>(
-                              `[data-${linked.kind}-id="${CSS.escape(linked.id)}"]`,
-                            )
-                            target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-                            target?.focus({ preventScroll: true })
-                          }}
+                          onClick={() => onNavigateLink(linked)}
                         >
                           {statusLabel(linked.kind)} · {shortId(linked.id)}
                         </button>
@@ -3237,7 +3417,11 @@ function App() {
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
   const [developerMode, setDeveloperMode] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
-  const [journeyOpen, setJourneyOpen] = useState(true)
+  const [selectedMissionId, setSelectedMissionId] = useState<string | null>(null)
+  const [activeWorkspaceView, setActiveWorkspaceView] = useState<WorkspaceView>(() =>
+    workspaceViewFromHash(window.location.hash),
+  )
+  const [journeyOpen, setJourneyOpen] = useState(false)
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -3253,12 +3437,81 @@ function App() {
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
   const composerInitialized = useRef(false)
+  const initialWorkspaceHash = useRef(window.location.hash)
 
   useEffect(() => {
     if (!data || composerInitialized.current) return
     composerInitialized.current = true
     setMissionComposerCollapsed(data.snapshot.missions.length > 0)
+    setJourneyOpen(data.snapshot.missions.length === 0)
+    if (initialWorkspaceHash.current) {
+      window.history.replaceState(
+        null,
+        '',
+        `${window.location.pathname}${window.location.search}${initialWorkspaceHash.current}`,
+      )
+      initialWorkspaceHash.current = ''
+    }
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    })
   }, [data])
+
+  useEffect(() => {
+    if (!initialWorkspaceHash.current) return
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${window.location.search}`,
+    )
+  }, [])
+
+  useEffect(() => {
+    const syncFromHash = () => {
+      setActiveWorkspaceView(workspaceViewFromHash(window.location.hash))
+    }
+    window.addEventListener('hashchange', syncFromHash)
+    window.addEventListener('popstate', syncFromHash)
+    return () => {
+      window.removeEventListener('hashchange', syncFromHash)
+      window.removeEventListener('popstate', syncFromHash)
+    }
+  }, [])
+
+  const navigateToWorkspaceEntity = useCallback(
+    (kind: EntityLink['kind'] | 'room', targetId: string) => {
+      if (kind === 'room') {
+        setActiveWorkspaceView('room')
+        window.history.replaceState(null, '', '#room')
+        setAnnouncement('Comms opened.')
+        window.setTimeout(() => revealEntityTarget(kind, targetId), 80)
+        return
+      }
+
+      const linkedRun =
+        kind === 'run'
+          ? data?.snapshot.runs.find((run) => run.id === targetId)
+          : kind === 'artifact'
+            ? data?.snapshot.runs.find((run) => run.artifact_id === targetId)
+            : undefined
+      const linkedTask =
+        kind === 'task'
+          ? data?.snapshot.tasks.find((task) => task.id === targetId)
+          : linkedRun
+            ? data?.snapshot.tasks.find((task) => task.id === linkedRun.task_id)
+            : undefined
+      const missionId = kind === 'mission' ? targetId : linkedTask?.mission_id
+      if (missionId) setSelectedMissionId(missionId)
+      setActiveWorkspaceView('missions')
+      window.history.replaceState(null, '', '#missions')
+      setAnnouncement(`${statusLabel(kind)} opened in Missions.`)
+      window.setTimeout(() => {
+        if (revealEntityTarget(kind, targetId)) return
+        if (missionId) revealEntityTarget('mission', missionId)
+      }, 80)
+    },
+    [data],
+  )
 
   useEffect(() => {
     const focus = (raw: string) => {
@@ -3275,13 +3528,14 @@ function App() {
           setError(`Deep link targets a different Corp: ${corp}`)
           return
         }
-        const target = (['run', 'task', 'mission', 'room'] as const)
-          .map((kind) => {
-            const id = values.get(kind)
-            return id ? document.querySelector(`[data-${kind}-id="${CSS.escape(id)}"]`) : null
-          })
-          .find(Boolean)
-        target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        const targetKind = (['run', 'task', 'mission', 'room'] as const).find(
+          (kind) => values.has(kind),
+        )
+        if (!targetKind) return
+        const targetId = values.get(targetKind)
+        if (!targetId) return
+
+        navigateToWorkspaceEntity(targetKind, targetId)
       } catch {
         setError('The desktop deep link is invalid.')
       }
@@ -3295,7 +3549,7 @@ function App() {
       window.removeEventListener('ecorp-deep-link', listener)
       window.removeEventListener('crony-deep-link', listener)
     }
-  }, [bootstrap])
+  }, [bootstrap, navigateToWorkspaceEntity])
   const lastEventSeq = useRef<Record<string, number>>({})
 
   const refresh = useCallback(async (corpId: string, actorId: string) => {
@@ -3547,6 +3801,9 @@ function App() {
       setMissionComposerStep('brief')
       setMissionContractTab('outcome')
       setMissionComposerCollapsed(true)
+      setSelectedMissionId(created.mission_id)
+      setActiveWorkspaceView('missions')
+      window.history.replaceState(null, '', '#missions')
       const refreshed = await refresh(bootstrap.corp_id, selectedActor.id)
       if (launched) {
         const launchedRun = refreshed.snapshot.runs.find(
@@ -4130,6 +4387,9 @@ function App() {
   const pendingApprovals = data.snapshot.action_approvals.filter(
     (approval) => approval.status === 'pending',
   )
+  const pendingVerificationRequests = data.snapshot.verification_requests.filter(
+    (request) => request.status === 'pending',
+  )
   const activeRuns = data.snapshot.runs.filter((run) =>
     ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
   )
@@ -4137,9 +4397,38 @@ function App() {
     (run) => run.verification_status === 'passed' && run.artifact_uri,
   )
   const productionAuthenticated = Boolean(storedAccessToken())
+  const activeFactoryItems = data.snapshot.factory_work_items.filter(
+    (item) => !['published', 'failed', 'cancelled'].includes(item.state),
+  )
+  const currentWorkspaceView =
+    WORKSPACE_VIEWS.find((view) => view.id === activeWorkspaceView) ??
+    WORKSPACE_VIEWS[0]
+  const selectedMission =
+    latestMissions.find((mission) => mission.id === selectedMissionId) ??
+    latestMissions[0]
+  const selectedMissionTasks = selectedMission
+    ? data.snapshot.tasks.filter((task) => task.mission_id === selectedMission.id)
+    : []
+  const selectedMissionTaskIds = new Set(selectedMissionTasks.map((task) => task.id))
+  const selectedMissionRuns = selectedMission
+    ? data.snapshot.runs.filter((run) => selectedMissionTaskIds.has(run.task_id))
+    : []
+
+  const activateWorkspaceView = (view: WorkspaceView) => {
+    const destination = WORKSPACE_VIEWS.find((candidate) => candidate.id === view)
+    setActiveWorkspaceView(view)
+    if (window.location.hash !== `#${view}`) {
+      window.history.pushState(null, '', `#${view}`)
+    }
+    setAnnouncement(`${destination?.label ?? 'Workspace'} opened.`)
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    window.requestAnimationFrame(() => {
+      document.getElementById(view)?.focus({ preventScroll: true })
+    })
+  }
 
   return (
-    <main className="app-shell" aria-busy={busy}>
+    <main className={`app-shell view-${activeWorkspaceView}`} aria-busy={busy}>
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {announcement}
       </div>
@@ -4180,17 +4469,72 @@ function App() {
       </header>
 
       <nav className="workspace-nav" aria-label="ECorp workspace sections">
-        <a href="#floor">Control floor</a>
-        <a href="#factory">Factory</a>
-        <a href="#missions">Missions</a>
-        <a href="#room">Comms</a>
-        <a href="#activity">Audit</a>
-        <button type="button" onClick={() => setJourneyOpen((current) => !current)}>
-          {journeyOpen ? 'Hide start guide' : 'Show start guide'}
+        {WORKSPACE_VIEWS.map((view) => (
+          <a
+            key={view.id}
+            href={`#${view.id}`}
+            className={activeWorkspaceView === view.id ? 'workspace-nav-active' : ''}
+            aria-current={activeWorkspaceView === view.id ? 'page' : undefined}
+            onClick={(event) => {
+              event.preventDefault()
+              activateWorkspaceView(view.id)
+            }}
+          >
+            <span className="workspace-nav-code">{view.code}</span>
+            <strong>{view.label}</strong>
+            <small>{activeWorkspaceView === view.id ? 'Active' : 'Load'}</small>
+          </a>
+        ))}
+        <button
+          className="workspace-nav-guide"
+          type="button"
+          onClick={() => setJourneyOpen((current) => !current)}
+        >
+          <span className="workspace-nav-code">?</span>
+          <strong>{journeyOpen ? 'Hide guide' : 'Start guide'}</strong>
+          <small>Help</small>
         </button>
       </nav>
 
-      <section className={`journey-panel ${journeyOpen ? '' : 'journey-panel-collapsed'}`}>
+      <section className="arcade-command-deck" aria-label="Operations overview">
+        <div className="arcade-command-focus">
+          <span>Active cabinet</span>
+          <strong>{currentWorkspaceView.label}</strong>
+          <small>{currentWorkspaceView.description}</small>
+        </div>
+        <div className="arcade-command-meters">
+          <button type="button" onClick={() => activateWorkspaceView('floor')}>
+            <span>Live runs</span>
+            <strong>{activeRuns.length}</strong>
+            <small>Take control</small>
+          </button>
+          <button
+            type="button"
+            className={
+              pendingApprovals.length + pendingVerificationRequests.length
+                ? 'arcade-meter-alert'
+                : ''
+            }
+            onClick={() => activateWorkspaceView('missions')}
+          >
+            <span>Decisions</span>
+            <strong>{pendingApprovals.length + pendingVerificationRequests.length}</strong>
+            <small>Review gates</small>
+          </button>
+          <button type="button" onClick={() => activateWorkspaceView('factory')}>
+            <span>Factory</span>
+            <strong>{activeFactoryItems.length}</strong>
+            <small>Active items</small>
+          </button>
+          <button type="button" onClick={() => activateWorkspaceView('activity')}>
+            <span>Verified</span>
+            <strong>{acceptedArtifacts.length}</strong>
+            <small>Evidence ready</small>
+          </button>
+        </div>
+      </section>
+
+      <section className="journey-panel" hidden={!journeyOpen}>
         <div className="journey-heading">
           <div>
             <span className="section-code">START HERE</span>
@@ -4323,19 +4667,29 @@ function App() {
         </div>
       ) : null}
 
-      <FactoryPanel
-        items={data.snapshot.factory_work_items}
-        missions={data.snapshot.missions}
-        publications={data.snapshot.pull_request_publications}
-        publicationAttempts={data.snapshot.pull_request_publication_attempts}
-      />
+      <div className="workspace-surface" hidden={activeWorkspaceView !== 'factory'}>
+        <FactoryPanel
+          items={data.snapshot.factory_work_items}
+          missions={data.snapshot.missions}
+          publications={data.snapshot.pull_request_publications}
+          publicationAttempts={data.snapshot.pull_request_publication_attempts}
+        />
+      </div>
 
       <section
-        className={`office-grid ${
-          missionComposerCollapsed ? 'office-grid-operating' : 'office-grid-authoring'
+        className={`office-grid workspace-surface office-grid-${activeWorkspaceView} ${
+          activeWorkspaceView === 'missions' && !missionComposerCollapsed
+            ? 'office-grid-authoring'
+            : 'office-grid-operating'
         }`}
+        hidden={!['floor', 'missions'].includes(activeWorkspaceView)}
       >
-        <div className="floor-panel panel" id="floor">
+        <div
+          className="floor-panel panel"
+          id="floor"
+          hidden={activeWorkspaceView !== 'floor'}
+          tabIndex={-1}
+        >
           <div className="panel-heading">
             <div>
               <span className="section-code">CONTROL FLOOR / 01</span>
@@ -4389,7 +4743,12 @@ function App() {
           </div>
         </div>
 
-        <aside className="mission-panel panel" id="missions">
+        <aside
+          className="mission-panel panel"
+          id="missions"
+          hidden={activeWorkspaceView !== 'missions'}
+          tabIndex={-1}
+        >
           <div className="panel-heading">
             <div>
               <span className="section-code">MISSION CONTROL / 02</span>
@@ -4931,67 +5290,102 @@ function App() {
             ) : null}
           </form>
           )}
-          <div className="mission-list">
+          <div
+            className={`mission-console ${
+              latestMissions.length ? '' : 'mission-console-empty'
+            }`}
+          >
             {latestMissions.length ? (
-              latestMissions.map((mission) => {
-                const tasks = data.snapshot.tasks.filter((candidate) => candidate.mission_id === mission.id)
-                const taskIds = new Set(tasks.map((task) => task.id))
-                const runs = data.snapshot.runs.filter((candidate) => taskIds.has(candidate.task_id))
-                return (
-                  <MissionCard
-                    key={mission.id}
-                    mission={mission}
-                    tasks={tasks}
-                    runs={runs}
-                    agents={data.snapshot.agents}
-                    evidence={data.snapshot.verification_evidence}
-                    deliverables={data.snapshot.source_deliverables}
-                    revisions={data.snapshot.mission_budget_revisions.filter(
-                      (revision) => revision.mission_id === mission.id,
-                    )}
-                    contractRevisions={data.snapshot.mission_contract_revisions.filter(
-                      (revision) => revision.mission_id === mission.id,
-                    )}
-                    actors={data.snapshot.actors}
-                    verificationRequests={data.snapshot.verification_requests}
-                    actionApprovals={data.snapshot.action_approvals}
-                    actorId={selectedActor.id}
-                    actorRole={selectedActor.role}
-                    busy={busy}
-                    onLaunch={launchMission}
-                    onResume={resumeAgentRun}
-                    onDownloadArtifact={downloadArtifact}
-                    onDownloadDeliverable={downloadDeliverable}
-                    onProposeBudgetRevision={proposeBudgetRevision}
-                    onBudgetRevisionDecision={decideBudgetRevision}
-                    onContractRevision={createContractRevision}
-                    onVerificationDecision={decideVerification}
-                    onActionApprovalDecision={decideActionApproval}
-                  />
-                )
-              })
-            ) : (
-              <div className="empty-state">
-                <strong>No missions yet</strong>
-                <span>Start with a concrete outcome and let ECorp create the task contract.</span>
-              </div>
-            )}
+              <nav className="mission-selector" aria-label="Mission records">
+                {latestMissions.map((mission) => {
+                  const missionTasks = data.snapshot.tasks.filter(
+                    (task) => task.mission_id === mission.id,
+                  )
+                  return (
+                    <button
+                      key={mission.id}
+                      type="button"
+                      className={
+                        selectedMission?.id === mission.id ? 'mission-selector-active' : ''
+                      }
+                      aria-pressed={selectedMission?.id === mission.id}
+                      data-status={mission.status}
+                      onClick={() => setSelectedMissionId(mission.id)}
+                    >
+                      <span>{statusLabel(mission.status)}</span>
+                      <strong>{mission.title}</strong>
+                      <small>
+                        {shortId(mission.id)} · {missionTasks.length} task
+                        {missionTasks.length === 1 ? '' : 's'}
+                      </small>
+                    </button>
+                  )
+                })}
+              </nav>
+            ) : null}
+            <div className="mission-list">
+              {selectedMission ? (
+                <MissionCard
+                  key={selectedMission.id}
+                  mission={selectedMission}
+                  tasks={selectedMissionTasks}
+                  runs={selectedMissionRuns}
+                  agents={data.snapshot.agents}
+                  evidence={data.snapshot.verification_evidence}
+                  deliverables={data.snapshot.source_deliverables}
+                  revisions={data.snapshot.mission_budget_revisions.filter(
+                    (revision) => revision.mission_id === selectedMission.id,
+                  )}
+                  contractRevisions={data.snapshot.mission_contract_revisions.filter(
+                    (revision) => revision.mission_id === selectedMission.id,
+                  )}
+                  actors={data.snapshot.actors}
+                  verificationRequests={data.snapshot.verification_requests}
+                  actionApprovals={data.snapshot.action_approvals}
+                  actorId={selectedActor.id}
+                  actorRole={selectedActor.role}
+                  busy={busy}
+                  onLaunch={launchMission}
+                  onResume={resumeAgentRun}
+                  onDownloadArtifact={downloadArtifact}
+                  onDownloadDeliverable={downloadDeliverable}
+                  onProposeBudgetRevision={proposeBudgetRevision}
+                  onBudgetRevisionDecision={decideBudgetRevision}
+                  onContractRevision={createContractRevision}
+                  onVerificationDecision={decideVerification}
+                  onActionApprovalDecision={decideActionApproval}
+                />
+              ) : (
+                <div className="empty-state">
+                  <strong>No missions yet</strong>
+                  <span>Start with a concrete outcome and let ECorp create the task contract.</span>
+                </div>
+              )}
+            </div>
           </div>
         </aside>
       </section>
 
-      <RoomPanel
-        room={room}
-        messages={data.snapshot.room_messages}
-        actors={data.snapshot.actors}
-        selectedActor={selectedActor}
-        missions={data.snapshot.missions}
-        tasks={data.snapshot.tasks}
-        runs={data.snapshot.runs}
-        onPost={postRoomMessage}
-      />
+      <div className="workspace-surface" hidden={activeWorkspaceView !== 'room'}>
+        <RoomPanel
+          room={room}
+          messages={data.snapshot.room_messages}
+          actors={data.snapshot.actors}
+          selectedActor={selectedActor}
+          missions={data.snapshot.missions}
+          tasks={data.snapshot.tasks}
+          runs={data.snapshot.runs}
+          onPost={postRoomMessage}
+          onNavigateLink={(link) => navigateToWorkspaceEntity(link.kind, link.id)}
+        />
+      </div>
 
-      <section className="operations-panel panel" id="activity">
+      <section
+        className="operations-panel panel workspace-surface"
+        id="activity"
+        hidden={activeWorkspaceView !== 'activity'}
+        tabIndex={-1}
+      >
         <div className="panel-heading operations-heading">
           <div>
             <span className="section-code">AUDIT NETWORK / 04</span>

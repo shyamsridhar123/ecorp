@@ -1361,3 +1361,643 @@
     height: 360px;
   }
 }
+
+/* Focused cabinet navigation */
+
+.workspace-surface[hidden],
+.journey-panel[hidden],
+.office-grid[hidden],
+.floor-panel[hidden],
+.mission-panel[hidden],
+.operations-panel[hidden] {
+  display: none !important;
+}
+
+.workspace-nav {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.workspace-nav a,
+.workspace-nav button {
+  display: flex;
+  min-width: 0;
+  min-height: 50px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 0 14px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  font: 800 10px/1 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+.workspace-nav a > span {
+  display: grid;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  color: var(--cobalt);
+  border: 1px solid var(--cobalt-dark);
+  background: #071225;
+  font-size: 8px;
+}
+
+.workspace-nav a:hover,
+.workspace-nav a:focus-visible,
+.workspace-nav .workspace-nav-active {
+  color: #02050c;
+  background: var(--cobalt);
+  box-shadow: inset 0 -5px 0 var(--signal);
+}
+
+.workspace-nav a:hover > span,
+.workspace-nav a:focus-visible > span,
+.workspace-nav .workspace-nav-active > span {
+  color: var(--paper-light);
+  border-color: #02050c;
+  background: #02050c;
+}
+
+.workspace-nav button {
+  min-width: 152px;
+  color: var(--marigold);
+  border-right: 0;
+}
+
+.arcade-command-deck {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.75fr) minmax(0, 1.75fr);
+  margin-top: 14px;
+  color: var(--ink);
+  border: 2px solid var(--cobalt-dark);
+  background:
+    linear-gradient(105deg, rgb(24 223 255 / 9%), transparent 42%),
+    #050a14;
+  box-shadow:
+    5px 5px 0 #02050c,
+    0 0 24px rgb(24 223 255 / 12%);
+}
+
+.arcade-command-focus {
+  position: relative;
+  display: grid;
+  align-content: center;
+  min-width: 0;
+  min-height: 112px;
+  padding: 18px 20px;
+  overflow: hidden;
+  border-right: 2px solid var(--line);
+}
+
+.arcade-command-focus::after {
+  position: absolute;
+  right: -28px;
+  bottom: -28px;
+  width: 150px;
+  height: 82px;
+  content: "";
+  background: repeating-linear-gradient(
+    135deg,
+    transparent 0 12px,
+    rgb(255 59 129 / 18%) 12px 17px
+  );
+  transform: rotate(-6deg);
+}
+
+.arcade-command-focus > * {
+  position: relative;
+  z-index: 1;
+}
+
+.arcade-command-focus span {
+  color: var(--mint);
+  font: 800 9px/1 var(--mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.arcade-command-focus strong {
+  margin-top: 8px;
+  font: 900 clamp(24px, 3vw, 42px) / 0.9 var(--sans);
+  letter-spacing: -0.035em;
+  text-transform: uppercase;
+  text-shadow: 3px 3px 0 #02050c;
+}
+
+.arcade-command-focus small {
+  max-width: 48ch;
+  margin-top: 9px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.arcade-command-meters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.arcade-command-meters button {
+  display: grid;
+  min-width: 0;
+  min-height: 112px;
+  align-content: center;
+  padding: 14px 16px;
+  color: var(--ink);
+  text-align: left;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: rgb(7 18 37 / 78%);
+  transition:
+    color 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+
+.arcade-command-meters button:last-child {
+  border-right: 0;
+}
+
+.arcade-command-meters button:hover,
+.arcade-command-meters button:focus-visible {
+  color: #02050c;
+  background: var(--cobalt);
+}
+
+.arcade-command-meters button:active {
+  transform: translateY(2px);
+}
+
+.arcade-command-meters span,
+.arcade-command-meters small {
+  overflow: hidden;
+  font: 800 9px/1 var(--mono);
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.arcade-command-meters span {
+  color: var(--cobalt);
+  letter-spacing: 0.08em;
+}
+
+.arcade-command-meters button:hover span,
+.arcade-command-meters button:focus-visible span {
+  color: #02050c;
+}
+
+.arcade-command-meters strong {
+  margin: 8px 0 7px;
+  font: 900 34px/0.82 var(--sans);
+  text-shadow: 2px 2px 0 #02050c;
+}
+
+.arcade-command-meters small {
+  color: var(--ink-soft);
+  font-size: 8px;
+}
+
+.arcade-command-meters button:hover small,
+.arcade-command-meters button:focus-visible small {
+  color: #07101f;
+}
+
+.arcade-command-meters .arcade-meter-alert {
+  box-shadow: inset 0 -5px 0 var(--signal);
+}
+
+.workspace-surface {
+  margin-top: 18px;
+  animation: cabinet-in 180ms steps(3, end);
+}
+
+.office-grid-floor,
+.office-grid-missions {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.office-grid-floor .floor-plan {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(330px, 0.65fr);
+  gap: 12px;
+}
+
+.office-grid-floor .office-stage {
+  grid-column: 1;
+  grid-row: 1;
+  height: clamp(480px, 56vh, 620px);
+}
+
+.office-grid-floor .agent-roster {
+  grid-column: 1;
+  grid-row: 2;
+  margin-top: 0;
+}
+
+.office-grid-floor .agent-inspector {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  grid-template-columns: 1fr;
+  align-content: start;
+  margin-top: 0;
+}
+
+.office-grid-floor .agent-inspector-help,
+.office-grid-floor .agent-inspector .desk-actions,
+.office-grid-floor .agent-inspector .transfer-control,
+.office-grid-floor .agent-inspector .emergency-stop,
+.office-grid-floor .agent-inspector .interrupt-run,
+.office-grid-floor .agent-inspector .agent-message {
+  grid-column: 1;
+}
+
+.factory-list {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  max-height: calc(100dvh - 320px);
+  overflow: auto;
+  scrollbar-color: var(--cobalt-dark) #050a14;
+}
+
+.factory-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.factory-card h3 {
+  display: -webkit-box;
+  min-height: 2.35em;
+  margin: 3px 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.factory-card-quick {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--ink-soft);
+  font: 800 9px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.factory-card-quick > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.factory-card-quick a {
+  color: var(--mint);
+}
+
+.factory-alert-line {
+  margin: 0;
+  padding: 8px 9px;
+  overflow: hidden;
+  color: #ffd9e8;
+  border-left: 4px solid var(--signal);
+  background: rgb(255 59 129 / 13%);
+  font: 800 10px/1.3 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.factory-card-details,
+.mission-dossier {
+  border: 1px solid var(--line);
+  background: #071225;
+}
+
+.factory-card-details > summary,
+.mission-dossier > summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  color: var(--cobalt);
+  cursor: pointer;
+  list-style: none;
+  font: 800 10px/1.2 var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.factory-card-details > summary::-webkit-details-marker,
+.mission-dossier > summary::-webkit-details-marker {
+  display: none;
+}
+
+.factory-card-details > summary span:last-child,
+.mission-dossier > summary small {
+  color: var(--ink-soft);
+  font-size: 9px;
+}
+
+.factory-card-details[open] > summary,
+.mission-dossier[open] > summary {
+  color: #02050c;
+  border-bottom: 1px solid var(--line);
+  background: var(--cobalt);
+}
+
+.factory-card-details[open] > summary span:last-child,
+.mission-dossier[open] > summary small {
+  color: #07101f;
+}
+
+.factory-card-dossier {
+  display: grid;
+  gap: 12px;
+  padding: 11px;
+}
+
+.factory-card-dossier > footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-soft);
+  font: 700 8px/1.2 var(--mono);
+  text-transform: uppercase;
+}
+
+.mission-selector {
+  display: grid;
+  grid-auto-columns: minmax(190px, 1fr);
+  grid-auto-flow: column;
+  gap: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+  background: #050a14;
+  scrollbar-color: var(--cobalt-dark) #050a14;
+}
+
+.mission-selector button {
+  display: grid;
+  min-width: 0;
+  min-height: 76px;
+  align-content: start;
+  gap: 5px;
+  padding: 10px;
+  color: var(--ink);
+  text-align: left;
+  border: 1px solid var(--line);
+  background: #071225;
+}
+
+.mission-selector button:hover,
+.mission-selector button:focus-visible,
+.mission-selector .mission-selector-active {
+  border-color: var(--cobalt);
+  background: #0b1d35;
+  box-shadow: inset 0 -4px 0 var(--cobalt);
+}
+
+.mission-selector button[data-status="failed"],
+.mission-selector button[data-status="cancelled"] {
+  box-shadow: inset 0 -4px 0 var(--signal);
+}
+
+.mission-selector button[data-status="completed"] {
+  box-shadow: inset 0 -4px 0 var(--mint);
+}
+
+.mission-selector span,
+.mission-selector small {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font: 800 8px/1 var(--mono);
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.mission-selector strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font: 800 12px/1.2 var(--sans);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.mission-list {
+  display: block;
+  max-height: calc(100dvh - 370px);
+  overflow: auto;
+  scrollbar-color: var(--cobalt-dark) #050a14;
+}
+
+.mission-card {
+  display: grid;
+  gap: 10px;
+}
+
+.mission-card > h3 {
+  margin-bottom: 0;
+  font-size: clamp(22px, 3vw, 34px);
+}
+
+.mission-briefing .mission-description {
+  max-height: 42vh;
+  margin: 0;
+  padding: 13px;
+  overflow: auto;
+  color: var(--ink-soft);
+  background: #050a14;
+}
+
+.mission-dossier .budget-ledger {
+  border: 0;
+  box-shadow: none;
+}
+
+.mission-task-dossier > .task-graph-list,
+.mission-task-dossier > .contract-revision-history {
+  margin: 10px;
+}
+
+.verification-box {
+  display: block;
+}
+
+.verification-box > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 44px;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.verification-box > summary::-webkit-details-marker {
+  display: none;
+}
+
+.verification-box > .evidence-checks {
+  padding: 0 10px 10px;
+}
+
+.room-panel .room-layout {
+  min-height: min(620px, calc(100dvh - 330px));
+}
+
+.operations-panel .approval-queue {
+  max-height: 190px;
+  overflow: auto;
+}
+
+.operations-panel .event-list {
+  max-height: calc(100dvh - 370px);
+  overflow: auto;
+  scrollbar-color: var(--cobalt-dark) #050a14;
+}
+
+@keyframes cabinet-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 1100px) {
+  .arcade-command-deck {
+    grid-template-columns: 1fr;
+  }
+
+  .arcade-command-focus {
+    min-height: 96px;
+    border-right: 0;
+    border-bottom: 2px solid var(--line);
+  }
+
+  .office-grid-floor .floor-plan {
+    grid-template-columns: 1fr;
+  }
+
+  .office-grid-floor .office-stage,
+  .office-grid-floor .agent-roster,
+  .office-grid-floor .agent-inspector {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .office-grid-floor .agent-inspector {
+    grid-template-columns: minmax(220px, 0.8fr) minmax(240px, 1fr);
+  }
+
+  .office-grid-floor .agent-inspector-help,
+  .office-grid-floor .agent-inspector .desk-actions,
+  .office-grid-floor .agent-inspector .transfer-control,
+  .office-grid-floor .agent-inspector .emergency-stop,
+  .office-grid-floor .agent-inspector .interrupt-run,
+  .office-grid-floor .agent-inspector .agent-message {
+    grid-column: 1 / -1;
+  }
+
+  .factory-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .workspace-nav {
+    grid-template-columns: repeat(5, minmax(104px, 1fr)) minmax(148px, 1fr);
+    overflow-x: auto;
+  }
+
+  .workspace-nav a,
+  .workspace-nav button {
+    min-height: 48px;
+    padding: 0 10px;
+  }
+
+  .arcade-command-deck {
+    margin-top: 10px;
+  }
+
+  .arcade-command-focus {
+    min-height: 88px;
+    padding: 15px;
+  }
+
+  .arcade-command-focus strong {
+    font-size: 28px;
+  }
+
+  .arcade-command-meters {
+    grid-template-columns: repeat(4, minmax(118px, 1fr));
+    overflow-x: auto;
+    scrollbar-color: var(--cobalt-dark) #050a14;
+  }
+
+  .arcade-command-meters button {
+    min-height: 78px;
+    padding: 11px 12px;
+  }
+
+  .workspace-surface {
+    margin-top: 10px;
+  }
+
+  .factory-list {
+    grid-template-columns: 1fr;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .mission-list {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .mission-selector {
+    grid-auto-columns: minmax(170px, 82vw);
+  }
+
+  .office-grid-floor .office-stage {
+    height: 390px;
+  }
+
+  .office-grid-floor .agent-inspector {
+    grid-template-columns: 1fr;
+  }
+
+  .office-grid-floor .agent-inspector-help,
+  .office-grid-floor .agent-inspector .desk-actions,
+  .office-grid-floor .agent-inspector .transfer-control,
+  .office-grid-floor .agent-inspector .emergency-stop,
+  .office-grid-floor .agent-inspector .interrupt-run,
+  .office-grid-floor .agent-inspector .agent-message {
+    grid-column: 1;
+  }
+
+  .room-panel .room-layout,
+  .operations-panel .event-list {
+    min-height: 0;
+    max-height: none;
+    overflow: visible;
+  }
+}
