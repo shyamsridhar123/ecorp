@@ -54,6 +54,14 @@ the runner emits `run.session_terminated` before verification and accepted compl
 persistent agent identity returns to `idle` with no `current_run_id`. It does not yet verify the
 entire operating-system descendant tree; that stronger cleanup boundary is tracked in #51.
 
+## External provider permission bridge
+
+The Claude Code adapter currently proves safe-mode launch and normalized lifecycle/evidence
+behavior, but its `acceptEdits` mode and custom stdin decision shape are not a complete durable
+provider-permission boundary. GitHub issue #110 tracks Claude's supported stream-JSON
+`can_use_tool` request/response bridge as a bounded slice of #51. Until that issue lands, Claude and
+OpenCode adapter tests must not be cited as proof of complete native permission mediation.
+
 ## Quality gates
 
 ```powershell
@@ -155,8 +163,11 @@ On September 1, 2026, one operator ran three enterprise-application scenarios th
 browser-to-server-to-runner path. VendorGuard passed 13 tests and its browser workflow; Incident
 Command passed 12 tests and its browser workflow; Credit Exception remained incomplete with 84
 failures and two errors. The pass exposed hard-breaker, budget-recovery, provider-isolation,
-permission-bridging, mission-contract, and portable-deliverable gaps. It is internal systems
-dogfood and does not satisfy the three-external-team requirement in GitHub issue #27. See
+permission-bridging, mission-contract, and portable-deliverable gaps at that time. Subsequent
+evidence below covers the landed breaker, budget-recovery, mission-contract, and portable-deliverable
+work. Provider isolation remains tracked in #51, with the Claude permission-bridge slice in #110.
+This is internal systems dogfood and does not satisfy the three-external-team requirement in GitHub
+issue #27. See
 `docs/evidence/2026-09-01-enterprise-application-dogfood.md`.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the

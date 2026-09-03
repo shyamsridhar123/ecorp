@@ -10,7 +10,7 @@ window must not terminate an active agent run.
 ### Experience plane
 
 - React web client
-- future Tauri desktop shell
+- Tauri 2 desktop shell
 - `crony` CLI
 
 Clients display state and send authenticated commands. They do not supervise agent processes.
@@ -168,8 +168,8 @@ crony-runner
     +-- Codex app-server JSON-RPC ---> provider thread + repository changes
 ```
 
-The deterministic process remains the offline systems fixture. The first real provider adapter
-uses Codex app-server over stdio JSON-RPC rather than scraping terminal text.
+The deterministic process remains the offline systems fixture. The Codex adapter uses app-server
+over stdio JSON-RPC rather than scraping terminal text.
 
 ## State and events
 
@@ -473,9 +473,10 @@ snapshot, work item, and mission remain authoritative even when more recent hist
 have displaced it from the shared snapshot. Claim and reclaim idempotency keys also include the
 normalized lease duration because lease duration is part of the persisted operation request.
 
-GitHub remains the planning and status source of truth, but external status changes must follow
-durable ECorp transitions. Pull-request publication, merge, and deployment are separate effects
-with separate authorization and idempotency boundaries. See ADR 0020.
+ECorp Build GitHub Project #3 and its linked issues remain the planning and status source of truth;
+`docs/BACKLOG.md` is historical seed material only. External status changes must follow durable
+ECorp transitions. Pull-request publication, merge, and deployment are separate effects with
+separate authorization and idempotency boundaries. See ADR 0020.
 
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
@@ -603,6 +604,9 @@ unless the operator supplies the exact same override; a newly derived source def
 the durable publication target.
 
 ## Near-term architecture work
+
+These categories are not a live priority list. Use ECorp Build Project #3 and linked issues for
+ordering and status.
 
 1. Add stronger OS/container isolation for untrusted child processes.
 2. Add artifact retention sweeping and signing-key rotation.
