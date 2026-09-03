@@ -500,6 +500,38 @@ marked `source_commit_upgrade_required`. A fenced operator may explicitly pin a 
 commit before launch; the operation updates policy and any no-run task contracts atomically,
 increments the factory version, and appends an audit event.
 
+## Verifier executable-resolution boundary
+
+Provider command execution and authoritative verification intentionally have different capabilities.
+A provider adapter owns its documented vendor process or shell behavior. The verifier never assumes
+that provider shell lookup is reproducible: it launches the persisted `program` and `args` as
+separate values without constructing a shell command.
+
+For a bare verifier program, the runner searches only absolute entries already present in its
+process `PATH`; empty and relative entries are ignored, so neither the assigned worktree nor the
+runner current directory is searched implicitly. Linux and macOS require an exact regular file with
+at least one executable bit in one of those entries. On Windows, a name with an extension requires
+an exact regular file, while an extensionless name is tested against the runner's validated
+alphanumeric `PATHEXT` entries in their declared order. This resolves installed shims such as
+`npm.cmd`, `pnpm.cmd`, and `npx.cmd` without mistaking an adjacent extensionless Unix shim for a
+Windows executable.
+
+An absolute program path is used only when explicitly declared. A relative program containing path
+components is anchored to the assigned worktree; traversal, dot, rooted, and drive-relative
+components are rejected, and canonical containment rejects symlink escapes. Every explicit target
+is canonicalized and must be a regular file. The resolved canonical file is passed to Rust's
+argv-based process API with each persisted argument separately.
+The verifier does not read an alternate shell path or synthesize a command string; Rust's Windows
+process implementation applies its platform batch-file argument escaping when the canonical target
+is a `.cmd` or `.bat` shim.
+
+Command evidence records the bounded requested program, `explicit_path`, `path`, or `path_pathext`
+resolution mode, and a resolved identity containing at most 128 filename characters plus a SHA-256
+digest of the canonical path. It never records the canonical path or the mutable `PATH`. An
+unresolved identity is `null`, and missing, non-regular, ambiguous, or unspawnable programs fail the
+check with a precise diagnostic. Resolution and execution share the declared timeout; stdin remains
+closed, output remains bounded, and dropping a timed-out child still kills it.
+
 ## Portable source-deliverable boundary
 
 Provider artifacts and application deliverables are separate object roles. After the provider

@@ -260,8 +260,13 @@ depth bounds, retry bounds, per-task budgets, and total mission budgets. See
 `docs/evidence/2026-08-29-task-graph-validation.md`.
 
 Runner verifier tests cover valid and missing files, artifact hashes, commands, tests, JSON
-required-key schemas, screenshot signatures, and path traversal. See
-`docs/evidence/2026-08-29-evidence-verification-validation.md`.
+required-key schemas, screenshot signatures, path traversal, exact executable lookup on Linux and
+macOS, and fail-closed explicit-path validation. Windows coverage deterministically exercises
+`npm`, explicit `npm.cmd`, `pnpm`, `npx`, another `PATHEXT` executable, injection-shaped arguments,
+missing tools, and the installed npm shim. `tools/e2e_windows_verifier_resolution.mjs` executes the
+candidate verifier with the exact `npm --prefix scenarios/incident-command test` policy. See
+`docs/evidence/2026-08-29-evidence-verification-validation.md` and
+`docs/evidence/2026-09-03-windows-verifier-command-resolution.md`.
 
 `tools/e2e_artifacts.mjs` verifies server-mediated upload, content-addressed storage, normalized
 media type, signed producer/run/task/verifier/retention provenance, path-free shared state,
