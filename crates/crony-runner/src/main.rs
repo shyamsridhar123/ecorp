@@ -1277,25 +1277,7 @@ async fn execute_assignment(
         Ok(AdapterExit::Completed) => "completed",
         Ok(AdapterExit::Failed) => "failed",
         Ok(AdapterExit::Cancelled) => "cancelled",
-        Err(error) => {
-            send_run_event(
-                &outbound,
-                &runner_id,
-                &assignment,
-                "run.failed",
-                json!({"error": format!(
-                    "adapter exited without a verified provider-scope teardown: {error}"
-                )}),
-            );
-            send_teardown_workspace_preserved(
-                &outbound,
-                &runner_id,
-                &assignment,
-                &workspace,
-                &format!("adapter error did not prove provider-scope termination: {error}"),
-            );
-            return Ok(());
-        }
+        Err(_) => "runtime_error",
     };
     send_run_event(
         &outbound,
@@ -1364,6 +1346,7 @@ async fn execute_assignment(
         let cleanup = workspaces.finalize(&workspace).await;
         send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
     }
+    execution?;
     Ok(())
 }
 
@@ -1588,30 +1571,6 @@ fn send_workspace_cleanup_event(
             (event_type, cleanup)
         }
 
-        fn send_teardown_workspace_preserved(
-            outbound: &OutboundBus,
-            runner_id: &str,
-            assignment: &Assignment,
-            workspace: &WorkspaceLease,
-            detail: &str,
-        ) {
-            send_run_event(
-                outbound,
-                runner_id,
-                assignment,
-                "run.workspace_preserved",
-                json!({
-                    "workspace": workspace.path,
-                    "workspace_branch": workspace.branch,
-                    "workspace_base_ref": workspace.base_ref,
-                    "workspace_base_commit": workspace.base_commit,
-                    "detail": detail,
-                    "dirty": Value::Null,
-                    "commits_ahead": Value::Null,
-                    "branch_deleted": false,
-                }),
-            );
-        }
         Err(error) => (
             "run.workspace_preserved",
             WorkspaceCleanup {
@@ -1640,6 +1599,32 @@ fn send_workspace_cleanup_event(
         }),
     );
 }
+
+fn send_teardown_workspace_preserved(
+    outbound: &OutboundBus,
+    runner_id: &str,
+    assignment: &Assignment,
+    workspace: &WorkspaceLease,
+    detail: &str,
+) {
+    send_run_event(
+        outbound,
+        runner_id,
+        assignment,
+        "run.workspace_preserved",
+        json!({
+            "workspace": workspace.path,
+            "workspace_branch": workspace.branch,
+            "workspace_base_ref": workspace.base_ref,
+            "workspace_base_commit": workspace.base_commit,
+            "detail": detail,
+            "dirty": Value::Null,
+            "commits_ahead": Value::Null,
+            "branch_deleted": false,
+        }),
+    );
+}
+
 fn send_run_event(
     outbound: &OutboundBus,
     runner_id: &str,
@@ -1678,9 +1663,103 @@ fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, process::Command as StdCommand};
+
+    use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
+    use tokio::sync::Notify;
 
     use super::*;
+
+    struct LatchedTeardownAdapter {
+        uncertain: Arc<Notify>,
+        verified: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl AgentAdapter for LatchedTeardownAdapter {
+        fn id(&self) -> &'static str {
+            "latched-teardown"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Latched teardown test adapter"
+        }
+
+        fn capabilities(&self) -> adapter::AdapterCapabilities {
+            let supported = adapter::FeatureSupport::Supported;
+            adapter::AdapterCapabilities {
+                spawn: supported.clone(),
+                stream: supported.clone(),
+                steer: supported.clone(),
+                interrupt: supported.clone(),
+                stop: supported.clone(),
+                resume: supported.clone(),
+                usage: supported.clone(),
+                artifacts: supported,
+            }
+        }
+
+        async fn execute(
+            &self,
+            request: AdapterRunRequest,
+            _controls: mpsc::UnboundedReceiver<AdapterControl>,
+            sink: Arc<dyn AdapterEventSink>,
+        ) -> Result<AdapterExit, adapter::AdapterError> {
+            sink.emit(AdapterEvent::Started {
+                workspace: request.workspace,
+            });
+            sink.emit(AdapterEvent::TeardownUncertain {
+                detail: "injected latched provider-scope query failure".to_owned(),
+            });
+            self.uncertain.notify_one();
+            self.verified.notified().await;
+            Err(adapter::AdapterError::Runtime(anyhow!(
+                "verified teardown runtime failure"
+            )))
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn teardown_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .join("crony-runner-teardown-tests")
+            .join(Uuid::new_v4().to_string());
+        let repository = root.join("source");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&repository).expect("create source repository");
+        git(&repository, &["init", "-b", "main"]);
+        std::fs::write(repository.join("sentinel.txt"), b"preserve exact bytes\n")
+            .expect("write sentinel");
+        git(&repository, &["add", "sentinel.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=ECorp Test",
+                "-c",
+                "user.email=crony@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        (root, repository, managed)
+    }
 
     fn secret(expires_at: DateTime<Utc>) -> ResolvedSecret {
         ResolvedSecret {
@@ -1736,5 +1815,303 @@ mod tests {
         };
         assert_eq!(connection_epoch, new_epoch);
         assert_eq!(rebound_token, assignment_token);
+    }
+
+    #[test]
+    fn teardown_fail_closed_preserves_workspace_without_false_terminal_claim() {
+        let assignment = Assignment {
+            corp_id: Uuid::new_v4(),
+            connection_epoch: Uuid::new_v4(),
+            room_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            workspace_run_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            assignment_token: Uuid::new_v4(),
+            adapter: "claude-code".to_owned(),
+            mission_title: "teardown failure".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+            resume_workspace_base_commit: None,
+            verification_policy: VerificationPolicy {
+                checks: Vec::new(),
+                manual_gate: None,
+            },
+            write_scope: Vec::new(),
+            deliverable: None,
+            secrets: Vec::new(),
+        };
+        let workspace = WorkspaceLease {
+            path: PathBuf::from("worktrees/exact-run"),
+            branch: "crony/task/exact-run".to_owned(),
+            base_ref: "ecorp/base".to_owned(),
+            base_commit: "0123456789abcdef".to_owned(),
+        };
+        let outbound = OutboundBus::default();
+        let teardown_uncertain = Arc::new(AtomicBool::new(false));
+        let terminal = Arc::new(Mutex::new(None));
+        let sink = RunnerEventSink {
+            outbound: outbound.clone(),
+            runner_id: "runner-test".to_owned(),
+            assignment,
+            workspace: workspace.clone(),
+            artifacts: Arc::new(Mutex::new(Vec::new())),
+            terminal: terminal.clone(),
+            teardown_uncertain: teardown_uncertain.clone(),
+        };
+
+        sink.emit(AdapterEvent::TeardownUncertain {
+            detail: "injected provider-scope query failure".to_owned(),
+        });
+        sink.emit(AdapterEvent::Cancelled {
+            reason: "stop requested".to_owned(),
+        });
+
+        let (connection, mut received) = mpsc::unbounded_channel();
+        outbound.attach(connection, Uuid::new_v4());
+        let messages = [received.try_recv().unwrap(), received.try_recv().unwrap()];
+        assert!(received.try_recv().is_err());
+        assert!(teardown_uncertain.load(Ordering::Acquire));
+        assert!(matches!(
+            terminal.lock().expect("terminal lock").as_ref(),
+            Some(BufferedTerminal::Cancelled(reason)) if reason == "stop requested"
+        ));
+
+        let mut event_types = Vec::new();
+        for message in messages {
+            let RunnerToServer::RunEvent {
+                event_type,
+                payload,
+                ..
+            } = message
+            else {
+                panic!("expected run event");
+            };
+            assert_ne!(event_type, "run.session_terminated");
+            assert_ne!(
+                payload.get("provider_process_alive"),
+                Some(&Value::Bool(false))
+            );
+            if event_type == "run.workspace_preserved" {
+                assert_eq!(payload["workspace"], json!(workspace.path));
+                assert_eq!(payload["dirty"], Value::Null);
+                assert_eq!(payload["branch_deleted"], false);
+            }
+            event_types.push(event_type);
+        }
+        assert_eq!(
+            event_types,
+            ["run.teardown_uncertain", "run.workspace_preserved"]
+        );
+
+        let (replacement, mut replayed) = mpsc::unbounded_channel();
+        outbound.attach(replacement, Uuid::new_v4());
+        assert!(replayed.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn teardown_fail_closed_execute_assignment_preserves_exact_workspace_until_verified() {
+        let (root, repository, managed) = teardown_fixture();
+        let workspaces =
+            WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+                .await
+                .expect("initialize workspace manager");
+        let task_id = Uuid::new_v4();
+        let workspace_run_id = Uuid::new_v4();
+        let expected_workspace = workspaces
+            .root()
+            .join("worktrees")
+            .join(task_id.simple().to_string())
+            .join(workspace_run_id.simple().to_string());
+        let expected_branch = format!(
+            "crony/task-{}/run-{}",
+            task_id.simple(),
+            workspace_run_id.simple()
+        );
+        let base_commit = workspaces.base_commit().to_owned();
+        let assignment = Assignment {
+            corp_id: Uuid::new_v4(),
+            connection_epoch: Uuid::new_v4(),
+            room_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            task_id,
+            run_id: Uuid::new_v4(),
+            workspace_run_id,
+            agent_id: Uuid::new_v4(),
+            assignment_token: Uuid::new_v4(),
+            adapter: "latched-teardown".to_owned(),
+            mission_title: "latched teardown failure".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+            resume_workspace_base_commit: None,
+            verification_policy: VerificationPolicy {
+                checks: Vec::new(),
+                manual_gate: None,
+            },
+            write_scope: Vec::new(),
+            deliverable: None,
+            secrets: Vec::new(),
+        };
+        let uncertain = Arc::new(Notify::new());
+        let verified = Arc::new(Notify::new());
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(LatchedTeardownAdapter {
+            uncertain: uncertain.clone(),
+            verified: verified.clone(),
+        });
+        let outbound = OutboundBus::default();
+        let (connection, mut received) = mpsc::unbounded_channel();
+        outbound.attach(connection, Uuid::new_v4());
+        let (_control_tx, controls) = mpsc::unbounded_channel();
+        let (_artifact_ack_tx, artifact_acks) = mpsc::unbounded_channel();
+        let task_assignment = assignment.clone();
+        let task_outbound = outbound.clone();
+        let execution = tokio::spawn(async move {
+            let result = execute_assignment(
+                Arc::new(workspaces),
+                "runner-test".to_owned(),
+                task_assignment.clone(),
+                adapter,
+                task_outbound.clone(),
+                AssignmentChannels {
+                    controls,
+                    artifact_acks,
+                },
+                None,
+            )
+            .await;
+            if let Err(error) = &result {
+                send_run_event(
+                    &task_outbound,
+                    "runner-test",
+                    &task_assignment,
+                    "run.failed",
+                    json!({"error": error.to_string()}),
+                );
+            }
+            result
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), uncertain.notified())
+            .await
+            .expect("teardown uncertainty was not observed");
+        let mut before_verification = Vec::new();
+        for _ in 0..3 {
+            before_verification.push(
+                tokio::time::timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .expect("runner event deadline")
+                    .expect("runner event channel closed"),
+            );
+        }
+        for message in &before_verification {
+            let RunnerToServer::RunEvent { event_type, .. } = message else {
+                panic!("expected run event");
+            };
+            assert!(!matches!(
+                event_type.as_str(),
+                "run.session_terminated" | "run.completed" | "run.failed" | "run.cancelled"
+            ));
+        }
+        assert!(!execution.is_finished());
+        let sentinel_before =
+            std::fs::read(expected_workspace.join("sentinel.txt")).expect("read sentinel");
+        assert!(!sentinel_before.is_empty());
+        assert_eq!(
+            git(&expected_workspace, &["rev-parse", "HEAD"]),
+            base_commit
+        );
+        assert_eq!(
+            git(&expected_workspace, &["branch", "--show-current"]),
+            expected_branch
+        );
+        assert!(git(&expected_workspace, &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            std::fs::canonicalize(&expected_workspace).expect("resolve managed worktree"),
+            std::fs::canonicalize(PathBuf::from(git(
+                &expected_workspace,
+                &["rev-parse", "--show-toplevel"],
+            )))
+            .expect("resolve reported worktree")
+        );
+
+        verified.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(10), execution)
+            .await
+            .expect("execute_assignment completion deadline")
+            .expect("join execute_assignment")
+            .expect_err("adapter runtime failure");
+        assert!(
+            error
+                .to_string()
+                .contains("verified teardown runtime failure")
+        );
+
+        let mut after_verification = Vec::new();
+        for _ in 0..3 {
+            after_verification.push(
+                tokio::time::timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .expect("terminal runner event deadline")
+                    .expect("runner event channel closed"),
+            );
+        }
+        let event_types = after_verification
+            .iter()
+            .map(|message| match message {
+                RunnerToServer::RunEvent { event_type, .. } => event_type.as_str(),
+                _ => panic!("expected run event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            [
+                "run.session_terminated",
+                "run.workspace_preserved",
+                "run.failed"
+            ]
+        );
+        let RunnerToServer::RunEvent { payload, .. } = &after_verification[0] else {
+            panic!("expected terminal run event");
+        };
+        assert_eq!(
+            payload.get("provider_process_alive"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            std::fs::read(expected_workspace.join("sentinel.txt")).expect("read sentinel"),
+            sentinel_before
+        );
+        assert_eq!(
+            git(&expected_workspace, &["rev-parse", "HEAD"]),
+            base_commit
+        );
+        assert_eq!(
+            git(&expected_workspace, &["branch", "--show-current"]),
+            expected_branch
+        );
+        assert!(git(&expected_workspace, &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            git(&repository, &["rev-parse", &expected_branch]),
+            base_commit
+        );
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                expected_workspace.to_str().expect("workspace path"),
+            ],
+        );
+        git(&repository, &["branch", "-D", &expected_branch]);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

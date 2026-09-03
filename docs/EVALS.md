@@ -57,8 +57,9 @@ persistent agent identity returns to `idle` with no `current_run_id`.
 inside `OwnedProcessTree`. It covers a stubborn descendant, an already-exited descendant,
 idempotent repeated termination, and an unrelated process that must remain alive. The external
 adapter tests drive both interrupt and stop through the same ownership boundary. Windows exercises
-the Job Object implementation; Unix exercises the process-group implementation. A release
-candidate must additionally rerun the real Claude parent/grandchild probe recorded in
+the Job Object implementation; Unix unit coverage verifies that external CLI capabilities fail
+closed rather than claiming process-group containment. A release candidate must additionally rerun
+the real Claude parent/grandchild probe recorded in
 `docs/evidence/2026-09-03-external-provider-process-tree.md`; unit success alone is insufficient.
 
 ## Quality gates

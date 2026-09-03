@@ -398,11 +398,15 @@ remain persisted for an explicit future resume, but they do not imply a resident
 
 External CLI adapters place the provider root inside an OS-owned process scope before provider code
 can launch tools. On Windows, the provider starts suspended, is assigned to a private Job Object
-with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and is resumed only after assignment succeeds. On Unix,
-the provider starts in a new session/process group. Interrupt, stop, breaker, protocol-failure, and
-drop paths converge on `OwnedProcessTree`, which terminates the owned scope, waits for the provider
-root, and verifies the scope is empty before the adapter returns. Failure to establish or verify
-ownership is a failed adapter boundary, not permission to emit a successful terminal claim.
+with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and is resumed only after assignment succeeds. If
+ownership setup fails after process creation, the still-suspended root remains owned until cleanup
+is positively verified. Interrupt, stop, breaker, protocol-failure, and drop paths converge on
+`OwnedProcessTree`, which terminates the owned scope, waits for the provider root, and verifies the
+scope is empty before the adapter returns. Unix external CLI adapters currently advertise
+unsupported and refuse to spawn because a session/process group is not a non-escapable descendant
+boundary. Availability probes use the same ownership boundary and allow only one outstanding
+probe-or-cleanup guardian per adapter. Failure to establish or verify ownership is not permission
+to emit a terminal claim.
 
 Provider runtimes implement one `AgentAdapter` contract:
 

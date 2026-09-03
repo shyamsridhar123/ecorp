@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 
@@ -11,6 +11,13 @@ function waitForever() {
   return new Promise(() => {
     setInterval(() => {}, 60_000)
   })
+}
+
+async function publishFixtureReady() {
+  const readyFileIndex = process.argv.indexOf('--fixture-ready-file')
+  if (readyFileIndex >= 0) {
+    await writeFile(process.argv[readyFileIndex + 1], 'ready\n')
+  }
 }
 
 const treeParentIndex = process.argv.indexOf('--fixture-tree-parent')
@@ -58,7 +65,32 @@ const provider =
         : 'external'
 
 if (process.argv.includes('--version')) {
+  if (process.argv.includes('--fixture-version-root-exit-with-child')) {
+    const pidFileIndex = process.argv.indexOf('--fixture-probe-pid-file')
+    const grandchild = spawn(
+      process.execPath,
+      [process.argv[1], '--fixture-tree-grandchild', '--stubborn'],
+      { stdio: 'ignore' },
+    )
+    await writeFile(
+      process.argv[pidFileIndex + 1],
+      JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }),
+    )
+    process.exit(0)
+  }
   if (process.argv.includes('--fixture-stall-version')) {
+    const pidFileIndex = process.argv.indexOf('--fixture-probe-pid-file')
+    if (pidFileIndex >= 0) {
+      const grandchild = spawn(
+        process.execPath,
+        [process.argv[1], '--fixture-tree-grandchild', '--stubborn'],
+        { stdio: 'ignore' },
+      )
+      await writeFile(
+        process.argv[pidFileIndex + 1],
+        JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }),
+      )
+    }
     await waitForever()
   }
   process.stdout.write(`${provider} fake 1.0.0\n`)
@@ -81,7 +113,7 @@ function output(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`)
 }
 
-function finish() {
+function finish(mission = '') {
   output({ text: `${provider} normalized provider output` })
   output({
     usage: {
@@ -90,13 +122,31 @@ function finish() {
       cost_microusd: 200,
     },
   })
-  output({ type: 'result', text: 'completed' })
+  const result = {
+    type: 'result',
+    subtype: mission.includes('[result:error-subtype]')
+      ? 'error_during_execution'
+      : 'success',
+    is_error: mission.includes('[result:error-flag]'),
+    text: 'completed',
+  }
+  if (mission.includes('[result:missing-is-error]')) {
+    delete result.is_error
+  }
+  output(result)
 }
 
-function startTreeFixture(mission) {
+async function startTreeFixture(mission) {
   if (!mission.includes('[process-tree')) {
     return
   }
+  const rootExitsWithInheritedPipe = mission.includes(
+    ':root-exit-inherited-pipe',
+  )
+  const rootExitsAfterResult = mission.includes(
+    ':root-exit-inherited-pipe-after-result',
+  )
+  const pidFile = path.join(process.cwd(), 'external-tree-pids.json')
   const flags = [
     ...(mission.includes(':stubborn') ? ['--stubborn'] : []),
     ...(mission.includes(':exited-descendant') ? ['--exit-soon'] : []),
@@ -106,18 +156,35 @@ function startTreeFixture(mission) {
     [
       process.argv[1],
       '--fixture-tree-parent',
-      path.join(process.cwd(), 'external-tree-pids.json'),
+      pidFile,
       ...flags,
     ],
-    mission.includes(':root-exit-inherited-pipe')
+    rootExitsWithInheritedPipe
       ? { stdio: ['ignore', 'inherit', 'inherit'] }
       : { stdio: 'ignore' },
   )
   assert.ok(parent.pid, 'fixture parent did not start')
+  if (rootExitsWithInheritedPipe) {
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      try {
+        const pids = JSON.parse(await readFile(pidFile, 'utf8'))
+        if (pids.parent === parent.pid && pids.grandchild) {
+          break
+        }
+      } catch {
+        // The child process has not published its PID evidence yet.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    if (!rootExitsAfterResult) {
+      process.exit(0)
+    }
+  }
 }
 
-async function finishClaude(input, inputInterface) {
-  finish()
+async function finishClaude(input, inputInterface, mission) {
+  finish(mission)
   const end = await input.next()
   assert.equal(end.done, true, 'Claude stream input remained open after result')
   inputInterface.close()
@@ -157,6 +224,7 @@ async function runClaude() {
   assert.equal(initializeFrame.request.hooks, null)
   assert.equal(typeof initializeFrame.request_id, 'string')
   if (process.argv.includes('--fixture-stall-initialize')) {
+    await publishFixtureReady()
     await waitForever()
   }
   output({
@@ -176,17 +244,24 @@ async function runClaude() {
   assert.equal(typeof missionFrame.message.content, 'string')
   const mission = missionFrame.message.content
   if (mission.includes('[stall:stdin]')) {
+    await publishFixtureReady()
+    inputInterface.close()
+    process.stdin.pause()
     await waitForever()
   }
 
   output({ type: 'system', subtype: 'init', session_id: sessionId })
-  startTreeFixture(mission)
+  await startTreeFixture(mission)
+  if (mission.includes(':root-exit-inherited-pipe-after-result')) {
+    finish(mission)
+    process.exit(0)
+  }
   if (mission.includes('[process-tree')) {
     await new Promise((resolve) => setTimeout(resolve, 10_000))
   }
 
   if (!mission.includes('[permission:')) {
-    await finishClaude(input, inputInterface)
+    await finishClaude(input, inputInterface, mission)
     return
   }
 
@@ -245,7 +320,7 @@ async function runClaude() {
   }
   if (mission.includes('[permission:cancelled]')) {
     output({ type: 'control_cancel_request', request_id: requestId })
-    await finishClaude(input, inputInterface)
+    await finishClaude(input, inputInterface, mission)
     return
   }
   const responseLine = await input.next()
@@ -268,7 +343,7 @@ async function runClaude() {
     assert.equal(typeof decision.message, 'string')
     assert.ok(decision.message.length <= 501)
   }
-  await finishClaude(input, inputInterface)
+  await finishClaude(input, inputInterface, mission)
 }
 
 try {

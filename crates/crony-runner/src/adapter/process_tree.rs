@@ -18,20 +18,36 @@ pub(crate) struct OwnedProcessTree {
     termination_sent: bool,
     #[cfg(test)]
     forced_verification_failures: usize,
+    #[cfg(test)]
+    forced_root_query_failures: usize,
+}
+
+pub(crate) enum OwnedProcessTreeSpawn {
+    Ready(OwnedProcessTree),
+    CleanupRequired {
+        tree: OwnedProcessTree,
+        error: io::Error,
+    },
 }
 
 impl OwnedProcessTree {
-    /// Spawns a process only after arranging an inheritable OS ownership boundary.
-    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+    /// Spawns a process and retains any suspended child whose ownership setup needs cleanup.
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<OwnedProcessTreeSpawn> {
         command.kill_on_drop(true);
-        let (child, owner) = platform::spawn_owned(command)?;
-        Ok(Self {
+        let (child, owner, setup_error) = platform::spawn_owned(command)?;
+        let tree = Self {
             child,
             owner,
             status: None,
             termination_sent: false,
             #[cfg(test)]
             forced_verification_failures: 0,
+            #[cfg(test)]
+            forced_root_query_failures: 0,
+        };
+        Ok(match setup_error {
+            Some(error) => OwnedProcessTreeSpawn::CleanupRequired { tree, error },
+            None => OwnedProcessTreeSpawn::Ready(tree),
         })
     }
 
@@ -40,6 +56,11 @@ impl OwnedProcessTree {
     }
 
     pub(crate) fn try_wait_root(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(test)]
+        if self.forced_root_query_failures > 0 {
+            self.forced_root_query_failures -= 1;
+            return Err(io::Error::other("injected provider-root query failure"));
+        }
         if self.status.is_none() {
             self.status = self.child.try_wait()?;
         }
@@ -51,13 +72,18 @@ impl OwnedProcessTree {
         self.forced_verification_failures = failures;
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_root_query_failures(&mut self, failures: usize) {
+        self.forced_root_query_failures = failures;
+    }
+
     /// Terminates and verifies the complete owned scope. Repeated calls are harmless.
     pub(crate) async fn terminate_and_wait(&mut self) -> io::Result<ExitStatus> {
         if !self.termination_sent {
             // Give a provider that already emitted its terminal frame a short opportunity
             // to preserve its real exit status before escalating the whole scope.
             tokio::time::sleep(GRACE_PERIOD).await;
-            platform::terminate(&self.owner)?;
+            platform::terminate(&self.owner, &mut self.child)?;
             // Never signal this numeric process-group identity again after waiting can
             // reap the root and permit its PID to be reused.
             self.termination_sent = true;
@@ -107,7 +133,7 @@ impl Drop for OwnedProcessTree {
         if !self.termination_sent {
             // Drop cannot truthfully wait from arbitrary async-runtime contexts. The
             // OS-owned scope is synchronously terminated here, and no success is emitted.
-            platform::terminate_on_drop(&self.owner);
+            platform::terminate_on_drop(&self.owner, &mut self.child);
         }
     }
 }
@@ -120,21 +146,23 @@ mod platform {
 
     pub(super) struct Owner;
 
-    pub(super) fn spawn_owned(_command: &mut Command) -> io::Result<(Child, Owner)> {
+    pub(super) fn spawn_owned(
+        _command: &mut Command,
+    ) -> io::Result<(Child, Owner, Option<io::Error>)> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "external CLI providers are disabled on Unix: setsid/setpgid descendants can escape process-group ownership",
         ))
     }
 
-    pub(super) fn terminate(_owner: &Owner) -> io::Result<()> {
+    pub(super) fn terminate(_owner: &Owner, _child: &mut Child) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Unix external-provider ownership is unavailable",
         ))
     }
 
-    pub(super) fn terminate_on_drop(_owner: &Owner) {}
+    pub(super) fn terminate_on_drop(_owner: &Owner, _child: &mut Child) {}
 
     pub(super) async fn verify_empty(
         _owner: &Owner,
@@ -177,6 +205,7 @@ mod platform {
 
     pub(super) struct Owner {
         job: isize,
+        root_assigned: bool,
     }
 
     impl Owner {
@@ -193,31 +222,48 @@ mod platform {
         }
     }
 
-    pub(super) fn spawn_owned(command: &mut Command) -> io::Result<(Child, Owner)> {
-        let owner = create_kill_on_close_job()?;
+    pub(super) fn spawn_owned(
+        command: &mut Command,
+    ) -> io::Result<(Child, Owner, Option<io::Error>)> {
+        let mut owner = create_kill_on_close_job()?;
         command.as_std_mut().creation_flags(CREATE_SUSPENDED);
-        let mut child = command.spawn()?;
-        let process = child
-            .raw_handle()
-            .ok_or_else(|| io::Error::other("suspended provider has no process handle"))?
-            as HANDLE;
+        let child = command.spawn()?;
+        let Some(process) = child.raw_handle().map(|handle| handle as HANDLE) else {
+            return Ok((
+                child,
+                owner,
+                Some(io::Error::other("suspended provider has no process handle")),
+            ));
+        };
 
         if unsafe { AssignProcessToJobObject(owner.handle(), process) } == 0 {
             let error = io::Error::last_os_error();
-            fail_suspended_spawn(&mut child, &owner);
-            return Err(io::Error::new(
-                error.kind(),
-                format!("assign suspended provider to Job Object: {error}"),
+            return Ok((
+                child,
+                owner,
+                Some(io::Error::new(
+                    error.kind(),
+                    format!("assign suspended provider to Job Object: {error}"),
+                )),
             ));
         }
+        owner.root_assigned = true;
         if let Err(error) = resume_primary_thread(child.id()) {
-            fail_suspended_spawn(&mut child, &owner);
-            return Err(error);
+            return Ok((child, owner, Some(error)));
         }
-        Ok((child, owner))
+        Ok((child, owner, None))
     }
 
-    pub(super) fn terminate(owner: &Owner) -> io::Result<()> {
+    pub(super) fn terminate(owner: &Owner, child: &mut Child) -> io::Result<()> {
+        if !owner.root_assigned {
+            return match child.start_kill() {
+                Ok(()) => Ok(()),
+                Err(error) => match child.try_wait()? {
+                    Some(_) => Ok(()),
+                    None => Err(error),
+                },
+            };
+        }
         if unsafe { TerminateJobObject(owner.handle(), 1) } == 0 {
             let error = io::Error::last_os_error();
             if active_processes(owner)? != 0 {
@@ -227,9 +273,13 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn terminate_on_drop(owner: &Owner) {
-        unsafe {
-            TerminateJobObject(owner.handle(), 1);
+    pub(super) fn terminate_on_drop(owner: &Owner, child: &mut Child) {
+        if owner.root_assigned {
+            unsafe {
+                TerminateJobObject(owner.handle(), 1);
+            }
+        } else {
+            let _ = child.start_kill();
         }
     }
 
@@ -238,6 +288,9 @@ mod platform {
         passes: usize,
         interval: Duration,
     ) -> io::Result<()> {
+        if !owner.root_assigned {
+            return Ok(());
+        }
         for _ in 0..passes {
             if active_processes(owner)? != 0 {
                 return Err(io::Error::other(
@@ -254,7 +307,10 @@ mod platform {
         if job.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let owner = Owner { job: job as isize };
+        let owner = Owner {
+            job: job as isize,
+            root_assigned: false,
+        };
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let result = unsafe {
@@ -326,13 +382,6 @@ mod platform {
             Ok(accounting.ActiveProcesses)
         }
     }
-
-    fn fail_suspended_spawn(child: &mut Child, owner: &Owner) {
-        unsafe {
-            TerminateJobObject(owner.handle(), 1);
-        }
-        let _ = child.start_kill();
-    }
 }
 
 #[cfg(all(test, windows))]
@@ -371,7 +420,7 @@ mod tests {
     use serde::Deserialize;
     use tokio::process::{Child, Command};
 
-    use super::{OwnedProcessTree, process_is_alive};
+    use super::{OwnedProcessTree, OwnedProcessTreeSpawn, process_is_alive};
 
     #[derive(Debug, Deserialize)]
     struct FixturePids {
@@ -394,6 +443,15 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    fn spawn_ready(command: &mut Command) -> OwnedProcessTree {
+        match OwnedProcessTree::spawn(command).expect("spawn owned fixture") {
+            OwnedProcessTreeSpawn::Ready(tree) => tree,
+            OwnedProcessTreeSpawn::CleanupRequired { error, .. } => {
+                panic!("fixture ownership setup failed: {error}")
+            }
+        }
     }
 
     async fn wait_for_fixture_pids(pid_file: &Path) -> FixturePids {
@@ -445,8 +503,7 @@ mod tests {
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&test_dir).expect("create fixture directory");
         let pid_file = test_dir.join("tree-pids.json");
-        let mut tree = OwnedProcessTree::spawn(&mut fixture_command(&pid_file, &["--stubborn"]))
-            .expect("spawn owned fixture");
+        let mut tree = spawn_ready(&mut fixture_command(&pid_file, &["--stubborn"]));
         let pids = wait_for_fixture_pids(&pid_file).await;
         let unrelated = spawn_unrelated().await;
         let unrelated_pid = unrelated.id().expect("unrelated fixture PID");
@@ -483,8 +540,7 @@ mod tests {
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&test_dir).expect("create fixture directory");
         let pid_file = test_dir.join("tree-pids.json");
-        let mut tree = OwnedProcessTree::spawn(&mut fixture_command(&pid_file, &["--exit-soon"]))
-            .expect("spawn owned fixture");
+        let mut tree = spawn_ready(&mut fixture_command(&pid_file, &["--exit-soon"]));
         let pids = wait_for_fixture_pids(&pid_file).await;
 
         wait_until_dead(pids.grandchild).await;
@@ -497,7 +553,9 @@ mod tests {
             .expect("repeat termination after descendant exit");
 
         wait_until_dead(pids.parent).await;
-        assert!(!process_is_alive(pids.grandchild));
+        // The earlier wait already proves this exact child exited. Do not reopen the
+        // numeric PID after unrelated concurrent tests may have caused Windows to
+        // reuse it for a different process.
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
@@ -508,8 +566,7 @@ mod tests {
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&test_dir).expect("create fixture directory");
         let pid_file = test_dir.join("tree-pids.json");
-        let mut tree = OwnedProcessTree::spawn(&mut fixture_command(&pid_file, &[]))
-            .expect("spawn owned fixture");
+        let mut tree = spawn_ready(&mut fixture_command(&pid_file, &[]));
         let pids = wait_for_fixture_pids(&pid_file).await;
         tree.force_verification_failures(1);
 
@@ -521,6 +578,30 @@ mod tests {
         tree.terminate_and_wait()
             .await
             .expect("retry verifies the same owned scope");
+
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn root_query_failure_keeps_the_owned_scope_for_verified_cleanup() {
+        let test_dir = std::env::temp_dir()
+            .join("crony-process-tree-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&test_dir).expect("create fixture directory");
+        let pid_file = test_dir.join("tree-pids.json");
+        let mut tree = spawn_ready(&mut fixture_command(&pid_file, &["--stubborn"]));
+        let pids = wait_for_fixture_pids(&pid_file).await;
+        tree.force_root_query_failures(1);
+
+        let error = tree
+            .try_wait_root()
+            .expect_err("injected root query must fail closed");
+        assert!(error.to_string().contains("injected"));
+        tree.terminate_and_wait()
+            .await
+            .expect("query failure must retain the same owned scope");
 
         wait_until_dead(pids.parent).await;
         wait_until_dead(pids.grandchild).await;

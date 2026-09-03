@@ -124,12 +124,16 @@ write fails the provider run.
 
 External CLI provider roots are owned as complete process scopes rather than supervised as single
 PIDs. Windows uses a private kill-on-close Job Object assigned while the provider is still
-suspended; Unix uses a new session/process group. Every terminal path invokes the same bounded
-terminate-and-verify operation. The adapter does not return until the provider root is reaped and
-the owned scope reports no active descendants. This prevents provider tools, plugin processes, or
-grandchildren from surviving an interrupt while ECorp reports `provider_process_alive=false`.
-Ownership is established before provider code runs, avoiding PID-enumeration races and unrelated
-process termination. This is host-process containment, not a network or filesystem sandbox.
+suspended. If assignment or resume setup fails, the suspended child remains under cleanup
+supervision until its death is verified. Every terminal path invokes the same bounded
+terminate-and-verify attempt and retries without dropping ownership when verification is uncertain.
+The adapter does not return until the provider root is reaped and the owned scope reports no active
+descendants. This prevents provider tools, plugin processes, or grandchildren from surviving an
+interrupt while ECorp reports `provider_process_alive=false`. Unix external CLI adapters are
+disabled because `setsid` or `setpgid` alone cannot prevent descendants from escaping the owned
+scope. Timed-out availability probes retain one shared cleanup guardian per adapter and reject
+duplicate probes until that guardian finishes, preventing unbounded detached cleanup tasks. This is
+host-process containment, not a network or filesystem sandbox.
 
 Mission descriptions, task contracts, and verifier policies are authority-bearing records.
 Creation validates their bounds before persistence, and every revision stores both prior and

@@ -18,17 +18,20 @@ The source checkout remained clean. The reproduction is recorded on #51, #117, a
 
 - **Windows:** create a private Job Object, enable
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, start the provider with `CREATE_SUSPENDED`, assign its process
-  handle to the Job Object, and resume the primary thread only after assignment succeeds.
-- **Unix:** start the provider in a new session with `setsid`, making its process group the owned
-  termination scope.
+  handle to the Job Object, and resume the primary thread only after assignment succeeds. A setup
+  failure after process creation retains the suspended root until cleanup is verified.
+- **Unix:** advertise external CLI adapters as unsupported and refuse to spawn. A session/process
+  group alone cannot prove that descendants did not escape.
 - **All terminal paths:** interrupt, stop, circuit breaker, malformed or oversized protocol input,
   failed control-response delivery, initialization failure, and adapter drop converge on the same
   owned-scope termination path.
-- **Verification:** terminate the scope, reap the provider root, and repeatedly verify that the Job
-  Object or process group is empty before returning from the adapter.
+- **Verification:** terminate the scope, reap the provider root, and repeatedly verify that the
+  Windows Job Object is empty before returning from the adapter.
 
 If spawn ownership, termination, or empty-scope verification fails, the adapter fails closed. It
 does not treat killing the provider root PID as proof that grandchildren are gone.
+Availability timeout returns do not abandon the Job Object: one shared cleanup guardian remains
+active, and duplicate probes are rejected until its empty-scope verification finishes.
 
 ## Deterministic evidence
 
@@ -41,12 +44,14 @@ cargo test -p crony-runner adapter::external::tests -- --nocapture
 cargo clippy -p crony-runner --all-targets -- -D warnings
 ```
 
-The focused process-tree filter runs four tests:
+The focused process-tree filter covers:
 
 1. a stubborn parent and grandchild are removed;
 2. repeated termination is idempotent;
 3. an unrelated process remains alive;
-4. a tree whose grandchild already exited still terminates cleanly.
+4. a tree whose grandchild already exited still terminates cleanly; and
+5. an injected verification failure retains ownership for a successful retry; and
+6. an injected root-query failure retains ownership for verified cleanup.
 
 The external-adapter filter includes real child-process fixtures for both interrupt and stop, in
 addition to the Claude stream-JSON permission suite.
