@@ -581,6 +581,10 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
+The selected deliverable run is always checked against current budget and breaker authority. A
+`stop` stage anywhere in the mission remains terminal. A historical `suspend` is accepted only when
+it is an explicit resumed ancestor of the selected verified run; unrelated suspends and missing,
+duplicate, or cyclic resume lineage fail closed.
 For the Project effect, the publisher reads the exact Project and Status identities, renews
 authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
 state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a
