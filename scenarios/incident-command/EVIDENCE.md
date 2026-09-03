@@ -30,8 +30,15 @@ Date: 2026-09-03
   including the tail, as `ENTRY_NOT_OBJECT`; malformed tails return a null
   `headHash`. Detail, audit, preview, download, and Markdown generation return
   stable `INVALID` evidence instead of dereferencing malformed entries.
+- The persisted incident version anchors the expected audit-entry count.
+  Removing the latest entry or the complete timeline now yields
+  `ENTRY_COUNT_MISMATCH`; an empty timeline also yields `TIMELINE_EMPTY`.
+- Startup validates every persisted incident, timeline entry, postmortem,
+  idempotency record, cached response, timestamp, and tenant/key binding before
+  reporting persistence as ready. Malformed records and truncated audit chains
+  fail startup instead of causing later 500 responses.
 - The optional Playwright harness is `e2e/browser.mjs`, outside Node's `test/`
-  discovery directory. Bare discovery runs only the 14 dependency-free
+  discovery directory. Bare discovery runs only the 16 dependency-free
   built-in server tests, while
   `npm run test:browser` explicitly executes the desktop/mobile workflow.
 - All prior fixes from the verified reference remain present, including
@@ -42,19 +49,49 @@ Date: 2026-09-03
 
 ```text
 npm --prefix scenarios/incident-command test
-14 tests, 14 passed, 0 failed
+16 tests, 16 passed, 0 failed
 ```
 
 ```text
 cd scenarios/incident-command
 node --test
-14 tests, 14 passed, 0 failed
+16 tests, 16 passed, 0 failed
 ```
 
 Both commands pass without `ECORP_PLAYWRIGHT_MODULE`; `npm test` reports only
-the 14 built-in server tests. Final execution of `npm run test:browser`, the
-unchanged 16-check verifier, full-suite verification, and regenerated browser
-evidence remain pending ECorp's authoritative verification.
+the 16 built-in server tests.
+
+```text
+$env:ECORP_PLAYWRIGHT_MODULE = '<bundled Playwright module>'
+npm --prefix scenarios/incident-command run test:browser
+Browser workflow passed
+```
+
+The regenerated browser result reports every workflow, SSE, tenant,
+concurrency, stale-response, audit, persistence, desktop, and mobile flag as
+`true`, with no unexpected console or page errors and no horizontal overflow
+at `1280x900` or `390x844`.
+
+```text
+pnpm check
+30 immutable migrations
+Rust formatting passed
+Clippy passed with warnings denied
+99 Rust tests passed
+Production web build passed
+Web lint passed
+```
+
+Evidence SHA-256:
+
+- `browser.png`:
+  `8ad4e147a2200c50e98a1d6fe0f750cb23dab8fddd1606981505e40ad6becca2`
+- `browser-mobile.png`:
+  `92a38945beb5c5eb500b409708fb2075e58e1bef0a0e85ef9641ace0f7282e19`
+- `browser-result.json`:
+  `1cda056a7d623531bedb080ae2c3b63f8fc34b3d1a7dd98fa8da5b743da62ce3`
+
+Port `9312` was free after both server and browser verification.
 
 ## Governance boundary
 

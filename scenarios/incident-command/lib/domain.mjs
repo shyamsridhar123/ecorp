@@ -584,7 +584,12 @@ export function timelineEntryHash(entry) {
   );
 }
 
-export function verifyTimeline(timeline, incidentId, tenantId) {
+export function verifyTimeline(
+  timeline,
+  incidentId,
+  tenantId,
+  expectedEntries = undefined,
+) {
   const issues = [];
   let expectedPreviousHash = GENESIS_HASH;
 
@@ -595,6 +600,26 @@ export function verifyTimeline(timeline, incidentId, tenantId) {
       headHash: null,
       issues: [{ sequence: null, code: 'TIMELINE_NOT_ARRAY' }],
     };
+  }
+
+  if (timeline.length === 0) {
+    issues.push({ sequence: null, code: 'TIMELINE_EMPTY' });
+  }
+  if (expectedEntries !== undefined) {
+    if (!Number.isInteger(expectedEntries) || expectedEntries < 1) {
+      issues.push({
+        sequence: null,
+        code: 'EXPECTED_ENTRY_COUNT_INVALID',
+        expectedEntries,
+      });
+    } else if (timeline.length !== expectedEntries) {
+      issues.push({
+        sequence: null,
+        code: 'ENTRY_COUNT_MISMATCH',
+        expectedEntries,
+        actualEntries: timeline.length,
+      });
+    }
   }
 
   for (let index = 0; index < timeline.length; index += 1) {
@@ -707,7 +732,12 @@ function deriveMilestone(deadline, metAt, nowMs) {
 export function presentIncident(incident, now) {
   const copy = structuredClone(incident);
   copy.slo = deriveSlo(copy, now);
-  copy.auditChain = verifyTimeline(copy.timeline, copy.id, copy.tenantId);
+  copy.auditChain = verifyTimeline(
+    copy.timeline,
+    copy.id,
+    copy.tenantId,
+    copy.version,
+  );
   return copy;
 }
 
@@ -720,6 +750,7 @@ export function buildPostmortemMarkdown(incident) {
     incident.timeline,
     incident.id,
     incident.tenantId,
+    incident.version,
   );
   const responseOutcome = completedMilestoneSummary(
     incident.targetResponseAt,

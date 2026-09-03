@@ -484,6 +484,7 @@ async function routeApi({ request, url, auth, store, broker }) {
         incident.timeline,
         incident.id,
         incident.tenantId,
+        incident.version,
       );
       if (url.searchParams.get('download') === '1') {
         return {
@@ -555,6 +556,7 @@ async function routeApi({ request, url, auth, store, broker }) {
           incident.timeline,
           incident.id,
           incident.tenantId,
+          incident.version,
         ),
       },
     };

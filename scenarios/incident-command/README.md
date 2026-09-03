@@ -172,7 +172,9 @@ renamed, and only then made visible in memory. Runtime data is ignored by Git.
 Every incident starts with a creation event. Each later change appends a
 timeline entry containing the prior hash and a SHA-256 hash over canonical event
 data. Reads expose `auditChain.valid`, entry count, head hash, and verification
-issues.
+issues. The incident's separately persisted integer version anchors the
+expected timeline length, so deleting the tail or the entire history is
+detected even when the remaining entries still form a valid hash prefix.
 
 Postmortems are generated directly from the scoped in-memory incident record;
 the API accepts no filesystem path and has no arbitrary-file read endpoint.
@@ -195,6 +197,9 @@ exports are byte-for-byte deterministic.
 - Browser responses include CSP, frame denial, no-referrer, and MIME-sniffing
   protections.
 - Corrupt persistence fails startup rather than silently discarding state.
+  Startup validates every incident, timeline entry, audit-chain anchor,
+  idempotency record, cached response, and tenant/key binding before reporting
+  persistence as ready.
 - SSE writes are tenant-filtered and disconnect/error cleanup is idempotent.
 
 The header identity model is intentionally a local simulation. In production,
@@ -210,14 +215,15 @@ npm test
 The dependency-free default runs only the built-in Incident Command server suite.
 It covers tenant isolation, RBAC, invalid transitions, durable
 idempotency replay/conflict, optimistic concurrency, deadline and breach
-calculations, timeline tamper detection, deterministic postmortem content, SSE
-tenant filtering/disconnects, restart persistence, launch health, and
-path-traversal resistance.
+calculations, timeline tamper and suffix-deletion detection, persisted-record
+validation, deterministic postmortem content, SSE tenant
+filtering/disconnects, restart persistence, launch health, and path-traversal
+resistance.
 
 The complete desktop/mobile browser workflow is an explicit separate command and
-requires ECorp's bundled Playwright module. Its
-The `e2e/browser.mjs` entry point lives outside Node's `test/` discovery
-directory, so bare `node --test` discovers only the 14 built-in server tests:
+requires ECorp's bundled Playwright module. The `e2e/browser.mjs` entry point
+lives outside Node's `test/` discovery directory, so bare `node --test`
+discovers only the built-in server tests:
 
 ```powershell
 $env:ECORP_PLAYWRIGHT_MODULE = '<absolute path to Playwright module>'

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -459,6 +459,103 @@ test('a null timeline tail is invalid across detail, audit, and postmortem views
   });
 });
 
+test('timeline verification rejects truncated suffixes and empty history in every view', async () => {
+  await withServer({}, async (harness) => {
+    const created = await createIncident(harness, reporter);
+    const incident = created.body.incident;
+    const updated = await api(
+      harness,
+      `/api/incidents/${incident.id}/timeline`,
+      {
+        auth: responder,
+        method: 'POST',
+        body: { message: 'Established the version-anchored audit length.' },
+      },
+    );
+    const storedIncident =
+      harness.app.store.state.tenants[incident.tenantId].incidents[incident.id];
+    assert.equal(updated.body.incident.version, 2);
+    assert.equal(storedIncident.timeline.length, 2);
+
+    storedIncident.timeline.pop();
+    const truncated = verifyTimeline(
+      storedIncident.timeline,
+      incident.id,
+      incident.tenantId,
+      storedIncident.version,
+    );
+    assert.equal(truncated.valid, false);
+    assert.ok(
+      truncated.issues.some(
+        (issue) =>
+          issue.code === 'ENTRY_COUNT_MISMATCH' &&
+          issue.expectedEntries === 2 &&
+          issue.actualEntries === 1,
+      ),
+    );
+
+    for (const route of [
+      `/api/incidents/${incident.id}`,
+      `/api/incidents/${incident.id}/audit`,
+      `/api/incidents/${incident.id}/postmortem`,
+    ]) {
+      const response = await api(harness, route, { auth: auditor });
+      const auditChain =
+        response.body.incident?.auditChain ?? response.body.auditChain;
+      assert.equal(response.status, 200);
+      assert.equal(auditChain.valid, false);
+      assert.ok(
+        auditChain.issues.some(
+          (issue) => issue.code === 'ENTRY_COUNT_MISMATCH',
+        ),
+      );
+    }
+    const truncatedDownload = await api(
+      harness,
+      `/api/incidents/${incident.id}/postmortem?download=1`,
+      { auth: auditor },
+    );
+    assert.equal(
+      truncatedDownload.headers.get('x-audit-chain-valid'),
+      'false',
+    );
+    assert.match(truncatedDownload.body, /n\/a:ENTRY_COUNT_MISMATCH/);
+
+    storedIncident.timeline = [];
+    const empty = verifyTimeline(
+      storedIncident.timeline,
+      incident.id,
+      incident.tenantId,
+      storedIncident.version,
+    );
+    assert.equal(empty.valid, false);
+    assert.equal(empty.headHash, null);
+    assert.ok(empty.issues.some((issue) => issue.code === 'TIMELINE_EMPTY'));
+    assert.ok(
+      empty.issues.some((issue) => issue.code === 'ENTRY_COUNT_MISMATCH'),
+    );
+
+    const emptyDetail = await api(
+      harness,
+      `/api/incidents/${incident.id}`,
+      { auth: auditor },
+    );
+    assert.equal(emptyDetail.body.incident.auditChain.valid, false);
+    assert.ok(
+      emptyDetail.body.incident.auditChain.issues.some(
+        (issue) => issue.code === 'TIMELINE_EMPTY',
+      ),
+    );
+    const emptyPreview = await api(
+      harness,
+      `/api/incidents/${incident.id}/postmortem`,
+      { auth: auditor },
+    );
+    assert.equal(emptyPreview.body.auditChain.valid, false);
+    assert.match(emptyPreview.body.markdown, /n\/a:TIMELINE_EMPTY/);
+  });
+});
+
 test('postmortem Markdown is deterministic and contains required evidence sections', async () => {
   const manual = manualClock('2026-09-01T02:00:00.000Z');
   await withServer({ clock: manual.clock }, async (harness) => {
@@ -620,6 +717,85 @@ test('durable state and idempotency survive a process restart', async () => {
     assert.deepEqual(replay.body, created.body);
   } finally {
     await second.app.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('startup rejects malformed incidents, idempotency records, and truncated audit history', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'incident-command-'));
+  const statePath = path.join(dataDir, 'state.json');
+  const key = 'corrupt-state-seed';
+  const first = await startHarness({ dataDir });
+  let incidentId;
+  try {
+    const created = await api(first, '/api/incidents', {
+      auth: reporter,
+      method: 'POST',
+      key,
+      body: incidentPayload({ title: 'Persistence validation seed' }),
+    });
+    incidentId = created.body.incident.id;
+  } finally {
+    await first.app.close();
+  }
+
+  try {
+    const baseline = JSON.parse(await readFile(statePath, 'utf8'));
+    const cases = [
+      {
+        name: 'null incident',
+        mutate(state) {
+          state.tenants[reporter.tenantId].incidents[incidentId] = null;
+        },
+        pattern: /Persisted incident .* is invalid/,
+      },
+      {
+        name: 'missing timeline',
+        mutate(state) {
+          delete state.tenants[reporter.tenantId].incidents[incidentId]
+            .timeline;
+        },
+        pattern: /has invalid timeline/,
+      },
+      {
+        name: 'truncated timeline',
+        mutate(state) {
+          state.tenants[reporter.tenantId].incidents[
+            incidentId
+          ].timeline.pop();
+        },
+        pattern: /invalid audit chain: TIMELINE_EMPTY, ENTRY_COUNT_MISMATCH/,
+      },
+      {
+        name: 'null idempotency record',
+        mutate(state) {
+          state.tenants[reporter.tenantId].idempotency[key] = null;
+        },
+        pattern: /Persisted idempotency record .* is invalid/,
+      },
+      {
+        name: 'malformed idempotency response',
+        mutate(state) {
+          state.tenants[reporter.tenantId].idempotency[key].response = null;
+        },
+        pattern: /Persisted idempotency response .* is invalid/,
+      },
+    ];
+
+    for (const fixture of cases) {
+      const state = structuredClone(baseline);
+      fixture.mutate(state);
+      await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+      await assert.rejects(
+        createIncidentCommandServer({
+          dataDir,
+          logger: { error() {} },
+        }),
+        fixture.pattern,
+        fixture.name,
+      );
+    }
+  } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
