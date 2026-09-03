@@ -1,7 +1,7 @@
 # Mission budget ceiling recovery
 
-**Date:** September 3, 2026  
-**Issue:** GitHub #80  
+**Date:** September 3, 2026
+**Issue:** GitHub #80
 **Source base:** `7b2e601b5881c0f9403df64a56e0817e4a999634`
 
 ## Schema alignment
@@ -14,7 +14,7 @@ Forward-only migration `0030_mission_budget_ceiling.sql` replaces
 No historical migration was changed. The SHA-384 recorded for migration 0030 is:
 
 ```text
-36994a8052952a036df2ae49baac5f41094015e3deb498fef8a7e356adc193ac8812bbbb5e88d2a4690354e8e12f276d
+2e487067ebf406d0cdc946e36a526c27ae758327ad6a963dde9df87bc23be91986c95d86ca71b1bd40bbcc20b3e5505e
 ```
 
 The distinct admission boundaries remain:
@@ -82,3 +82,24 @@ migration changes no mission, task, run, provider-session, or worktree data, so
 the pending 2,750,000-token owner decision can be retried without replacing the
 preserved provider session or workspace lineage. Approval and the subsequent
 resume must be captured as post-merge operational evidence against #74.
+
+## Independent review recovery note
+
+Independent review found that the two metadata lines above contained trailing
+spaces. The original `git diff --check` verifier did not inspect this new,
+previously untracked file; GitHub issue #81 tracks that verifier gap.
+
+The review also found that the original manifest hash was calculated from CRLF
+working-tree bytes. The runner's post-verification Git commit normalized the
+migration to canonical LF bytes, changing its SHA-384 after the pre-commit
+verifier had passed. The manifest and hash above now use the exact committed LF
+blob bytes. GitHub issue #82 tracks the systemic verifier-to-commit byte
+identity fix.
+
+ECorp persisted contract revision 2 and resumed the same Copilot session and
+worktree to correct the evidence. A local host-process interruption stopped the
+server and runner before that correction could reach verification, and
+reconciliation marked the latest run lost. Commit `121a9d9` remains the
+runner-created implementation. This recovery branch changes only the manifest
+checksum and this evidence document; the migration SQL and Rust regression
+bytes remain exactly as verified by ECorp.
