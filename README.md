@@ -202,16 +202,24 @@ After the factory item reaches `verified`, an owner, admin, or manager can publi
 commit/branch deliverable through the trusted GitHub CLI boundary:
 
 ```powershell
+$PublisherId = "crony-cli:$env:COMPUTERNAME"
+$PublisherCredentialPath = Join-Path $env:USERPROFILE '.ecorp-publisher\publisher.credential'
+$WorkItemId = '<factory-work-item-id>'
+
 cargo run -p crony-cli -- factory-publish `
   00000000-0000-4000-8000-000000000001 `
   00000000-0000-4000-8000-000000000011 `
-  <factory-work-item-id> `
+  $WorkItemId `
+  --publisher-id $PublisherId `
+  --publisher-credential-file $PublisherCredentialPath `
   --authorization-reason "Publish the verified result for review."
 ```
 
 Duplicate calls, process restart, and partial remote success recover the same branch and pull
 request. Project status enters review only after the pull request exists. Publication never enables
-auto-merge and does not merge or deploy.
+auto-merge and does not merge or deploy. Create a short-lived credential before publication, then
+revoke it and delete its plaintext file immediately afterward; see the
+[dark-factory contributor guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md).
 
 ## What to try first
 
@@ -253,6 +261,8 @@ The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environme
 
 ## Go deeper
 
+- [Contributing](CONTRIBUTING.md)
+- [Dark-factory contributor guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md)
 - [User and developer journey](docs/USER_AND_DEVELOPER_JOURNEY.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security](docs/SECURITY.md)
