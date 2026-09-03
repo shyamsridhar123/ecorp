@@ -1,0 +1,41 @@
+{
+  "status": "passed",
+  "health": {
+    "status": "ok",
+    "service": "vendor-guard"
+  },
+  "mobileHealth": {
+    "status": "ok",
+    "service": "vendor-guard"
+  },
+  "workflow": {
+    "tenantIsolation": true,
+    "requesterCreateSubmit": true,
+    "makerCheckerDenied": true,
+    "independentReview": true,
+    "staleVersionConflict": true,
+    "idempotentReplay": true,
+    "idempotencyConflict": true,
+    "riskExplanation": true,
+    "auditVerified": true
+  },
+  "consoleErrors": [],
+  "pageErrors": [],
+  "viewport": {
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1280,
+    "horizontalOverflow": false
+  },
+  "mobileViewport": {
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "horizontalOverflow": false
+  },
+  "expectedNetworkErrors": [
+    "Failed to load resource: the server responded with a status of 409 (Conflict)",
+    "Failed to load resource: the server responded with a status of 409 (Conflict)",
+    "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+  ]
+}
