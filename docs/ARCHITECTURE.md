@@ -583,8 +583,9 @@ recovery, and every renewal also require the acting publisher to remain a curren
 mission room.
 The selected deliverable run is always checked against current budget and breaker authority. A
 `stop` stage anywhere in the mission remains terminal. A historical `suspend` is accepted only when
-it is an explicit resumed ancestor of the selected verified run; unrelated suspends and missing,
-duplicate, or cyclic resume lineage fail closed.
+it is an explicit resumed ancestor of the selected verified run and its current no-progress and
+repeated-tool counters remain below the current policy limits. Unrelated suspends, stop-level loop
+metrics, and missing, duplicate, or cyclic resume lineage fail closed.
 For the Project effect, the publisher reads the exact Project and Status identities, renews
 authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
 state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a

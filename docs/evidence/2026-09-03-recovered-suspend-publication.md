@@ -42,6 +42,8 @@ mission's locked run rows.
 - `stop` remains terminal in every position.
 - A historical `suspend` bypasses the repeated historical-run check only when it is an actual
   ancestor of the selected run.
+- Recovered suspend ancestors still recheck current no-progress and repeated-tool counters and fail
+  when either reaches the current policy limit.
 - An unrelated suspended run still fails.
 - A selected suspended run still fails through the selected-run check.
 - Missing, duplicate, or cyclic lineage fails closed.
@@ -61,6 +63,7 @@ All 19 `crony-store` tests passed. New focused coverage proves:
 - recovered suspend ancestors are recognized;
 - unrelated suspends are not recognized as recovered;
 - stop ancestors are never treated as recovered;
+- recovered ancestors with current stop-level loop metrics are rejected;
 - the selected run cannot bypass its own hard-breaker check;
 - missing and cyclic resume lineage fail closed.
 

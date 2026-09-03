@@ -1844,9 +1844,13 @@ async fn validate_publication_prerequisites(
     .await?;
     let run_rows = sqlx::query(
         r#"
-        SELECT run.id, run.resumed_from_run_id, run.breaker_stage
+        SELECT run.id, run.resumed_from_run_id, run.breaker_stage,
+               run.no_progress_events, run.repeated_tool_count,
+               COALESCE(policy.no_progress_event_limit, 8) AS no_progress_limit,
+               COALESCE(policy.repeated_tool_limit, 5) AS repeated_tool_limit
         FROM runs run
         JOIN tasks task ON task.id = run.task_id
+        LEFT JOIN corp_budget_policies policy ON policy.corp_id = run.corp_id
         WHERE run.corp_id = $1 AND task.mission_id = $2
         ORDER BY run.created_at, run.id
         FOR UPDATE OF run
@@ -1870,14 +1874,22 @@ async fn validate_publication_prerequisites(
     for run in run_rows {
         let run_id: Uuid = run.get("id");
         let breaker_stage: String = run.get("breaker_stage");
-        if run_id == selected_run_id
-            || historical_suspend_is_recovered(
-                run_id,
-                selected_run_id,
-                &breaker_stage,
-                &selected_lineage,
-            )
-        {
+        if run_id == selected_run_id {
+            run_ids.push(run_id);
+            continue;
+        }
+        if historical_suspend_is_recovered(
+            run_id,
+            selected_run_id,
+            &breaker_stage,
+            &selected_lineage,
+        ) {
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
             run_ids.push(run_id);
             continue;
         }
@@ -2257,6 +2269,22 @@ fn historical_suspend_is_recovered(
     selected_lineage: &HashSet<Uuid>,
 ) -> bool {
     run_id != selected_run_id && breaker_stage == "suspend" && selected_lineage.contains(&run_id)
+}
+
+fn ensure_recovered_suspend_loop_metrics_allow_publication(
+    no_progress_events: i32,
+    repeated_tool_count: i32,
+    no_progress_limit: i32,
+    repeated_tool_limit: i32,
+) -> Result<()> {
+    if (no_progress_limit > 0 && no_progress_events >= no_progress_limit)
+        || (repeated_tool_limit > 0 && repeated_tool_count >= repeated_tool_limit)
+    {
+        return Err(anyhow!(
+            "pull-request publication is blocked because current loop metrics require a hard breaker"
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_publication_attempt_tx(
@@ -2715,6 +2743,9 @@ mod tests {
         assert!(!historical_suspend_is_recovered(
             selected, selected, "suspend", &lineage
         ));
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(7, 4, 8, 5).is_ok());
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(8, 4, 8, 5).is_err());
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(7, 5, 8, 5).is_err());
     }
 
     #[test]

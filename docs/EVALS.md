@@ -340,8 +340,9 @@ publication regression. The original provider run crossed its token ceiling and 
 `suspend`; an approved budget revision then resumed the same provider session and worktree through
 two descendants. The final run passed 16/16 checks and independent review, but publication rejected
 the historical suspend ancestor. The corrected server accepts only suspend ancestors in the
-selected deliverable run's explicit resume chain, while preserving terminal rejection for `stop`,
-unrelated suspend, and malformed lineage. The same live database then published PR #99 at exact
+selected deliverable run's explicit resume chain whose current loop counters remain below policy,
+while preserving terminal rejection for `stop`, unrelated suspend, stop-level loop metrics, and
+malformed lineage. The same live database then published PR #99 at exact
 runner commit `ada87bd85dafdc62f354c4641c7e9340be5b1ece`; an identical publication replay returned the
 same PR with one attempt and no additional remote effect. See
 `docs/evidence/2026-09-03-recovered-suspend-publication.md`.
