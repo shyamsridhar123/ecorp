@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Local Incident Command dogfood control room"
+    >
+    <title>Incident Command — Local Dogfood</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" type="module"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">IC</span>
+        <div>
+          <p class="eyebrow">Operations control room</p>
+          <h1>Incident Command</h1>
+        </div>
+      </div>
+      <div class="dogfood-notice">
+        <strong>Local dogfood application</strong>
+        <span>Not a production pager replacement</span>
+      </div>
+    </header>
+
+    <section class="identity-shell" aria-labelledby="identity-title">
+      <div>
+        <p class="eyebrow" id="identity-title">Request identity</p>
+        <p class="identity-help">
+          Every API and live-stream request is scoped by these local demo headers.
+        </p>
+      </div>
+      <form id="identity-form" class="identity-form">
+        <label>
+          Tenant
+          <input
+            id="tenant-id"
+            name="tenant"
+            value="acme-ops"
+            maxlength="128"
+            required
+          >
+        </label>
+        <label>
+          Actor
+          <input
+            id="actor-id"
+            name="actor"
+            value="alice"
+            maxlength="128"
+            required
+          >
+        </label>
+        <label>
+          Role
+          <select id="role" name="role">
+            <option value="reporter">Reporter</option>
+            <option value="responder">Responder</option>
+            <option value="commander">Commander</option>
+            <option value="auditor">Auditor</option>
+          </select>
+        </label>
+        <button type="submit" class="button button-primary">Apply identity</button>
+      </form>
+      <div class="stream-indicator" aria-live="polite">
+        <span id="stream-dot" class="status-dot" aria-hidden="true"></span>
+        <span id="stream-status">Stream disconnected</span>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <aside class="incident-rail" aria-label="Incident list">
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Queue</p>
+              <h2>Incidents</h2>
+            </div>
+            <button id="refresh-button" class="button button-quiet" type="button">
+              Refresh
+            </button>
+          </div>
+          <div class="filters">
+            <label>
+              Severity
+              <select id="filter-severity">
+                <option value="">All</option>
+                <option value="sev1">SEV1</option>
+                <option value="sev2">SEV2</option>
+                <option value="sev3">SEV3</option>
+                <option value="sev4">SEV4</option>
+              </select>
+            </label>
+            <label>
+              State
+              <select id="filter-state">
+                <option value="">All</option>
+                <option value="open">Open</option>
+                <option value="investigating">Investigating</option>
+                <option value="mitigating">Mitigating</option>
+                <option value="resolved">Resolved</option>
+                <option value="postmortem_complete">Postmortem complete</option>
+              </select>
+            </label>
+          </div>
+          <p id="incident-count" class="muted">Loading incidents…</p>
+          <div id="incident-list" class="incident-list"></div>
+        </section>
+
+        <section id="create-panel" class="panel accent-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Reporter action</p>
+              <h2>Declare incident</h2>
+            </div>
+          </div>
+          <p id="create-permission" class="permission-note"></p>
+          <form id="create-form" class="stack-form">
+            <label>
+              Summary
+              <input
+                name="title"
+                maxlength="160"
+                placeholder="Checkout requests failing"
+                required
+              >
+            </label>
+            <div class="form-pair">
+              <label>
+                Severity
+                <select name="severity">
+                  <option value="sev1">SEV1</option>
+                  <option value="sev2" selected>SEV2</option>
+                  <option value="sev3">SEV3</option>
+                  <option value="sev4">SEV4</option>
+                </select>
+              </label>
+              <label>
+                Affected service
+                <input
+                  name="affectedService"
+                  maxlength="120"
+                  placeholder="checkout-api"
+                  required
+                >
+              </label>
+            </div>
+            <label>
+              Customer impact
+              <textarea
+                name="customerImpact"
+                rows="3"
+                maxlength="2000"
+                placeholder="Customers cannot complete purchases."
+                required
+              ></textarea>
+            </label>
+            <button class="button button-danger" type="submit">
+              Declare incident
+            </button>
+          </form>
+        </section>
+      </aside>
+
+      <section class="command-stage" aria-live="polite">
+        <div id="empty-state" class="empty-state panel">
+          <div class="radar" aria-hidden="true"><span></span></div>
+          <p class="eyebrow">Control room ready</p>
+          <h2>Select an incident</h2>
+          <p>
+            Triage severity, coordinate responders, record the technical
+            timeline, and close the audit loop.
+          </p>
+        </div>
+
+        <article id="incident-detail" class="detail-grid hidden">
+          <section class="panel incident-hero">
+            <div class="incident-title-row">
+              <div>
+                <p id="detail-id" class="mono muted"></p>
+                <h2 id="detail-title"></h2>
+              </div>
+              <div class="badge-row">
+                <span id="detail-severity" class="badge"></span>
+                <span id="detail-state" class="badge badge-state"></span>
+              </div>
+            </div>
+            <p id="detail-impact" class="impact-copy"></p>
+            <dl class="fact-grid">
+              <div>
+                <dt>Affected service</dt>
+                <dd id="detail-service"></dd>
+              </div>
+              <div>
+                <dt>Owner</dt>
+                <dd id="detail-owner"></dd>
+              </div>
+              <div>
+                <dt>Version</dt>
+                <dd id="detail-version"></dd>
+              </div>
+              <div>
+                <dt>Audit chain</dt>
+                <dd id="detail-audit"></dd>
+              </div>
+            </dl>
+            <div class="slo-grid">
+              <div id="response-slo" class="slo-card">
+                <span>Response target</span>
+                <strong class="slo-value"></strong>
+                <small class="slo-deadline"></small>
+              </div>
+              <div id="mitigation-slo" class="slo-card">
+                <span>Mitigation target</span>
+                <strong class="slo-value"></strong>
+                <small class="slo-deadline"></small>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel control-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Commander controls</p>
+                <h3>Triage &amp; workflow</h3>
+              </div>
+              <span id="commander-lock" class="role-lock"></span>
+            </div>
+            <div class="control-grid">
+              <form id="assignment-form" class="inline-form">
+                <label>
+                  Assign owner
+                  <input name="owner" maxlength="128" required>
+                </label>
+                <button class="button button-secondary" type="submit">Assign</button>
+              </form>
+              <form id="severity-form" class="inline-form">
+                <label>
+                  Change severity
+                  <select name="severity">
+                    <option value="sev1">SEV1</option>
+                    <option value="sev2">SEV2</option>
+                    <option value="sev3">SEV3</option>
+                    <option value="sev4">SEV4</option>
+                  </select>
+                </label>
+                <button class="button button-secondary" type="submit">Update</button>
+              </form>
+            </div>
+            <form id="transition-form" class="transition-form">
+              <label>
+                Transition note
+                <input
+                  name="note"
+                  maxlength="1000"
+                  placeholder="Optional command decision"
+                >
+              </label>
+              <button id="transition-button" class="button button-primary" type="submit">
+                Advance workflow
+              </button>
+            </form>
+          </section>
+
+          <section class="panel timeline-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Append-only record</p>
+                <h3>Incident timeline</h3>
+              </div>
+              <span id="timeline-head" class="mono hash-label"></span>
+            </div>
+            <form id="timeline-form" class="timeline-entry-form">
+              <label>
+                Technical update
+                <textarea
+                  name="message"
+                  rows="2"
+                  maxlength="4000"
+                  placeholder="Responder findings, actions, and observations"
+                  required
+                ></textarea>
+              </label>
+              <button class="button button-secondary" type="submit">
+                Append update
+              </button>
+              <span id="responder-lock" class="role-lock"></span>
+            </form>
+            <ol id="timeline-list" class="timeline-list"></ol>
+          </section>
+
+          <section class="panel postmortem-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Close the loop</p>
+                <h3>Postmortem</h3>
+              </div>
+              <div class="button-row">
+                <button id="preview-button" class="button button-quiet" type="button">
+                  Preview
+                </button>
+                <button id="download-button" class="button button-secondary" type="button">
+                  Download Markdown
+                </button>
+              </div>
+            </div>
+            <form id="postmortem-form" class="postmortem-form">
+              <label>
+                Contributing factors <span class="muted">(one per line)</span>
+                <textarea name="contributingFactors" rows="4"></textarea>
+              </label>
+              <label>
+                Corrective actions <span class="muted">(one per line)</span>
+                <textarea name="correctiveActions" rows="4"></textarea>
+              </label>
+              <button class="button button-primary" type="submit">
+                Save postmortem
+              </button>
+              <span id="postmortem-lock" class="role-lock"></span>
+            </form>
+            <pre id="postmortem-preview" class="markdown-preview hidden"></pre>
+          </section>
+        </article>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </body>
+</html>

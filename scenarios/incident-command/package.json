@@ -1,0 +1,14 @@
+{
+  "name": "incident-command-local-dogfood",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs --port 9312",
+    "test": "node --test test/incident-command.test.mjs",
+    "test:browser": "node test/browser.test.mjs"
+  }
+}
