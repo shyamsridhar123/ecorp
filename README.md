@@ -49,13 +49,13 @@ The floor is not decorative animation. Every sprite, cabinet, alert, approval, a
 | --- | --- |
 | **GitHub Copilot** | Official SDK, live account model discovery, model and reasoning selection, streaming, steering, interruption, durable approvals, usage, evidence, and resumable sessions. |
 | **OpenAI Codex** | Native app-server lifecycle with structured output, live steering, interruption, stop, resume, usage, and repository-change evidence. |
-| **Claude Code** | Plugin-free normalized CLI execution with streaming, interruption, stop, resume, usage, and common evidence. |
+| **Claude Code** | Plugin-free normalized CLI execution with durable stdio approval mediation, streaming, interruption, stop, resume, usage, and common evidence. |
 | **OpenCode** | Plugin-free normalized CLI execution through the same runner, worktree, budget, and evidence contracts. |
 | **Deterministic harness** | Quota-free lifecycle fixture for orchestration, verification, approvals, budgets, retries, and failure paths. |
 
 The provider is not the control plane. Runners advertise their exact capabilities, and ECorp dispatches only when the requested adapter, model, reasoning effort, and workspace identity are compatible.
 
-Claude Code runs without user plugins, hooks, MCP servers, browser integration, slash commands, or auto-memory. Its provider permission prompts are not yet bridged through ECorp's durable approval lifecycle. [Issue #110](https://github.com/shyamsridhar123/ecorp/issues/110) tracks that boundary.
+Claude Code runs without user plugins, hooks, MCP servers, browser integration, slash commands, or auto-memory. Its supported stream-JSON permission requests are bridged into durable ECorp approvals. Complete descendant cleanup and fail-closed teardown remain tracked in [#51](https://github.com/shyamsridhar123/ecorp/issues/51) and [#124](https://github.com/shyamsridhar123/ecorp/issues/124).
 
 ## Evidence is the finish line
 
@@ -127,13 +127,24 @@ Remove `--dry-run` to claim the issue, pin its immutable source commit, create t
 After independent verification, an authorized operator with an enrolled publisher credential can publish the exact commit and branch deliverable:
 
 ```powershell
+$PublisherId = "crony-cli:$env:COMPUTERNAME"
+$PublisherCredentialPath = Join-Path $env:USERPROFILE '.ecorp-publisher\publisher.credential'
+$WorkItemId = '<factory-work-item-id>'
+
 cargo run -p crony-cli -- factory-publish `
-  <corp-id> <actor-id> <factory-work-item-id> `
-  --publisher-credential-file <path> `
+  00000000-0000-4000-8000-000000000001 `
+  00000000-0000-4000-8000-000000000011 `
+  $WorkItemId `
+  --publisher-id $PublisherId `
+  --publisher-credential-file $PublisherCredentialPath `
   --authorization-reason "Publish the verified result for review."
 ```
 
-Duplicate calls, process restarts, and partial remote success recover the same branch and pull request. Project status enters review only after the pull request exists. See the [user and developer journey](docs/USER_AND_DEVELOPER_JOURNEY.md) for the complete operator flow.
+Duplicate calls, process restart, and partial remote success recover the same branch and pull
+request. Project status enters review only after the pull request exists. Publication never enables
+auto-merge and does not merge or deploy. Create a short-lived credential before publication, then
+revoke it and delete its plaintext file immediately afterward; see the
+[dark-factory contributor guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md).
 
 ## Current state and boundaries
 
@@ -145,7 +156,7 @@ Current boundaries:
 
 - ECorp is not yet a safe sandbox for fully untrusted child processes. Stronger OS or container isolation and descendant-process verification remain open.
 - Development mode uses fixed demo identities, permissive local CORS, a deterministic process running with the local user's permissions, and no network sandbox.
-- External CLI adapters remain lower assurance than the GitHub Copilot SDK path. Claude's durable permission bridge is tracked in [#110](https://github.com/shyamsridhar123/ecorp/issues/110).
+- External CLI adapters remain lower assurance than the GitHub Copilot SDK path. Claude's durable stdio permission bridge is implemented; isolated provider homes, inherited-environment allowlisting, and fail-closed process-tree teardown remain tracked in [#51](https://github.com/shyamsridhar123/ecorp/issues/51) and [#124](https://github.com/shyamsridhar123/ecorp/issues/124).
 - Production deployments require OIDC, deployment-managed keys, explicit runner enrollment, private S3-compatible artifact storage, and an intentional network policy.
 - The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environment variables, and `X-Crony-*` headers remain for compatibility during the transition.
 
@@ -153,8 +164,14 @@ The September 1, 2026 enterprise dogfood report captures the gaps found on that 
 
 ## Documentation
 
+The September 1, 2026 enterprise-application dogfood pass is recorded in
+[`docs/evidence/2026-09-01-enterprise-application-dogfood.md`](docs/evidence/2026-09-01-enterprise-application-dogfood.md).
+It validated two generated applications and exposed gaps that are now either landed or represented
+by current Project #3 issues.
+
 | Goal | Read |
 | --- | --- |
+| Contribute without conflicting with another mission | [Contributing](CONTRIBUTING.md) and the [dark-factory contributor guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md) |
 | Operate a first mission | [User and developer journey](docs/USER_AND_DEVELOPER_JOURNEY.md) |
 | Understand the planes and state model | [Architecture](docs/ARCHITECTURE.md) |
 | Review shipped controls and current limits | [Security](docs/SECURITY.md) and [threat model](docs/THREAT_MODEL.md) |

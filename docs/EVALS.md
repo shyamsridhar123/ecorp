@@ -52,15 +52,21 @@ An implementation claim needs evidence at the same scope:
 `node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active, that
 the runner emits `run.session_terminated` before verification and accepted completion, and that the
 persistent agent identity returns to `idle` with no `current_run_id`. It does not yet verify the
-entire operating-system descendant tree; that stronger cleanup boundary is tracked in #51.
+entire operating-system descendant tree; that stronger fail-closed cleanup boundary is tracked in
+#124 as a bounded slice of #51.
 
 ## External provider permission bridge
 
-The Claude Code adapter currently proves safe-mode launch and normalized lifecycle/evidence
-behavior, but its `acceptEdits` mode and custom stdin decision shape are not a complete durable
-provider-permission boundary. GitHub issue #110 tracks Claude's supported stream-JSON
-`can_use_tool` request/response bridge as a bounded slice of #51. Until that issue lands, Claude and
-OpenCode adapter tests must not be cited as proof of complete native permission mediation.
+The Claude Code adapter now uses Claude's supported stream-JSON `can_use_tool` request/response
+protocol, manual permission mode, and required initialize handshake to translate tool requests into
+durable ECorp approvals. Focused tests cover correlated allow/deny responses, bounded hashed
+approval context, contained-path auto-allow behavior, rejected and expired decisions, and
+provider-response write failure. See
+`docs/evidence/2026-09-03-claude-permission-bridge.md`.
+
+That evidence proves native permission mediation, not complete process-tree teardown. Issue #124
+tracks bounded initialization and protocol I/O, truthful terminal claims, and fail-closed descendant
+cleanup.
 
 ## Quality gates
 
@@ -165,7 +171,8 @@ Command passed 12 tests and its browser workflow; Credit Exception remained inco
 failures and two errors. The pass exposed hard-breaker, budget-recovery, provider-isolation,
 permission-bridging, mission-contract, and portable-deliverable gaps at that time. Subsequent
 evidence below covers the landed breaker, budget-recovery, mission-contract, and portable-deliverable
-work. Provider isolation remains tracked in #51, with the Claude permission-bridge slice in #110.
+work. Claude permission mediation has also landed; provider-home isolation and fail-closed
+process-tree teardown remain tracked in #51 and #124.
 This is internal systems dogfood and does not satisfy the three-external-team requirement in GitHub
 issue #27. See
 `docs/evidence/2026-09-01-enterprise-application-dogfood.md`.
@@ -188,6 +195,18 @@ failed state in desktop and mobile Chromium. See
 The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
 completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
+
+The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
+stream JSON. It verifies manual permission mode, the initialize response before the typed initial
+user frame, hardened launch arguments, exact
+`can_use_tool` correlation, bounded approval context, unchanged approved input, bounded rejection
+and expiry denials, duplicate-decision rejection, and fail-closed cleanup. Contained worktree
+read/write requests are the only local auto-allow case; blocked, ambiguous, outside-worktree, Bash,
+and network requests suspend for a durable ECorp decision. It also proves raw tool input is absent
+from durable approval text and control-response write failure fails the run. An installed Claude
+Code `2.1.223` probe emitted `can_use_tool` for a Bash marker write after initialize under manual
+mode; the correlated denial left the marker absent. See
+`docs/evidence/2026-09-03-claude-permission-bridge.md`.
 
 `tools/e2e_copilot.mjs` uses a deterministic Copilot fixture to verify model discovery, disabled
 policy states, model and reasoning validation, persisted selection, evidence, and same-session
@@ -271,8 +290,13 @@ depth bounds, retry bounds, per-task budgets, and total mission budgets. See
 `docs/evidence/2026-08-29-task-graph-validation.md`.
 
 Runner verifier tests cover valid and missing files, artifact hashes, commands, tests, JSON
-required-key schemas, screenshot signatures, and path traversal. See
-`docs/evidence/2026-08-29-evidence-verification-validation.md`.
+required-key schemas, screenshot signatures, path traversal, exact executable lookup on Linux and
+macOS, and fail-closed explicit-path validation. Windows coverage deterministically exercises
+`npm`, explicit `npm.cmd`, `pnpm`, `npx`, another `PATHEXT` executable, injection-shaped arguments,
+missing tools, and the installed npm shim. `tools/e2e_windows_verifier_resolution.mjs` executes the
+candidate verifier with the exact `npm --prefix scenarios/incident-command test` policy. See
+`docs/evidence/2026-08-29-evidence-verification-validation.md` and
+`docs/evidence/2026-09-03-windows-verifier-command-resolution.md`.
 
 `tools/e2e_artifacts.mjs` verifies server-mediated upload, content-addressed storage, normalized
 media type, signed producer/run/task/verifier/retention provenance, path-free shared state,
