@@ -6,6 +6,12 @@ ECorp turns a repository-level outcome into isolated agent work, human decisions
 artifacts. The office is a live projection of that workflow; it is not a separate game layer or the
 system of record.
 
+The browser is organized as five arcade-cabinet views: **Control floor**, **Factory**,
+**Missions**, **Comms**, and **Audit**. Only one primary view is rendered at a time. A persistent
+operations HUD keeps live runs, pending decisions, active factory work, and verified results
+visible without stacking every subsystem into one page. Hash links and desktop deep links select
+the appropriate view before focusing the requested room, mission, task, or run.
+
 ## The four-step user journey
 
 ### 1. Connect a runner
