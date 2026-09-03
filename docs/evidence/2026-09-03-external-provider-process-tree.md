@@ -49,23 +49,50 @@ The focused process-tree filter covers:
 1. a stubborn parent and grandchild are removed;
 2. repeated termination is idempotent;
 3. an unrelated process remains alive;
-4. a tree whose grandchild already exited still terminates cleanly; and
+4. a tree whose grandchild already exited still terminates cleanly;
 5. an injected verification failure retains ownership for a successful retry; and
 6. an injected root-query failure retains ownership for verified cleanup.
 
 The external-adapter filter includes real child-process fixtures for both interrupt and stop, in
 addition to the Claude stream-JSON permission suite.
 
-## Release gate
+## Exact-commit real-Claude release gate
 
-The original real-Claude probe failed and is intentionally preserved as evidence. After ECorp
-creates a verified candidate commit, the operator must build a runner from that exact commit and
-repeat the parent/grandchild interrupt probe. Publication is allowed only if:
+The original failed probe above remains preserved as the regression. The corrected implementation
+was committed and locally verified at
+`50379ba61eafbc798655000ee95f096ccd2fc4df`. The runner binary built from that exact commit had
+SHA-256 `1822f8de30828ed356db6fc2b9452b9cf3d63ec4d08146936418ef811ab56aa1`.
 
-- the Claude root, tool shell, Python parent, and Python child are all absent;
-- `run.session_terminated` follows verified subtree cleanup;
-- no manual process cleanup is required;
-- the configured source checkout remains uncontaminated.
+ECorp mission `b94edf34-3fb3-41d1-bc52-8056c07d203a`, run
+`21288e49-f5da-4fc5-9b46-441fee49d4b5`, used installed Claude Code `2.1.223`.
+Bob independently approved the one bounded Bash request. The observed process lineage was:
+
+```text
+crony-runner 18780
+└─ claude 40328
+   └─ bash 29564
+      └─ bash 43600
+         └─ bash 14940
+            └─ powershell 21704
+               └─ python parent 36300
+                  └─ python child 8636
+```
+
+The Python child was configured to sleep for 300 seconds. ECorp persisted
+`run.interrupt_requested` at `2026-09-03T23:28:35.491103Z`, then persisted
+`run.session_terminated` at `2026-09-03T23:28:36.015419Z`, 524.316 milliseconds later. The terminal
+payload reported `provider_process_alive=false`, followed by `run.cancelled` at
+`2026-09-03T23:28:36.025392Z`.
+
+After the terminal event, the original Claude process, all three Bash wrappers, PowerShell, the
+Python parent, and the Python child were absent. The runner remained connected, no manual process
+cleanup was required, and the configured source checkout was clean before and after the probe. The
+isolated run worktree was correctly preserved because it contained the PID evidence file.
+
+The exact implementation commit also passed the complete local repository gate, five consecutive
+22-test external-adapter suites, two `teardown_fail_closed` regressions, and the six-test
+process-tree filter. Hosted GitHub Actions were unavailable because the account jobs were rejected
+before step one for billing/spending-limit reasons; they are not acceptance evidence.
 
 This boundary owns provider descendants. It does not replace the still-open network sandbox,
 isolated provider-home, or inherited-environment allowlist work in #51.
