@@ -1,0 +1,19 @@
+  ok  server started on port 9313
+  ok  chromium launched (C:\Users\shyamsridhar\AppData\Local\ms-playwright\chromium_headless_shell-1234\chrome-headless-shell-win64\chrome-headless-shell.exe)
+  ok  app booted
+  ok  created EXC-NORT-00001
+  ok  tenant isolation: cascadia sees no northwind records
+  ok  role denial: auditor has no submit action
+  ok  submitted for review
+  ok  version conflict returned 409 version_conflict
+  ok  eligibility analysis routed to risk review
+  ok  risk review approved
+  ok  compliance review approved
+  ok  maker-checker denial: forbidden
+  ok  final authority approved the exception
+  ok  audit chain verified: Chain VALID · 6 entries · tenant entries 6
+  ok  audit entries rendered: 6
+  ok  mobile 390x844 rendered detail and verification without overflow
+  ok  server stopped (exit 1)
+
+browser smoke: PASS (17 steps, 0 errors)

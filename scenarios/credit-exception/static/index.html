@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credit Policy Exception Workflow</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">CE</span>
+    <div>
+      <h1>Credit Policy Exception Workflow</h1>
+      <p class="sub">Regulated maker-checker exception governance</p>
+    </div>
+  </div>
+  <div class="actor-picker">
+    <label for="actor-select">Acting as</label>
+    <select id="actor-select" data-testid="actor-select"></select>
+    <p class="caps" id="actor-caps" data-testid="actor-caps"></p>
+  </div>
+</header>
+
+<div id="banner" class="banner" data-testid="banner" hidden role="status"></div>
+
+<main class="layout">
+  <section class="panel" aria-labelledby="create-heading">
+    <h2 id="create-heading">New exception request</h2>
+    <form id="create-form" data-testid="create-form" novalidate>
+      <div class="field">
+        <label for="applicant">Applicant pseudonym</label>
+        <input id="applicant" name="applicant_pseudonym" data-testid="input-applicant"
+               placeholder="APP-XXXXXX" autocomplete="off" required>
+        <small>Pseudonymous key only. Never enter real customer data.</small>
+      </div>
+      <div class="field">
+        <label for="rule">Policy rule</label>
+        <select id="rule" name="rule_id" data-testid="input-rule" required></select>
+        <small id="rule-hint"></small>
+      </div>
+      <div class="field">
+        <label for="deviation">Requested deviation (bps)</label>
+        <input id="deviation" name="requested_deviation_bps" type="number" min="1"
+               data-testid="input-deviation" required>
+      </div>
+      <div class="field">
+        <label for="justification">Justification</label>
+        <textarea id="justification" name="justification" rows="3"
+                  data-testid="input-justification" required></textarea>
+        <small>Minimum 40 characters.</small>
+      </div>
+      <div class="field">
+        <label for="controls">Compensating controls</label>
+        <textarea id="controls" name="compensating_controls" rows="3"
+                  data-testid="input-controls" required></textarea>
+        <small>One control per line, minimum 15 characters each.</small>
+      </div>
+      <div class="field">
+        <label for="expires">Exception expiry</label>
+        <input id="expires" name="expires_at" type="date" data-testid="input-expires" required>
+      </div>
+      <button type="submit" class="primary" data-testid="btn-create">Create draft</button>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="list-heading">
+    <div class="panel-head">
+      <h2 id="list-heading">Exceptions</h2>
+      <button type="button" class="ghost" id="refresh" data-testid="btn-refresh">Refresh</button>
+    </div>
+    <ul class="exception-list" id="exception-list" data-testid="exception-list"></ul>
+  </section>
+
+  <section class="panel detail" aria-labelledby="detail-heading">
+    <h2 id="detail-heading">Detail</h2>
+    <div id="detail" data-testid="detail">
+      <p class="empty">Select an exception to view its workflow.</p>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

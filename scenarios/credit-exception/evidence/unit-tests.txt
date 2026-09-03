@@ -1,0 +1,105 @@
+test_actor_tamper_detected (tests.test_credit_exception.TestAuditIntegrity.test_actor_tamper_detected) ... ok
+test_chain_valid_after_full_workflow (tests.test_credit_exception.TestAuditIntegrity.test_chain_valid_after_full_workflow) ... ok
+test_deletion_detected (tests.test_credit_exception.TestAuditIntegrity.test_deletion_detected) ... ok
+test_entries_are_hash_linked (tests.test_credit_exception.TestAuditIntegrity.test_entries_are_hash_linked) ... ok
+test_every_transition_is_audited (tests.test_credit_exception.TestAuditIntegrity.test_every_transition_is_audited) ... ok
+test_genesis_link (tests.test_credit_exception.TestAuditIntegrity.test_genesis_link) ... ok
+test_head_hash_advances (tests.test_credit_exception.TestAuditIntegrity.test_head_hash_advances) ... ok
+test_payload_tamper_detected (tests.test_credit_exception.TestAuditIntegrity.test_payload_tamper_detected) ... ok
+test_reordering_detected (tests.test_credit_exception.TestAuditIntegrity.test_reordering_detected) ... ok
+test_auditor_cannot_create (tests.test_credit_exception.TestAuthorization.test_auditor_cannot_create) ... ok
+test_capability_matrix_is_least_privilege (tests.test_credit_exception.TestAuthorization.test_capability_matrix_is_least_privilege) ... ok
+test_missing_token_rejected (tests.test_credit_exception.TestAuthorization.test_missing_token_rejected) ... ok
+test_non_owner_cannot_withdraw (tests.test_credit_exception.TestAuthorization.test_non_owner_cannot_withdraw) ... ok
+test_non_owner_requester_cannot_submit (tests.test_credit_exception.TestAuthorization.test_non_owner_requester_cannot_submit) ... ok
+test_requester_cannot_perform_risk_review (tests.test_credit_exception.TestAuthorization.test_requester_cannot_perform_risk_review) ... ok
+test_reviewer_cannot_create (tests.test_credit_exception.TestAuthorization.test_reviewer_cannot_create) ... ok
+test_reviewer_cannot_make_final_decision (tests.test_credit_exception.TestAuthorization.test_reviewer_cannot_make_final_decision) ... ok
+test_risk_reviewer_cannot_do_compliance_review (tests.test_credit_exception.TestAuthorization.test_risk_reviewer_cannot_do_compliance_review) ... ok
+test_unknown_token_rejected (tests.test_credit_exception.TestAuthorization.test_unknown_token_rejected) ... ok
+test_concurrent_creates_get_distinct_ids (tests.test_credit_exception.TestConcurrency.test_concurrent_creates_get_distinct_ids) ... ok
+test_concurrent_reviews_only_one_wins (tests.test_credit_exception.TestConcurrency.test_concurrent_reviews_only_one_wins)
+Two threads race the same risk-review seat; exactly one succeeds. ... ok
+test_missing_version_rejected (tests.test_credit_exception.TestConcurrency.test_missing_version_rejected) ... ok
+test_non_integer_version_rejected (tests.test_credit_exception.TestConcurrency.test_non_integer_version_rejected) ... ok
+test_stale_version_rejected (tests.test_credit_exception.TestConcurrency.test_stale_version_rejected) ... ok
+test_version_increments_on_every_transition (tests.test_credit_exception.TestConcurrency.test_version_increments_on_every_transition) ... ok
+test_approval_ttl_never_outlives_record_expiry (tests.test_credit_exception.TestExpiry.test_approval_ttl_never_outlives_record_expiry)
+Approval TTL is clamped to the exception's own expiry. ... ok
+test_approval_valid_just_before_ttl (tests.test_credit_exception.TestExpiry.test_approval_valid_just_before_ttl) ... ok
+test_approved_record_stays_approved_after_horizon (tests.test_credit_exception.TestExpiry.test_approved_record_stays_approved_after_horizon)
+History is not rewritten; a granted decision remains recorded. ... ok
+test_expired_approval_cannot_authorize (tests.test_credit_exception.TestExpiry.test_expired_approval_cannot_authorize) ... ok
+test_expired_approvals_do_not_block_rejection (tests.test_credit_exception.TestExpiry.test_expired_approvals_do_not_block_rejection)
+A stale file can still be declined; only approval is fenced. ... ok
+test_expired_record_rejects_further_transitions (tests.test_credit_exception.TestExpiry.test_expired_record_rejects_further_transitions) ... ok
+test_record_expires_when_horizon_passes (tests.test_credit_exception.TestExpiry.test_record_expires_when_horizon_passes) ... ok
+test_bad_command_id_rejected (tests.test_credit_exception.TestHttpApi.test_bad_command_id_rejected) ... ok
+test_delete_is_405 (tests.test_credit_exception.TestHttpApi.test_delete_is_405) ... ok
+test_full_workflow_over_http (tests.test_credit_exception.TestHttpApi.test_full_workflow_over_http) ... ok
+test_health_is_open (tests.test_credit_exception.TestHttpApi.test_health_is_open) ... ok
+test_idempotency_mismatch_over_http (tests.test_credit_exception.TestHttpApi.test_idempotency_mismatch_over_http) ... ok
+test_idempotent_replay_over_http (tests.test_credit_exception.TestHttpApi.test_idempotent_replay_over_http) ... ok
+test_invalid_state_filter_rejected (tests.test_credit_exception.TestHttpApi.test_invalid_state_filter_rejected) ... ok
+test_malformed_json_is_422 (tests.test_credit_exception.TestHttpApi.test_malformed_json_is_422) ... ok
+test_missing_actor_header_is_401 (tests.test_credit_exception.TestHttpApi.test_missing_actor_header_is_401) ... ok
+test_policy_rules_listed (tests.test_credit_exception.TestHttpApi.test_policy_rules_listed) ... ok
+test_prohibited_rule_over_http (tests.test_credit_exception.TestHttpApi.test_prohibited_rule_over_http) ... ok
+test_role_denial_over_http (tests.test_credit_exception.TestHttpApi.test_role_denial_over_http) ... ok
+test_static_index_served (tests.test_credit_exception.TestHttpApi.test_static_index_served) ... ok
+test_static_traversal_blocked (tests.test_credit_exception.TestHttpApi.test_static_traversal_blocked) ... ok
+test_tenant_denial_over_http (tests.test_credit_exception.TestHttpApi.test_tenant_denial_over_http) ... ok
+test_unknown_actor_is_401 (tests.test_credit_exception.TestHttpApi.test_unknown_actor_is_401) ... ok
+test_unknown_route_is_404 (tests.test_credit_exception.TestHttpApi.test_unknown_route_is_404) ... ok
+test_version_conflict_over_http (tests.test_credit_exception.TestHttpApi.test_version_conflict_over_http) ... ok
+test_command_ids_are_tenant_scoped (tests.test_credit_exception.TestIdempotencyStore.test_command_ids_are_tenant_scoped) ... ok
+test_key_order_does_not_change_fingerprint (tests.test_credit_exception.TestIdempotencyStore.test_key_order_does_not_change_fingerprint) ... ok
+test_replay_returns_prior_record (tests.test_credit_exception.TestIdempotencyStore.test_replay_returns_prior_record) ... ok
+test_replay_with_different_payload_rejected (tests.test_credit_exception.TestIdempotencyStore.test_replay_with_different_payload_rejected) ... ok
+test_independent_authority_can_approve (tests.test_credit_exception.TestMakerChecker.test_independent_authority_can_approve) ... ok
+test_requester_cannot_review_own_request (tests.test_credit_exception.TestMakerChecker.test_requester_cannot_review_own_request) ... ok
+test_requester_cannot_self_approve_as_authority (tests.test_credit_exception.TestMakerChecker.test_requester_cannot_self_approve_as_authority)
+The dual-hat actor holds both roles; separation must still bind. ... ok
+test_reviewer_cannot_also_be_final_authority (tests.test_credit_exception.TestMakerChecker.test_reviewer_cannot_also_be_final_authority) ... ok
+test_same_actor_cannot_fill_two_review_seats (tests.test_credit_exception.TestMakerChecker.test_same_actor_cannot_fill_two_review_seats)
+A hypothetical dual-role reviewer still cannot double-sign. ... ok
+test_cannot_analyze_a_draft (tests.test_credit_exception.TestStateMachine.test_cannot_analyze_a_draft) ... ok
+test_cannot_decide_before_reviews (tests.test_credit_exception.TestStateMachine.test_cannot_decide_before_reviews) ... ok
+test_cannot_submit_twice (tests.test_credit_exception.TestStateMachine.test_cannot_submit_twice) ... ok
+test_full_lifecycle_states_observed (tests.test_credit_exception.TestStateMachine.test_full_lifecycle_states_observed) ... ok
+test_invalid_review_decision_rejected (tests.test_credit_exception.TestStateMachine.test_invalid_review_decision_rejected) ... ok
+test_risk_rejection_is_terminal (tests.test_credit_exception.TestStateMachine.test_risk_rejection_is_terminal) ... ok
+test_withdraw_requires_reason (tests.test_credit_exception.TestStateMachine.test_withdraw_requires_reason) ... ok
+test_withdraw_then_no_further_action (tests.test_credit_exception.TestStateMachine.test_withdraw_then_no_further_action) ... ok
+test_cross_tenant_audit_read_denied (tests.test_credit_exception.TestTenantIsolation.test_cross_tenant_audit_read_denied) ... ok
+test_cross_tenant_existence_not_leaked (tests.test_credit_exception.TestTenantIsolation.test_cross_tenant_existence_not_leaked)
+A foreign record must look identical to a nonexistent one. ... ok
+test_listing_is_tenant_scoped (tests.test_credit_exception.TestTenantIsolation.test_listing_is_tenant_scoped) ... ok
+test_other_tenant_cannot_act (tests.test_credit_exception.TestTenantIsolation.test_other_tenant_cannot_act) ... ok
+test_other_tenant_cannot_read (tests.test_credit_exception.TestTenantIsolation.test_other_tenant_cannot_read) ... ok
+test_tenant_audit_counts_are_scoped (tests.test_credit_exception.TestTenantIsolation.test_tenant_audit_counts_are_scoped) ... ok
+test_analysis_is_deterministic (tests.test_credit_exception.TestValidationAndPolicy.test_analysis_is_deterministic) ... ok
+test_boolean_deviation_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_boolean_deviation_rejected) ... ok
+test_deviation_over_rule_ceiling_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_deviation_over_rule_ceiling_rejected) ... ok
+test_deviation_over_tenant_ceiling_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_deviation_over_tenant_ceiling_rejected)
+Cascadia caps at 1500 bps even though CP-101 allows 2000. ... ok
+test_duplicate_controls_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_duplicate_controls_rejected) ... ok
+test_empty_controls_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_empty_controls_rejected) ... ok
+test_expiry_beyond_horizon_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_expiry_beyond_horizon_rejected) ... ok
+test_happy_path_create (tests.test_credit_exception.TestValidationAndPolicy.test_happy_path_create) ... ok
+test_missing_field_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_missing_field_rejected) ... ok
+test_negative_deviation_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_negative_deviation_rejected) ... ok
+test_past_expiry_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_past_expiry_rejected) ... ok
+test_prohibited_rule_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_prohibited_rule_rejected) ... ok
+test_real_identifier_shape_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_real_identifier_shape_rejected)
+Data minimization: only APP-XXXXXX pseudonyms are accepted. ... ok
+test_risk_only_rule_skips_compliance (tests.test_credit_exception.TestValidationAndPolicy.test_risk_only_rule_skips_compliance) ... ok
+test_same_request_allowed_for_larger_tenant (tests.test_credit_exception.TestValidationAndPolicy.test_same_request_allowed_for_larger_tenant) ... ok
+test_short_justification_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_short_justification_rejected) ... ok
+test_statutory_rule_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_statutory_rule_rejected) ... ok
+test_unknown_rule_rejected (tests.test_credit_exception.TestValidationAndPolicy.test_unknown_rule_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 91 tests in 0.724s
+
+OK

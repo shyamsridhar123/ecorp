@@ -1,0 +1,38 @@
+{
+  "started_at": "2026-09-03T13:47:18.089319+00:00",
+  "finished_at": "2026-09-03T13:47:26.850406+00:00",
+  "port": 9313,
+  "viewports": {
+    "desktop": {
+      "width": 1440,
+      "height": 900
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844
+    }
+  },
+  "browser_executable": "C:\\Users\\shyamsridhar\\AppData\\Local\\ms-playwright\\chromium_headless_shell-1234\\chrome-headless-shell-win64\\chrome-headless-shell.exe",
+  "exception_id": "EXC-NORT-00001",
+  "steps": [
+    "server started on port 9313",
+    "chromium launched (C:\\Users\\shyamsridhar\\AppData\\Local\\ms-playwright\\chromium_headless_shell-1234\\chrome-headless-shell-win64\\chrome-headless-shell.exe)",
+    "app booted",
+    "created EXC-NORT-00001",
+    "tenant isolation: cascadia sees no northwind records",
+    "role denial: auditor has no submit action",
+    "submitted for review",
+    "version conflict returned 409 version_conflict",
+    "eligibility analysis routed to risk review",
+    "risk review approved",
+    "compliance review approved",
+    "maker-checker denial: forbidden",
+    "final authority approved the exception",
+    "audit chain verified: Chain VALID \u00b7 6 entries \u00b7 tenant entries 6",
+    "audit entries rendered: 6",
+    "mobile 390x844 rendered detail and verification without overflow",
+    "server stopped (exit 1)"
+  ],
+  "errors": [],
+  "passed": true
+}
