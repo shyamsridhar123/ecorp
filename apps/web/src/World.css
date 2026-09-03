@@ -1435,191 +1435,30 @@ summary:focus-visible,
     -5px 0 0 rgb(2 1 6 / 72%);
 }
 
-.sprite-person {
+.sprite-person.office-character-art {
   position: absolute;
-  bottom: 7px;
+  bottom: 9px;
   left: 50%;
-  width: 42px;
-  height: 60px;
-  transform: translateX(-50%) scale(1.12);
+  display: block;
+  width: 58px;
+  height: 80px;
+  overflow: visible;
+  filter: drop-shadow(3px 3px 0 rgb(2 1 6 / 72%));
+  image-rendering: pixelated;
+  shape-rendering: crispEdges;
+  transform: translateX(-50%);
   transform-origin: 50% 100%;
 }
 
-.sprite-head {
-  position: absolute;
-  z-index: 4;
-  top: 0;
-  left: 8px;
-  width: 27px;
-  height: 25px;
-  border: 4px solid #08050f;
-  background: #d98a61;
-  box-shadow:
-    inset 0 -4px 0 #a94f55,
-    3px 3px 0 #08050f;
+.office-character-art .sprite-character,
+.office-character-art .character-arm,
+.office-character-art .character-leg {
+  transform-box: fill-box;
+  transform-origin: center bottom;
 }
 
-.sprite-hair {
-  position: absolute;
-  z-index: 2;
-  top: -4px;
-  right: -4px;
-  left: -4px;
-  height: 10px;
-  background: #23162c;
-  box-shadow:
-    -3px 7px 0 #23162c,
-    3px 4px 0 #23162c;
-}
-
-[data-agent="claudia"] .sprite-hair {
-  height: 14px;
-  background: #7b3f52;
-  box-shadow:
-    -4px 8px 0 #7b3f52,
-    4px 6px 0 #7b3f52;
-}
-
-[data-agent="cody"] .sprite-hair {
-  right: 2px;
-  height: 7px;
-  background: #e8c077;
-  box-shadow: -4px 5px 0 #e8c077;
-}
-
-[data-agent="opal"] .sprite-hair {
-  height: 12px;
-  background: #123b42;
-  box-shadow:
-    -4px 5px 0 #123b42,
-    4px 8px 0 #123b42;
-}
-
-[data-agent="piper"] .sprite-hair {
-  height: 8px;
-  background: #39274f;
-  box-shadow:
-    5px 4px 0 #39274f,
-    -5px 8px 0 #39274f;
-}
-
-[data-agent="margo"] .sprite-hair {
-  height: 13px;
-  background: #5a263d;
-  box-shadow: 4px 7px 0 #5a263d;
-}
-
-.sprite-face {
-  position: absolute;
-  z-index: 3;
-  top: 8px;
-  right: 2px;
-  left: 2px;
-  height: 9px;
-  border: 0;
-  background: #efb17a;
-}
-
-.sprite-eye {
-  position: absolute;
-  top: 3px;
-  width: 3px;
-  height: 3px;
-  background: #08050f;
-}
-
-.sprite-eye-left {
-  left: 5px;
-}
-
-.sprite-eye-right {
-  right: 5px;
-}
-
-.sprite-headset {
-  position: absolute;
-  z-index: 5;
-  top: 4px;
-  right: -6px;
-  width: 5px;
-  height: 13px;
-  background: var(--cobalt);
-  box-shadow:
-    -2px -3px 0 #08050f,
-    2px 0 0 #08050f,
-    0 10px 0 #08050f;
-}
-
-.sprite-body {
-  position: absolute;
-  z-index: 3;
-  top: 25px;
-  left: 5px;
-  width: 33px;
-  height: 25px;
-  border: 4px solid #08050f;
-  background: var(--sprite-accent) !important;
-  box-shadow:
-    inset 0 -6px 0 rgb(14 8 24 / 30%),
-    3px 3px 0 #08050f;
-}
-
-.sprite-badge {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 6px;
-  height: 6px;
-  background: var(--marigold);
-  box-shadow: 0 8px 0 #08050f;
-}
-
-.sprite-arm,
-.sprite-leg {
-  position: absolute;
-  z-index: 2;
-  border: 3px solid #08050f;
-  background: var(--sprite-accent);
-}
-
-.sprite-arm {
-  top: 29px;
-  width: 9px;
-  height: 22px;
-  transform-origin: 50% 2px;
-}
-
-.sprite-arm-left {
-  left: 0;
-}
-
-.sprite-arm-right {
-  right: 0;
-}
-
-.sprite-leg {
-  top: 47px;
-  width: 12px;
-  height: 13px;
-  background: #242043;
-}
-
-.sprite-leg-left {
-  left: 8px;
-}
-
-.sprite-leg-right {
-  right: 8px;
-}
-
-.sprite-leg::after {
-  position: absolute;
-  right: -4px;
-  bottom: -5px;
-  width: 14px;
-  height: 5px;
-  content: "";
-  background: #08050f;
+.office-character-art .sprite-accent-fill {
+  fill: var(--sprite-accent);
 }
 
 .sprite-signal {
@@ -1738,28 +1577,41 @@ summary:focus-visible,
   border-top-color: var(--signal);
 }
 
-.sprite-idle .sprite-person {
+.sprite-idle .sprite-character {
   animation: sprite-idle 1400ms steps(2, end) infinite;
 }
 
-.sprite-starting .sprite-person {
+.sprite-starting .sprite-character {
   animation: sprite-walk 420ms steps(2, end) infinite;
 }
 
-.sprite-working .sprite-person {
+.sprite-starting .character-arm-left,
+.sprite-starting .character-leg-right {
+  animation: sprite-stride 420ms steps(2, end) infinite alternate;
+}
+
+.sprite-starting .character-arm-right,
+.sprite-starting .character-leg-left {
+  animation: sprite-stride 420ms steps(2, end) infinite alternate-reverse;
+}
+
+.sprite-working .sprite-character {
   animation: sprite-work 520ms steps(2, end) infinite;
 }
 
-.sprite-working .sprite-arm-left,
-.sprite-working .sprite-arm-right {
+.sprite-working .character-arm-left {
   animation: sprite-type 260ms steps(2, end) infinite alternate;
 }
 
-.sprite-reviewing .sprite-person {
+.sprite-working .character-arm-right {
+  animation: sprite-type 260ms steps(2, end) infinite alternate-reverse;
+}
+
+.sprite-reviewing .sprite-character {
   animation: sprite-review 900ms steps(2, end) infinite;
 }
 
-.sprite-blocked .sprite-person {
+.sprite-blocked .sprite-character {
   animation: sprite-blocked 520ms steps(2, end) infinite;
 }
 
@@ -2044,58 +1896,67 @@ summary:focus-visible,
 @keyframes sprite-idle {
   0%,
   100% {
-    transform: translateX(-50%) translateY(0) scale(1.12);
+    transform: translateY(0);
   }
   50% {
-    transform: translateX(-50%) translateY(-2px) scale(1.12);
+    transform: translateY(-2px);
   }
 }
 
 @keyframes sprite-walk {
   0% {
-    transform: translateX(-50%) translateY(0) rotate(-2deg) scale(1.12);
+    transform: translateY(0) rotate(-2deg);
   }
   100% {
-    transform: translateX(-50%) translateY(-3px) rotate(2deg) scale(1.12);
+    transform: translateY(-3px) rotate(2deg);
   }
 }
 
 @keyframes sprite-work {
   0%,
   100% {
-    transform: translateX(-50%) translateY(0) scale(1.12);
+    transform: translateY(0);
   }
   50% {
-    transform: translateX(-50%) translateY(2px) scale(1.12);
+    transform: translateY(1px);
   }
 }
 
 @keyframes sprite-type {
   from {
-    transform: rotate(-22deg);
+    transform: translateY(0);
   }
   to {
-    transform: rotate(22deg);
+    transform: translateY(2px);
+  }
+}
+
+@keyframes sprite-stride {
+  from {
+    transform: skewX(-2deg);
+  }
+  to {
+    transform: skewX(2deg);
   }
 }
 
 @keyframes sprite-review {
   0%,
   100% {
-    transform: translateX(-50%) rotate(0) scale(1.12);
+    transform: rotate(0);
   }
   50% {
-    transform: translateX(-50%) rotate(3deg) scale(1.12);
+    transform: rotate(2deg);
   }
 }
 
 @keyframes sprite-blocked {
   0%,
   100% {
-    transform: translateX(-50%) translateY(0) scale(1.12);
+    transform: translateX(0);
   }
   50% {
-    transform: translateX(-50%) translateY(-5px) scale(1.12);
+    transform: translateX(3px);
   }
 }
 
@@ -2434,11 +2295,14 @@ summary:focus-visible,
     transform-origin: top center;
   }
 
-  .sprite-idle .sprite-person,
-  .sprite-starting .sprite-person,
-  .sprite-working .sprite-person,
-  .sprite-reviewing .sprite-person,
-  .sprite-blocked .sprite-person {
+  .sprite-idle .sprite-character,
+  .sprite-starting .sprite-character,
+  .sprite-starting .character-arm,
+  .sprite-starting .character-leg,
+  .sprite-working .sprite-character,
+  .sprite-working .character-arm,
+  .sprite-reviewing .sprite-character,
+  .sprite-blocked .sprite-character {
     animation: none;
   }
 
@@ -2566,8 +2430,9 @@ summary:focus-visible,
 @media (prefers-reduced-motion: reduce) {
   .world-inspector,
   .office-agent,
-  .sprite-person,
-  .sprite-arm {
+  .sprite-character,
+  .character-arm,
+  .character-leg {
     animation: none !important;
     transition: none !important;
   }

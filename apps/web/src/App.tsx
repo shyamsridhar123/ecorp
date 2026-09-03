@@ -4,6 +4,7 @@ import './App.css'
 import './Arcade.css'
 import './Cabinet.css'
 import './World.css'
+import { AgentSprite } from './AgentSprite'
 
 type Actor = {
   id: string
@@ -1704,23 +1705,7 @@ function AgentAvatar({ agent }: { agent: Agent }) {
       aria-hidden="true"
     >
       <span className="sprite-shadow" />
-      <span className="sprite-person">
-        <span className="sprite-head">
-          <span className="sprite-hair" />
-          <span className="sprite-face">
-            <i className="sprite-eye sprite-eye-left" />
-            <i className="sprite-eye sprite-eye-right" />
-          </span>
-          <span className="sprite-headset" />
-        </span>
-        <span className="sprite-body">
-          <span className="sprite-badge" />
-        </span>
-        <span className="sprite-arm sprite-arm-left" />
-        <span className="sprite-arm sprite-arm-right" />
-        <span className="sprite-leg sprite-leg-left" />
-        <span className="sprite-leg sprite-leg-right" />
-      </span>
+      <AgentSprite agentId={agent.id} />
       <span className="sprite-signal" />
     </div>
   )
