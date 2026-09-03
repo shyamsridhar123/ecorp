@@ -3,6 +3,7 @@ mod copilot;
 mod external;
 mod fake;
 mod permission;
+mod process_tree;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
