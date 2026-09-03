@@ -12,7 +12,6 @@ Known development-only shortcuts:
 - permissive CORS
 - fake process runs with the local user's permissions
 - no network sandbox
-- external CLI adapters do not yet have verified descendant-process cleanup
 
 These are explicit backlog items, not production claims.
 
@@ -23,7 +22,7 @@ are only a partial boundary. Claude's supported stdio permission control protoco
 permission mode, and required initialize handshake now translate
 tool requests to durable ECorp approvals without permission bypass, terminal scraping, or custom
 stdin messages. GitHub issue #51 still tracks isolated provider homes, inherited-environment
-allowlisting, stop deadlines, and process-tree verification.
+allowlisting, stronger container isolation, and remaining real-provider recovery drills.
 
 Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
 maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.
@@ -122,6 +121,15 @@ approval text records bounded field metadata and SHA-256 hashes. Approval return
 input only to the correlated provider request. Rejection and expiry return a bounded denial;
 duplicate, unknown, cancelled, or mismatched requests fail closed, and a failed control-response
 write fails the provider run.
+
+External CLI provider roots are owned as complete process scopes rather than supervised as single
+PIDs. Windows uses a private kill-on-close Job Object assigned while the provider is still
+suspended; Unix uses a new session/process group. Every terminal path invokes the same bounded
+terminate-and-verify operation. The adapter does not return until the provider root is reaped and
+the owned scope reports no active descendants. This prevents provider tools, plugin processes, or
+grandchildren from surviving an interrupt while ECorp reports `provider_process_alive=false`.
+Ownership is established before provider code runs, avoiding PID-enumeration races and unrelated
+process termination. This is host-process containment, not a network or filesystem sandbox.
 
 Mission descriptions, task contracts, and verifier policies are authority-bearing records.
 Creation validates their bounds before persistence, and every revision stores both prior and

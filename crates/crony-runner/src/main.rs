@@ -6,7 +6,10 @@ mod workspace;
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -1013,6 +1016,7 @@ struct RunnerEventSink {
     workspace: WorkspaceLease,
     artifacts: Arc<Mutex<Vec<AdapterArtifact>>>,
     terminal: Arc<Mutex<Option<BufferedTerminal>>>,
+    teardown_uncertain: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1126,6 +1130,28 @@ impl AdapterEventSink for RunnerEventSink {
                     "human_conversation": human_conversation,
                 }),
             ),
+            AdapterEvent::TeardownUncertain { detail } => {
+                self.teardown_uncertain.store(true, Ordering::Release);
+                send_run_event(
+                    &self.outbound,
+                    &self.runner_id,
+                    &self.assignment,
+                    "run.teardown_uncertain",
+                    json!({
+                        "adapter": self.assignment.adapter,
+                        "provider_process_state": "unverified",
+                        "detail": detail,
+                    }),
+                );
+                send_teardown_workspace_preserved(
+                    &self.outbound,
+                    &self.runner_id,
+                    &self.assignment,
+                    &self.workspace,
+                    &detail,
+                );
+                return;
+            }
             AdapterEvent::Completed { summary } => {
                 if let Ok(mut terminal) = self.terminal.lock() {
                     *terminal = Some(BufferedTerminal::Completed(summary));
@@ -1232,6 +1258,7 @@ async fn execute_assignment(
     };
     let artifacts = Arc::new(Mutex::new(Vec::<AdapterArtifact>::new()));
     let terminal = Arc::new(Mutex::new(None::<BufferedTerminal>));
+    let teardown_uncertain = Arc::new(AtomicBool::new(false));
     let sink: Arc<dyn AdapterEventSink> = Arc::new(RunnerEventSink {
         outbound: outbound.clone(),
         runner_id: runner_id.clone(),
@@ -1239,6 +1266,7 @@ async fn execute_assignment(
         workspace: workspace.clone(),
         artifacts: artifacts.clone(),
         terminal: terminal.clone(),
+        teardown_uncertain: teardown_uncertain.clone(),
     });
     let execution = if let Some(session_id) = resume_session_id {
         adapter.resume(request, &session_id, controls, sink).await
@@ -1249,7 +1277,25 @@ async fn execute_assignment(
         Ok(AdapterExit::Completed) => "completed",
         Ok(AdapterExit::Failed) => "failed",
         Ok(AdapterExit::Cancelled) => "cancelled",
-        Err(_) => "runtime_error",
+        Err(error) => {
+            send_run_event(
+                &outbound,
+                &runner_id,
+                &assignment,
+                "run.failed",
+                json!({"error": format!(
+                    "adapter exited without a verified provider-scope teardown: {error}"
+                )}),
+            );
+            send_teardown_workspace_preserved(
+                &outbound,
+                &runner_id,
+                &assignment,
+                &workspace,
+                &format!("adapter error did not prove provider-scope termination: {error}"),
+            );
+            return Ok(());
+        }
     };
     send_run_event(
         &outbound,
@@ -1306,9 +1352,18 @@ async fn execute_assignment(
             ),
         }
     }
-    let cleanup = workspaces.finalize(&workspace).await;
-    send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
-    execution?;
+    if teardown_uncertain.load(Ordering::Acquire) {
+        send_teardown_workspace_preserved(
+            &outbound,
+            &runner_id,
+            &assignment,
+            &workspace,
+            "provider teardown required a verification retry; exact worktree retained",
+        );
+    } else {
+        let cleanup = workspaces.finalize(&workspace).await;
+        send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
+    }
     Ok(())
 }
 
@@ -1531,6 +1586,31 @@ fn send_workspace_cleanup_event(
                 WorkspaceDisposition::Preserved => "run.workspace_preserved",
             };
             (event_type, cleanup)
+        }
+
+        fn send_teardown_workspace_preserved(
+            outbound: &OutboundBus,
+            runner_id: &str,
+            assignment: &Assignment,
+            workspace: &WorkspaceLease,
+            detail: &str,
+        ) {
+            send_run_event(
+                outbound,
+                runner_id,
+                assignment,
+                "run.workspace_preserved",
+                json!({
+                    "workspace": workspace.path,
+                    "workspace_branch": workspace.branch,
+                    "workspace_base_ref": workspace.base_ref,
+                    "workspace_base_commit": workspace.base_commit,
+                    "detail": detail,
+                    "dirty": Value::Null,
+                    "commits_ahead": Value::Null,
+                    "branch_deleted": false,
+                }),
+            );
         }
         Err(error) => (
             "run.workspace_preserved",

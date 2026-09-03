@@ -1,10 +1,51 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
+
+function waitForever() {
+  return new Promise(() => {
+    setInterval(() => {}, 60_000)
+  })
+}
+
+const treeParentIndex = process.argv.indexOf('--fixture-tree-parent')
+const treeGrandchildIndex = process.argv.indexOf('--fixture-tree-grandchild')
+const inheritedPipeChildIndex = process.argv.indexOf('--fixture-inherited-pipe-child')
+if (inheritedPipeChildIndex >= 0) {
+  await waitForever()
+} else if (treeGrandchildIndex >= 0) {
+  if (process.argv.includes('--stubborn')) {
+    process.on('SIGTERM', () => {})
+  }
+  if (process.argv.includes('--exit-soon')) {
+    setTimeout(() => process.exit(0), 50)
+  }
+  await waitForever()
+} else if (treeParentIndex >= 0) {
+  const pidFile = process.argv[treeParentIndex + 1]
+  const fixtureFlags = [
+    ...(process.argv.includes('--stubborn') ? ['--stubborn'] : []),
+    ...(process.argv.includes('--exit-soon') ? ['--exit-soon'] : []),
+  ]
+  if (fixtureFlags.includes('--stubborn')) {
+    process.on('SIGTERM', () => {})
+  }
+  const grandchild = spawn(
+    process.execPath,
+    [process.argv[1], '--fixture-tree-grandchild', ...fixtureFlags],
+    { stdio: 'ignore' },
+  )
+  await writeFile(
+    pidFile,
+    JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }),
+  )
+  await waitForever()
+}
 
 const providerIndex = process.argv.indexOf('--provider')
 const provider =
@@ -17,6 +58,9 @@ const provider =
         : 'external'
 
 if (process.argv.includes('--version')) {
+  if (process.argv.includes('--fixture-stall-version')) {
+    await waitForever()
+  }
   process.stdout.write(`${provider} fake 1.0.0\n`)
   process.exit(0)
 }
@@ -47,6 +91,29 @@ function finish() {
     },
   })
   output({ type: 'result', text: 'completed' })
+}
+
+function startTreeFixture(mission) {
+  if (!mission.includes('[process-tree')) {
+    return
+  }
+  const flags = [
+    ...(mission.includes(':stubborn') ? ['--stubborn'] : []),
+    ...(mission.includes(':exited-descendant') ? ['--exit-soon'] : []),
+  ]
+  const parent = spawn(
+    process.execPath,
+    [
+      process.argv[1],
+      '--fixture-tree-parent',
+      path.join(process.cwd(), 'external-tree-pids.json'),
+      ...flags,
+    ],
+    mission.includes(':root-exit-inherited-pipe')
+      ? { stdio: ['ignore', 'inherit', 'inherit'] }
+      : { stdio: 'ignore' },
+  )
+  assert.ok(parent.pid, 'fixture parent did not start')
 }
 
 async function finishClaude(input, inputInterface) {
@@ -89,6 +156,9 @@ async function runClaude() {
   assert.equal(initializeFrame.request.subtype, 'initialize')
   assert.equal(initializeFrame.request.hooks, null)
   assert.equal(typeof initializeFrame.request_id, 'string')
+  if (process.argv.includes('--fixture-stall-initialize')) {
+    await waitForever()
+  }
   output({
     type: 'control_response',
     response: {
@@ -105,8 +175,15 @@ async function runClaude() {
   assert.equal(missionFrame.message.role, 'user')
   assert.equal(typeof missionFrame.message.content, 'string')
   const mission = missionFrame.message.content
+  if (mission.includes('[stall:stdin]')) {
+    await waitForever()
+  }
 
   output({ type: 'system', subtype: 'init', session_id: sessionId })
+  startTreeFixture(mission)
+  if (mission.includes('[process-tree')) {
+    await new Promise((resolve) => setTimeout(resolve, 10_000))
+  }
 
   if (!mission.includes('[permission:')) {
     await finishClaude(input, inputInterface)
