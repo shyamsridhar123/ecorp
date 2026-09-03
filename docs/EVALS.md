@@ -52,7 +52,21 @@ An implementation claim needs evidence at the same scope:
 `node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active, that
 the runner emits `run.session_terminated` before verification and accepted completion, and that the
 persistent agent identity returns to `idle` with no `current_run_id`. It does not yet verify the
-entire operating-system descendant tree; that stronger cleanup boundary is tracked in #51.
+entire operating-system descendant tree; that stronger fail-closed cleanup boundary is tracked in
+#124 as a bounded slice of #51.
+
+## External provider permission bridge
+
+The Claude Code adapter now uses Claude's supported stream-JSON `can_use_tool` request/response
+protocol, manual permission mode, and required initialize handshake to translate tool requests into
+durable ECorp approvals. Focused tests cover correlated allow/deny responses, bounded hashed
+approval context, contained-path auto-allow behavior, rejected and expired decisions, and
+provider-response write failure. See
+`docs/evidence/2026-09-03-claude-permission-bridge.md`.
+
+That evidence proves native permission mediation, not complete process-tree teardown. Issue #124
+tracks bounded initialization and protocol I/O, truthful terminal claims, and fail-closed descendant
+cleanup.
 
 ## Quality gates
 
@@ -155,8 +169,12 @@ On September 1, 2026, one operator ran three enterprise-application scenarios th
 browser-to-server-to-runner path. VendorGuard passed 13 tests and its browser workflow; Incident
 Command passed 12 tests and its browser workflow; Credit Exception remained incomplete with 84
 failures and two errors. The pass exposed hard-breaker, budget-recovery, provider-isolation,
-permission-bridging, mission-contract, and portable-deliverable gaps. It is internal systems
-dogfood and does not satisfy the three-external-team requirement in GitHub issue #27. See
+permission-bridging, mission-contract, and portable-deliverable gaps at that time. Subsequent
+evidence below covers the landed breaker, budget-recovery, mission-contract, and portable-deliverable
+work. Claude permission mediation has also landed; provider-home isolation and fail-closed
+process-tree teardown remain tracked in #51 and #124.
+This is internal systems dogfood and does not satisfy the three-external-team requirement in GitHub
+issue #27. See
 `docs/evidence/2026-09-01-enterprise-application-dogfood.md`.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the

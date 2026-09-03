@@ -12,9 +12,10 @@ Known development-only shortcuts:
 - permissive CORS
 - fake process runs with the local user's permissions
 - no network sandbox
-- external CLI adapters do not yet have verified descendant-process cleanup
+- external CLI adapters do not yet have fail-closed, verified complete descendant-process cleanup
 
-These are explicit backlog items, not production claims.
+These gaps are tracked in ECorp Build GitHub Project #3 and linked issues, not in
+`docs/BACKLOG.md`, which is historical seed material only. They are not production claims.
 
 Claude Code is launched in safe mode without user plugins, hooks, MCP servers, browser integration,
 slash commands, or auto-memory. OpenCode uses its plugin-free `--pure` mode. These controls prevent
@@ -22,8 +23,9 @@ the customization leakage observed during the September 1, 2026 enterprise dogfo
 are only a partial boundary. Claude's supported stdio permission control protocol, manual
 permission mode, and required initialize handshake now translate
 tool requests to durable ECorp approvals without permission bypass, terminal scraping, or custom
-stdin messages. GitHub issue #51 still tracks isolated provider homes, inherited-environment
-allowlisting, stop deadlines, and process-tree verification.
+stdin messages. GitHub issue #51 still tracks isolated provider homes and inherited-environment
+allowlisting. Issue #124 tracks bounded fail-closed teardown, truthful terminal claims, and
+complete process-tree verification.
 
 Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
 maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.
