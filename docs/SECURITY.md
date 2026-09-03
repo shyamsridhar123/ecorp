@@ -12,17 +12,17 @@ Known development-only shortcuts:
 - permissive CORS
 - fake process runs with the local user's permissions
 - no network sandbox
-- external CLI adapters do not yet have a complete durable provider-permission bridge or verified
-  descendant-process cleanup
+- external CLI adapters do not yet have verified descendant-process cleanup
 
 These are explicit backlog items, not production claims.
 
 Claude Code is launched in safe mode without user plugins, hooks, MCP servers, browser integration,
 slash commands, or auto-memory. OpenCode uses its plugin-free `--pure` mode. These controls prevent
 the customization leakage observed during the September 1, 2026 enterprise dogfood pass, but they
-are only a partial boundary. GitHub issue #51 tracks isolated provider homes,
-inherited-environment allowlisting, durable permission translation, stop deadlines, and
-process-tree verification.
+are only a partial boundary. Claude's supported stdio permission control protocol now translates
+tool requests to durable ECorp approvals without permission bypass, terminal scraping, or custom
+stdin messages. GitHub issue #51 still tracks isolated provider homes, inherited-environment
+allowlisting, stop deadlines, and process-tree verification.
 
 Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
 maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.
@@ -109,6 +109,15 @@ directory isolated to that worktree. It canonicalizes existing ancestors to reje
 External paths, network URLs, sandbox bypass, managed-policy approvals, and ambiguous shell
 commands suspend durably. Shell approval cards include the bounded command text rather than only a
 generic action label.
+
+Claude permission requests use the same fail-closed worktree containment helper. Only recognized
+read/write tools with an explicit contained path can be allowed locally. Existing ancestors are
+canonicalized, so symlink escapes, traversal, unavailable worktree roots, blocked paths, Bash,
+network tools, unknown tools, and malformed or oversized control frames cannot be auto-approved.
+Suspended approval context preserves the request ID, tool-use ID, tool name, structured input,
+blocked path, decision reason, title, display name, and description within durable event bounds.
+Approval returns the exact original input only to the correlated provider request. Rejection and
+expiry return a bounded denial; duplicate, unknown, cancelled, or mismatched requests fail closed.
 
 Mission descriptions, task contracts, and verifier policies are authority-bearing records.
 Creation validates their bounds before persistence, and every revision stores both prior and

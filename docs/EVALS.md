@@ -178,6 +178,14 @@ The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run 
 through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
 completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
 
+The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
+stream JSON. It verifies the typed initial user frame, hardened launch arguments, exact
+`can_use_tool` correlation, bounded approval context, unchanged approved input, bounded rejection
+and expiry denials, duplicate-decision rejection, and fail-closed cleanup. Contained worktree
+read/write requests are the only local auto-allow case; blocked, ambiguous, outside-worktree, Bash,
+and network requests suspend for a durable ECorp decision. See
+`docs/evidence/2026-09-03-claude-permission-bridge.md`.
+
 `tools/e2e_copilot.mjs` uses a deterministic Copilot fixture to verify model discovery, disabled
 policy states, model and reasoning validation, persisted selection, evidence, and same-session
 resume without requiring an account. `tools/probe_copilot_live.mjs` is the separate authenticated

@@ -116,6 +116,17 @@ commands are retried after server or runner reconnect. They remain pending until
 acknowledges application, while runner command IDs suppress duplicate process effects. Expired
 approvals cancel the run, task, and mission coherently and enqueue a durable rejection.
 
+Claude Code uses its supported bidirectional stream-JSON boundary rather than terminal scraping or
+an ECorp-specific child protocol. The runner starts Claude with stream-JSON input/output and the
+stdio permission prompt tool, sends the mission as a typed user frame, and correlates each
+`can_use_tool` control request by its unchanged provider request and tool-use IDs. A strictly
+contained worktree-local read or write may receive an immediate one-shot response. Bash, network,
+blocked-path, outside-worktree, and ambiguous requests emit one bounded durable action approval and
+remain pending in the adapter. The durable decision produces the matching `control_response`;
+allow responses retain the provider's original structured input, while rejection, expiry, stop,
+interrupt, provider cancellation, or breaker termination denies or clears the pending request
+before terminal session reporting. Unknown and duplicate decisions cannot select another request.
+
 ## Budgets and circuit breaking
 
 Run, mission, requester, and Corp token/cost limits are evaluated after usage events. Explicit

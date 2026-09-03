@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
+import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import readline from 'node:readline'
 
 const providerIndex = process.argv.indexOf('--provider')
 const provider =
@@ -18,25 +22,154 @@ if (process.argv.includes('--version')) {
 }
 
 const slow = process.argv.some((value) => value.includes('[slow]'))
-const sessionFlag = provider === 'claude' ? '--resume' : '--session'
-const sessionIndex = process.argv.indexOf(sessionFlag)
-const sessionId =
-  sessionIndex >= 0 ? process.argv[sessionIndex + 1] : `${provider}-${randomUUID()}`
-
-process.stdout.write(`${JSON.stringify({ session_id: sessionId })}\n`)
-process.stdout.write(
-  `${JSON.stringify({ text: `${provider} normalized provider output` })}\n`,
+const sessionArgument = process.argv.find((value) =>
+  value.startsWith(provider === 'claude-code' ? '--resume=' : '--session='),
 )
-process.stdout.write(
-  `${JSON.stringify({
+const legacySessionFlag = provider === 'claude-code' ? '--resume' : '--session'
+const legacySessionIndex = process.argv.indexOf(legacySessionFlag)
+const sessionId =
+  sessionArgument?.slice(sessionArgument.indexOf('=') + 1) ??
+  (legacySessionIndex >= 0
+    ? process.argv[legacySessionIndex + 1]
+    : `${provider}-${randomUUID()}`)
+
+function output(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`)
+}
+
+function finish() {
+  output({ text: `${provider} normalized provider output` })
+  output({
     usage: {
       input_tokens: 100,
       output_tokens: 40,
       cost_microusd: 200,
     },
-  })}\n`,
-)
-if (slow) {
-  await new Promise((resolve) => setTimeout(resolve, 10_000))
+  })
+  output({ type: 'result', text: 'completed' })
 }
-process.stdout.write(`${JSON.stringify({ type: 'result', text: 'completed' })}\n`)
+
+async function runClaude() {
+  for (const required of [
+    '--safe-mode',
+    '--no-chrome',
+    '--disable-slash-commands',
+    '--strict-mcp-config',
+    '--input-format',
+    '--output-format',
+    '--permission-prompt-tool',
+  ]) {
+    assert.ok(process.argv.includes(required), `missing Claude argument ${required}`)
+  }
+  assert.ok(!process.argv.includes('--dangerously-skip-permissions'))
+  assert.ok(!process.argv.includes('bypassPermissions'))
+
+  const inputInterface = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  })
+  const input = inputInterface[Symbol.asyncIterator]()
+  const first = await input.next()
+  assert.equal(first.done, false, 'Claude mission frame missing')
+  const missionFrame = JSON.parse(first.value)
+  assert.equal(missionFrame.type, 'user')
+  assert.equal(missionFrame.message.role, 'user')
+  assert.equal(typeof missionFrame.message.content, 'string')
+  const mission = missionFrame.message.content
+
+  output({ type: 'system', subtype: 'init', session_id: sessionId })
+
+  if (!mission.includes('[permission:')) {
+    finish()
+    inputInterface.close()
+    return
+  }
+
+  const requestId = 'claude-request-001'
+  const toolUseId = 'claude-tool-use-001'
+  const artifactPath = path.join(process.cwd(), 'claude-permission-artifact.txt')
+  let toolName = 'Bash'
+  let toolInput = { command: 'node -e "process.stdout.write(\'approved\')"' }
+  let blockedPath = null
+
+  if (mission.includes('[permission:safe]')) {
+    toolName = 'Write'
+    toolInput = {
+      file_path: artifactPath,
+      content: 'safe worktree write\n',
+    }
+  } else if (mission.includes('[permission:outside]')) {
+    toolName = 'Write'
+    toolInput = {
+      file_path: path.join(process.cwd(), '..', 'outside.txt'),
+      content: 'must not be written\n',
+    }
+  } else if (mission.includes('[permission:blocked]')) {
+    toolName = 'Write'
+    toolInput = {
+      file_path: artifactPath,
+      content: 'must require approval\n',
+    }
+    blockedPath = artifactPath
+  }
+
+  const request = {
+    subtype: 'can_use_tool',
+    tool_name: toolName,
+    input: toolInput,
+    tool_use_id: toolUseId,
+    blocked_path: blockedPath,
+    decision_reason: 'Fake provider requires a governed decision',
+    title: 'Protocol-faithful fake request',
+    display_name: `Claude ${toolName}`,
+    description: 'Exercises ECorp durable permission translation',
+  }
+  if (mission.includes('[permission:malformed]')) {
+    delete request.input
+  }
+  output({ type: 'control_request', request_id: requestId, request })
+
+  if (mission.includes('[permission:cancelled]')) {
+    output({ type: 'control_cancel_request', request_id: requestId })
+    finish()
+    inputInterface.close()
+    return
+  }
+  const responseLine = await input.next()
+  assert.equal(responseLine.done, false, 'Claude control response missing')
+  const response = JSON.parse(responseLine.value)
+  assert.equal(response.type, 'control_response')
+  assert.equal(response.response.subtype, 'success')
+  assert.equal(response.response.request_id, requestId)
+  const decision = response.response.response
+  if (decision.behavior === 'allow') {
+    assert.deepEqual(decision.updatedInput, toolInput)
+    await writeFile(
+      artifactPath,
+      mission.includes('[permission:safe]')
+        ? toolInput.content
+        : 'durably approved exactly once\n',
+    )
+  } else {
+    assert.equal(decision.behavior, 'deny')
+    assert.equal(typeof decision.message, 'string')
+    assert.ok(decision.message.length <= 501)
+  }
+  finish()
+  inputInterface.close()
+}
+
+try {
+  if (provider === 'claude-code') {
+    await runClaude()
+  } else {
+    output({ session_id: sessionId })
+    finish()
+  }
+  if (slow) {
+    await new Promise((resolve) => setTimeout(resolve, 10_000))
+  }
+} catch (error) {
+  process.stderr.write(`${error.stack ?? error}\n`)
+  process.exitCode = 2
+}
