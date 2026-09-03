@@ -1844,9 +1844,13 @@ async fn validate_publication_prerequisites(
     .await?;
     let run_rows = sqlx::query(
         r#"
-        SELECT run.id, run.breaker_stage
+        SELECT run.id, run.resumed_from_run_id, run.breaker_stage,
+               run.no_progress_events, run.repeated_tool_count,
+               COALESCE(policy.no_progress_event_limit, 8) AS no_progress_limit,
+               COALESCE(policy.repeated_tool_limit, 5) AS repeated_tool_limit
         FROM runs run
         JOIN tasks task ON task.id = run.task_id
+        LEFT JOIN corp_budget_policies policy ON policy.corp_id = run.corp_id
         WHERE run.corp_id = $1 AND task.mission_id = $2
         ORDER BY run.created_at, run.id
         FOR UPDATE OF run
@@ -1856,10 +1860,39 @@ async fn validate_publication_prerequisites(
     .bind(mission_id)
     .fetch_all(&mut **tx)
     .await?;
+    let resume_edges = run_rows
+        .iter()
+        .map(|run| {
+            (
+                run.get::<Uuid, _>("id"),
+                run.get::<Option<Uuid>, _>("resumed_from_run_id"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected_lineage = publication_resume_lineage(selected_run_id, &resume_edges)?;
     let mut run_ids = Vec::with_capacity(run_rows.len());
     for run in run_rows {
         let run_id: Uuid = run.get("id");
         let breaker_stage: String = run.get("breaker_stage");
+        if run_id == selected_run_id {
+            run_ids.push(run_id);
+            continue;
+        }
+        if historical_suspend_is_recovered(
+            run_id,
+            selected_run_id,
+            &breaker_stage,
+            &selected_lineage,
+        ) {
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
+            run_ids.push(run_id);
+            continue;
+        }
         ensure_run_not_hard_blocked_tx(
             tx,
             request.corp_id,
@@ -2197,6 +2230,58 @@ fn ensure_pull_request_identity_matches(
     {
         return Err(anyhow!(
             "conflict: pull request identity does not match the durable publication"
+        ));
+    }
+    Ok(())
+}
+
+fn publication_resume_lineage(
+    selected_run_id: Uuid,
+    resume_edges: &[(Uuid, Option<Uuid>)],
+) -> Result<HashSet<Uuid>> {
+    let parents = resume_edges.iter().copied().collect::<HashMap<_, _>>();
+    if parents.len() != resume_edges.len() {
+        return Err(anyhow!(
+            "pull-request publication run lineage contains duplicate run identifiers"
+        ));
+    }
+    let mut lineage = HashSet::new();
+    let mut current = Some(selected_run_id);
+    while let Some(run_id) = current {
+        if !lineage.insert(run_id) {
+            return Err(anyhow!(
+                "pull-request publication run lineage contains a resume cycle"
+            ));
+        }
+        current = *parents.get(&run_id).with_context(|| {
+            format!(
+                "pull-request publication run lineage references run {run_id} outside the factory mission"
+            )
+        })?;
+    }
+    Ok(lineage)
+}
+
+fn historical_suspend_is_recovered(
+    run_id: Uuid,
+    selected_run_id: Uuid,
+    breaker_stage: &str,
+    selected_lineage: &HashSet<Uuid>,
+) -> bool {
+    run_id != selected_run_id && breaker_stage == "suspend" && selected_lineage.contains(&run_id)
+}
+
+fn ensure_recovered_suspend_loop_metrics_allow_publication(
+    no_progress_events: i32,
+    repeated_tool_count: i32,
+    no_progress_limit: i32,
+    repeated_tool_limit: i32,
+) -> Result<()> {
+    if (no_progress_limit > 0 && no_progress_events >= no_progress_limit)
+        || (repeated_tool_limit > 0 && repeated_tool_count >= repeated_tool_limit)
+    {
+        return Err(anyhow!(
+            "pull-request publication is blocked because current loop metrics require a hard breaker"
         ));
     }
     Ok(())
@@ -2627,5 +2712,62 @@ mod tests {
             "owner/myrepo",
             41
         ));
+    }
+
+    #[test]
+    fn only_suspend_ancestors_are_treated_as_recovered_for_publication() {
+        let suspended = Uuid::from_u128(1);
+        let verifier_retry = Uuid::from_u128(2);
+        let selected = Uuid::from_u128(3);
+        let unrelated = Uuid::from_u128(4);
+        let lineage = publication_resume_lineage(
+            selected,
+            &[
+                (suspended, None),
+                (verifier_retry, Some(suspended)),
+                (selected, Some(verifier_retry)),
+                (unrelated, None),
+            ],
+        )
+        .expect("valid lineage");
+
+        assert!(historical_suspend_is_recovered(
+            suspended, selected, "suspend", &lineage
+        ));
+        assert!(!historical_suspend_is_recovered(
+            unrelated, selected, "suspend", &lineage
+        ));
+        assert!(!historical_suspend_is_recovered(
+            suspended, selected, "stop", &lineage
+        ));
+        assert!(!historical_suspend_is_recovered(
+            selected, selected, "suspend", &lineage
+        ));
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(7, 4, 8, 5).is_ok());
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(8, 4, 8, 5).is_err());
+        assert!(ensure_recovered_suspend_loop_metrics_allow_publication(7, 5, 8, 5).is_err());
+    }
+
+    #[test]
+    fn publication_resume_lineage_fails_closed_on_missing_or_cyclic_parents() {
+        let selected = Uuid::from_u128(1);
+        let missing = Uuid::from_u128(2);
+        assert!(
+            publication_resume_lineage(selected, &[(selected, Some(missing))])
+                .unwrap_err()
+                .to_string()
+                .contains("outside the factory mission")
+        );
+
+        let other = Uuid::from_u128(3);
+        assert!(
+            publication_resume_lineage(
+                selected,
+                &[(selected, Some(other)), (other, Some(selected))]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("resume cycle")
+        );
     }
 }
