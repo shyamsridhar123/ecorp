@@ -1,0 +1,58 @@
+{
+  "status": "passed",
+  "health": {
+    "status": "ok",
+    "service": "incident-command",
+    "persistence": "ready",
+    "sseConnections": 0
+  },
+  "mobileHealth": {
+    "status": "ok",
+    "service": "incident-command",
+    "persistence": "ready",
+    "sseConnections": 1
+  },
+  "sse": {
+    "connection": true,
+    "tenantFiltering": true,
+    "draftPreservingRefresh": true
+  },
+  "concurrency": {
+    "postmortemConflictPreservedDraft": true,
+    "postmortemConflictWarningOnly": true,
+    "tenantSwitchClearedImmediately": true,
+    "tenantSwitchIgnoredDelayedResponse": true
+  },
+  "workflow": {
+    "incidentDeclared": true,
+    "commanderWorkflow": true,
+    "responderTimeline": true,
+    "sseConnected": true,
+    "sseRefreshPreservedDraft": true,
+    "postmortemConflictPreservedDraft": true,
+    "tenantSwitchGenerationFence": true,
+    "postmortemReloadPersistence": true,
+    "deterministicPostmortem": true,
+    "auditVerified": true,
+    "tenantIsolation": true,
+    "desktopResponsive": true,
+    "mobileResponsive": true
+  },
+  "expectedRejectedRequestDiagnostics": [
+    "desktop: Failed to load resource: the server responded with a status of 412 (Precondition Failed)"
+  ],
+  "consoleErrors": [],
+  "pageErrors": [],
+  "viewport": {
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1280,
+    "horizontalOverflow": false
+  },
+  "mobileViewport": {
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "horizontalOverflow": false
+  }
+}
