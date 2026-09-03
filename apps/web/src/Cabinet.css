@@ -1621,8 +1621,10 @@ body::before {
   }
 
   .office-empty {
-    right: 12px;
-    bottom: 12px;
+    top: 104px;
+    right: auto;
+    bottom: auto;
+    left: 12px;
     width: min(280px, calc(100% - 24px));
   }
 
