@@ -21,6 +21,7 @@ use super::{
     AdapterArtifact, AdapterCapabilities, AdapterControl, AdapterError, AdapterEvent,
     AdapterEventSink, AdapterExit, AdapterRunRequest, AgentAdapter, FeatureSupport, UsageSnapshot,
     permission::{bounded_text, path_is_inside_workspace},
+    process_tree::OwnedProcessTree,
 };
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 64 * 1024;
@@ -175,14 +176,21 @@ impl ExternalCliAdapter {
             .envs(&request.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
+            .stderr(Stdio::piped());
+        let mut tree = OwnedProcessTree::spawn(&mut command)
             .with_context(|| format!("spawn {}", self.display_name()))?;
-        let mut stdin = child.stdin.take().context("provider stdin missing")?;
-        let stdout = child.stdout.take().context("provider stdout missing")?;
-        let stderr = child.stderr.take().context("provider stderr missing")?;
+        let streams = {
+            let child = tree.child_mut();
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        };
+        let (Some(mut stdin), Some(stdout), Some(stderr)) = streams else {
+            tree.terminate_and_wait()
+                .await
+                .context("terminate provider with missing standard stream")?;
+            return Err(AdapterError::Runtime(anyhow!(
+                "provider standard stream missing"
+            )));
+        };
         let stderr_sink = sink.clone();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -197,21 +205,32 @@ impl ExternalCliAdapter {
         let mut raw_output = Vec::new();
         let mut lines = BufReader::new(stdout).lines();
         if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
-            initialize_claude(&mut stdin, &mut lines, &mut raw_output)
+            let initialized = async {
+                initialize_claude(&mut stdin, &mut lines, &mut raw_output)
+                    .await
+                    .context("initialize Claude stream protocol")?;
+                send_protocol_frame(
+                    &mut stdin,
+                    &json!({
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": request.mission_title,
+                        },
+                    }),
+                )
                 .await
-                .context("initialize Claude stream protocol")?;
-            send_protocol_frame(
-                &mut stdin,
-                &json!({
-                    "type": "user",
-                    "message": {
-                        "role": "user",
-                        "content": request.mission_title,
-                    },
-                }),
-            )
-            .await
-            .context("send Claude mission frame")?;
+                .context("send Claude mission frame")
+            }
+            .await;
+            if let Err(error) = initialized {
+                drop(stdin);
+                tree.terminate_and_wait()
+                    .await
+                    .context("terminate provider after Claude initialization failure")?;
+                stderr_task.abort();
+                return Err(AdapterError::Runtime(error));
+            }
         }
 
         let mut session_id = resume_session_id.map(str::to_owned);
@@ -234,7 +253,6 @@ impl ExternalCliAdapter {
                                 "failed to deliver Claude permission denial: {error}"
                             ));
                         }
-                        child.kill().await.context("stop provider process")?;
                         if failed.is_none() {
                             cancelled = Some(reason);
                         }
@@ -270,9 +288,6 @@ impl ExternalCliAdapter {
                                 failed = Some(format!(
                                     "failed to deliver Claude permission response: {error}"
                                 ));
-                                child.kill().await.context(
-                                    "stop provider after permission response delivery failure",
-                                )?;
                                 break;
                             }
                         }
@@ -289,7 +304,6 @@ impl ExternalCliAdapter {
                                     "failed to deliver Claude permission denial: {error}"
                                 ));
                             }
-                            child.kill().await.context("stop provider at circuit breaker")?;
                             if failed.is_none() {
                                 cancelled = Some(format!(
                                     "Circuit breaker {stage} checkpoint: {reason}"
@@ -316,16 +330,20 @@ impl ExternalCliAdapter {
                             failed = Some(format!(
                                 "failed to deliver Claude circuit-breaker frame: {error}"
                             ));
-                            child.kill().await.context(
-                                "stop provider after circuit-breaker delivery failure",
-                            )?;
                             break;
                         }
                     }
                     None => {}
                 },
                 line = lines.next_line() => {
-                    let Some(line) = line? else { break };
+                    let line = match line {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(error) => {
+                            failed = Some(format!("read provider protocol stream: {error}"));
+                            break;
+                        }
+                    };
                     if line.len() > MAX_PROTOCOL_LINE_BYTES {
                         failed = Some("provider emitted an oversized stream-JSON frame".to_owned());
                         if let Err(error) = deny_pending_permissions(
@@ -338,7 +356,6 @@ impl ExternalCliAdapter {
                                 "failed to deliver Claude permission denial: {error}"
                             ));
                         }
-                        child.kill().await.context("stop provider after oversized frame")?;
                         break;
                     }
                     raw_output.extend_from_slice(line.as_bytes());
@@ -364,9 +381,6 @@ impl ExternalCliAdapter {
                                         "failed to deliver Claude permission denial: {error}"
                                     ));
                                 }
-                                child.kill().await.context(
-                                    "stop provider after malformed control cancellation",
-                                )?;
                                 break;
                             };
                             let Some(approval_id) =
@@ -385,18 +399,12 @@ impl ExternalCliAdapter {
                                         "failed to deliver Claude permission denial: {error}"
                                     ));
                                 }
-                                child.kill().await.context(
-                                    "stop provider after unknown control cancellation",
-                                )?;
                                 break;
                             };
                             if pending.remove(&approval_id).is_none() {
                                 failed = Some(
                                     "Claude cancellation did not match a pending approval".to_owned(),
                                 );
-                                child.kill().await.context(
-                                    "stop provider after mismatched control cancellation",
-                                )?;
                                 break;
                             }
                             continue;
@@ -431,9 +439,6 @@ impl ExternalCliAdapter {
                                                 "failed to deliver Claude permission denial: {error}"
                                             ));
                                         }
-                                        child.kill().await.context(
-                                            "stop provider after control request ID reuse",
-                                        )?;
                                         break;
                                     }
                                     if claude_permission_is_automatically_safe(
@@ -449,9 +454,6 @@ impl ExternalCliAdapter {
                                             failed = Some(format!(
                                                 "failed to deliver Claude permission response: {error}"
                                             ));
-                                            child.kill().await.context(
-                                                "stop provider after permission response delivery failure",
-                                            )?;
                                             break;
                                         }
                                         continue;
@@ -472,12 +474,6 @@ impl ExternalCliAdapter {
                                                         "failed to deliver Claude permission denial: {error}"
                                                     ));
                                                 }
-                                                child
-                                                    .kill()
-                                                    .await
-                                                    .context(
-                                                        "stop provider after oversized permission context",
-                                                    )?;
                                                 break;
                                             }
                                         };
@@ -533,9 +529,6 @@ impl ExternalCliAdapter {
                                             "failed to deliver Claude permission denial: {delivery_error}"
                                         ));
                                     }
-                                    child.kill().await.context(
-                                        "stop provider after invalid permission request",
-                                    )?;
                                     break;
                                 }
                             }
@@ -561,20 +554,12 @@ impl ExternalCliAdapter {
                                         "failed to deliver Claude permission denial: {error}"
                                     ));
                                 }
-                                child
-                                    .kill()
-                                    .await
-                                    .context("stop provider after premature Claude result")?;
                                 break;
                             }
                             if let Err(error) = stdin.shutdown().await {
                                 failed = Some(format!(
                                     "close Claude stream input after result: {error}"
                                 ));
-                                child
-                                    .kill()
-                                    .await
-                                    .context("stop provider after Claude input close failure")?;
                                 break;
                             }
                             break;
@@ -615,9 +600,6 @@ impl ExternalCliAdapter {
                                     "failed to deliver Claude permission denial: {error}"
                                 ));
                             }
-                            child.kill().await.context(
-                                "stop provider after malformed stream-JSON control data",
-                            )?;
                             break;
                         }
                         sink.emit(AdapterEvent::Output {
@@ -641,7 +623,10 @@ impl ExternalCliAdapter {
             });
         }
         drop(stdin);
-        let status = child.wait().await?;
+        let status = tree
+            .terminate_and_wait()
+            .await
+            .context("terminate and verify provider process tree")?;
         stderr_task.abort();
         if let Some(reason) = cancelled {
             sink.emit(AdapterEvent::Cancelled { reason });
@@ -1059,9 +1044,12 @@ fn find_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
+
+    use serde::Deserialize;
 
     use super::*;
+    use crate::adapter::process_tree::process_is_alive;
 
     #[derive(Default)]
     struct RecordingSink {
@@ -1072,6 +1060,18 @@ mod tests {
         fn emit(&self, event: AdapterEvent) {
             self.events.lock().expect("event lock").push(event);
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixturePids {
+        parent: u32,
+        grandchild: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TreeControl {
+        Interrupt,
+        Stop,
     }
 
     fn adapter(flavor: ExternalFlavor) -> ExternalCliAdapter {
@@ -1237,8 +1237,106 @@ mod tests {
         }
     }
 
+    async fn wait_for_tree_pids(workspace: &Path) -> FixturePids {
+        let pid_file = workspace.join("external-tree-pids.json");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = tokio::fs::read(&pid_file).await
+                    && let Ok(pids) = serde_json::from_slice(&bytes)
+                {
+                    return pids;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external tree PID file timeout")
+    }
+
+    async fn wait_until_dead(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_is_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external fixture process remained alive");
+    }
+
+    async fn assert_control_removes_tree(
+        mission_title: &str,
+        control: TreeControl,
+        descendant_exits_first: bool,
+    ) {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = mission_title.to_owned();
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_adapter = adapter.clone();
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { task_adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        assert!(process_is_alive(pids.parent));
+        if descendant_exits_first {
+            wait_until_dead(pids.grandchild).await;
+        } else {
+            assert!(process_is_alive(pids.grandchild));
+        }
+
+        let reason = match control {
+            TreeControl::Interrupt => "process-tree interrupt",
+            TreeControl::Stop => "process-tree stop",
+        };
+        let command = match control {
+            TreeControl::Interrupt => AdapterControl::Interrupt {
+                reason: reason.to_owned(),
+            },
+            TreeControl::Stop => AdapterControl::Stop {
+                reason: reason.to_owned(),
+            },
+        };
+        control_tx.send(command).expect("send tree control");
+        let exit = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("external adapter termination timeout")
+            .expect("join external adapter")
+            .expect("execute external adapter");
+
+        assert_eq!(exit, AdapterExit::Cancelled);
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        assert!(sink.events.lock().expect("event lock").iter().any(
+            |event| matches!(event, AdapterEvent::Cancelled { reason: actual } if actual == reason)
+        ));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn external_interrupt_removes_stubborn_process_tree() {
+        assert_control_removes_tree(
+            "[process-tree:stubborn] interrupt fixture",
+            TreeControl::Interrupt,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn external_stop_removes_process_tree_after_grandchild_already_exited() {
+        assert_control_removes_tree(
+            "[process-tree:exited-descendant] stop fixture",
+            TreeControl::Stop,
+            true,
+        )
+        .await;
+    }
+
     async fn wait_for_approval(sink: &RecordingSink) -> (Uuid, String, String) {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if let Some(approval) =
                     sink.events

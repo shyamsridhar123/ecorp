@@ -51,8 +51,15 @@ An implementation claim needs evidence at the same scope:
 
 `node tools/e2e_idle_cleanup.mjs` proves that a worker is visible only while its run is active, that
 the runner emits `run.session_terminated` before verification and accepted completion, and that the
-persistent agent identity returns to `idle` with no `current_run_id`. It does not yet verify the
-entire operating-system descendant tree; that stronger cleanup boundary is tracked in #51.
+persistent agent identity returns to `idle` with no `current_run_id`.
+
+`cargo test -p crony-runner process_tree -- --nocapture` creates a real parent/grandchild fixture
+inside `OwnedProcessTree`. It covers a stubborn descendant, an already-exited descendant,
+idempotent repeated termination, and an unrelated process that must remain alive. The external
+adapter tests drive both interrupt and stop through the same ownership boundary. Windows exercises
+the Job Object implementation; Unix exercises the process-group implementation. A release
+candidate must additionally rerun the real Claude parent/grandchild probe recorded in
+`docs/evidence/2026-09-03-external-provider-process-tree.md`; unit success alone is insufficient.
 
 ## Quality gates
 
