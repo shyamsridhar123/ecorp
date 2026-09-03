@@ -3,6 +3,7 @@ import type { CSSProperties, FormEvent } from 'react'
 import './App.css'
 import './Arcade.css'
 import './Cabinet.css'
+import './World.css'
 
 type Actor = {
   id: string
@@ -629,12 +630,21 @@ function usesDeterministicHarness(strategy: string): boolean {
 }
 
 const OFFICE_POSITIONS = [
-  { x: 14, y: 31 },
-  { x: 39, y: 31 },
-  { x: 64, y: 31 },
-  { x: 24, y: 69 },
-  { x: 50, y: 69 },
-  { x: 76, y: 69 },
+  { x: 17, y: 42 },
+  { x: 41, y: 42 },
+  { x: 65, y: 42 },
+  { x: 28, y: 72 },
+  { x: 53, y: 72 },
+  { x: 78, y: 72 },
+] as const
+
+const OFF_SHIFT_POSITIONS = [
+  { x: 12, y: 74 },
+  { x: 28, y: 82 },
+  { x: 45, y: 76 },
+  { x: 61, y: 84 },
+  { x: 78, y: 77 },
+  { x: 88, y: 68 },
 ] as const
 
 function adapterLabel(adapter: string): string {
@@ -1688,18 +1698,30 @@ function FactoryPanel({
 
 function AgentAvatar({ agent }: { agent: Agent }) {
   return (
-    <div className={`agent-sprite accent-${agent.accent} sprite-${agent.status}`} aria-hidden="true">
+    <div
+      className={`agent-sprite accent-${agent.accent} sprite-${agent.status}`}
+      data-agent={agent.name.toLowerCase()}
+      aria-hidden="true"
+    >
       <span className="sprite-shadow" />
       <span className="sprite-person">
         <span className="sprite-head">
-          <span className="sprite-face" />
+          <span className="sprite-hair" />
+          <span className="sprite-face">
+            <i className="sprite-eye sprite-eye-left" />
+            <i className="sprite-eye sprite-eye-right" />
+          </span>
+          <span className="sprite-headset" />
         </span>
-        <span className="sprite-body" />
+        <span className="sprite-body">
+          <span className="sprite-badge" />
+        </span>
         <span className="sprite-arm sprite-arm-left" />
         <span className="sprite-arm sprite-arm-right" />
         <span className="sprite-leg sprite-leg-left" />
         <span className="sprite-leg sprite-leg-right" />
       </span>
+      <span className="sprite-signal" />
     </div>
   )
 }
@@ -1720,36 +1742,55 @@ function OfficeFloor({
   )
   return (
     <div className="office-stage" aria-label="Live agent office">
+      <div className="world-sky" aria-hidden="true">
+        <span className="world-moon" />
+        <span className="world-star world-star-one" />
+        <span className="world-star world-star-two" />
+        <span className="world-star world-star-three" />
+        <span className="world-city world-city-back" />
+        <span className="world-city world-city-front" />
+      </div>
       <div className="office-wall">
         <span className="office-clock" />
         <span className="office-window office-window-left" />
+        <span className="office-window office-window-center" />
         <span className="office-window office-window-right" />
-        <span className="office-sign">ECORP · AUTOMATION CONTROL</span>
+        <span className="office-sign">
+          {liveAgents.length ? 'ECORP // LIVE FLOOR' : 'ECORP // FLOOR CLEAR'}
+        </span>
+        <span className="world-server-rack world-server-rack-left" />
+        <span className="world-server-rack world-server-rack-right" />
       </div>
       <div className="office-zone zone-review">
-        <span>Review table</span>
+        <span className="sr-only">Review table</span>
         <i />
       </div>
       <div className="office-zone zone-approval">
-        <span>Approval desk</span>
+        <span className="sr-only">Approval desk</span>
         <i />
       </div>
       <div className="office-zone zone-lounge">
-        <span>Operator bay</span>
+        <span className="sr-only">Operator bay</span>
         <i />
+      </div>
+      <div className="world-floor-markings" aria-hidden="true">
+        <span className="world-lane world-lane-one" />
+        <span className="world-lane world-lane-two" />
+        <span className="world-lane world-lane-three" />
       </div>
       {agents.map((agent) => {
         const index = agents.findIndex((candidate) => candidate.id === agent.id)
         const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+        const offShift = OFF_SHIFT_POSITIONS[index % OFF_SHIFT_POSITIONS.length]
         const destination =
           agent.status === 'blocked'
-            ? { x: 86, y: 25 }
+            ? { x: 83, y: 39 }
             : agent.status === 'reviewing'
-              ? { x: 51 + (index % 2) * 8, y: 23 }
+              ? { x: 48 + (index % 2) * 8, y: 38 }
               : agent.status === 'offline'
-                ? { x: 7 + (index % 2) * 5, y: 82 - (index % 3) * 4 }
+                ? { x: 91, y: 78 - (index % 3) * 7 }
                 : agent.status === 'idle'
-                  ? { x: 20 + (index % 6) * 12, y: 77 }
+                  ? offShift
                   : home
         const style = {
           '--agent-x': `${destination.x}%`,
@@ -1766,11 +1807,16 @@ function OfficeFloor({
             style={style}
             onClick={() => onSelect(agent)}
             aria-label={`Inspect ${agent.name}, ${agent.status}`}
+            aria-pressed={selectedAgentId === agent.id}
             data-testid={`agent-${agent.name}`}
           >
             {agent.status !== 'idle' && agent.status !== 'offline' ? (
               <span className="sprite-activity">
-                {agent.status === 'blocked' ? 'Approval needed' : agent.station ?? agent.status}
+                {agent.status === 'blocked'
+                  ? 'Approval needed'
+                  : agent.status === 'reviewing'
+                    ? 'Review ready'
+                    : agent.station ?? agent.status}
               </span>
             ) : null}
             <AgentAvatar agent={agent} />
@@ -1783,9 +1829,8 @@ function OfficeFloor({
       })}
       {liveAgents.length === 0 ? (
         <div className="office-empty" role="status">
-          <span>No live agent processes</span>
-          <strong>The crew is off shift</strong>
-          <small>Start a mission to launch a worker in an isolated worktree.</small>
+          <span>Floor clear</span>
+          <strong>Select Missions to deploy</strong>
         </div>
       ) : null}
       {agents.map((agent, index) => {
@@ -1802,7 +1847,15 @@ function OfficeFloor({
           </div>
         )
       })}
-      <div className="office-door" aria-hidden="true"><span>Secure runner</span></div>
+      <div className="world-console world-console-left" aria-hidden="true">
+        <span />
+        <i />
+      </div>
+      <div className="world-console world-console-right" aria-hidden="true">
+        <span />
+        <i />
+      </div>
+      <div className="office-door" aria-hidden="true"><span>RUNNER</span></div>
       <div className="office-carpet" aria-hidden="true" />
     </div>
   )
@@ -3417,6 +3470,7 @@ function App() {
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
   const [developerMode, setDeveloperMode] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [floorInspectorOpen, setFloorInspectorOpen] = useState(false)
   const [selectedMissionId, setSelectedMissionId] = useState<string | null>(null)
   const [activeWorkspaceView, setActiveWorkspaceView] = useState<WorkspaceView>(() =>
     workspaceViewFromHash(window.location.hash),
@@ -3477,6 +3531,15 @@ function App() {
       window.removeEventListener('popstate', syncFromHash)
     }
   }, [])
+
+  useEffect(() => {
+    if (!floorInspectorOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFloorInspectorOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [floorInspectorOpen])
 
   const navigateToWorkspaceEntity = useCallback(
     (kind: EntityLink['kind'] | 'room', targetId: string) => {
@@ -4417,6 +4480,7 @@ function App() {
   const activateWorkspaceView = (view: WorkspaceView) => {
     const destination = WORKSPACE_VIEWS.find((candidate) => candidate.id === view)
     setActiveWorkspaceView(view)
+    if (view !== 'floor') setFloorInspectorOpen(false)
     if (window.location.hash !== `#${view}`) {
       window.history.pushState(null, '', `#${view}`)
     }
@@ -4434,14 +4498,14 @@ function App() {
       </div>
       <header className="topbar">
         <div className="brand-lockup">
-          <span className="brand-kicker">Distributed intelligence division</span>
+          <span className="brand-kicker">Human + agent operations</span>
           <div className="brand-row">
             <span className="brand-mark" aria-hidden="true">
               <span className="brand-e">E</span>
               <span className="brand-slash" />
             </span>
-            <h1><span>e</span>corp</h1>
-            <span className="alpha-stamp">OPS NETWORK / NODE 00A</span>
+            <h1><span>E</span>CORP</h1>
+            <span className="alpha-stamp">1P READY</span>
           </div>
         </div>
         <div className="operator-console">
@@ -4498,7 +4562,7 @@ function App() {
 
       <section className="arcade-command-deck" aria-label="Operations overview">
         <div className="arcade-command-focus">
-          <span>Active cabinet</span>
+          <span>Cabinet</span>
           <strong>{currentWorkspaceView.label}</strong>
           <small>{currentWorkspaceView.description}</small>
         </div>
@@ -4690,11 +4754,11 @@ function App() {
           hidden={activeWorkspaceView !== 'floor'}
           tabIndex={-1}
         >
-          <div className="panel-heading">
+          <div className="panel-heading world-titleplate">
             <div>
-              <span className="section-code">CONTROL FLOOR / 01</span>
+              <span className="section-code">LIVE FLOOR</span>
               <h2>{room?.name ?? 'Automation division'}</h2>
-              <p>Active sessions and work awaiting review appear on the floor. Finished agents return off shift.</p>
+              <p>Authoritative crew state. Select a sprite to inspect or take control.</p>
             </div>
             <div className="floor-legend">
               <span><StatusMark status="idle" /> off shift</span>
@@ -4707,39 +4771,66 @@ function App() {
             <OfficeFloor
               agents={data.snapshot.agents}
               selectedAgentId={selectedAgent.id}
-              onSelect={(agent) => setSelectedAgentId(agent.id)}
+              onSelect={(agent) => {
+                setSelectedAgentId(agent.id)
+                setFloorInspectorOpen(true)
+              }}
             />
-            <div className="agent-roster" aria-label="Agent roster">
-              {data.snapshot.agents.map((agent) => (
+            <div className="world-crew-select" aria-label="Available crew">
+              <span>CREW</span>
+              {data.snapshot.agents.map((agent, index) => (
                 <button
                   key={agent.id}
                   type="button"
-                  className={selectedAgent.id === agent.id ? 'agent-roster-selected' : ''}
-                  onClick={() => setSelectedAgentId(agent.id)}
+                  className={selectedAgent.id === agent.id ? 'world-crew-selected' : ''}
+                  aria-label={`Inspect ${agent.name}, ${agent.status}`}
+                  onClick={() => {
+                    setSelectedAgentId(agent.id)
+                    setFloorInspectorOpen(true)
+                  }}
                 >
+                  <span>{String(index + 1).padStart(2, '0')}</span>
+                  <strong>{agent.name}</strong>
                   <StatusMark status={agent.status} />
-                  <span>{agent.name}</span>
-                  <small>
-                    {adapterLabel(agent.adapter)} · {agentStatusLabel(agent)}
-                  </small>
                 </button>
               ))}
             </div>
-            <AgentDesk
-              agent={selectedAgent}
-              capability={selectedAgentCapability}
-              actor={selectedActor}
-              humans={humans}
-              lease={data.snapshot.leases.find((lease) => lease.agent_id === selectedAgent.id)}
-              leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, selectedAgent.id)]}
-              queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === selectedAgent.id).length}
-              onClaim={claimLease}
-              onRelease={releaseLease}
-              onTransfer={transferLease}
-              onInterrupt={interruptRun}
-              onEmergencyStop={emergencyStop}
-              onMessage={sendMessage}
-            />
+            {floorInspectorOpen ? (
+              <div className="world-inspector-layer">
+                <button
+                  type="button"
+                  className="world-inspector-scrim"
+                  aria-label="Close agent inspector"
+                  tabIndex={-1}
+                  onClick={() => setFloorInspectorOpen(false)}
+                />
+                <aside className="world-inspector" aria-label={`${selectedAgent.name} command HUD`}>
+                  <button
+                    type="button"
+                    className="world-inspector-close"
+                    onClick={() => setFloorInspectorOpen(false)}
+                    autoFocus
+                  >
+                    Close
+                  </button>
+                  <AgentDesk
+                    agent={selectedAgent}
+                    capability={selectedAgentCapability}
+                    actor={selectedActor}
+                    humans={humans}
+                    lease={data.snapshot.leases.find((lease) => lease.agent_id === selectedAgent.id)}
+                    leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, selectedAgent.id)]}
+                    queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === selectedAgent.id).length}
+                    onClaim={claimLease}
+                    onRelease={releaseLease}
+                    onTransfer={transferLease}
+                    onInterrupt={interruptRun}
+                    onEmergencyStop={emergencyStop}
+                    onMessage={sendMessage}
+                  />
+                </aside>
+              </div>
+            ) : null}
           </div>
         </div>
 

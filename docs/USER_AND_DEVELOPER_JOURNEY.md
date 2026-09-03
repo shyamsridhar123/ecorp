@@ -6,17 +6,19 @@ ECorp turns a repository-level outcome into isolated agent work, human decisions
 artifacts. The office is a live projection of that workflow; it is not a separate game layer or the
 system of record.
 
-The browser is organized as five arcade-cabinet views: **Control floor**, **Factory**,
-**Missions**, **Comms**, and **Audit**. Only one primary view is rendered at a time. A persistent
-operations HUD keeps live runs, pending decisions, active factory work, and verified results
-visible without stacking every subsystem into one page. Hash links and desktop deep links select
-the appropriate view before focusing the requested room, mission, task, or run.
+The browser is one arcade game shell with five focused cabinets: **Control floor**, **Factory**,
+**Missions**, **Comms**, and **Audit**. Only one primary view is rendered at a time. A compact score
+rail keeps live runs, pending decisions, active factory work, and verified results visible without
+stacking every subsystem into one page. Hash links and desktop deep links select the appropriate
+cabinet before focusing the requested room, mission, task, or run.
 
-On desktop, a compact cartridge rail switches cabinets while the selected workspace owns the
-remaining screen. The Control floor keeps authoritative agent sprites in the playfield, including
-truthful off-shift identities. Factory uses one issue queue and one full workbench dossier. Missions
-uses one cartridge list and one active quest dossier. Mobile keeps the same model with a
-horizontally scrollable cabinet rail and no document-level horizontal overflow.
+A fixed bottom control dock switches cabinets while the selected workspace owns the screen. The
+Control floor is a coherent sprite-art world rather than a framed dashboard. Every authoritative
+agent identity remains selectable in the playfield, including truthful off-shift identities. Agent
+details and controls open as a dismissible command HUD instead of consuming a permanent column.
+Factory uses one issue queue and one full workbench dossier. Missions uses one cartridge list and
+one active quest dossier. Mobile keeps the same game-world model with a bottom dock, a command
+sheet, and no document-level horizontal overflow.
 
 ## The four-step user journey
 
@@ -121,7 +123,8 @@ The shared office maps authoritative agent state to visible behavior:
 
 Select a sprite to inspect the agent. Claiming control grants the live steering lease. People without
 the lease can still queue a note. Authorized operators can transfer or release control, interrupt a
-turn, or issue an emergency stop.
+turn, or issue an emergency stop. The command HUD closes through its visible control, its scrim, or
+the Escape key without ending or changing the agent process.
 
 When a run becomes completed, failed, or cancelled, its adapter disconnects or stops the provider,
 the runner removes the run from its active-process map, and the employee identity returns off shift.

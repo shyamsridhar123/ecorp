@@ -27,7 +27,7 @@ evidence-backed results.
 
 ![ECorp operations control room](./docs/assets/ecorp-control-room.png)
 
-<p align="center"><sub><strong>LIVE CONTROL FLOOR:</strong> concurrent Claude Code and OpenCode adapter sessions plus a deterministic worker, projected from actual runner state.</sub></p>
+<p align="center"><sub><strong>PLAYABLE CONTROL FLOOR:</strong> server-backed crew sprites inhabit one game world, agent commands open in context, and the bottom dock switches focused cabinets.</sub></p>
 
 <p align="center"><strong>Meet Relay.</strong> Part dispatcher, part safety officer, always asking for evidence.</p>
 
