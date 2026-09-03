@@ -948,6 +948,36 @@ pub(super) async fn mission_usage_tx(
 mod tests {
     use super::*;
 
+    fn proposal_with_token_budgets(
+        proposed_budget_tokens: i64,
+        finish_scope_budget_tokens: Option<i64>,
+    ) -> ProposeMissionBudgetRevisionInput {
+        ProposeMissionBudgetRevisionInput {
+            corp_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            actor_id: Uuid::new_v4(),
+            expected_budget_tokens: 2_000_000,
+            expected_budget_cost_microusd: 1_000_000,
+            proposed_budget_tokens,
+            proposed_budget_cost_microusd: 1_000_000,
+            rationale: "Finish the verified application after review.".to_owned(),
+            idempotency_key: Uuid::new_v4(),
+            finish_scope: finish_scope_budget_tokens.map(|budget_tokens| MissionFinishScopeInput {
+                task_id: Uuid::new_v4(),
+                objective: "Complete the bounded recovery scope.".to_owned(),
+                expected_output: "A verified recovery artifact.".to_owned(),
+                acceptance_tests: vec!["The recovery artifact is verified.".to_owned()],
+                write_scope: vec!["crates/**".to_owned()],
+                budget_tokens,
+                budget_cost_microusd: 1_000_000,
+                verification_policy: VerificationPolicy {
+                    checks: Vec::new(),
+                    manual_gate: None,
+                },
+            }),
+        }
+    }
+
     #[test]
     fn proposal_normalization_requires_a_monotonic_bounded_increase() {
         let normalized = normalize_proposal(ProposeMissionBudgetRevisionInput {
@@ -986,6 +1016,52 @@ mod tests {
                 .to_string()
                 .contains("increase")
         );
+    }
+
+    #[test]
+    fn recovery_and_finish_scope_token_ceilings_are_distinct() {
+        let mission_ceiling =
+            normalize_proposal(proposal_with_token_budgets(MAX_MISSION_BUDGET_TOKENS, None))
+                .expect("the recovery mission ceiling must be accepted");
+        assert_eq!(
+            mission_ceiling.proposed_budget_tokens,
+            MAX_MISSION_BUDGET_TOKENS
+        );
+
+        let mission_over_ceiling = proposal_with_token_budgets(MAX_MISSION_BUDGET_TOKENS + 1, None);
+        assert!(
+            normalize_proposal(mission_over_ceiling)
+                .unwrap_err()
+                .to_string()
+                .contains("proposed mission token budget is out of range")
+        );
+
+        normalize_proposal(proposal_with_token_budgets(
+            2_750_000,
+            Some(MAX_TASK_BUDGET_TOKENS),
+        ))
+        .expect("the per-task finish-scope ceiling must be accepted");
+
+        let finish_scope_over_ceiling =
+            proposal_with_token_budgets(2_750_000, Some(MAX_TASK_BUDGET_TOKENS + 1));
+        assert!(
+            normalize_proposal(finish_scope_over_ceiling)
+                .unwrap_err()
+                .to_string()
+                .contains("finish-scope token budget is out of range")
+        );
+    }
+
+    #[test]
+    fn mission_budget_ceiling_migration_preserves_graph_shape_bounds() {
+        let migration = include_str!("../../../db/migrations/0030_mission_budget_ceiling.sql");
+
+        assert!(migration.contains("DROP CONSTRAINT IF EXISTS missions_graph_limits_check"));
+        assert!(migration.contains("ADD CONSTRAINT missions_graph_limits_check"));
+        assert!(migration.contains("max_nodes BETWEEN 1 AND 32"));
+        assert!(migration.contains("max_depth BETWEEN 0 AND 8"));
+        assert!(migration.contains("budget_tokens BETWEEN 1 AND 20000000"));
+        assert!(!migration.contains("budget_tokens BETWEEN 1 AND 2000000\n"));
     }
 
     #[test]

@@ -145,6 +145,11 @@
       "version": 29,
       "file": "0029_mission_contract_revisions.sql",
       "sha384": "c7f13f0e6be558c7c5e04bceedca544deca02573ac005bfdb309920f1775449a36781d009ac0a84612588a391f24338d"
+    },
+    {
+      "version": 30,
+      "file": "0030_mission_budget_ceiling.sql",
+      "sha384": "36994a8052952a036df2ae49baac5f41094015e3deb498fef8a7e356adc193ac8812bbbb5e88d2a4690354e8e12f276d"
     }
   ]
 }
