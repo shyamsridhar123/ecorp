@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="VendorGuard third-party risk review workspace">
+    <title>VendorGuard | Third-party risk review</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="VendorGuard home">
+        <span class="brand-mark" aria-hidden="true">VG</span>
+        <span><strong>VendorGuard</strong><small>Third-party assurance</small></span>
+      </a>
+      <div class="environment"><span></span> Local review workspace</div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Risk operations / Vendor intake</p>
+          <h1>Decisions backed by evidence.</h1>
+          <p class="hero-copy">
+            Submit, review, and verify vendor assessments with deterministic scoring
+            and a linked audit trail.
+          </p>
+        </div>
+        <div class="hero-stat">
+          <span id="pending-count">0</span>
+          <small>awaiting review</small>
+        </div>
+      </section>
+
+      <section class="context-panel" aria-labelledby="context-title">
+        <div>
+          <p class="eyebrow" id="context-title">Active security context</p>
+          <p class="context-help">Tenant and role headers are explicit in this local demonstration.</p>
+        </div>
+        <div class="context-controls">
+          <label>Tenant
+            <select id="tenant">
+              <option value="acme">Acme Holdings</option>
+              <option value="globex">Globex Group</option>
+            </select>
+          </label>
+          <label>Actor
+            <input id="actor" value="requester.alex" maxlength="80">
+          </label>
+          <label>Role
+            <select id="role">
+              <option value="requester">Requester</option>
+              <option value="reviewer">Reviewer</option>
+              <option value="admin">Administrator</option>
+            </select>
+          </label>
+          <button id="apply-context" class="button secondary" type="button">Apply context</button>
+        </div>
+      </section>
+
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+      <section class="workspace">
+        <aside class="intake" id="intake-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">New assessment</p>
+              <h2>Vendor intake</h2>
+            </div>
+            <span class="step">01</span>
+          </div>
+          <form id="vendor-form">
+            <label>Vendor name
+              <input id="vendor-name" name="name" required minlength="2" maxlength="120" placeholder="e.g. Northstar Data">
+            </label>
+            <label>Service provided
+              <textarea id="vendor-service" name="service" required minlength="2" maxlength="240" rows="3" placeholder="Describe the business service"></textarea>
+            </label>
+            <div class="form-grid">
+              <label>Data classification
+                <select id="data-classification" name="dataClassification">
+                  <option value="public">Public</option>
+                  <option value="internal">Internal</option>
+                  <option value="confidential">Confidential</option>
+                  <option value="restricted">Restricted</option>
+                </select>
+              </label>
+              <label>Business criticality
+                <select id="criticality" name="criticality">
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+            </div>
+            <label>Annual spend (USD)
+              <input id="annual-spend" name="annualSpend" type="number" min="0" max="10000000" value="50000" required>
+            </label>
+            <label class="check-row">
+              <input id="internet-exposure" name="internetExposure" type="checkbox">
+              <span><strong>Internet-facing access</strong><small>Vendor service is reachable from the public internet.</small></span>
+            </label>
+            <label class="check-row">
+              <input id="security-review" name="securityReview" type="checkbox">
+              <span><strong>Security review completed</strong><small>Documented technical review is available.</small></span>
+            </label>
+            <button class="button primary full" type="submit">Create draft assessment</button>
+          </form>
+          <p class="boundary-note">Demonstration control boundary — not a compliance certification.</p>
+        </aside>
+
+        <section class="queue" aria-labelledby="queue-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Decision queue</p>
+              <h2 id="queue-title">Vendor assessments</h2>
+            </div>
+            <button id="refresh" class="text-button" type="button">Refresh</button>
+          </div>
+          <div id="vendor-list" class="vendor-list">
+            <div class="empty">Loading tenant workspace…</div>
+          </div>
+        </section>
+      </section>
+
+      <section id="audit-panel" class="audit-panel" hidden>
+        <div>
+          <p class="eyebrow">Administrator control</p>
+          <h2>Audit chain verification</h2>
+          <p>Recompute every tenant event hash and link from persisted data.</p>
+        </div>
+        <button id="verify-audit" class="button secondary" type="button">Verify SHA-256 chain</button>
+        <div id="audit-result" class="audit-result">Not yet verified</div>
+      </section>
+    </main>
+
+    <template id="vendor-template">
+      <article class="vendor-card">
+        <div class="vendor-summary">
+          <div>
+            <div class="vendor-meta">
+              <span class="status-pill"></span>
+              <span class="version"></span>
+            </div>
+            <h3 class="vendor-title"></h3>
+            <p class="vendor-service"></p>
+          </div>
+          <div class="risk-gauge">
+            <strong class="risk-score"></strong>
+            <span class="risk-level"></span>
+          </div>
+        </div>
+        <details class="risk-details">
+          <summary>Risk explanation and thresholds</summary>
+          <div class="thresholds"></div>
+          <ul class="factor-list"></ul>
+        </details>
+        <div class="review-history"></div>
+        <div class="card-actions"></div>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
