@@ -117,13 +117,15 @@ acknowledges application, while runner command IDs suppress duplicate process ef
 approvals cancel the run, task, and mission coherently and enqueue a durable rejection.
 
 Claude Code uses its supported bidirectional stream-JSON boundary rather than terminal scraping or
-an ECorp-specific child protocol. The runner starts Claude with stream-JSON input/output and the
-stdio permission prompt tool, sends the mission as a typed user frame, and correlates each
+an ECorp-specific child protocol. The runner starts Claude with stream-JSON input/output, manual
+permission mode, and the stdio permission prompt tool. It completes a correlated `initialize`
+control request/response before sending the mission as a typed user frame, then correlates each
 `can_use_tool` control request by its unchanged provider request and tool-use IDs. A strictly
 contained worktree-local read or write may receive an immediate one-shot response. Bash, network,
 blocked-path, outside-worktree, and ambiguous requests emit one bounded durable action approval and
 remain pending in the adapter. The durable decision produces the matching `control_response`;
-allow responses retain the provider's original structured input, while rejection, expiry, stop,
+allow responses retain the provider's original structured input in process memory, while durable
+approval text contains bounded metadata and hashes rather than raw tool input. Rejection, expiry, stop,
 interrupt, provider cancellation, or breaker termination denies or clears the pending request
 before terminal session reporting. Unknown and duplicate decisions cannot select another request.
 

@@ -49,6 +49,13 @@ function finish() {
   output({ type: 'result', text: 'completed' })
 }
 
+async function finishClaude(input, inputInterface) {
+  finish()
+  const end = await input.next()
+  assert.equal(end.done, true, 'Claude stream input remained open after result')
+  inputInterface.close()
+}
+
 async function runClaude() {
   for (const required of [
     '--safe-mode',
@@ -57,12 +64,18 @@ async function runClaude() {
     '--strict-mcp-config',
     '--input-format',
     '--output-format',
+    '--permission-mode',
     '--permission-prompt-tool',
   ]) {
     assert.ok(process.argv.includes(required), `missing Claude argument ${required}`)
   }
   assert.ok(!process.argv.includes('--dangerously-skip-permissions'))
   assert.ok(!process.argv.includes('bypassPermissions'))
+  const argumentValue = (name) => process.argv[process.argv.indexOf(name) + 1]
+  assert.equal(argumentValue('--input-format'), 'stream-json')
+  assert.equal(argumentValue('--output-format'), 'stream-json')
+  assert.equal(argumentValue('--permission-mode'), 'manual')
+  assert.equal(argumentValue('--permission-prompt-tool'), 'stdio')
 
   const inputInterface = readline.createInterface({
     input: process.stdin,
@@ -70,8 +83,24 @@ async function runClaude() {
   })
   const input = inputInterface[Symbol.asyncIterator]()
   const first = await input.next()
-  assert.equal(first.done, false, 'Claude mission frame missing')
-  const missionFrame = JSON.parse(first.value)
+  assert.equal(first.done, false, 'Claude initialize frame missing')
+  const initializeFrame = JSON.parse(first.value)
+  assert.equal(initializeFrame.type, 'control_request')
+  assert.equal(initializeFrame.request.subtype, 'initialize')
+  assert.equal(initializeFrame.request.hooks, null)
+  assert.equal(typeof initializeFrame.request_id, 'string')
+  output({
+    type: 'control_response',
+    response: {
+      subtype: 'success',
+      request_id: initializeFrame.request_id,
+      response: {},
+    },
+  })
+
+  const missionLine = await input.next()
+  assert.equal(missionLine.done, false, 'Claude mission frame missing')
+  const missionFrame = JSON.parse(missionLine.value)
   assert.equal(missionFrame.type, 'user')
   assert.equal(missionFrame.message.role, 'user')
   assert.equal(typeof missionFrame.message.content, 'string')
@@ -80,8 +109,7 @@ async function runClaude() {
   output({ type: 'system', subtype: 'init', session_id: sessionId })
 
   if (!mission.includes('[permission:')) {
-    finish()
-    inputInterface.close()
+    await finishClaude(input, inputInterface)
     return
   }
 
@@ -89,7 +117,11 @@ async function runClaude() {
   const toolUseId = 'claude-tool-use-001'
   const artifactPath = path.join(process.cwd(), 'claude-permission-artifact.txt')
   let toolName = 'Bash'
-  let toolInput = { command: 'node -e "process.stdout.write(\'approved\')"' }
+  let toolInput = {
+    command:
+      'node -e "process.stdout.write(process.env.ECORP_SECRET_TOKEN)"',
+    env: { ECORP_SECRET_TOKEN: 'sk-secret-must-not-be-durable' },
+  }
   let blockedPath = null
 
   if (mission.includes('[permission:safe]')) {
@@ -129,10 +161,14 @@ async function runClaude() {
   }
   output({ type: 'control_request', request_id: requestId, request })
 
+  if (mission.includes('[permission:response-write-failure]')) {
+    inputInterface.close()
+    process.stdin.destroy()
+    return
+  }
   if (mission.includes('[permission:cancelled]')) {
     output({ type: 'control_cancel_request', request_id: requestId })
-    finish()
-    inputInterface.close()
+    await finishClaude(input, inputInterface)
     return
   }
   const responseLine = await input.next()
@@ -155,8 +191,7 @@ async function runClaude() {
     assert.equal(typeof decision.message, 'string')
     assert.ok(decision.message.length <= 501)
   }
-  finish()
-  inputInterface.close()
+  await finishClaude(input, inputInterface)
 }
 
 try {

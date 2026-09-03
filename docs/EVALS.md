@@ -179,11 +179,15 @@ through Claude Code and OpenCode normalization, verifying equivalent session, us
 completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
 
 The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
-stream JSON. It verifies the typed initial user frame, hardened launch arguments, exact
+stream JSON. It verifies manual permission mode, the initialize response before the typed initial
+user frame, hardened launch arguments, exact
 `can_use_tool` correlation, bounded approval context, unchanged approved input, bounded rejection
 and expiry denials, duplicate-decision rejection, and fail-closed cleanup. Contained worktree
 read/write requests are the only local auto-allow case; blocked, ambiguous, outside-worktree, Bash,
-and network requests suspend for a durable ECorp decision. See
+and network requests suspend for a durable ECorp decision. It also proves raw tool input is absent
+from durable approval text and control-response write failure fails the run. An installed Claude
+Code `2.1.223` probe emitted `can_use_tool` for a Bash marker write after initialize under manual
+mode; the correlated denial left the marker absent. See
 `docs/evidence/2026-09-03-claude-permission-bridge.md`.
 
 `tools/e2e_copilot.mjs` uses a deterministic Copilot fixture to verify model discovery, disabled
