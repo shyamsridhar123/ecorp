@@ -272,6 +272,35 @@ title and persisted source marker from the fresh snapshot rather than following 
 mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
 verifies Markdown section boundaries for dependency and acceptance parsing.
 
+`tools/e2e_factory_controller_service.mjs` verifies durable controller registration and exact
+idempotent replay, owner-only configuration, manager-capable control, member denial, pause/resume,
+monotonic reconciliation generations, bounded failure text, blocked and watching projections,
+lease-expiry offline state, stale connection-epoch rejection, and reconnect recovery.
+The live watcher probe starts `crony factory-watch` against a deterministic GitHub boundary,
+observes `watching`, applies durable pause and resume, verifies resume requests a reconciliation
+generation, terminates the watcher, and observes `offline` after the heartbeat lease expires.
+
+`tools/e2e_factory_cockpit_reconnect.mjs` drives one factory work item through two independently
+attributed browser-protocol clients. It posts contextual comments, takes and rotates the control
+lease, delivers steering through durable runner commands, restarts the server, resumes each
+browser from its prior sequence cursor, and records Bob's decision after reconnect. Exact replay
+of comment, steer, claim, materialization, and decision operation keys creates no duplicate
+message, provider effect, work item, mission, or run. The same drill proves two durable steer
+acknowledgments, stale-token rejection, cancellation of a pending steer after its lease version
+rotates, controller recovery to `watching`, and final `verified` state. A separate rendered
+two-browser pass exposed and verified the **Reclaim control** recovery for a browser that lost its
+private fencing token. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
+
+`tools/e2e_factory_cockpit_publication.mjs` continues that operating lane through a verified
+commit/branch deliverable and the trusted publisher. It crashes after the deterministic GitHub
+boundary has created the pull request but before ECorp records the remote checkpoint, restarts the
+server, and concurrently retries publication. The focused drill proves one work item, mission,
+run, branch, pull request, and publication; Project status changes to `In Review` only after pull
+request creation; Alice and Bob resume from independent event cursors; and auto-merge, merge, and
+deployment remain disabled. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each

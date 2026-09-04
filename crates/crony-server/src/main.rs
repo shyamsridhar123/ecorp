@@ -33,20 +33,22 @@ use crony_domain::{
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
+    ConfigureFactoryControllerRequest, ControlFactoryControllerRequest,
     CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
     CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
     CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
     CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
     DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
-    EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
-    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
-    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
-    MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, MissionSource, PreflightFactoryMissionRequest,
-    PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
-    PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
-    QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
+    EmergencyStopResponse, FactoryControllerHeartbeatRequest, FactoryControllerResponse,
+    FactoryMissionContract, FactoryPublicationContextResponse, FactoryWorkItemResponse,
+    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
+    LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    MissionBudgetRevisionResponse, MissionContractRevisionResponse, MissionSource,
+    PreflightFactoryMissionRequest, PreflightFactoryMissionResponse,
+    ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
+    PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
+    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
     RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
@@ -56,10 +58,11 @@ use crony_protocol::{
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
-    DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
-    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
-    PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
+    ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput, ControlFactoryControllerInput,
+    CreateMissionContractRevisionInput, DecideMissionBudgetRevisionInput, FactorySourceInput,
+    HeartbeatFactoryControllerInput, LaunchRecord, MaterializeFactoryMissionInput,
+    MissionFinishScopeInput, NewRoomMessageInput, PendingRunnerCommand, PgStore,
+    PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
     RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
     RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
@@ -439,6 +442,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers",
+            post(configure_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/heartbeat",
+            post(heartbeat_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/control",
+            post(control_factory_controller),
         )
         .route(
             "/api/corps/{corp_id}/factory/preflight",
@@ -1239,24 +1254,113 @@ fn valid_scope_component(value: &str) -> bool {
 }
 
 async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> anyhow::Result<()> {
-    let Some(sender) = state
-        .runners
-        .get(runner_id)
-        .map(|connection| connection.tx.clone())
-    else {
+    let Some((sender, durable_control)) = state.runners.get(runner_id).map(|connection| {
+        (
+            connection.tx.clone(),
+            connection
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "durable-control-v1" && capability.available),
+        )
+    }) else {
         return Ok(());
     };
-    for command in state.store.pending_runner_commands(runner_id).await? {
-        let outgoing = decode_runner_command(&command)?;
-        if sender.send(outgoing).is_err() {
+    loop {
+        let commands = state.store.pending_runner_commands(runner_id).await?;
+        let batch_len = commands.len();
+        if batch_len == 0 {
+            break;
+        }
+        let mut dispatched = false;
+        for command in commands {
+            let control_lease_token = if command.command_kind == "control_message" {
+                match state.store.control_command_lease_token(&command).await? {
+                    Some(token) => Some(token),
+                    None => {
+                        if let Some(event) = state
+                            .store
+                            .fail_runner_command(
+                                command.id,
+                                runner_id,
+                                "control lease changed or expired before durable steering dispatch",
+                            )
+                            .await?
+                        {
+                            publish(state, event);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let outgoing = decode_runner_command(&command, control_lease_token, durable_control)?;
+            if sender.send(outgoing).is_err() {
+                return Ok(());
+            }
+            if command.command_kind == "control_message"
+                && !durable_control
+                && let Some(event) = state
+                    .store
+                    .acknowledge_runner_command(command.id, runner_id)
+                    .await?
+            {
+                publish(state, event);
+            }
+            dispatched = true;
+        }
+        if dispatched || batch_len < 100 {
             break;
         }
     }
     Ok(())
 }
 
-fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
+fn decode_runner_command(
+    command: &PendingRunnerCommand,
+    control_lease_token: Option<Uuid>,
+    durable_control: bool,
+) -> anyhow::Result<ServerToRunner> {
     match command.command_kind.as_str() {
+        "control_message" => Ok(ServerToRunner::ControlMessage {
+            command_id: durable_control.then_some(command.id),
+            message_id: if durable_control {
+                Some(
+                    command
+                        .payload
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                        .context("control message command omitted message_id")
+                        .and_then(|value| {
+                            Uuid::parse_str(value).context("message id is invalid")
+                        })?,
+                )
+            } else {
+                None
+            },
+            corp_id: command.corp_id,
+            run_id: command.run_id,
+            agent_id: command
+                .payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted agent_id")
+                .and_then(|value| Uuid::parse_str(value).context("agent id is invalid"))?,
+            actor_id: command
+                .payload
+                .get("actor_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted actor_id")
+                .and_then(|value| Uuid::parse_str(value).context("actor id is invalid"))?,
+            lease_token: control_lease_token
+                .context("control message command omitted current lease token")?,
+            text: command
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted text")?
+                .to_owned(),
+        }),
         "approval_decision" => Ok(ServerToRunner::ApprovalDecision {
             command_id: command.id,
             run_id: command.run_id,
@@ -1869,6 +1973,118 @@ async fn lookup_factory_work_items(
         .map_err(map_store_error)?;
     let total_count = items.len();
     Ok(Json(LookupFactoryWorkItemsResponse { items, total_count }))
+}
+
+async fn configure_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<ConfigureFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .configure_factory_controller(ConfigureFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id: request.controller_id,
+            source_project_owner: request.source_project_owner,
+            source_project_number: request.source_project_number,
+            source_repository_owner: request.source_repository_owner,
+            source_repository_name: request.source_repository_name,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn heartbeat_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<FactoryControllerHeartbeatRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .heartbeat_factory_controller(HeartbeatFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            active_work_item_id: request.active_work_item_id,
+            completed_reconcile_generation: request.completed_reconcile_generation,
+            reconcile_result: request.reconcile_result,
+            error: request.error,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: false,
+    }))
+}
+
+async fn control_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ControlFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .control_factory_controller(ControlFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            expected_version: request.expected_version,
+            action: request.action.as_str().to_owned(),
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
 }
 
 async fn renew_factory_work_item(
@@ -2664,12 +2880,16 @@ async fn create_room_message(
             reply_to_id: request.reply_to_id,
             mentions: request.mentions,
             link: request.link,
+            idempotency_key: request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         })
         .await
         .map_err(map_store_error)?;
-    publish(&state, outcome.event);
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
     Ok(Json(CreateRoomMessageResponse {
         message_id: outcome.message.id,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -3562,51 +3782,26 @@ async fn queue_message(
             actor_id,
             request.lease_token,
             &request.text,
+            request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         )
         .await
         .map_err(ApiError::conflict)?;
     let message_id = outcome.message.id;
-    let mut delivery = outcome.delivery.clone();
-    publish(&state, outcome.event);
-
-    if delivery == "immediate" {
-        let sent = if let (Some(run_id), Some(runner_id), Some(lease_token)) =
-            (outcome.run_id, outcome.runner_id, request.lease_token)
-        {
-            state.runners.get(&runner_id).is_some_and(|runner| {
-                runner
-                    .tx
-                    .send(ServerToRunner::ControlMessage {
-                        corp_id,
-                        run_id,
-                        agent_id,
-                        actor_id,
-                        lease_token,
-                        text: request.text.clone(),
-                    })
-                    .is_ok()
-            })
-        } else {
-            false
-        };
-        if !sent {
-            let event = state
-                .store
-                .requeue_control_message(
-                    corp_id,
-                    message_id,
-                    "runner disconnected before live control delivery",
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            publish(&state, event);
-            delivery = "queued".to_owned();
-        }
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.command_queued
+        && let Some(runner_id) = outcome.runner_id.as_deref()
+    {
+        dispatch_pending_runner_commands(&state, runner_id)
+            .await
+            .map_err(ApiError::internal)?;
     }
 
     Ok(Json(QueueMessageResponse {
         message_id,
-        delivery,
+        delivery: outcome.delivery,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -4176,6 +4371,17 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 }
                 if !applied {
                     warn!(%runner_id, %command_id, %detail, "runner could not apply durable command");
+                    match state
+                        .store
+                        .fail_runner_command(command_id, &runner_id, &detail)
+                        .await
+                    {
+                        Ok(Some(event)) => publish(&state, event),
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, %runner_id, %command_id, "runner command failure persistence failed")
+                        }
+                    }
                     continue;
                 }
                 match state

@@ -45,6 +45,10 @@ enum Command {
         #[command(flatten)]
         args: Box<factory::FactoryArgs>,
     },
+    FactoryWatch {
+        #[command(flatten)]
+        args: Box<factory::FactoryWatchArgs>,
+    },
     FactoryPublish {
         #[command(flatten)]
         args: Box<publish::FactoryPublishArgs>,
@@ -218,6 +222,9 @@ async fn main() -> Result<()> {
         Command::Factory { args: factory_args } => {
             factory::run(&client, &args.server, *factory_args).await?
         }
+        Command::FactoryWatch { args: watch_args } => {
+            factory::watch(&client, &args.server, *watch_args).await?
+        }
         Command::FactoryPublish { args: publish_args } => {
             publish::run(&client, &args.server, *publish_args).await?
         }
@@ -294,6 +301,7 @@ async fn main() -> Result<()> {
                     reply_to_id: reply_to,
                     mentions: mention,
                     link,
+                    idempotency_key: Some(Uuid::new_v4()),
                 })?),
             )
             .await?
@@ -409,6 +417,7 @@ async fn main() -> Result<()> {
                     actor_id,
                     lease_token,
                     text,
+                    idempotency_key: Some(Uuid::new_v4()),
                 })?),
             )
             .await?

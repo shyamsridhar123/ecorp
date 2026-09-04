@@ -106,6 +106,30 @@ incompatible task contracts, and any mission that has already produced a run. Ne
 requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
 Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
 match the persisted policy ref before resolving or storing a commit.
+
+Factory-wide pause, resume, and reconciliation controls require an owner, admin, or manager and an
+expected controller version plus idempotency key. Members may inspect controller health but cannot
+change Corp-wide intake. Controller heartbeats are fenced by a rotating connection epoch, bounded
+lease, service actor, and Corp. A stale process cannot extend the active lease or complete another
+process's reconciliation generation. Controller status never exposes GitHub credentials or
+work-item claim tokens.
+
+Inline cockpit decisions do not weaken the underlying authorization boundary. Action approvals and
+verification reviews retain their existing role, expiry, requester-exclusion, and idempotency
+rules. Contextual comments remain ordinary durable room messages linked to the mission; comment
+text cannot approve an effect, create a task, or steer a provider session implicitly. Comment
+operation UUIDs are scoped to the Corp and exact normalized request; replay returns the existing
+message, while changed content under the same key is rejected.
+
+Cockpit steering uses the existing single-holder agent lease and lease token. The token is checked
+before persistence but is never stored in the durable runner command. A separate client operation
+UUID prevents retry from creating another control message, and the runner command ID fences
+duplicate delivery across server reconnect. A monotonic lease version is persisted with the
+command and rechecked before dispatch, so renewal, release, transfer, or expiry cancels a pending
+stale steer. Negative runner acknowledgments also terminalize the command rather than leaving it
+pending indefinitely. A browser that lost its private token must reclaim the same actor's lease,
+which rotates the token and lease version before another steer. This does not add a second input
+path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

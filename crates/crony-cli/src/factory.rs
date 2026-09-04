@@ -21,7 +21,7 @@ use uuid::Uuid;
 const DEFAULT_GITHUB_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct FactoryArgs {
     pub corp_id: Uuid,
     pub actor_id: Uuid,
@@ -94,6 +94,29 @@ pub struct FactoryArgs {
 
     #[arg(long, env = "ECORP_GITHUB_CLI", default_value = "gh")]
     pub github_cli: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct FactoryWatchArgs {
+    #[command(flatten)]
+    pub factory: FactoryArgs,
+
+    #[arg(
+        long,
+        env = "ECORP_FACTORY_CONTROLLER_ID",
+        default_value = "00000000-0000-4000-8000-000000000051"
+    )]
+    pub controller_id: Uuid,
+
+    #[arg(
+        long,
+        env = "ECORP_FACTORY_WATCH_INTERVAL_SECONDS",
+        default_value_t = 30
+    )]
+    pub interval_seconds: u64,
+
+    #[arg(long, env = "ECORP_FACTORY_HEARTBEAT_SECONDS", default_value_t = 10)]
+    pub heartbeat_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -847,6 +870,184 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "launch": launch,
         "auto_merge": false,
     }))
+}
+
+pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) -> Result<Value> {
+    normalize_args(&mut args.factory)?;
+    validate_args(&args.factory)?;
+    if args.factory.dry_run {
+        bail!("factory watch cannot run in dry-run mode");
+    }
+    if !(5..=300).contains(&args.heartbeat_seconds) {
+        bail!("factory heartbeat interval must be between 5 and 300 seconds");
+    }
+    if !(5..=3600).contains(&args.interval_seconds) {
+        bail!("factory watch interval must be between 5 and 3600 seconds");
+    }
+    let (repository_owner, repository_name) = repository_parts(&args.factory.repository)?;
+    let connection_epoch = Uuid::new_v4();
+    let controller_url = format!(
+        "{server}/api/corps/{}/factory/controllers",
+        args.factory.corp_id
+    );
+    let configured = server_json(
+        client,
+        Method::POST,
+        controller_url,
+        Some(json!({
+            "actor_id": args.factory.actor_id,
+            "controller_id": args.controller_id,
+            "source_project_owner": args.factory.owner,
+            "source_project_number": args.factory.project_number,
+            "source_repository_owner": repository_owner,
+            "source_repository_name": repository_name,
+            "connection_epoch": connection_epoch,
+            "lease_seconds": (args.heartbeat_seconds * 3).clamp(10, 300),
+            "idempotency_key": format!(
+                "factory-controller:{}:connect:{}",
+                args.controller_id, connection_epoch
+            )
+        })),
+    )
+    .await?;
+    let mut controller = configured["controller"].clone();
+    let mut cycle: Option<tokio::task::JoinHandle<Result<Value>>> = None;
+    let mut cycle_generation: Option<i64> = None;
+    let mut next_periodic = Instant::now();
+    let mut last_error: Option<String> = None;
+    let mut last_result: Option<&'static str> = None;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(args.heartbeat_seconds));
+
+    loop {
+        heartbeat.tick().await;
+        if cycle.as_ref().is_some_and(|task| task.is_finished()) {
+            let result = cycle
+                .take()
+                .context("factory cycle disappeared")?
+                .await
+                .context("factory cycle task failed")?;
+            match result {
+                Ok(_) => {
+                    last_error = None;
+                    last_result = Some("succeeded");
+                }
+                Err(error)
+                    if error
+                        .to_string()
+                        .starts_with("no eligible factory issue found") =>
+                {
+                    last_error = None;
+                    last_result = Some("succeeded");
+                }
+                Err(error) => {
+                    last_error = Some(bounded_status_error(&error.to_string()));
+                    last_result = Some("failed");
+                }
+            }
+            next_periodic = Instant::now() + Duration::from_secs(args.interval_seconds);
+        }
+
+        let snapshot = match server_json(
+            client,
+            Method::GET,
+            format!(
+                "{server}/api/corps/{}/snapshot?actor_id={}",
+                args.factory.corp_id, args.factory.actor_id
+            ),
+            None,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!(
+                    "factory watch snapshot unavailable: {}",
+                    bounded_status_error(&error.to_string())
+                );
+                continue;
+            }
+        };
+        if let Some(current) = snapshot["snapshot"]["factory_controllers"]
+            .as_array()
+            .and_then(|controllers| {
+                controllers
+                    .iter()
+                    .find(|candidate| candidate["id"] == args.controller_id.to_string())
+            })
+        {
+            controller = current.clone();
+        }
+        let active_work_item_id = snapshot["snapshot"]["factory_work_items"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item["source_project_owner"] == args.factory.owner
+                        && item["source_project_number"] == i64::from(args.factory.project_number)
+                        && item["source_repository_owner"] == repository_owner
+                        && item["source_repository_name"] == repository_name
+                        && !matches!(
+                            item["state"].as_str(),
+                            Some("published" | "failed" | "cancelled")
+                        )
+                })
+            })
+            .and_then(|item| item["id"].as_str());
+        let pending_generation = controller["reconcile_generation"].as_i64().unwrap_or(0);
+        let completed_generation = controller["completed_reconcile_generation"]
+            .as_i64()
+            .unwrap_or(0);
+        let heartbeat_result = server_json(
+            client,
+            Method::POST,
+            format!(
+                "{server}/api/corps/{}/factory/controllers/{}/heartbeat",
+                args.factory.corp_id, args.controller_id
+            ),
+            Some(json!({
+                "actor_id": args.factory.actor_id,
+                "connection_epoch": connection_epoch,
+                "lease_seconds": (args.heartbeat_seconds * 3).clamp(10, 300),
+                "active_work_item_id": active_work_item_id,
+                "completed_reconcile_generation": cycle_generation
+                    .filter(|_| cycle.is_none()),
+                "reconcile_result": cycle_generation
+                    .filter(|_| cycle.is_none())
+                    .and(last_result),
+                "error": last_error
+            })),
+        )
+        .await;
+        if let Ok(response) = heartbeat_result {
+            controller = response["controller"].clone();
+            if cycle.is_none() && cycle_generation.is_some() {
+                cycle_generation = None;
+                last_result = None;
+            }
+        } else if let Err(error) = heartbeat_result {
+            eprintln!(
+                "factory watch heartbeat failed: {}",
+                bounded_status_error(&error.to_string())
+            );
+            continue;
+        }
+
+        let paused = controller["desired_state"].as_str() == Some("paused");
+        let forced = pending_generation > completed_generation;
+        if cycle.is_none() && !paused && (forced || Instant::now() >= next_periodic) {
+            cycle_generation = forced.then_some(pending_generation);
+            let cycle_client = client.clone();
+            let cycle_server = server.to_owned();
+            let cycle_args = args.factory.clone();
+            cycle = Some(tokio::spawn(async move {
+                run(&cycle_client, &cycle_server, cycle_args).await
+            }));
+        }
+    }
+}
+
+fn bounded_status_error(value: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    value.chars().take(1_000).collect()
 }
 
 fn new_factory_policy(

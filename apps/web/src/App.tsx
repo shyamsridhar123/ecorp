@@ -411,6 +411,27 @@ type FactoryWorkItem = {
   failure_detail: string | null
 }
 
+type FactoryController = {
+  id: string
+  service_actor_id: string
+  configured_by: string
+  source_project_owner: string
+  source_project_number: number
+  source_repository_owner: string
+  source_repository_name: string
+  desired_state: 'running' | 'paused'
+  status: 'offline' | 'watching' | 'working' | 'blocked' | 'needs_decision'
+  version: number
+  lease_expires_at: string
+  last_heartbeat_at: string
+  reconcile_generation: number
+  completed_reconcile_generation: number
+  active_work_item_id: string | null
+  last_reconciled_at: string | null
+  last_reconcile_result: 'succeeded' | 'failed' | null
+  last_error: string | null
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -512,6 +533,7 @@ type SnapshotResponse = {
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
+    factory_controllers?: FactoryController[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -836,6 +858,41 @@ function storedAccessToken(): string | null {
   return window.sessionStorage.getItem('ecorp_access_token')
 }
 
+class ApiRequestError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
+}
+
+function browserOperationKey(storageKey: string, payload: string): string {
+  try {
+    const stored = window.sessionStorage.getItem(storageKey)
+    if (stored) {
+      const operation = JSON.parse(stored) as { payload?: unknown; key?: unknown }
+      if (
+        operation.payload === payload &&
+        typeof operation.key === 'string' &&
+        operation.key
+      ) {
+        return operation.key
+      }
+    }
+    const key = crypto.randomUUID()
+    window.sessionStorage.setItem(storageKey, JSON.stringify({ payload, key }))
+    return key
+  } catch {
+    return crypto.randomUUID()
+  }
+}
+
+function clearBrowserOperation(storageKey: string) {
+  window.sessionStorage.removeItem(storageKey)
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const token = storedAccessToken()
   const response = await fetch(`${API_URL}${path}`, {
@@ -848,7 +905,10 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   })
   const body = await response.json()
   if (!response.ok) {
-    throw new Error(body.error ?? `${response.status} ${response.statusText}`)
+    throw new ApiRequestError(
+      response.status,
+      body.error ?? `${response.status} ${response.statusText}`,
+    )
   }
   return body as T
 }
@@ -1527,12 +1587,69 @@ function FactoryPanel({
   missions,
   publications,
   publicationAttempts,
+  controllers,
+  tasks,
+  runs,
+  room,
+  messages,
+  actors,
+  agents,
+  leases,
+  leaseTokens,
+  selectedActor,
+  actionApprovals,
+  verificationRequests,
+  canControlFactory,
+  busy,
+  onControllerControl,
+  onPostComment,
+  onActionDecision,
+  onVerificationDecision,
+  onClaimLease,
+  onSteer,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
   publications: PullRequestPublication[]
   publicationAttempts: PullRequestPublicationAttempt[]
+  controllers: FactoryController[]
+  tasks: Task[]
+  runs: Run[]
+  room: { id: string; name: string; purpose: string } | undefined
+  messages: RoomMessage[]
+  actors: Actor[]
+  agents: Agent[]
+  leases: Lease[]
+  leaseTokens: Record<string, string>
+  selectedActor: Actor
+  actionApprovals: ActionApproval[]
+  verificationRequests: VerificationRequest[]
+  canControlFactory: boolean
+  busy: boolean
+  onControllerControl: (
+    controller: FactoryController,
+    action: 'pause' | 'resume' | 'reconcile',
+  ) => void
+  onPostComment: (input: {
+    roomId: string
+    body: string
+    replyToId: string | null
+    mentions: string[]
+    link: EntityLink | null
+    idempotencyKey: string
+  }) => Promise<boolean>
+  onActionDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
+  onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
+  onClaimLease: (agent: Agent) => Promise<void>
+  onSteer: (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ) => Promise<boolean>
 }) {
+  const [commentBody, setCommentBody] = useState('')
+  const [steerText, setSteerText] = useState('')
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
     if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
@@ -1549,12 +1666,51 @@ function FactoryPanel({
   )
   const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
   const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
+  const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
+  const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
+  const selectedRuns = runs.filter((run) => selectedTaskIds.has(run.task_id))
+  const activeRun = selectedRuns.find((run) =>
+    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval'].includes(
+      run.status,
+    ),
+  )
+  const activeAgent = agents.find((agent) => agent.id === activeRun?.agent_id)
+  const activeLease = leases.find((lease) => lease.agent_id === activeAgent?.id)
+  const activeLeaseToken = activeAgent
+    ? leaseTokens[leaseTokenKey(selectedActor.id, activeAgent.id)]
+    : undefined
+  const leaseAttributedToSelectedActor =
+    activeLease?.actor_id === selectedActor.id
+  const leaseHeldBySelectedActor =
+    leaseAttributedToSelectedActor && Boolean(activeLeaseToken)
+  const selectedRunIds = new Set(selectedRuns.map((run) => run.id))
+  const pendingActions = actionApprovals.filter(
+    (approval) => selectedRunIds.has(approval.run_id) && approval.status === 'pending',
+  )
+  const pendingReviews = verificationRequests.filter(
+    (request) => selectedRunIds.has(request.run_id) && request.status === 'pending',
+  )
+  const linkedIds = new Set([
+    ...(selectedMission ? [selectedMission.id] : []),
+    ...selectedTasks.map((task) => task.id),
+    ...selectedRuns.flatMap((run) => [
+      run.id,
+      ...(run.artifact_id ? [run.artifact_id] : []),
+    ]),
+  ])
+  const contextualMessages = messages
+    .filter((message) => message.link && linkedIds.has(message.link.id))
+    .slice(-8)
   const selectedPublication = publications.find(
     (candidate) => candidate.factory_work_item_id === selected?.id,
   )
   const selectedAttempts = publicationAttempts
     .filter((attempt) => attempt.publication_id === selectedPublication?.id)
     .sort((left, right) => right.attempt - left.attempt)
+  const controller = controllers[0]
+  const controllerState = controller?.desired_state === 'paused'
+    ? 'paused'
+    : controller?.status ?? 'not_configured'
 
   return (
     <section
@@ -1577,6 +1733,78 @@ function FactoryPanel({
           <span>auto-merge off</span>
         </div>
       </div>
+      <section
+        className={`factory-controller-strip factory-controller-${controllerState}`}
+        aria-label="Factory controller status"
+      >
+        <div>
+          <span className="factory-controller-kicker">Controller</span>
+          <strong>{statusLabel(controllerState)}</strong>
+          <small>
+            {controller
+              ? `${controller.source_project_owner} / Project #${controller.source_project_number} · ${controller.source_repository_owner}/${controller.source_repository_name}`
+              : 'No trusted factory watcher has registered with this Corp.'}
+          </small>
+        </div>
+        {controller ? (
+          <>
+            <dl>
+              <div>
+                <dt>Heartbeat</dt>
+                <dd>{time(controller.last_heartbeat_at)}</dd>
+              </div>
+              <div>
+                <dt>Reconciled</dt>
+                <dd>
+                  {controller.last_reconciled_at
+                    ? time(controller.last_reconciled_at)
+                    : 'Not yet'}
+                </dd>
+              </div>
+              <div>
+                <dt>Generation</dt>
+                <dd>
+                  {controller.completed_reconcile_generation}/
+                  {controller.reconcile_generation}
+                </dd>
+              </div>
+            </dl>
+            <div className="factory-controller-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                disabled={busy || !canControlFactory}
+                onClick={() =>
+                  onControllerControl(
+                    controller,
+                    controller.desired_state === 'paused' ? 'resume' : 'pause',
+                  )
+                }
+              >
+                {controller.desired_state === 'paused' ? 'Resume intake' : 'Pause intake'}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={busy || !canControlFactory}
+                onClick={() => onControllerControl(controller, 'reconcile')}
+              >
+                Reconcile now
+              </button>
+            </div>
+          </>
+        ) : (
+          <p>
+            Configure the trusted controller process to make Factory actively watch GitHub
+            Project intake.
+          </p>
+        )}
+        {controller?.last_error ? (
+          <p className="factory-controller-error" role="alert">
+            {controller.last_error}
+          </p>
+        ) : null}
+      </section>
       <div className={`factory-console ${items.length ? '' : 'factory-console-empty'}`}>
         {items.length ? (
           <>
@@ -1670,6 +1898,266 @@ function FactoryPanel({
                       <dd>{time(selected.lease_expires_at)}</dd>
                     </div>
                   </dl>
+
+                  {selectedMission ? (
+                    <div className="factory-cockpit-grid">
+                      <section className="work-item-decisions" aria-label="Work-item decisions">
+                        <div className="factory-cockpit-heading">
+                          <span>Decisions</span>
+                          <strong>{pendingActions.length + pendingReviews.length}</strong>
+                        </div>
+                        {pendingActions.map((approval) => {
+                          const eligible = approval.required_roles.includes(selectedActor.role)
+                          return (
+                            <article key={approval.id}>
+                              <strong>{approval.action}</strong>
+                              <p>{approval.rationale}</p>
+                              <small>
+                                {statusLabel(approval.risk)} risk · expires{' '}
+                                {time(approval.expires_at)}
+                              </small>
+                              <div>
+                                <button
+                                  type="button"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onActionDecision(approval, false)}
+                                >
+                                  Reject
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button button-primary"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onActionDecision(approval, true)}
+                                >
+                                  Approve
+                                </button>
+                              </div>
+                            </article>
+                          )
+                        })}
+                        {pendingReviews.map((request) => {
+                          const run = selectedRuns.find(
+                            (candidate) => candidate.id === request.run_id,
+                          )
+                          const eligible =
+                            request.gate.roles.includes(selectedActor.role) &&
+                            !(
+                              request.gate.type === 'independent_review' &&
+                              request.gate.exclude_requester &&
+                              selectedMission.requested_by === selectedActor.id
+                            )
+                          return run ? (
+                            <article key={request.run_id}>
+                              <strong>{statusLabel(request.gate_type)}</strong>
+                              <p>Review the persisted verification evidence for this run.</p>
+                              <small>Run {shortId(run.id)}</small>
+                              <div>
+                                <button
+                                  type="button"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onVerificationDecision(run, false)}
+                                >
+                                  Reject
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button button-primary"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onVerificationDecision(run, true)}
+                                >
+                                  Accept evidence
+                                </button>
+                              </div>
+                            </article>
+                          ) : null
+                        })}
+                        {!pendingActions.length && !pendingReviews.length ? (
+                          <p className="factory-cockpit-empty">
+                            No policy exception or review decision is waiting.
+                          </p>
+                        ) : null}
+                      </section>
+                      <section className="work-item-comms" aria-label="Work-item comments">
+                        <div className="factory-cockpit-heading">
+                          <span>Contextual Comms</span>
+                          <strong>{contextualMessages.length}</strong>
+                        </div>
+                        <ol>
+                          {contextualMessages.map((message) => (
+                            <li key={message.id}>
+                              <strong>
+                                {actors.find((actor) => actor.id === message.actor_id)?.name ??
+                                  'Unknown actor'}
+                              </strong>
+                              <p>{message.body}</p>
+                              <small>{time(message.created_at)}</small>
+                            </li>
+                          ))}
+                        </ol>
+                        {!contextualMessages.length ? (
+                          <p className="factory-cockpit-empty">
+                            No comments are linked to this work item yet.
+                          </p>
+                        ) : null}
+                        {room ? (
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault()
+                              if (!commentBody.trim()) return
+                              const mentionedNames = Array.from(
+                                commentBody.matchAll(/@([A-Za-z0-9_-]+)/g),
+                                (match) => match[1].toLowerCase(),
+                              )
+                              const body = commentBody.trim()
+                              const mentions = actors
+                                .filter((actor) =>
+                                  mentionedNames.includes(actor.name.toLowerCase()),
+                                )
+                                .map((actor) => actor.id)
+                              const payload = JSON.stringify({
+                                roomId: room.id,
+                                body,
+                                mentions,
+                                missionId: selectedMission.id,
+                              })
+                              const operationStorageKey =
+                                `ecorp:factory-comment:${selected.id}:${selectedActor.id}`
+                              const idempotencyKey = browserOperationKey(
+                                operationStorageKey,
+                                payload,
+                              )
+                              void onPostComment({
+                                roomId: room.id,
+                                body,
+                                replyToId: null,
+                                mentions,
+                                link: { kind: 'mission', id: selectedMission.id },
+                                idempotencyKey,
+                              }).then((saved) => {
+                                if (saved) {
+                                  clearBrowserOperation(operationStorageKey)
+                                  setCommentBody('')
+                                }
+                              })
+                            }}
+                          >
+                            <label htmlFor={`factory-comment-${selected.id}`}>
+                              Comment as {selectedActor.name}
+                            </label>
+                            <textarea
+                              id={`factory-comment-${selected.id}`}
+                              rows={3}
+                              value={commentBody}
+                              onChange={(event) => setCommentBody(event.target.value)}
+                              placeholder="Comment on this work item. Use agent controls to steer."
+                            />
+                            <button
+                              type="submit"
+                              className="button button-secondary"
+                              disabled={busy || !commentBody.trim()}
+                            >
+                              Post comment
+                            </button>
+                          </form>
+                        ) : null}
+                      </section>
+                      <section className="work-item-steer" aria-label="Live agent direction">
+                        <div className="factory-cockpit-heading">
+                          <span>Steer</span>
+                          <strong>{activeAgent?.name ?? 'No active agent'}</strong>
+                        </div>
+                        {activeAgent && activeRun ? (
+                          <>
+                            <p>
+                              Run {shortId(activeRun.id)} · {statusLabel(activeRun.status)}
+                            </p>
+                            {!activeLease ||
+                            (leaseAttributedToSelectedActor && !activeLeaseToken) ? (
+                              <>
+                                {leaseAttributedToSelectedActor ? (
+                                  <p className="factory-cockpit-empty">
+                                    This browser reconnected without {selectedActor.name}&apos;s
+                                    private fencing token. Reclaim control to rotate it; the old
+                                    token will stop working.
+                                  </p>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  className="button button-secondary"
+                                  disabled={busy}
+                                  onClick={() => void onClaimLease(activeAgent)}
+                                >
+                                  {leaseAttributedToSelectedActor
+                                    ? 'Reclaim control'
+                                    : 'Take control'}
+                                </button>
+                              </>
+                            ) : leaseHeldBySelectedActor ? (
+                              <form
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  if (!steerText.trim()) return
+                                  void onSteer(
+                                    activeAgent,
+                                    steerText.trim(),
+                                    activeLeaseToken,
+                                    (() => {
+                                      const payload = JSON.stringify({
+                                        agentId: activeAgent.id,
+                                        actorId: selectedActor.id,
+                                        text: steerText.trim(),
+                                      })
+                                      return browserOperationKey(
+                                        `ecorp:factory-steer:${activeRun.id}:${selectedActor.id}`,
+                                        payload,
+                                      )
+                                    })(),
+                                  ).then((saved) => {
+                                    if (saved) {
+                                      clearBrowserOperation(
+                                        `ecorp:factory-steer:${activeRun.id}:${selectedActor.id}`,
+                                      )
+                                      setSteerText('')
+                                    }
+                                  })
+                                }}
+                              >
+                                <label htmlFor={`factory-steer-${selected.id}`}>
+                                  Direction from {selectedActor.name}
+                                </label>
+                                <textarea
+                                  id={`factory-steer-${selected.id}`}
+                                  rows={3}
+                                  value={steerText}
+                                  onChange={(event) => setSteerText(event.target.value)}
+                                  placeholder="Send live direction under your control lease."
+                                />
+                                <button
+                                  type="submit"
+                                  className="button button-primary"
+                                  disabled={busy || !steerText.trim()}
+                                >
+                                  Send direction
+                                </button>
+                              </form>
+                            ) : (
+                              <p className="factory-cockpit-empty">
+                                Controlled by{' '}
+                                {actors.find((actor) => actor.id === activeLease.actor_id)?.name ??
+                                  'another operator'}
+                                . Comments remain available without the control lease.
+                              </p>
+                            )}
+                          </>
+                        ) : (
+                          <p className="factory-cockpit-empty">
+                            Live direction appears here while an agent is running.
+                          </p>
+                        )}
+                      </section>
+                    </div>
+                  ) : null}
 
                   {selectedPublication ? (
                     <div className="publication-proof" data-testid="factory-publication">
@@ -1960,7 +2448,12 @@ function AgentDesk({
   onTransfer: (agent: Agent, token: string, toActor: Actor) => Promise<void>
   onInterrupt: (agent: Agent, token: string) => Promise<void>
   onEmergencyStop: (agent: Agent) => Promise<void>
-  onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
+  onMessage: (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ) => Promise<boolean>
 }) {
   const [text, setText] = useState('')
   const [transferActorId, setTransferActorId] = useState('')
@@ -1988,8 +2481,24 @@ function AgentDesk({
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!text.trim()) return
-    await onMessage(agent, text, messageToken)
-    setText('')
+    const normalized = text.trim()
+    const payload = JSON.stringify({
+      agentId: agent.id,
+      actorId: actor.id,
+      text: normalized,
+    })
+    const operationStorageKey = `ecorp:agent-message:${agent.id}:${actor.id}`
+    const idempotencyKey = browserOperationKey(operationStorageKey, payload)
+    const saved = await onMessage(
+      agent,
+      normalized,
+      messageToken,
+      idempotencyKey,
+    )
+    if (saved) {
+      clearBrowserOperation(operationStorageKey)
+      setText('')
+    }
   }
 
   return (
@@ -3336,7 +3845,8 @@ function RoomPanel({
     replyToId: string | null
     mentions: string[]
     link: EntityLink | null
-  }) => Promise<void>
+    idempotencyKey: string
+  }) => Promise<boolean>
   onNavigateLink: (link: EntityLink) => void
 }) {
   const [body, setBody] = useState('')
@@ -3396,16 +3906,29 @@ function RoomPanel({
       kind && id
         ? ({ kind, id } as EntityLink)
         : null
-    await onPost({
+    const payload = JSON.stringify({
       roomId: room.id,
-      body,
+      body: body.trim(),
       replyToId,
       mentions,
       link,
     })
-    setBody('')
-    setReplyToId(null)
-    setLinkValue('')
+    const operationStorageKey = `ecorp:room-message:${room.id}:${selectedActor.id}`
+    const idempotencyKey = browserOperationKey(operationStorageKey, payload)
+    const saved = await onPost({
+      roomId: room.id,
+      body: body.trim(),
+      replyToId,
+      mentions,
+      link,
+      idempotencyKey,
+    })
+    if (saved) {
+      clearBrowserOperation(operationStorageKey)
+      setBody('')
+      setReplyToId(null)
+      setLinkValue('')
+    }
   }
 
   return (
@@ -4179,6 +4702,16 @@ function App() {
 
   const decideActionApproval = async (approval: ActionApproval, approved: boolean) => {
     if (!bootstrap || !selectedActor) return
+    const note = approved
+      ? `${selectedActor.name} approved the scoped action.`
+      : `${selectedActor.name} rejected the scoped action.`
+    const operationStorageKey =
+      `ecorp:approval-decision:${bootstrap.corp_id}:${selectedActor.id}:` +
+      `${approval.id}:${approved ? 'approve' : 'reject'}`
+    const decisionKey = browserOperationKey(
+      operationStorageKey,
+      JSON.stringify({ approvalId: approval.id, approved, note }),
+    )
     setBusy(true)
     setError(null)
     try {
@@ -4189,13 +4722,12 @@ function App() {
           body: JSON.stringify({
             actor_id: selectedActor.id,
             approved,
-            note: approved
-              ? `${selectedActor.name} approved the scoped action.`
-              : `${selectedActor.name} rejected the scoped action.`,
-            decision_key: crypto.randomUUID(),
+            note,
+            decision_key: decisionKey,
           }),
         },
       )
+      clearBrowserOperation(operationStorageKey)
       await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -4320,8 +4852,13 @@ function App() {
     }
   }
 
-  const sendMessage = async (agent: Agent, text: string, token: string | undefined) => {
-    if (!bootstrap || !selectedActor) return
+  const sendMessage = async (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/messages`, {
@@ -4330,11 +4867,14 @@ function App() {
           actor_id: selectedActor.id,
           lease_token: token ?? null,
           text,
+          idempotency_key: idempotencyKey,
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
+      return true
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+      return false
     }
   }
 
@@ -4344,8 +4884,9 @@ function App() {
     replyToId: string | null
     mentions: string[]
     link: EntityLink | null
-  }) => {
-    if (!bootstrap || !selectedActor) return
+    idempotencyKey: string
+  }): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/rooms/${input.roomId}/messages`, {
@@ -4356,11 +4897,14 @@ function App() {
           reply_to_id: input.replyToId,
           mentions: input.mentions,
           link: input.link,
+          idempotency_key: input.idempotencyKey,
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
+      return true
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+      return false
     }
   }
 
@@ -4430,6 +4974,70 @@ function App() {
       setAnnouncement('Source deliverable download started.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
+  const controlFactoryController = async (
+    controller: FactoryController,
+    action: 'pause' | 'resume' | 'reconcile',
+  ) => {
+    if (!bootstrap || !selectedActor) return
+    const operationStorageKey =
+      `ecorp:factory-control:${bootstrap.corp_id}:${selectedActor.id}:` +
+      `${controller.id}:${action}`
+    let pendingOperation: { idempotencyKey: string; expectedVersion: number } | null = null
+    try {
+      const stored = window.sessionStorage.getItem(operationStorageKey)
+      if (stored) {
+        pendingOperation = JSON.parse(stored) as {
+          idempotencyKey: string
+          expectedVersion: number
+        }
+      }
+    } catch {
+      window.sessionStorage.removeItem(operationStorageKey)
+    }
+    if (!pendingOperation) {
+      pendingOperation = {
+        idempotencyKey: crypto.randomUUID(),
+        expectedVersion: controller.version,
+      }
+      window.sessionStorage.setItem(
+        operationStorageKey,
+        JSON.stringify(pendingOperation),
+      )
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/factory/controllers/${controller.id}/control`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            expected_version: pendingOperation.expectedVersion,
+            action,
+            idempotency_key: pendingOperation.idempotencyKey,
+          }),
+        },
+      )
+      window.sessionStorage.removeItem(operationStorageKey)
+      await refresh(bootstrap.corp_id, selectedActor.id)
+      setAnnouncement(
+        action === 'pause'
+          ? 'Factory intake paused. Active missions continue.'
+          : action === 'resume'
+            ? 'Factory intake resumed and reconciliation requested.'
+            : 'Factory reconciliation requested.',
+      )
+    } catch (caught) {
+      if (caught instanceof ApiRequestError && caught.status >= 400 && caught.status < 500) {
+        window.sessionStorage.removeItem(operationStorageKey)
+      }
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -4847,6 +5455,26 @@ function App() {
           missions={data.snapshot.missions}
           publications={data.snapshot.pull_request_publications}
           publicationAttempts={data.snapshot.pull_request_publication_attempts}
+          controllers={data.snapshot.factory_controllers ?? []}
+          tasks={data.snapshot.tasks}
+          runs={data.snapshot.runs}
+          room={room}
+          messages={data.snapshot.room_messages}
+          actors={data.snapshot.actors}
+          agents={data.snapshot.agents}
+          leases={data.snapshot.leases}
+          leaseTokens={leaseTokens}
+          selectedActor={selectedActor}
+          actionApprovals={data.snapshot.action_approvals}
+          verificationRequests={data.snapshot.verification_requests}
+          canControlFactory={['owner', 'admin', 'manager'].includes(selectedActor.role)}
+          busy={busy}
+          onControllerControl={controlFactoryController}
+          onPostComment={postRoomMessage}
+          onActionDecision={decideActionApproval}
+          onVerificationDecision={decideVerification}
+          onClaimLease={claimLease}
+          onSteer={sendMessage}
         />
       </div>
 
