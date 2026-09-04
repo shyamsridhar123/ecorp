@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, FormEvent } from 'react'
 import './App.css'
-import './Arcade.css'
-import './Cabinet.css'
 import './World.css'
 import './Accessible.css'
+import './Simple.css'
 import { AgentSprite } from './AgentSprite'
 
 type Actor = {
@@ -2777,6 +2776,31 @@ function MissionCard({
         .filter((item) => item.run_id === latestRun.id)
         .toSorted((left, right) => left.check_index - right.check_index)
     : []
+  const passedAutomatedChecks = latestEvidence.filter(
+    (item) => item.status === 'passed',
+  ).length
+  const failedAutomatedChecks = latestEvidence.length - passedAutomatedChecks
+  const latestVerificationRequest = latestRun
+    ? verificationRequests.find((request) => request.run_id === latestRun.id)
+    : undefined
+  const verificationDecider = latestVerificationRequest?.decided_by
+    ? actors.find((actor) => actor.id === latestVerificationRequest.decided_by)
+    : undefined
+  const reviewRejected = latestVerificationRequest?.status === 'rejected'
+  const reviewDecisionLabel =
+    latestVerificationRequest?.gate_type === 'independent_review'
+      ? 'Independent review'
+      : 'Human approval'
+  const reviewDecisionNote =
+    latestVerificationRequest?.decision_note ??
+    'The reviewer rejected the evidence and requested a bounded correction.'
+  const reviewDecisionSummary =
+    reviewDecisionNote.length > 240
+      ? `${reviewDecisionNote
+          .slice(0, 237)
+          .replace(/\s+\S*$/, '')
+          .trimEnd()}…`
+      : reviewDecisionNote
   const latestDeliverable = latestRun
     ? deliverables.find((deliverable) => deliverable.run_id === latestRun.id)
     : undefined
@@ -3008,13 +3032,22 @@ function MissionCard({
         <details
           className={`verification-box verification-${latestRun.verification_status}`}
           data-testid="verification-evidence"
-          open={latestRun.verification_status === 'failed'}
         >
           <summary>
-            <strong>{statusLabel(latestRun.verification_status)}</strong>
-            <span>
-              {latestEvidence.filter((item) => item.status === 'passed').length}/
-              {latestEvidence.length} checks passed
+            <span className="verification-summary-copy">
+              <strong>Automated verification</strong>
+              <small>
+                {!latestEvidence.length
+                  ? statusLabel(latestRun.verification_status)
+                  : failedAutomatedChecks
+                  ? `${failedAutomatedChecks} check${failedAutomatedChecks === 1 ? '' : 's'} need attention`
+                  : 'All recorded checks passed'}
+              </small>
+            </span>
+            <span className="verification-score">
+              {latestEvidence.length
+                ? `${passedAutomatedChecks}/${latestEvidence.length} passed`
+                : 'No check records'}
             </span>
           </summary>
           {latestEvidence.length ? (
@@ -3030,7 +3063,34 @@ function MissionCard({
           ) : null}
         </details>
       ) : null}
-      {latestRun && terminalRun(latestRun.status) ? (
+      {reviewRejected ? (
+        <section
+          className="review-decision review-decision-rejected"
+          role="alert"
+          aria-label={`${reviewDecisionLabel} changes requested`}
+          data-testid="review-decision"
+        >
+          <span className="review-decision-mark" aria-hidden="true">!</span>
+          <div>
+            <span>{reviewDecisionLabel}</span>
+            <strong>Changes requested</strong>
+            <p>{reviewDecisionSummary}</p>
+            {reviewDecisionSummary !== reviewDecisionNote ? (
+              <details className="review-decision-details">
+                <summary>Read full reviewer findings</summary>
+                <p>{reviewDecisionNote}</p>
+              </details>
+            ) : null}
+            <small>
+              {verificationDecider?.name
+                ? `Reviewed by ${verificationDecider.name}. `
+                : ''}
+              Resolve the finding, then run the governed verification flow again.
+            </small>
+          </div>
+        </section>
+      ) : null}
+      {latestRun && terminalRun(latestRun.status) && !reviewRejected ? (
         <div className={`terminal-summary terminal-${latestRun.status}`}>
           <strong>{statusLabel(latestRun.status)}</strong>
           <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
@@ -3042,21 +3102,34 @@ function MissionCard({
           </small>
         </div>
       ) : null}
-      {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
-        <div className="usage-box">
-          {latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out
-        </div>
-      ) : null}
-      {latestRun?.model ? (
-        <div className="usage-box">
-          {latestRun.model}
-          {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
-        </div>
-      ) : null}
-      {latestRun?.workspace_branch ? (
-        <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
-          <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
-          <strong>{latestRun.workspace_branch}</strong>
+      {latestRun &&
+      (latestRun.input_tokens > 0 ||
+        latestRun.output_tokens > 0 ||
+        latestRun.model ||
+        latestRun.workspace_branch) ? (
+        <div className="run-metadata" aria-label="Run details">
+          {latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ? (
+            <span>
+              <strong>Usage</strong>
+              {latestRun.input_tokens.toLocaleString()} in ·{' '}
+              {latestRun.output_tokens.toLocaleString()} out
+            </span>
+          ) : null}
+          {latestRun.model ? (
+            <span>
+              <strong>Model</strong>
+              {latestRun.model}
+              {latestRun.reasoning_effort
+                ? ` · ${latestRun.reasoning_effort} reasoning`
+                : ''}
+            </span>
+          ) : null}
+          {latestRun.workspace_branch ? (
+            <span title={latestRun.workspace_detail ?? undefined}>
+              <strong>{latestRun.workspace_disposition ?? 'active'} worktree</strong>
+              {latestRun.workspace_branch}
+            </span>
+          ) : null}
         </div>
       ) : null}
       {latestDeliverable ? (
