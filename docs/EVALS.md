@@ -268,6 +268,9 @@ verifies Markdown section boundaries for dependency and acceptance parsing.
 idempotent replay, owner-only configuration, manager-capable control, member denial, pause/resume,
 monotonic reconciliation generations, bounded failure text, blocked and watching projections,
 lease-expiry offline state, stale connection-epoch rejection, and reconnect recovery.
+The live watcher probe starts `crony factory-watch` against a deterministic GitHub boundary,
+observes `watching`, applies durable pause and resume, verifies resume requests a reconciliation
+generation, terminates the watcher, and observes `offline` after the heartbeat lease expires.
 
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write

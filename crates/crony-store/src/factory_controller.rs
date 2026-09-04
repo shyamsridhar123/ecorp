@@ -414,7 +414,9 @@ pub(super) fn map_factory_controller(row: sqlx::postgres::PgRow) -> FactoryContr
         "offline"
     } else if needs_decision {
         "needs_decision"
-    } else if last_reconcile_result.as_deref() == Some("failed") {
+    } else if last_reconcile_result.as_deref() == Some("failed")
+        || row.get::<Option<String>, _>("last_error").is_some()
+    {
         "blocked"
     } else if active_work_item_id.is_some() {
         "working"

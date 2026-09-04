@@ -45,6 +45,10 @@ enum Command {
         #[command(flatten)]
         args: Box<factory::FactoryArgs>,
     },
+    FactoryWatch {
+        #[command(flatten)]
+        args: Box<factory::FactoryWatchArgs>,
+    },
     FactoryPublish {
         #[command(flatten)]
         args: Box<publish::FactoryPublishArgs>,
@@ -202,6 +206,9 @@ async fn main() -> Result<()> {
         }
         Command::Factory { args: factory_args } => {
             factory::run(&client, &args.server, *factory_args).await?
+        }
+        Command::FactoryWatch { args: watch_args } => {
+            factory::watch(&client, &args.server, *watch_args).await?
         }
         Command::FactoryPublish { args: publish_args } => {
             publish::run(&client, &args.server, *publish_args).await?

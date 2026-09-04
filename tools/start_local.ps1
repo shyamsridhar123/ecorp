@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipInstall,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$SkipFactoryController
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +43,22 @@ $runnerWorkspace = if ($env:CRONY_RUNNER_WORKSPACE) {
     )
 } else {
     Join-Path $root 'output\runner'
+}
+$factoryWatchEnabled = -not $SkipFactoryController -and $env:ECORP_FACTORY_WATCH -eq '1'
+$factoryAdapter = if ($env:ECORP_FACTORY_ADAPTER) {
+    $env:ECORP_FACTORY_ADAPTER
+} else {
+    'github-copilot'
+}
+$factoryBudgetTokens = if ($env:ECORP_FACTORY_BUDGET_TOKENS) {
+    [int64]$env:ECORP_FACTORY_BUDGET_TOKENS
+} else {
+    1000000
+}
+$factoryBudgetCost = if ($env:ECORP_FACTORY_BUDGET_COST_MICROUSD) {
+    [int64]$env:ECORP_FACTORY_BUDGET_COST_MICROUSD
+} else {
+    1000000
 }
 
 New-Item -ItemType Directory -Path $output -Force | Out-Null
@@ -87,6 +104,8 @@ try {
         'server.stderr.log',
         'runner.stdout.log',
         'runner.stderr.log',
+        'factory-controller.stdout.log',
+        'factory-controller.stderr.log',
         'web.stdout.log',
         'web.stderr.log'
     )
@@ -114,6 +133,7 @@ try {
     @{
         server = $server.Id
         runner = $null
+        factoryController = $null
         web = $null
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'local-pids.json')
 
@@ -170,6 +190,28 @@ try {
         -PassThru `
         -WindowStyle Hidden
 
+    $factoryController = $null
+    if ($factoryWatchEnabled) {
+        $factoryController = Start-Process `
+            -FilePath (Join-Path $root 'target\debug\crony-cli.exe') `
+            -ArgumentList @(
+                '--server', "http://127.0.0.1:$serverPort",
+                'factory-watch',
+                $demo.corp_id,
+                $demo.alice_actor_id,
+                '--adapter', $factoryAdapter,
+                '--budget-tokens', $factoryBudgetTokens,
+                '--budget-cost-microusd', $factoryBudgetCost,
+                '--source-repository-path', (ConvertTo-ProcessArgument $sourceRepository),
+                '--source-base-ref', $sourceBaseRef
+            ) `
+            -WorkingDirectory $root `
+            -RedirectStandardOutput (Join-Path $output 'factory-controller.stdout.log') `
+            -RedirectStandardError (Join-Path $output 'factory-controller.stderr.log') `
+            -PassThru `
+            -WindowStyle Hidden
+    }
+
     $web = Start-Process `
         -FilePath (Join-Path $root 'apps\web\node_modules\.bin\vite.cmd') `
         -ArgumentList @(
@@ -186,6 +228,7 @@ try {
     @{
         server = $server.Id
         runner = $runner.Id
+        factoryController = if ($factoryController) { $factoryController.Id } else { $null }
         web = $web.Id
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'local-pids.json')
 
@@ -194,7 +237,16 @@ try {
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$serverPort/health" -TimeoutSec 3
             $page = Invoke-WebRequest -Uri "http://127.0.0.1:$webPort" -TimeoutSec 3
-            if ($health.status -eq 'ok' -and $health.runners -ge 1 -and $page.StatusCode -eq 200) {
+            $factoryReady = -not $factoryWatchEnabled
+            if ($factoryWatchEnabled) {
+                $snapshot = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:$serverPort/api/corps/$($demo.corp_id)/snapshot?actor_id=$($demo.alice_actor_id)" `
+                    -TimeoutSec 3
+                $factoryReady = @($snapshot.snapshot.factory_controllers |
+                    Where-Object { $_.status -ne 'offline' }).Count -ge 1
+            }
+            if ($health.status -eq 'ok' -and $health.runners -ge 1 -and
+                $page.StatusCode -eq 200 -and $factoryReady) {
                 break
             }
         } catch {
@@ -202,7 +254,8 @@ try {
         }
     } while ((Get-Date) -lt $deadline)
 
-    if ($health.status -ne 'ok' -or $health.runners -lt 1 -or $page.StatusCode -ne 200) {
+    if ($health.status -ne 'ok' -or $health.runners -lt 1 -or
+        $page.StatusCode -ne 200 -or -not $factoryReady) {
         throw 'ECorp local stack did not become ready.'
     }
 
@@ -211,6 +264,7 @@ try {
     Write-Host "Runner count: $($health.runners)"
     Write-Host "Source repo:  $sourceRepository ($sourceBaseRef)"
     Write-Host "Worktrees:    $runnerWorkspace"
+    Write-Host "Factory:      $(if ($factoryWatchEnabled) { 'watching' } else { 'not configured' })"
 } finally {
     Pop-Location
 }

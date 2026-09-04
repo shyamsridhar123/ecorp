@@ -530,6 +530,12 @@ result, and bounded failure detail. The browser derives `offline`, `watching`, `
 `blocked`, and `needs decision` from this authoritative record and exposes versioned pause, resume,
 and reconciliation controls. Pausing intake never interrupts an existing mission.
 
+`crony factory-watch` keeps heartbeat and control polling independent from the one-at-a-time intake
+cycle. It reconnects using a new epoch, observes durable pause and reconciliation generations, and
+continues heartbeats while the current controller cycle waits on GitHub, a mission, or verification.
+The documented local stack starts this watcher only when `ECORP_FACTORY_WATCH=1`; otherwise the UI
+truthfully reports that Factory is not configured.
+
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
 It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded

@@ -82,6 +82,18 @@ pnpm install --frozen-lockfile
 
 Open **http://127.0.0.1:5187**. The script starts Postgres, the Rust control plane, an enrolled outbound runner, and the React operations console, then checks service health and runner connectivity.
 
+To start the configured trusted GitHub Project watcher with the same stack:
+
+```powershell
+$env:ECORP_FACTORY_WATCH = '1'
+$env:ECORP_FACTORY_ADAPTER = 'github-copilot'
+./tools/start_local.ps1
+```
+
+When configured, startup waits for a fresh controller heartbeat and Factory displays `Watching`.
+Pause stops new intake without interrupting active missions. GitHub authentication remains in the
+controller process; it is not forwarded to runners or agents.
+
 Stop the stack with:
 
 ```powershell
