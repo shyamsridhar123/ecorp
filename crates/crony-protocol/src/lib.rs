@@ -518,7 +518,7 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub remaining_attempts: i32,
     pub remaining_mission_tokens: i64,
     pub remaining_mission_cost_microusd: i64,
-    pub workspace_fingerprint: String,
+    pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
 }
 

@@ -543,9 +543,11 @@ recovery flow and executable evidence for both supported modes.
 - **Verifier-only recovery:** use this when the source and preserved checkpoint are correct. ECorp
   creates one provider-free verification run, checks the exact workspace fingerprint, reuses the
   durable provider artifact, and preserves the existing head commit. Automated checks run in a
-  bounded, ephemeral physical snapshot that excludes the worktree's `.git` control file; command or
-  test side effects are discarded with that snapshot. The runner fingerprints the preserved source
-  worktree again after verification and rejects a mismatch. A preserved run created before
+  fresh bounded, ephemeral physical snapshot that excludes the worktree's `.git` control file and
+  rejects links that escape the worktree. A command or test cannot create state for a later check,
+  and bounded snapshot cleanup must finish before verification can be accepted. The runner
+  fingerprints the preserved source worktree again after verification and rejects a mismatch. A
+  preserved run created before
   fingerprints existed first receives a runner-owned checkpoint command. That command verifies the
   managed worktree and head, records the full physical-workspace fingerprint, and starts no provider.
 - **Source-correction recovery:** use this when source bytes must change. First store a versioned
@@ -584,6 +586,12 @@ leave the recovery active. The replacement run and recovery must become failed, 
 must return to `verification_failed`, and the durable command must stop redelivering. Repair the
 cause, provide a new recovery reason, and reuse the preserved source checkpoint.
 
+An interrupted verifier-only recovery follows the same fail-closed factory rule: the run records
+`cancelled`, while its task and factory item return to `verification_failed`, the recovery becomes
+terminal, and the one-active-recovery fence is released. Controller retry loads the exact work-item
+recovery context rather than relying on the bounded Corp snapshot, so an active recovery cannot be
+lost behind newer recovery history.
+
 ## Publish a verified result
 
 Publication is allowed only after:
@@ -599,9 +607,12 @@ Publication is allowed only after:
 For a result completed through verification recovery, review the source-issue provenance as two
 separate facts: `claimed_revision` is the immutable revision from the original factory claim, while
 `revision` is the effective reviewed revision from the completed recovery and `recovery_id` links
-that recovery. Without a completed recovery, `revision` equals `claimed_revision` and
-`recovery_id` is null. Do not rewrite the original claim or present the reviewed recovery revision
-as if it were the initially claimed source.
+that recovery. Recovery linkage follows the verified deliverable's resume ancestry, including a
+descendant that completes after the first recovery run. New records use provenance schema version 2;
+schema-version-1 in-flight publications remain resumable against their original claimed revision.
+Without a completed recovery, `revision` equals `claimed_revision` and `recovery_id` is null. Do not
+rewrite the original claim or present the reviewed recovery revision as if it were the initially
+claimed source.
 
 ### Create a short-lived publisher credential
 

@@ -61,6 +61,10 @@ async function psql(sql) {
     const script = [
       'import sys, psycopg',
       'dsn, sql = sys.argv[1], sys.argv[2]',
+      'def render(value):',
+      '  if isinstance(value, memoryview): value = value.tobytes()',
+      "  if isinstance(value, (bytes, bytearray)): value = value.decode('utf-8')",
+      "  return 't' if value is True else 'f' if value is False else '' if value is None else str(value)",
       'with psycopg.connect(dsn, autocommit=True) as connection:',
       '  with connection.cursor() as cursor:',
       "    statements = [item.strip() for item in sql.split(';') if item.strip()]",
@@ -68,7 +72,7 @@ async function psql(sql) {
       '      cursor.execute(statement)',
       '    if cursor.description:',
       '      for row in cursor.fetchall():',
-      "        print('|'.join('t' if value is True else 'f' if value is False else '' if value is None else str(value) for value in row))",
+      "        print('|'.join(render(value) for value in row))",
     ].join('\n')
     const { stdout } = await execFile(
       process.env.ECORP_TEST_PYTHON ?? 'python',
@@ -391,6 +395,15 @@ async function verifierOnlyRecovery() {
   const policy = {
     checks: [
       { type: 'artifact', min_bytes: 1 },
+      {
+        type: 'command',
+        program: 'node',
+        args: [
+          '-e',
+          "const fs=require('node:fs');const p='verifier-command-side-effect.txt';const existed=fs.existsSync(p);const n=existed?Number(fs.readFileSync(p,'utf8'))+1:1;fs.writeFileSync(p,String(n));if(existed)fs.writeFileSync('result.md','snapshot-only corruption')",
+        ],
+        timeout_ms: 30_000,
+      },
       { type: 'file', path: 'result.md', min_bytes: 50 },
     ],
     manual_gate: {
@@ -505,19 +518,6 @@ async function verifierOnlyRecovery() {
     },
   )
   assert.equal(recovered.launch.legacy_workspace_checkpointed, true)
-  const replay = await runController(
-    demo,
-    issue.number,
-    statePath,
-    policyPath,
-    {
-      adapter: 'fake-process',
-      recovery: 'verifier-only',
-      recoveryReason,
-    },
-  )
-  assert.equal(replay.launch.recovery_id, recovered.launch.recovery_id)
-  assert.equal(replay.launch.run_id, recovered.launch.run_id)
   const recoveredWaiting = await waitFor(
     demo,
     (state) => {
@@ -538,6 +538,65 @@ async function verifierOnlyRecovery() {
     'verifier-only recovery review',
   )
   const recoveryRun = recoveredWaiting.value.run
+  await psql(`
+    INSERT INTO factory_verification_recoveries (
+      id, corp_id, factory_work_item_id, mission_id, task_id,
+      source_run_id, replacement_run_id, mode, status, authorized_by,
+      reason, idempotency_key, observed_source_revision,
+      reviewed_source_snapshot, contract_revision_id,
+      previous_verification_policy, replacement_verification_policy, request,
+      created_at, updated_at
+    )
+    SELECT
+      gen_random_uuid(),
+      ${sqlLiteral(demo.corp_id)}::uuid,
+      ${sqlLiteral(first.factory_work_item_id)}::uuid,
+      ${sqlLiteral(first.mission_id)}::uuid,
+      ${sqlLiteral(recoveryRun.task_id)}::uuid,
+      ${sqlLiteral(sourceRun.id)}::uuid,
+      NULL,
+      'verifier_only',
+      'failed',
+      ${sqlLiteral(demo.alice_actor_id)}::uuid,
+      'historical bounded-snapshot recovery ' || series,
+      gen_random_uuid(),
+      ${sqlLiteral(issue.updatedAt)},
+      '{}'::jsonb,
+      NULL,
+      '{"checks":[],"manual_gate":null}'::jsonb,
+      '{"checks":[],"manual_gate":null}'::jsonb,
+      '{}'::jsonb,
+      now() + series * interval '1 millisecond',
+      now() + series * interval '1 millisecond'
+    FROM generate_series(1, 101) AS series
+  `)
+  const boundedSnapshot = await snapshot(demo)
+  assert.ok(
+    !boundedSnapshot.snapshot.factory_verification_recoveries.some(
+      (recovery) => recovery.id === recovered.launch.recovery_id,
+    ),
+  )
+  const exactContext = await requestOk(
+    `/api/corps/${demo.corp_id}/factory/work-items/${first.factory_work_item_id}/verification-recoveries?actor_id=${demo.alice_actor_id}`,
+  )
+  assert.ok(
+    exactContext.recoveries.some(
+      (recovery) => recovery.id === recovered.launch.recovery_id,
+    ),
+  )
+  const replay = await runController(
+    demo,
+    issue.number,
+    statePath,
+    policyPath,
+    {
+      adapter: 'fake-process',
+      recovery: 'verifier-only',
+      recoveryReason,
+    },
+  )
+  assert.equal(replay.launch.recovery_id, recovered.launch.recovery_id)
+  assert.equal(replay.launch.run_id, recovered.launch.run_id)
   const checkpointedSourceRun = recoveredWaiting.state.snapshot.runs.find(
     (run) => run.id === sourceRun.id,
   )
@@ -560,8 +619,17 @@ async function verifierOnlyRecovery() {
     recoveredWaiting.state.snapshot.verification_evidence.filter(
       (item) => item.run_id === recoveryRun.id,
     )
-  assert.equal(recoveryEvidence.length, 2)
+  assert.equal(recoveryEvidence.length, 3)
   assert.ok(recoveryEvidence.every((item) => item.status === 'passed'))
+  assert.equal(
+    await readFile(path.join(sourceRun.workspace_path, 'verifier-command-side-effect.txt'), 'utf8'),
+    '1',
+  )
+  assert.ok(
+    (
+      await readFile(path.join(sourceRun.workspace_path, 'result.md'), 'utf8')
+    ).length >= 50,
+  )
   const recoveryDeliverable =
     recoveredWaiting.state.snapshot.source_deliverables.find(
       (deliverable) => deliverable.run_id === recoveryRun.id,
@@ -609,6 +677,7 @@ async function verifierOnlyRecovery() {
     legacy_workspace_checkpointed:
       recovered.launch.legacy_workspace_checkpointed,
     legacy_provider_artifact_metadata_recovered: true,
+    verifier_side_effect_isolated: true,
     provider_events_on_recovery: recoveryEvents.filter((event) =>
       ['run.session', 'run.session_terminated', 'run.output', 'run.artifact'].includes(
         event.type,
@@ -932,6 +1001,272 @@ async function sourceCorrectionRecovery() {
   }
 }
 
+async function cancelledRecoveryTerminalizes() {
+  const demo = await post('/api/demo/reset', {})
+  const issue = {
+    id: 'I_FACTORY_RECOVERY_9250',
+    number: 9250,
+    title: 'Terminalize an interrupted verifier recovery',
+    body: [
+      '## Outcome',
+      '',
+      'An interrupted verifier-only recovery returns to governed recovery state.',
+      '',
+      '## Acceptance criteria',
+      '',
+      '- [ ] Cancellation releases the active recovery slot.',
+      '- [ ] A later recovery can be authorized from the preserved lineage.',
+      '',
+    ].join('\n'),
+    url: 'https://github.com/shyamsridhar123/ecorp/issues/9250',
+    state: 'OPEN',
+    createdAt: '2026-09-04T01:30:00Z',
+    updatedAt: '2026-09-04T01:30:00Z',
+    labels: [{ name: 'factory:ready' }],
+  }
+  const statePath = path.join(output, 'factory-cancelled-recovery-github.json')
+  const policyPath = path.join(output, 'factory-cancelled-recovery-policy.json')
+  const policy = {
+    checks: [
+      { type: 'artifact', min_bytes: 1 },
+      { type: 'file', path: 'result.md', min_bytes: 50 },
+      {
+        type: 'command',
+        program: 'node',
+        args: [
+          '-e',
+          "const fs=require('node:fs');if(fs.existsSync('hold-verification.flag'))setTimeout(()=>{},30000)",
+        ],
+        timeout_ms: 60_000,
+      },
+    ],
+    manual_gate: {
+      type: 'independent_review',
+      roles: ['owner', 'admin', 'manager', 'member'],
+      exclude_requester: true,
+    },
+  }
+  await writeFile(
+    statePath,
+    `${JSON.stringify(
+      projectState(
+        issue,
+        'PVTI_FACTORY_RECOVERY_9250',
+        'PVT_FACTORY_RECOVERY_CANCEL',
+        'PVTSSF_FACTORY_RECOVERY_CANCEL',
+      ),
+      null,
+      2,
+    )}\n`,
+  )
+  await writeFile(policyPath, `${JSON.stringify(policy, null, 2)}\n`)
+  const first = await runController(demo, issue.number, statePath, policyPath, {
+    adapter: 'fake-process',
+  })
+  const firstWaiting = await waitFor(
+    demo,
+    (state) => {
+      const task = state.tasks.find((item) => item.mission_id === first.mission_id)
+      const run = state.runs.find(
+        (item) =>
+          item.task_id === task?.id &&
+          item.status === 'waiting_for_approval' &&
+          item.workspace_fingerprint,
+      )
+      return run ? { task, run } : null
+    },
+    'cancellation source review',
+  )
+  const sourceRun = firstWaiting.value.run
+  await post(
+    `/api/corps/${demo.corp_id}/runs/${sourceRun.id}/verification-decision`,
+    {
+      actor_id: demo.bob_actor_id,
+      approved: false,
+      note: 'Exercise verifier-only cancellation and retry.',
+      decision_key: randomUUID(),
+    },
+  )
+  await waitFor(
+    demo,
+    (state) => {
+      const item = state.factory_work_items.find(
+        (candidate) => candidate.id === first.factory_work_item_id,
+      )
+      return item?.state === 'verification_failed' ? item : null
+    },
+    'cancellation source rejection',
+  )
+  await writeFile(
+    path.join(sourceRun.workspace_path, 'hold-verification.flag'),
+    'hold\n',
+  )
+  await psql(`
+    UPDATE runs
+    SET workspace_fingerprint = NULL
+    WHERE id = ${sqlLiteral(sourceRun.id)}::uuid;
+    UPDATE tasks
+    SET max_attempts = 4
+    WHERE id = ${sqlLiteral(firstWaiting.value.task.id)}::uuid;
+  `)
+  const firstReason =
+    'Start a verifier-only recovery and interrupt it while an isolated check is active.'
+  const firstRecovery = await runController(
+    demo,
+    issue.number,
+    statePath,
+    policyPath,
+    {
+      adapter: 'fake-process',
+      recovery: 'verifier-only',
+      recoveryReason: firstReason,
+    },
+  )
+  const firstActive = await waitFor(
+    demo,
+    (state) => {
+      const recovery = state.factory_verification_recoveries.find(
+        (candidate) => candidate.id === firstRecovery.launch.recovery_id,
+      )
+      const run = state.runs.find(
+        (candidate) => candidate.id === firstRecovery.launch.run_id,
+      )
+      return recovery?.status === 'running' && run?.status === 'verifying'
+        ? { recovery, run }
+        : null
+    },
+    'active verifier-only recovery before interrupt',
+  )
+  const firstLease = await post(
+    `/api/corps/${demo.corp_id}/agents/${firstActive.value.run.agent_id}/lease`,
+    { actor_id: demo.alice_actor_id },
+  )
+  assert.equal(firstLease.acquired, true)
+  assert.ok(firstLease.token)
+  await post(
+    `/api/corps/${demo.corp_id}/agents/${firstActive.value.run.agent_id}/interrupt`,
+    {
+      actor_id: demo.alice_actor_id,
+      lease_token: firstLease.token,
+      reason: 'Cancel the verifier-only recovery without cancelling the factory lineage.',
+    },
+  )
+  const firstCancelled = await waitFor(
+    demo,
+    (state) => {
+      const recovery = state.factory_verification_recoveries.find(
+        (candidate) => candidate.id === firstRecovery.launch.recovery_id,
+      )
+      const run = state.runs.find(
+        (candidate) => candidate.id === firstRecovery.launch.run_id,
+      )
+      const task = state.tasks.find((candidate) => candidate.id === run?.task_id)
+      const mission = state.missions.find(
+        (candidate) => candidate.id === first.mission_id,
+      )
+      const item = state.factory_work_items.find(
+        (candidate) => candidate.id === first.factory_work_item_id,
+      )
+      return recovery?.status === 'failed' &&
+        run?.status === 'cancelled' &&
+        run.workspace_disposition === 'preserved' &&
+        run.workspace_fingerprint &&
+        task?.status === 'verification_failed' &&
+        task.verification_status === 'failed' &&
+        mission?.status === 'failed' &&
+        item?.state === 'verification_failed'
+        ? { recovery, run, task, mission, item }
+        : null
+    },
+    'terminalized cancelled recovery',
+  )
+  assert.equal(
+    firstCancelled.state.snapshot.factory_verification_recoveries.filter(
+      (recovery) =>
+        recovery.factory_work_item_id === first.factory_work_item_id &&
+        ['authorized', 'running'].includes(recovery.status),
+    ).length,
+    0,
+  )
+  const context = await requestOk(
+    `/api/corps/${demo.corp_id}/factory/work-items/${first.factory_work_item_id}/verification-recoveries?actor_id=${demo.alice_actor_id}`,
+  )
+  assert.equal(context.source_run_id, firstCancelled.value.run.id)
+  const secondReason =
+    'Authorize a fresh verifier-only recovery after the interrupted attempt released its slot.'
+  const secondRecovery = await runController(
+    demo,
+    issue.number,
+    statePath,
+    policyPath,
+    {
+      adapter: 'fake-process',
+      recovery: 'verifier-only',
+      recoveryReason: secondReason,
+    },
+  )
+  assert.notEqual(
+    secondRecovery.launch.recovery_id,
+    firstRecovery.launch.recovery_id,
+  )
+  assert.notEqual(secondRecovery.launch.run_id, firstRecovery.launch.run_id)
+  const secondActive = await waitFor(
+    demo,
+    (state) => {
+      const recovery = state.factory_verification_recoveries.find(
+        (candidate) => candidate.id === secondRecovery.launch.recovery_id,
+      )
+      const run = state.runs.find(
+        (candidate) => candidate.id === secondRecovery.launch.run_id,
+      )
+      return recovery?.status === 'running' && run?.status === 'verifying'
+        ? { recovery, run }
+        : null
+    },
+    'fresh recovery after cancellation',
+  )
+  const secondLease = await post(
+    `/api/corps/${demo.corp_id}/agents/${secondActive.value.run.agent_id}/lease`,
+    { actor_id: demo.alice_actor_id },
+  )
+  assert.equal(secondLease.acquired, true)
+  assert.ok(secondLease.token)
+  await post(
+    `/api/corps/${demo.corp_id}/agents/${secondActive.value.run.agent_id}/interrupt`,
+    {
+      actor_id: demo.alice_actor_id,
+      lease_token: secondLease.token,
+      reason: 'Clean up the second cancellation regression run.',
+    },
+  )
+  await waitFor(
+    demo,
+    (state) => {
+      const recovery = state.factory_verification_recoveries.find(
+        (candidate) => candidate.id === secondRecovery.launch.recovery_id,
+      )
+      const run = state.runs.find(
+        (candidate) => candidate.id === secondRecovery.launch.run_id,
+      )
+      return recovery?.status === 'failed' && run?.status === 'cancelled'
+        ? { recovery, run }
+        : null
+    },
+    'second cancelled recovery cleanup',
+  )
+  return {
+    factory_work_item_id: first.factory_work_item_id,
+    mission_id: first.mission_id,
+    first_recovery_id: firstRecovery.launch.recovery_id,
+    first_cancelled_run_id: firstRecovery.launch.run_id,
+    second_recovery_id: secondRecovery.launch.recovery_id,
+    second_cancelled_run_id: secondRecovery.launch.run_id,
+    active_slot_released: true,
+    exact_context_selected_cancelled_source: true,
+    fresh_recovery_authorized: true,
+  }
+}
+
 async function exhaustedRecoveryIsRejected() {
   const demo = await post('/api/demo/reset', {})
   const issue = {
@@ -1059,6 +1394,7 @@ const report = {
   passed: true,
   verifier_only: await verifierOnlyRecovery(),
   source_correction: await sourceCorrectionRecovery(),
+  cancelled_recovery: await cancelledRecoveryTerminalizes(),
   exhausted_attempts: await exhaustedRecoveryIsRejected(),
 }
 await writeFile(

@@ -326,12 +326,14 @@ For a preserved run created before fingerprints existed, an authorized durable c
 first asks the owning runner to verify the managed worktree and verification-linked head, compute
 the fingerprint without starting a provider, and persist it on the original run.
 
-Verifier-only recovery executes automated checks against a bounded, ephemeral physical snapshot,
-not the preserved source worktree. The runner copies the admitted worktree contents into a unique
-temporary directory while excluding the worktree's `.git` control file and enforcing entry and byte
-ceilings. Command and test side effects therefore remain inside the snapshot, which is removed after
-verification. The runner fingerprints the preserved source worktree again after the checks and
-rejects the recovery if that authoritative checkpoint no longer matches.
+Verifier-only recovery executes each automated check against a fresh bounded, ephemeral physical
+snapshot, not the preserved source worktree. The runner copies the admitted worktree contents into a
+unique temporary directory while excluding the worktree's `.git` control file, rejecting symbolic
+links or Windows reparse points whose resolved target escapes the worktree, and enforcing entry and
+byte ceilings. Command and test side effects therefore cannot alter the source or satisfy a later
+check. Snapshot removal has a bounded explicit completion gate; cleanup failure becomes run failure
+before accepted verification can be emitted. The runner fingerprints the preserved source worktree
+again after the checks and rejects the recovery if that authoritative checkpoint no longer matches.
 
 ## Planning and scheduling
 
@@ -412,10 +414,11 @@ policy, attempt ceiling, and remaining budgets. `verification_failed -> running`
 through the generic transition endpoint.
 
 - `verifier_only` creates a run with `execution_mode=verification_only`, reuses the stored provider
-  artifact, and starts no provider process. It runs the verifier in the bounded physical snapshot,
-  fingerprints the preserved source worktree after verification, and preserves an existing commit
-  when the source already has one. Legacy provider artifacts without relative-path metadata are
-  resolved only inside the preserved worktree by file name, exact byte count, and SHA-256.
+  artifact, and starts no provider process. Each check receives a fresh bounded physical snapshot;
+  snapshot cleanup completes before accepted verification, and the preserved source worktree is
+  fingerprinted afterward. An existing commit is preserved when the source already has one. Legacy
+  provider artifacts without relative-path metadata are resolved only inside the preserved worktree
+  by file name, exact byte count, and SHA-256.
 - `source_correction` requires a versioned `resume` contract revision and resumes the exact provider
   session, branch, and workspace lineage. The revision can update reviewed issue text and verifier
   metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
@@ -656,8 +659,11 @@ When the selected verified run completed through factory verification recovery, 
 provenance keeps the original claim and the reviewed recovery source distinct. The source issue's
 `claimed_revision` remains the revision captured by the factory claim, while `revision` records the
 effective reviewed revision observed by the completed recovery and `recovery_id` links that
-recovery. Without a completed recovery, both revisions are the claimed revision and `recovery_id`
-is null. Publication authority revalidation checks this tuple before later effects.
+recovery. Recovery selection follows the selected deliverable run's persisted resume lineage rather
+than requiring the deliverable to belong directly to the first replacement run. New provenance is
+schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
+claimed revision so an in-flight publication can survive deployment. Without a completed recovery,
+both revisions are the claimed revision and `recovery_id` is null.
 
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,

@@ -269,12 +269,14 @@ task, branch, and workspace lineage can recover after verification rejection. It
 case rejects evidence through an independent-review gate, replays the keyed decision, creates one
 `verification_only` run, emits zero provider session/output/artifact events, preserves the exact
 head commit, and reaches one verified factory item. A direct-command verifier writes a side-effect
-file during the original run and attempts to increment it during verifier-only recovery; the
-regression asserts the preserved source still contains the original value after recovery because
-the second command ran in the ephemeral physical snapshot. The runner then fingerprints the
-preserved source after verification. The
+file during the original run, then attempts to increment it and corrupt `result.md` during
+verifier-only recovery. The later file check still reads a fresh snapshot, while the preserved
+source retains its original side-effect value and valid `result.md`. The runner explicitly removes
+each snapshot before accepted verification and then fingerprints the preserved source. The
 `verifier_snapshot_is_physical_isolated_and_excludes_git_control` unit regression separately checks
-snapshot isolation, `.git` exclusion, cleanup, and copying of untracked and ignored source files.
+snapshot isolation, `.git` exclusion, bounded explicit cleanup, and copying of untracked and ignored
+source files. Unix coverage additionally rejects a relative symlink that escapes the worktree;
+Windows runtime code rejects escaping symbolic links and reparse points.
 Before recovery, the E2E removes the source run's fingerprint and provider-artifact relative path
 to reproduce a pre-0032 preserved run. It then proves the owning runner checkpoints the workspace
 without provider execution and resolves the legacy artifact by exact file name, bytes, and digest.
@@ -287,6 +289,13 @@ terminalizes the run and recovery, clears the active-recovery uniqueness fence, 
 The retry resumes the exact Codex fixture session/worktree, increments the attempt monotonically,
 and completes after independent approval. The report is written to
 `output/e2e-factory-verification-recovery.json`.
+
+The same harness interrupts a verifier-only recovery while a snapshot command is active. It proves
+the cancelled run is preserved, the recovery becomes failed, the task and factory item return to
+`verification_failed`, the active slot is released, and a second recovery can be authorized. It
+also inserts 101 newer historical recoveries so the live recovery disappears from the bounded Corp
+snapshot, then proves the exact work-item recovery context still returns and replays the original
+recovery and run.
 
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
@@ -412,11 +421,13 @@ coverage detaches worktree HEAD and proves the validated branch still produces a
 with no temporary ref left behind. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
 
-The `publication_source_revision_links_completed_recovery` store unit regression covers the
-recovery-aware provenance selection added during issue #113 review: a completed recovery selects
-its reviewed source revision and recovery ID, while a non-recovery publication retains the original
-claimed revision with a null recovery ID. This is unit coverage of provenance selection, not a new
-recovery-to-publication remote-effect claim.
+Store unit regressions cover recovery-aware publication provenance. A completed recovery selects
+its reviewed source revision and recovery ID; recovery selection follows the chosen deliverable
+run's resume lineage; a non-recovery publication retains the original claimed revision with a null
+recovery ID; and legacy schema-version-1 provenance remains resumable while version 2 requires the
+claimed/effective/recovery tuple. The complete deterministic publication E2E also passes after this
+change, including restart recovery and exact publication-context lookup. This is local fixture
+evidence, not a new real-GitHub recovery-to-publication effect claim.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,

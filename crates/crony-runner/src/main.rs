@@ -5,7 +5,7 @@ mod workspace;
 
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -37,7 +37,9 @@ use adapter::{
     AdapterArtifact, AdapterControl, AdapterEvent, AdapterEventSink, AdapterExit, AdapterRegistry,
     AdapterRegistryConfig, AdapterRunRequest, AgentAdapter, CopilotSdkConfig,
 };
-use workspace::{WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager};
+use workspace::{
+    VerificationSnapshot, WorkspaceCleanup, WorkspaceDisposition, WorkspaceLease, WorkspaceManager,
+};
 
 #[derive(Debug, Parser, Clone)]
 #[command(name = "crony-runner")]
@@ -1630,6 +1632,7 @@ async fn execute_assignment(
                     &runner_id,
                     &assignment,
                     &workspace,
+                    None,
                     &artifacts,
                     &mut artifact_acks,
                     &summary,
@@ -1738,55 +1741,82 @@ async fn execute_verification_assignment(
             ));
         }
     }
+    let mut verification_snapshot =
+        workspace::verification_snapshot(&workspace.path, assignment.run_id).await?;
     let artifacts = match assignment.provider_artifact.as_ref() {
         Some(reference) => vec![verifier_only_artifact(&workspace, reference).await?],
         None => Vec::new(),
     };
     let artifacts = Arc::new(Mutex::new(artifacts));
-    let verification = send_verification_events(
-        &outbound,
-        &runner_id,
-        &assignment,
-        &workspace,
-        &artifacts,
-        &mut artifact_acks,
-        "Verifier-only recovery completed without starting a provider.",
-        Some(expected_fingerprint),
-        assignment.expected_head_commit.as_deref(),
-    );
-    tokio::pin!(verification);
-    loop {
-        tokio::select! {
-            () = &mut verification => break,
-            control = controls.recv() => {
-                match control {
-                    Some(AdapterControl::Interrupt { reason })
-                    | Some(AdapterControl::Stop { reason }) => {
-                        send_run_event(
-                            &outbound,
-                            &runner_id,
-                            &assignment,
-                            "run.cancelled",
-                            json!({"reason": reason}),
-                        );
-                        break;
+    let interruption = {
+        let verification = send_verification_events(
+            &outbound,
+            &runner_id,
+            &assignment,
+            &workspace,
+            Some(&mut verification_snapshot),
+            &artifacts,
+            &mut artifact_acks,
+            "Verifier-only recovery completed without starting a provider.",
+            Some(expected_fingerprint),
+            assignment.expected_head_commit.as_deref(),
+        );
+        tokio::pin!(verification);
+        loop {
+            tokio::select! {
+                () = &mut verification => break None,
+                control = controls.recv() => {
+                    match control {
+                        Some(AdapterControl::Interrupt { reason })
+                        | Some(AdapterControl::Stop { reason }) => {
+                            break Some(Ok(reason));
+                        }
+                        Some(AdapterControl::CircuitBreaker { stage, reason })
+                            if matches!(stage.as_str(), "suspend" | "stop") =>
+                        {
+                            break Some(Ok(format!("circuit breaker {stage}: {reason}")));
+                        }
+                        Some(_) => {}
+                        None => {
+                            break Some(Err(
+                                "verifier-only control channel closed during verification"
+                                    .to_owned(),
+                            ));
+                        }
                     }
-                    Some(AdapterControl::CircuitBreaker { stage, reason })
-                        if matches!(stage.as_str(), "suspend" | "stop") =>
-                    {
-                        send_run_event(
-                            &outbound,
-                            &runner_id,
-                            &assignment,
-                            "run.cancelled",
-                            json!({"reason": format!("circuit breaker {stage}: {reason}")}),
-                        );
-                        break;
-                    }
-                    Some(_) => {}
-                    None => break,
                 }
             }
+        }
+    };
+    if let Some(interruption) = interruption {
+        match verification_snapshot.cleanup().await {
+            Ok(()) => match interruption {
+                Ok(reason) => send_run_event(
+                    &outbound,
+                    &runner_id,
+                    &assignment,
+                    "run.cancelled",
+                    json!({"reason": reason}),
+                ),
+                Err(error) => send_run_event(
+                    &outbound,
+                    &runner_id,
+                    &assignment,
+                    "run.failed",
+                    json!({"error": error}),
+                ),
+            },
+            Err(error) => send_run_event(
+                &outbound,
+                &runner_id,
+                &assignment,
+                "run.failed",
+                json!({
+                    "error": format!(
+                        "verifier-only snapshot cleanup failed after interruption: {error:#}"
+                    ),
+                }),
+            ),
         }
     }
     let cleanup = workspaces.finalize(&workspace).await;
@@ -1928,12 +1958,52 @@ fn validate_assignment_source(
         .context("reject source assignment")
 }
 
+async fn verify_isolated_recovery_checks(
+    policy: &VerificationPolicy,
+    source_workspace: &Path,
+    run_id: Uuid,
+    snapshot: &mut VerificationSnapshot,
+    artifacts: &[AdapterArtifact],
+) -> Result<verifier::VerificationReport> {
+    let mut checks = Vec::with_capacity(policy.checks.len());
+    if policy.checks.is_empty() {
+        snapshot
+            .cleanup()
+            .await
+            .context("clean empty verifier snapshot")?;
+    }
+    for (index, check) in policy.checks.iter().enumerate() {
+        checks.push(verifier::run_check(index as i32, check, snapshot.path(), artifacts).await);
+        snapshot
+            .cleanup()
+            .await
+            .with_context(|| format!("clean verifier snapshot after check {index}"))?;
+        if index + 1 < policy.checks.len() {
+            *snapshot = workspace::verification_snapshot(source_workspace, run_id)
+                .await
+                .with_context(|| format!("refresh verifier snapshot before check {}", index + 1))?;
+        }
+    }
+    let failed = checks.iter().filter(|check| !check.passed).count();
+    Ok(verifier::VerificationReport {
+        passed: failed == 0,
+        summary: if failed == 0 {
+            format!("all {} verifier checks passed", checks.len())
+        } else {
+            format!("{failed} of {} verifier checks failed", checks.len())
+        },
+        checks,
+        manual_gate: policy.manual_gate.clone(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_verification_events(
     outbound: &OutboundBus,
     runner_id: &str,
     assignment: &Assignment,
     workspace: &WorkspaceLease,
+    verification_snapshot: Option<&mut VerificationSnapshot>,
     artifacts: &Arc<Mutex<Vec<AdapterArtifact>>>,
     artifact_acks: &mut mpsc::UnboundedReceiver<ArtifactAck>,
     completion_summary: &str,
@@ -1953,8 +2023,35 @@ async fn send_verification_events(
         .lock()
         .map(|artifacts| artifacts.clone())
         .unwrap_or_default();
-    let mut report =
-        verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await;
+    let mut report = if let Some(snapshot) = verification_snapshot {
+        match verify_isolated_recovery_checks(
+            &assignment.verification_policy,
+            &workspace.path,
+            assignment.run_id,
+            snapshot,
+            &artifacts,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                send_run_event(
+                    outbound,
+                    runner_id,
+                    assignment,
+                    "run.failed",
+                    json!({
+                        "error": format!(
+                            "verifier-only isolated verification failed: {error:#}"
+                        ),
+                    }),
+                );
+                return;
+            }
+        }
+    } else {
+        verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await
+    };
     if let Some(expected_fingerprint) = expected_workspace_fingerprint {
         let fingerprint = workspace::fingerprint_path(&workspace.path).await;
         let mismatch = match fingerprint {

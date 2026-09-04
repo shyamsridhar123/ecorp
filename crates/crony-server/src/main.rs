@@ -42,11 +42,11 @@ use crony_protocol::{
     CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
     DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
     EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
-    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
-    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
-    MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, PreflightFactoryMissionRequest,
+    FactoryVerificationRecoveryContextResponse, FactoryWorkItemResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    MissionBudgetRevisionResponse, MissionContractRevisionResponse, PreflightFactoryMissionRequest,
     PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
@@ -470,7 +470,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/verification-recoveries",
-            post(create_factory_verification_recovery),
+            get(get_factory_verification_recovery_context)
+                .post(create_factory_verification_recovery),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
@@ -2113,6 +2114,42 @@ async fn transition_factory_work_item(
         work_item: outcome.work_item,
         claim_token: outcome.claim_token,
         replayed: outcome.replayed,
+    }))
+}
+
+async fn get_factory_verification_recovery_context(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<FactoryVerificationRecoveryContextResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let context = state
+        .store
+        .factory_verification_recovery_context(corp_id, actor_id, work_item_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| {
+            ApiError::not_found("factory verification recovery context was not found")
+        })?;
+    Ok(Json(FactoryVerificationRecoveryContextResponse {
+        work_item: context.work_item,
+        recoveries: context.recoveries,
+        mission_id: context.mission_id,
+        task_id: context.task_id,
+        source_run_id: context.source_run_id,
+        remaining_attempts: context.remaining_attempts,
+        remaining_mission_tokens: context.remaining_mission_tokens,
+        remaining_mission_cost_microusd: context.remaining_mission_cost_microusd,
+        workspace_fingerprint: context.workspace_fingerprint,
+        expected_head_commit: context.expected_head_commit,
     }))
 }
 

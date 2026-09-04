@@ -11,10 +11,12 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::Mutex};
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const VERIFICATION_SNAPSHOT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -629,6 +631,275 @@ pub async fn find_file_by_digest(
     .context("join workspace artifact search task")?
 }
 
+#[derive(Debug)]
+pub struct VerificationSnapshot {
+    path: Option<PathBuf>,
+}
+
+impl VerificationSnapshot {
+    pub fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("verification snapshot path is unavailable after cleanup")
+    }
+
+    pub async fn cleanup(&mut self) -> Result<()> {
+        let Some(path) = self.path.take() else {
+            return Ok(());
+        };
+        if let Err(error) = remove_verification_snapshot(path.clone()).await {
+            self.path = Some(path);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VerificationSnapshot {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = remove_verification_snapshot(path.clone()).await {
+                        warn!(
+                            path = %path.display(),
+                            error = %format!("{error:#}"),
+                            "background verifier snapshot cleanup failed"
+                        );
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "verifier snapshot dropped outside a Tokio runtime"
+                );
+            }
+        }
+    }
+}
+
+pub async fn verification_snapshot(root: &Path, run_id: Uuid) -> Result<VerificationSnapshot> {
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .context("canonicalize verifier-only source workspace")?;
+    let path = std::env::temp_dir()
+        .join("ecorp-verification-snapshots")
+        .join(format!("{}-{}", run_id.simple(), Uuid::new_v4().simple()));
+    let snapshot_root = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        copy_workspace_snapshot(&root, &snapshot_root)?;
+        Ok::<_, anyhow::Error>(snapshot_root)
+    })
+    .await
+    .context("join verifier-only workspace snapshot task")?;
+    match result {
+        Ok(path) => Ok(VerificationSnapshot { path: Some(path) }),
+        Err(error) => match remove_verification_snapshot(path).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "verifier snapshot cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+    }
+}
+
+async fn remove_verification_snapshot(path: PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let display = path.display().to_string();
+    tokio::time::timeout(
+        VERIFICATION_SNAPSHOT_CLEANUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            fs::remove_dir_all(&path).with_context(|| format!("remove verifier snapshot {display}"))
+        }),
+    )
+    .await
+    .context("verifier snapshot cleanup timed out")?
+    .context("join verifier snapshot cleanup task")?
+}
+
+fn copy_workspace_snapshot(root: &Path, destination: &Path) -> Result<()> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    if destination.exists() {
+        return Err(anyhow!(
+            "verifier-only workspace snapshot target already exists"
+        ));
+    }
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "create verifier-only workspace snapshot {}",
+            destination.display()
+        )
+    })?;
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    copy_snapshot_directory(
+        root,
+        root,
+        destination,
+        &mut entries,
+        &mut bytes,
+        MAX_ENTRIES,
+        MAX_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_snapshot_directory(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    entries: &mut usize,
+    bytes: &mut u64,
+    max_entries: usize,
+    max_bytes: u64,
+) -> Result<()> {
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read verifier snapshot directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        if source_path == root.join(".git") {
+            continue;
+        }
+        *entries += 1;
+        if *entries > max_entries {
+            return Err(anyhow!(
+                "verifier-only workspace snapshot exceeds {max_entries} entries"
+            ));
+        }
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path).with_context(|| {
+            format!("inspect verifier snapshot entry {}", source_path.display())
+        })?;
+        let file_type = metadata.file_type();
+        if snapshot_entry_is_link(&metadata) {
+            copy_snapshot_symlink(root, &source_path, &destination_path)?;
+        } else if file_type.is_dir() {
+            fs::create_dir(&destination_path).with_context(|| {
+                format!(
+                    "create verifier snapshot directory {}",
+                    destination_path.display()
+                )
+            })?;
+            copy_snapshot_directory(
+                root,
+                &source_path,
+                &destination_path,
+                entries,
+                bytes,
+                max_entries,
+                max_bytes,
+            )?;
+        } else if file_type.is_file() {
+            let length = metadata.len();
+            *bytes = bytes
+                .checked_add(length)
+                .context("verifier-only workspace snapshot byte count overflowed")?;
+            if *bytes > max_bytes {
+                return Err(anyhow!(
+                    "verifier-only workspace snapshot exceeds {max_bytes} bytes"
+                ));
+            }
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy verifier snapshot file {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        } else {
+            return Err(anyhow!(
+                "verifier-only workspace snapshot encountered unsupported entry {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn snapshot_entry_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn snapshot_entry_is_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn validated_snapshot_symlink_target(root: &Path, source: &Path) -> Result<PathBuf> {
+    let target = fs::read_link(source)
+        .with_context(|| format!("read verifier snapshot symlink {}", source.display()))?;
+    if target.is_absolute() {
+        return Err(anyhow!(
+            "verifier snapshot symlink {} has an absolute target",
+            source.display()
+        ));
+    }
+    let resolved = source
+        .parent()
+        .context("verifier snapshot symlink has no parent")?
+        .join(&target);
+    let canonical = fs::canonicalize(&resolved).with_context(|| {
+        format!(
+            "canonicalize verifier snapshot symlink target {}",
+            source.display()
+        )
+    })?;
+    let git_control = root.join(".git");
+    if !canonical.starts_with(root) || canonical.starts_with(&git_control) {
+        return Err(anyhow!(
+            "verifier snapshot symlink {} escapes the preserved workspace",
+            source.display()
+        ));
+    }
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn copy_snapshot_symlink(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let target = validated_snapshot_symlink_target(root, source)?;
+    std::os::unix::fs::symlink(&target, destination).with_context(|| {
+        format!(
+            "copy verifier snapshot symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn copy_snapshot_symlink(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let target = validated_snapshot_symlink_target(root, source)?;
+    let target_is_directory = fs::metadata(source)
+        .with_context(|| format!("inspect verifier snapshot symlink {}", source.display()))?
+        .is_dir();
+    if target_is_directory {
+        std::os::windows::fs::symlink_dir(&target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(&target, destination)
+    }
+    .with_context(|| {
+        format!(
+            "copy verifier snapshot symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
 fn find_workspace_file_by_digest(
     root: &Path,
     file_name: &str,
@@ -1119,6 +1390,83 @@ mod tests {
             .to_string()
             .contains("did not match")
         );
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn verifier_snapshot_is_physical_isolated_and_excludes_git_control() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        std::fs::write(workspace.path.join("untracked.txt"), "source\n")
+            .expect("write untracked source");
+        std::fs::write(workspace.path.join("valuable.log"), "ignored\n")
+            .expect("write ignored source");
+        let mut snapshot = verification_snapshot(&workspace.path, Uuid::new_v4())
+            .await
+            .expect("create verifier snapshot");
+        let snapshot_path = snapshot.path().to_owned();
+        assert!(!snapshot_path.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path.join("untracked.txt"))
+                .expect("read snapshot untracked source"),
+            "source\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path.join("valuable.log"))
+                .expect("read snapshot ignored source"),
+            "ignored\n"
+        );
+        std::fs::write(
+            snapshot_path.join("untracked.txt"),
+            "verifier side effect\n",
+        )
+        .expect("modify verifier snapshot");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("untracked.txt"))
+                .expect("read unchanged source"),
+            "source\n"
+        );
+        snapshot.cleanup().await.expect("clean verifier snapshot");
+        assert!(!snapshot_path.exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_snapshot_rejects_a_symlink_that_escapes_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        let outside = workspace
+            .path
+            .parent()
+            .expect("worktree parent")
+            .join("outside.txt");
+        std::fs::write(&outside, "outside\n").expect("write outside file");
+        symlink("../outside.txt", workspace.path.join("escape.txt"))
+            .expect("create escaping symlink");
+        let error = verification_snapshot(&workspace.path, Uuid::new_v4())
+            .await
+            .expect_err("escaping symlink must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("escapes the preserved workspace")
+        );
+        std::fs::remove_file(outside).expect("remove outside file");
         cleanup_fixture(&root, &repository);
     }
 

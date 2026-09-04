@@ -51,6 +51,8 @@ struct NewPublicationOperation<'a> {
 #[derive(Debug)]
 struct PublicationPrerequisites {
     work_item: FactoryWorkItem,
+    effective_source_revision: String,
+    source_recovery_id: Option<Uuid>,
     mission_id: Uuid,
     room_id: Uuid,
     artifact_id: Uuid,
@@ -450,12 +452,14 @@ impl PgStore {
         let publisher_token = Uuid::new_v4();
         let authorization = publication_authorization(&normalized, now);
         let provenance = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "source_issue": {
                 "number": prerequisites.work_item.source_issue_number,
                 "node_id": prerequisites.work_item.source_issue_node_id,
                 "url": prerequisites.work_item.source_issue_url,
-                "revision": prerequisites.work_item.source_revision,
+                "revision": prerequisites.effective_source_revision,
+                "claimed_revision": prerequisites.work_item.source_revision,
+                "recovery_id": prerequisites.source_recovery_id,
             },
             "factory_work_item_id": prerequisites.work_item.id,
             "mission_id": prerequisites.mission_id,
@@ -1615,6 +1619,12 @@ async fn revalidate_publication_authority_tx(
         || prerequisites.commit_sha != publication.commit_sha
         || provenance_deliverable_sha != Some(prerequisites.deliverable_sha256.as_str())
         || provenance_verification_sha != Some(prerequisites.verification_sha256.as_str())
+        || !publication_source_provenance_matches(
+            &publication.provenance,
+            &prerequisites.work_item.source_revision,
+            &prerequisites.effective_source_revision,
+            prerequisites.source_recovery_id,
+        )?
     {
         return Err(anyhow!(
             "conflict: publication authority no longer matches its verified provenance"
@@ -1870,6 +1880,38 @@ async fn validate_publication_prerequisites(
         })
         .collect::<Vec<_>>();
     let selected_lineage = publication_resume_lineage(selected_run_id, &resume_edges)?;
+    let completed_recoveries = sqlx::query(
+        r#"
+        SELECT id, observed_source_revision, replacement_run_id
+        FROM factory_verification_recoveries
+        WHERE corp_id = $1
+          AND factory_work_item_id = $2
+          AND mission_id = $3
+          AND task_id = $4
+          AND status = 'completed'
+          AND replacement_run_id IS NOT NULL
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(request.corp_id)
+    .bind(work_item.id)
+    .bind(mission_id)
+    .bind(row.get::<Uuid, _>("task_id"))
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|recovery| {
+        (
+            recovery.get::<Uuid, _>("id"),
+            recovery.get::<String, _>("observed_source_revision"),
+            recovery.get::<Uuid, _>("replacement_run_id"),
+        )
+    })
+    .collect::<Vec<_>>();
+    let completed_recovery =
+        publication_recovery_for_lineage(&completed_recoveries, &selected_lineage);
+    let (effective_source_revision, source_recovery_id) =
+        publication_source_revision(&work_item.source_revision, completed_recovery);
     let mut run_ids = Vec::with_capacity(run_rows.len());
     for run in run_rows {
         let run_id: Uuid = run.get("id");
@@ -1925,6 +1967,8 @@ async fn validate_publication_prerequisites(
     }
     Ok(PublicationPrerequisites {
         work_item,
+        effective_source_revision,
+        source_recovery_id,
         mission_id,
         room_id: row.get("room_id"),
         artifact_id: row.get("artifact_id"),
@@ -1941,6 +1985,64 @@ async fn validate_publication_prerequisites(
         run_ids,
         evidence_ids,
     })
+}
+
+fn publication_source_revision(
+    claimed_revision: &str,
+    completed_recovery: Option<(Uuid, String)>,
+) -> (String, Option<Uuid>) {
+    match completed_recovery {
+        Some((recovery_id, observed_revision)) => (observed_revision, Some(recovery_id)),
+        None => (claimed_revision.to_owned(), None),
+    }
+}
+
+fn publication_recovery_for_lineage(
+    completed_recoveries: &[(Uuid, String, Uuid)],
+    selected_lineage: &HashSet<Uuid>,
+) -> Option<(Uuid, String)> {
+    completed_recoveries
+        .iter()
+        .find(|(_, _, replacement_run_id)| selected_lineage.contains(replacement_run_id))
+        .map(|(recovery_id, observed_revision, _)| (*recovery_id, observed_revision.clone()))
+}
+
+fn publication_source_provenance_matches(
+    provenance: &Value,
+    claimed_revision: &str,
+    effective_revision: &str,
+    recovery_id: Option<Uuid>,
+) -> Result<bool> {
+    let schema_version = provenance
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let persisted_revision = provenance
+        .pointer("/source_issue/revision")
+        .and_then(Value::as_str);
+    if schema_version == 1 {
+        return Ok(persisted_revision == Some(claimed_revision));
+    }
+    if schema_version != 2 {
+        return Ok(false);
+    }
+    let persisted_claimed_revision = provenance
+        .pointer("/source_issue/claimed_revision")
+        .and_then(Value::as_str);
+    let persisted_recovery = match provenance.pointer("/source_issue/recovery_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            Some(Uuid::parse_str(value).context("publication provenance recovery id is invalid")?)
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "publication provenance recovery id has an invalid type"
+            ));
+        }
+    };
+    Ok(persisted_revision == Some(effective_revision)
+        && persisted_claimed_revision == Some(claimed_revision)
+        && persisted_recovery == recovery_id)
 }
 
 fn ensure_publication_matches_start(
@@ -2677,6 +2779,109 @@ mod tests {
         assert!(
             publication_state_rank(PullRequestPublicationState::PullRequestCreated)
                 < publication_state_rank(PullRequestPublicationState::Published)
+        );
+    }
+
+    #[test]
+    fn publication_source_revision_links_completed_recovery() {
+        let recovery_id = Uuid::new_v4();
+        assert_eq!(
+            publication_source_revision(
+                "claimed-revision",
+                Some((recovery_id, "reviewed-revision".to_owned())),
+            ),
+            ("reviewed-revision".to_owned(), Some(recovery_id))
+        );
+        assert_eq!(
+            publication_source_revision("claimed-revision", None),
+            ("claimed-revision".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn publication_recovery_selection_follows_the_selected_resume_lineage() {
+        let unrelated_run = Uuid::new_v4();
+        let recovery_run = Uuid::new_v4();
+        let selected_run = Uuid::new_v4();
+        let unrelated_recovery = Uuid::new_v4();
+        let matching_recovery = Uuid::new_v4();
+        let lineage = publication_resume_lineage(
+            selected_run,
+            &[
+                (unrelated_run, None),
+                (recovery_run, None),
+                (selected_run, Some(recovery_run)),
+            ],
+        )
+        .expect("valid lineage");
+        assert_eq!(
+            publication_recovery_for_lineage(
+                &[
+                    (
+                        unrelated_recovery,
+                        "unrelated-revision".to_owned(),
+                        unrelated_run,
+                    ),
+                    (
+                        matching_recovery,
+                        "reviewed-revision".to_owned(),
+                        recovery_run,
+                    ),
+                ],
+                &lineage,
+            ),
+            Some((matching_recovery, "reviewed-revision".to_owned()))
+        );
+    }
+
+    #[test]
+    fn publication_source_provenance_is_backward_compatible_and_versioned() {
+        let recovery_id = Uuid::new_v4();
+        let legacy = json!({
+            "schema_version": 1,
+            "source_issue": {"revision": "claimed-revision"},
+        });
+        assert!(
+            publication_source_provenance_matches(
+                &legacy,
+                "claimed-revision",
+                "reviewed-revision",
+                Some(recovery_id),
+            )
+            .expect("legacy provenance")
+        );
+        let current = json!({
+            "schema_version": 2,
+            "source_issue": {
+                "revision": "reviewed-revision",
+                "claimed_revision": "claimed-revision",
+                "recovery_id": recovery_id,
+            },
+        });
+        assert!(
+            publication_source_provenance_matches(
+                &current,
+                "claimed-revision",
+                "reviewed-revision",
+                Some(recovery_id),
+            )
+            .expect("current provenance")
+        );
+        assert!(
+            !publication_source_provenance_matches(
+                &json!({
+                    "schema_version": 2,
+                    "source_issue": {
+                        "revision": "claimed-revision",
+                        "claimed_revision": "claimed-revision",
+                        "recovery_id": recovery_id,
+                    },
+                }),
+                "claimed-revision",
+                "reviewed-revision",
+                Some(recovery_id),
+            )
+            .expect("mismatched provenance")
         );
     }
 

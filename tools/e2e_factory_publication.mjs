@@ -398,6 +398,34 @@ async function restartLocalServer() {
 
 async function psql(sql) {
   const invocation = await psqlInvocation()
+  if (invocation.mode === 'python') {
+    const script = [
+      'import sys, psycopg',
+      'dsn, sql = sys.argv[1], sys.argv[2]',
+      'def render(value):',
+      '  if isinstance(value, memoryview): value = value.tobytes()',
+      "  if isinstance(value, (bytes, bytearray)): value = value.decode('utf-8')",
+      "  return 't' if value is True else 'f' if value is False else '' if value is None else str(value)",
+      'with psycopg.connect(dsn, autocommit=True) as connection:',
+      '  with connection.cursor() as cursor:',
+      "    statements = [item.strip() for item in sql.split(';') if item.strip()]",
+      '    for statement in statements:',
+      '      cursor.execute(statement)',
+      '    if cursor.description:',
+      '      for row in cursor.fetchall():',
+      "        print('|'.join(render(value) for value in row))",
+    ].join('\n')
+    const { stdout } = await execFile(
+      process.env.ECORP_TEST_PYTHON ?? 'python',
+      ['-c', script, databaseUrl, sql],
+      {
+        cwd: root,
+        windowsHide: true,
+        maxBuffer: 8 * 1024 * 1024,
+      },
+    )
+    return stdout.trim()
+  }
   const { stdout } = await execFile(
     invocation.command,
     [
@@ -423,8 +451,12 @@ async function psqlInvocation() {
       await execFile('psql', ['--version'], { cwd: root, windowsHide: true })
       psqlMode = 'direct'
     } catch {
-      psqlMode = 'docker'
+      psqlMode =
+        process.env.ECORP_TEST_PYTHON_PSQL === '1' ? 'python' : 'docker'
     }
+  }
+  if (psqlMode === 'python') {
+    return { mode: 'python' }
   }
   if (psqlMode === 'direct') {
     return { command: 'psql', args: [databaseUrl] }

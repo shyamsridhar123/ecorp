@@ -205,17 +205,22 @@ new full repository gate or a completed recovery-to-publication remote-effect ru
 - Runner unit regression
   `verifier_snapshot_is_physical_isolated_and_excludes_git_control` creates a physical snapshot,
   verifies that `.git` is excluded, copies untracked and ignored source files, mutates the snapshot
-  without changing the preserved worktree, and verifies cleanup when the snapshot is dropped.
+  without changing the preserved worktree, and verifies explicit cleanup. Runtime snapshot copying
+  rejects symbolic links and Windows reparse points whose resolved targets escape the worktree.
 - `tools/e2e_factory_verification_recovery.mjs` adds a direct-command verifier side effect. The
-  original run writes the source file once; verifier-only recovery runs the same command in the
-  ephemeral snapshot, and the assertion confirms the preserved source still contains the original
-  value. The runner fingerprints that preserved source after verification.
-- Store unit regression `publication_source_revision_links_completed_recovery` selects the reviewed
-  source revision and recovery ID for a completed recovery, and falls back to the original claimed
-  revision with a null recovery ID when publication does not follow recovery.
+  original run writes the source file once; verifier-only recovery increments it and corrupts
+  `result.md` in one check's snapshot. A later file check receives a fresh snapshot, and the
+  preserved source still contains the original value and valid result. Snapshot cleanup completes
+  before accepted verification, then the runner fingerprints the preserved source.
+- The E2E also proves exact work-item recovery lookup survives 101 newer history rows, and an
+  interrupted recovery releases its active slot and permits a new authorization from the preserved
+  cancelled run.
+- Store unit regressions select the reviewed source revision and recovery ID from the chosen run's
+  resume lineage, fall back to the claimed revision without recovery, and preserve compatibility
+  with schema-version-1 in-flight publication provenance.
 - Publication provenance retains both `source_issue.claimed_revision` and the effective
-  `source_issue.revision`, plus `source_issue.recovery_id` when applicable. Revalidation compares
-  those fields with the currently selected verified recovery before allowing later effects.
+  `source_issue.revision`, plus `source_issue.recovery_id` when applicable. New records use schema
+  version 2, while revalidation keeps schema-version-1 operations resumable by their original claim.
 
 ## Browser evidence
 

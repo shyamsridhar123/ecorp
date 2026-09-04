@@ -58,7 +58,7 @@ pub async fn verify(
     }
 }
 
-async fn run_check(
+pub(crate) async fn run_check(
     check_index: i32,
     check: &VerifierCheck,
     workspace: &Path,

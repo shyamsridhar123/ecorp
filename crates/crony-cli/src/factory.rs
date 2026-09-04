@@ -2140,6 +2140,50 @@ async fn load_factory_recovery_snapshot(
     mode: FactoryVerificationRecoveryMode,
     reason: &str,
 ) -> Result<FactoryRecoverySnapshot> {
+    let context = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{work_item_id}/verification-recoveries?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await?;
+    if value_uuid(&context, "/work_item/id")? != work_item_id
+        || value_uuid(&context, "/mission_id")? != mission_id
+    {
+        bail!("factory recovery context does not match the selected work item");
+    }
+    let recoveries = context
+        .get("recoveries")
+        .and_then(Value::as_array)
+        .context("factory recovery context omitted recoveries")?;
+    let active_recoveries = recoveries
+        .iter()
+        .filter(|recovery| {
+            recovery
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "authorized" | "running"))
+        })
+        .collect::<Vec<_>>();
+    if active_recoveries.len() > 1 {
+        bail!("factory recovery context returned multiple active recoveries");
+    }
+    if let Some(active) = active_recoveries.first()
+        && active.get("mode").and_then(Value::as_str) != Some(mode.as_str())
+    {
+        bail!(
+            "factory work item already has an active {} recovery",
+            active
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        );
+    }
+    let task_id = value_uuid(&context, "/task_id")?;
+    let source_run_id = value_uuid(&context, "/source_run_id")?;
     let snapshot = server_json(
         client,
         Method::GET,
@@ -2158,63 +2202,15 @@ async fn load_factory_recovery_snapshot(
         .pointer("/snapshot/runs")
         .and_then(Value::as_array)
         .context("factory recovery snapshot omitted runs")?;
-    let recoveries = snapshot
-        .pointer("/snapshot/factory_verification_recoveries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mode_name = mode.as_str();
-    let existing_recovery = recoveries.iter().find(|recovery| {
-        recovery
-            .get("factory_work_item_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == work_item_id.to_string())
-            && recovery.get("mode").and_then(Value::as_str) == Some(mode_name)
-            && recovery
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| matches!(status, "authorized" | "running"))
-    });
-    let source_run_id = if let Some(recovery) = existing_recovery {
-        value_uuid(recovery, "/source_run_id")?
-    } else {
-        let failed_tasks = tasks
-            .iter()
-            .filter(|task| {
-                task.get("mission_id").and_then(Value::as_str)
-                    == Some(mission_id.to_string().as_str())
-                    && task.get("status").and_then(Value::as_str) == Some("verification_failed")
-                    && task
-                        .get("verification_status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|status| matches!(status, "failed" | "pending"))
-            })
-            .collect::<Vec<_>>();
-        if failed_tasks.len() != 1 {
-            bail!(
-                "factory verification recovery requires exactly one failed task; found {}",
-                failed_tasks.len()
-            );
-        }
-        let task_id = value_uuid(failed_tasks[0], "/id")?;
-        runs.iter()
-            .find(|run| {
-                run.get("task_id").and_then(Value::as_str) == Some(task_id.to_string().as_str())
-                    && run.get("status").and_then(Value::as_str) == Some("failed")
-                    && run.get("verification_status").and_then(Value::as_str) == Some("failed")
-                    && run.get("workspace_disposition").and_then(Value::as_str) == Some("preserved")
-            })
-            .map(|run| value_uuid(run, "/id"))
-            .transpose()?
-            .context("factory verification recovery found no failed source run")?
-    };
     let source_run = runs
         .iter()
         .find(|run| {
             run.get("id").and_then(Value::as_str) == Some(source_run_id.to_string().as_str())
         })
         .context("factory verification recovery source run is absent from the snapshot")?;
-    let task_id = value_uuid(source_run, "/task_id")?;
+    if value_uuid(source_run, "/task_id")? != task_id {
+        bail!("factory recovery context source run does not match its task");
+    }
     let task = tasks
         .iter()
         .find(|task| task.get("id").and_then(Value::as_str) == Some(task_id.to_string().as_str()))
@@ -2231,20 +2227,12 @@ async fn load_factory_recovery_snapshot(
             .context("factory recovery task omitted verification policy")?,
     )
     .context("decode factory recovery verification policy")?;
-    let workspace_fingerprint = source_run
+    let workspace_fingerprint = context
         .get("workspace_fingerprint")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let expected_head_commit = snapshot
-        .pointer("/snapshot/source_deliverables")
-        .and_then(Value::as_array)
-        .and_then(|deliverables| {
-            deliverables.iter().find(|deliverable| {
-                deliverable.get("run_id").and_then(Value::as_str)
-                    == Some(source_run_id.to_string().as_str())
-            })
-        })
-        .and_then(|deliverable| deliverable.get("head_commit"))
+    let expected_head_commit = context
+        .get("expected_head_commit")
         .and_then(Value::as_str)
         .map(str::to_owned);
     let mission_id_text = mission_id.to_string();
