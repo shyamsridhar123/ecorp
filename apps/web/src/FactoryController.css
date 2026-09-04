@@ -100,6 +100,87 @@
   font-size: 13px;
 }
 
+.factory-cockpit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 18px 0;
+}
+
+.work-item-decisions,
+.work-item-comms {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.factory-cockpit-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.factory-cockpit-heading span {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.work-item-decisions article,
+.work-item-comms li {
+  margin-top: 8px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.work-item-decisions article p,
+.work-item-comms li p,
+.factory-cockpit-empty {
+  margin: 6px 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.work-item-decisions article > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.work-item-decisions button,
+.work-item-comms button {
+  min-height: 44px;
+}
+
+.work-item-comms ol {
+  max-height: 260px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.work-item-comms form {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.work-item-comms textarea {
+  width: 100%;
+  resize: vertical;
+}
+
 @media (max-width: 720px) {
   .factory-controller-strip {
     grid-template-columns: 1fr;
@@ -112,5 +193,9 @@
 
   .factory-controller-actions .button {
     flex: 1 1 160px;
+  }
+
+  .factory-cockpit-grid {
+    grid-template-columns: 1fr;
   }
 }

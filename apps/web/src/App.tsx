@@ -1455,22 +1455,51 @@ function FactoryPanel({
   publications,
   publicationAttempts,
   controllers,
+  tasks,
+  runs,
+  room,
+  messages,
+  actors,
+  selectedActor,
+  actionApprovals,
+  verificationRequests,
   canControlFactory,
   busy,
   onControllerControl,
+  onPostComment,
+  onActionDecision,
+  onVerificationDecision,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
   publications: PullRequestPublication[]
   publicationAttempts: PullRequestPublicationAttempt[]
   controllers: FactoryController[]
+  tasks: Task[]
+  runs: Run[]
+  room: { id: string; name: string; purpose: string } | undefined
+  messages: RoomMessage[]
+  actors: Actor[]
+  selectedActor: Actor
+  actionApprovals: ActionApproval[]
+  verificationRequests: VerificationRequest[]
   canControlFactory: boolean
   busy: boolean
   onControllerControl: (
     controller: FactoryController,
     action: 'pause' | 'resume' | 'reconcile',
   ) => void
+  onPostComment: (input: {
+    roomId: string
+    body: string
+    replyToId: string | null
+    mentions: string[]
+    link: EntityLink | null
+  }) => Promise<void>
+  onActionDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
+  onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
 }) {
+  const [commentBody, setCommentBody] = useState('')
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
     if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
@@ -1487,6 +1516,27 @@ function FactoryPanel({
   )
   const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
   const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
+  const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
+  const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
+  const selectedRuns = runs.filter((run) => selectedTaskIds.has(run.task_id))
+  const selectedRunIds = new Set(selectedRuns.map((run) => run.id))
+  const pendingActions = actionApprovals.filter(
+    (approval) => selectedRunIds.has(approval.run_id) && approval.status === 'pending',
+  )
+  const pendingReviews = verificationRequests.filter(
+    (request) => selectedRunIds.has(request.run_id) && request.status === 'pending',
+  )
+  const linkedIds = new Set([
+    ...(selectedMission ? [selectedMission.id] : []),
+    ...selectedTasks.map((task) => task.id),
+    ...selectedRuns.flatMap((run) => [
+      run.id,
+      ...(run.artifact_id ? [run.artifact_id] : []),
+    ]),
+  ])
+  const contextualMessages = messages
+    .filter((message) => message.link && linkedIds.has(message.link.id))
+    .slice(-8)
   const selectedPublication = publications.find(
     (candidate) => candidate.factory_work_item_id === selected?.id,
   )
@@ -1684,6 +1734,152 @@ function FactoryPanel({
                       <dd>{time(selected.lease_expires_at)}</dd>
                     </div>
                   </dl>
+
+                  {selectedMission ? (
+                    <div className="factory-cockpit-grid">
+                      <section className="work-item-decisions" aria-label="Work-item decisions">
+                        <div className="factory-cockpit-heading">
+                          <span>Decisions</span>
+                          <strong>{pendingActions.length + pendingReviews.length}</strong>
+                        </div>
+                        {pendingActions.map((approval) => {
+                          const eligible = approval.required_roles.includes(selectedActor.role)
+                          return (
+                            <article key={approval.id}>
+                              <strong>{approval.action}</strong>
+                              <p>{approval.rationale}</p>
+                              <small>
+                                {statusLabel(approval.risk)} risk · expires{' '}
+                                {time(approval.expires_at)}
+                              </small>
+                              <div>
+                                <button
+                                  type="button"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onActionDecision(approval, false)}
+                                >
+                                  Reject
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button button-primary"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onActionDecision(approval, true)}
+                                >
+                                  Approve
+                                </button>
+                              </div>
+                            </article>
+                          )
+                        })}
+                        {pendingReviews.map((request) => {
+                          const run = selectedRuns.find(
+                            (candidate) => candidate.id === request.run_id,
+                          )
+                          const eligible =
+                            request.gate.roles.includes(selectedActor.role) &&
+                            !(
+                              request.gate.type === 'independent_review' &&
+                              request.gate.exclude_requester &&
+                              selectedMission.requested_by === selectedActor.id
+                            )
+                          return run ? (
+                            <article key={request.run_id}>
+                              <strong>{statusLabel(request.gate_type)}</strong>
+                              <p>Review the persisted verification evidence for this run.</p>
+                              <small>Run {shortId(run.id)}</small>
+                              <div>
+                                <button
+                                  type="button"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onVerificationDecision(run, false)}
+                                >
+                                  Reject
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button button-primary"
+                                  disabled={busy || !eligible}
+                                  onClick={() => void onVerificationDecision(run, true)}
+                                >
+                                  Accept evidence
+                                </button>
+                              </div>
+                            </article>
+                          ) : null
+                        })}
+                        {!pendingActions.length && !pendingReviews.length ? (
+                          <p className="factory-cockpit-empty">
+                            No policy exception or review decision is waiting.
+                          </p>
+                        ) : null}
+                      </section>
+                      <section className="work-item-comms" aria-label="Work-item comments">
+                        <div className="factory-cockpit-heading">
+                          <span>Contextual Comms</span>
+                          <strong>{contextualMessages.length}</strong>
+                        </div>
+                        <ol>
+                          {contextualMessages.map((message) => (
+                            <li key={message.id}>
+                              <strong>
+                                {actors.find((actor) => actor.id === message.actor_id)?.name ??
+                                  'Unknown actor'}
+                              </strong>
+                              <p>{message.body}</p>
+                              <small>{time(message.created_at)}</small>
+                            </li>
+                          ))}
+                        </ol>
+                        {!contextualMessages.length ? (
+                          <p className="factory-cockpit-empty">
+                            No comments are linked to this work item yet.
+                          </p>
+                        ) : null}
+                        {room ? (
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault()
+                              if (!commentBody.trim()) return
+                              const mentionedNames = Array.from(
+                                commentBody.matchAll(/@([A-Za-z0-9_-]+)/g),
+                                (match) => match[1].toLowerCase(),
+                              )
+                              void onPostComment({
+                                roomId: room.id,
+                                body: commentBody.trim(),
+                                replyToId: null,
+                                mentions: actors
+                                  .filter((actor) =>
+                                    mentionedNames.includes(actor.name.toLowerCase()),
+                                  )
+                                  .map((actor) => actor.id),
+                                link: { kind: 'mission', id: selectedMission.id },
+                              }).then(() => setCommentBody(''))
+                            }}
+                          >
+                            <label htmlFor={`factory-comment-${selected.id}`}>
+                              Comment as {selectedActor.name}
+                            </label>
+                            <textarea
+                              id={`factory-comment-${selected.id}`}
+                              rows={3}
+                              value={commentBody}
+                              onChange={(event) => setCommentBody(event.target.value)}
+                              placeholder="Comment on this work item. Use agent controls to steer."
+                            />
+                            <button
+                              type="submit"
+                              className="button button-secondary"
+                              disabled={busy || !commentBody.trim()}
+                            >
+                              Post comment
+                            </button>
+                          </form>
+                        ) : null}
+                      </section>
+                    </div>
+                  ) : null}
 
                   {selectedPublication ? (
                     <div className="publication-proof" data-testid="factory-publication">
@@ -4862,9 +5058,20 @@ function App() {
           publications={data.snapshot.pull_request_publications}
           publicationAttempts={data.snapshot.pull_request_publication_attempts}
           controllers={data.snapshot.factory_controllers ?? []}
+          tasks={data.snapshot.tasks}
+          runs={data.snapshot.runs}
+          room={room}
+          messages={data.snapshot.room_messages}
+          actors={data.snapshot.actors}
+          selectedActor={selectedActor}
+          actionApprovals={data.snapshot.action_approvals}
+          verificationRequests={data.snapshot.verification_requests}
           canControlFactory={['owner', 'admin', 'manager'].includes(selectedActor.role)}
           busy={busy}
           onControllerControl={controlFactoryController}
+          onPostComment={postRoomMessage}
+          onActionDecision={decideActionApproval}
+          onVerificationDecision={decideVerification}
         />
       </div>
 

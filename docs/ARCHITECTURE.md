@@ -536,6 +536,12 @@ continues heartbeats while the current controller cycle waits on GitHub, a missi
 The documented local stack starts this watcher only when `ECORP_FACTORY_WATCH=1`; otherwise the UI
 truthfully reports that Factory is not configured.
 
+The Factory workbench is also the selected work item's operational cockpit. It resolves the
+item's mission, tasks, runs, pending action approvals, verification decisions, artifacts, and
+room messages into one context. Comments are persisted as room messages with a structured mission
+link; approval and verification actions continue to use their existing durable, role-gated
+decision endpoints rather than being inferred from conversation.
+
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
 It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded

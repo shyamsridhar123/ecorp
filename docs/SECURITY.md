@@ -108,6 +108,11 @@ change Corp-wide intake. Controller heartbeats are fenced by a rotating connecti
 lease, service actor, and Corp. A stale process cannot extend the active lease or complete another
 process's reconciliation generation. Controller status never exposes GitHub credentials or
 work-item claim tokens.
+
+Inline cockpit decisions do not weaken the underlying authorization boundary. Action approvals and
+verification reviews retain their existing role, expiry, requester-exclusion, and idempotency
+rules. Contextual comments remain ordinary durable room messages linked to the mission; comment
+text cannot approve an effect, create a task, or steer a provider session implicitly.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
