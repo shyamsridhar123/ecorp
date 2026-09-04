@@ -1598,14 +1598,22 @@ function FactoryPanel({
     replyToId: string | null
     mentions: string[]
     link: EntityLink | null
-  }) => Promise<void>
+    idempotencyKey: string
+  }) => Promise<boolean>
   onActionDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onClaimLease: (agent: Agent) => Promise<void>
-  onSteer: (agent: Agent, text: string, token: string | undefined) => Promise<void>
+  onSteer: (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ) => Promise<boolean>
 }) {
   const [commentBody, setCommentBody] = useState('')
   const [steerText, setSteerText] = useState('')
+  const commentOperation = useRef<{ payload: string; key: string } | null>(null)
+  const steerOperation = useRef<{ payload: string; key: string } | null>(null)
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
     if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
@@ -1635,8 +1643,10 @@ function FactoryPanel({
   const activeLeaseToken = activeAgent
     ? leaseTokens[leaseTokenKey(selectedActor.id, activeAgent.id)]
     : undefined
+  const leaseAttributedToSelectedActor =
+    activeLease?.actor_id === selectedActor.id
   const leaseHeldBySelectedActor =
-    activeLease?.actor_id === selectedActor.id && Boolean(activeLeaseToken)
+    leaseAttributedToSelectedActor && Boolean(activeLeaseToken)
   const selectedRunIds = new Set(selectedRuns.map((run) => run.id))
   const pendingActions = actionApprovals.filter(
     (approval) => selectedRunIds.has(approval.run_id) && approval.status === 'pending',
@@ -1963,17 +1973,38 @@ function FactoryPanel({
                                 commentBody.matchAll(/@([A-Za-z0-9_-]+)/g),
                                 (match) => match[1].toLowerCase(),
                               )
+                              const body = commentBody.trim()
+                              const mentions = actors
+                                .filter((actor) =>
+                                  mentionedNames.includes(actor.name.toLowerCase()),
+                                )
+                                .map((actor) => actor.id)
+                              const payload = JSON.stringify({
+                                roomId: room.id,
+                                body,
+                                mentions,
+                                missionId: selectedMission.id,
+                              })
+                              if (commentOperation.current?.payload !== payload) {
+                                commentOperation.current = {
+                                  payload,
+                                  key: crypto.randomUUID(),
+                                }
+                              }
+                              const idempotencyKey = commentOperation.current.key
                               void onPostComment({
                                 roomId: room.id,
-                                body: commentBody.trim(),
+                                body,
                                 replyToId: null,
-                                mentions: actors
-                                  .filter((actor) =>
-                                    mentionedNames.includes(actor.name.toLowerCase()),
-                                  )
-                                  .map((actor) => actor.id),
+                                mentions,
                                 link: { kind: 'mission', id: selectedMission.id },
-                              }).then(() => setCommentBody(''))
+                                idempotencyKey,
+                              }).then((saved) => {
+                                if (saved) {
+                                  commentOperation.current = null
+                                  setCommentBody('')
+                                }
+                              })
                             }}
                           >
                             <label htmlFor={`factory-comment-${selected.id}`}>
@@ -2006,15 +2037,27 @@ function FactoryPanel({
                             <p>
                               Run {shortId(activeRun.id)} · {statusLabel(activeRun.status)}
                             </p>
-                            {!activeLease ? (
-                              <button
-                                type="button"
-                                className="button button-secondary"
-                                disabled={busy}
-                                onClick={() => void onClaimLease(activeAgent)}
-                              >
-                                Take control
-                              </button>
+                            {!activeLease ||
+                            (leaseAttributedToSelectedActor && !activeLeaseToken) ? (
+                              <>
+                                {leaseAttributedToSelectedActor ? (
+                                  <p className="factory-cockpit-empty">
+                                    This browser reconnected without {selectedActor.name}&apos;s
+                                    private fencing token. Reclaim control to rotate it; the old
+                                    token will stop working.
+                                  </p>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  className="button button-secondary"
+                                  disabled={busy}
+                                  onClick={() => void onClaimLease(activeAgent)}
+                                >
+                                  {leaseAttributedToSelectedActor
+                                    ? 'Reclaim control'
+                                    : 'Take control'}
+                                </button>
+                              </>
                             ) : leaseHeldBySelectedActor ? (
                               <form
                                 onSubmit={(event) => {
@@ -2024,7 +2067,26 @@ function FactoryPanel({
                                     activeAgent,
                                     steerText.trim(),
                                     activeLeaseToken,
-                                  ).then(() => setSteerText(''))
+                                    (() => {
+                                      const payload = JSON.stringify({
+                                        agentId: activeAgent.id,
+                                        actorId: selectedActor.id,
+                                        text: steerText.trim(),
+                                      })
+                                      if (steerOperation.current?.payload !== payload) {
+                                        steerOperation.current = {
+                                          payload,
+                                          key: crypto.randomUUID(),
+                                        }
+                                      }
+                                      return steerOperation.current.key
+                                    })(),
+                                  ).then((saved) => {
+                                    if (saved) {
+                                      steerOperation.current = null
+                                      setSteerText('')
+                                    }
+                                  })
                                 }}
                               >
                                 <label htmlFor={`factory-steer-${selected.id}`}>
@@ -2352,10 +2414,16 @@ function AgentDesk({
   onTransfer: (agent: Agent, token: string, toActor: Actor) => Promise<void>
   onInterrupt: (agent: Agent, token: string) => Promise<void>
   onEmergencyStop: (agent: Agent) => Promise<void>
-  onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
+  onMessage: (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ) => Promise<boolean>
 }) {
   const [text, setText] = useState('')
   const [transferActorId, setTransferActorId] = useState('')
+  const messageOperation = useRef<{ payload: string; key: string } | null>(null)
   const ownsLease = lease?.actor_id === actor.id
   const live = Boolean(agent.current_run_id)
   const operator = canOperate(actor.role)
@@ -2380,8 +2448,25 @@ function AgentDesk({
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!text.trim()) return
-    await onMessage(agent, text, messageToken)
-    setText('')
+    const normalized = text.trim()
+    const payload = JSON.stringify({
+      agentId: agent.id,
+      actorId: actor.id,
+      text: normalized,
+    })
+    if (messageOperation.current?.payload !== payload) {
+      messageOperation.current = { payload, key: crypto.randomUUID() }
+    }
+    const saved = await onMessage(
+      agent,
+      normalized,
+      messageToken,
+      messageOperation.current.key,
+    )
+    if (saved) {
+      messageOperation.current = null
+      setText('')
+    }
   }
 
   return (
@@ -3728,12 +3813,14 @@ function RoomPanel({
     replyToId: string | null
     mentions: string[]
     link: EntityLink | null
-  }) => Promise<void>
+    idempotencyKey: string
+  }) => Promise<boolean>
   onNavigateLink: (link: EntityLink) => void
 }) {
   const [body, setBody] = useState('')
   const [replyToId, setReplyToId] = useState<string | null>(null)
   const [linkValue, setLinkValue] = useState('')
+  const messageOperation = useRef<{ payload: string; key: string } | null>(null)
 
   if (!room) {
     return (
@@ -3788,16 +3875,30 @@ function RoomPanel({
       kind && id
         ? ({ kind, id } as EntityLink)
         : null
-    await onPost({
+    const payload = JSON.stringify({
       roomId: room.id,
-      body,
+      body: body.trim(),
       replyToId,
       mentions,
       link,
     })
-    setBody('')
-    setReplyToId(null)
-    setLinkValue('')
+    if (messageOperation.current?.payload !== payload) {
+      messageOperation.current = { payload, key: crypto.randomUUID() }
+    }
+    const saved = await onPost({
+      roomId: room.id,
+      body: body.trim(),
+      replyToId,
+      mentions,
+      link,
+      idempotencyKey: messageOperation.current.key,
+    })
+    if (saved) {
+      messageOperation.current = null
+      setBody('')
+      setReplyToId(null)
+      setLinkValue('')
+    }
   }
 
   return (
@@ -4712,8 +4813,13 @@ function App() {
     }
   }
 
-  const sendMessage = async (agent: Agent, text: string, token: string | undefined) => {
-    if (!bootstrap || !selectedActor) return
+  const sendMessage = async (
+    agent: Agent,
+    text: string,
+    token: string | undefined,
+    idempotencyKey: string,
+  ): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/agents/${agent.id}/messages`, {
@@ -4722,11 +4828,14 @@ function App() {
           actor_id: selectedActor.id,
           lease_token: token ?? null,
           text,
+          idempotency_key: idempotencyKey,
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
+      return true
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+      return false
     }
   }
 
@@ -4736,8 +4845,9 @@ function App() {
     replyToId: string | null
     mentions: string[]
     link: EntityLink | null
-  }) => {
-    if (!bootstrap || !selectedActor) return
+    idempotencyKey: string
+  }): Promise<boolean> => {
+    if (!bootstrap || !selectedActor) return false
     setError(null)
     try {
       await api(`/api/corps/${bootstrap.corp_id}/rooms/${input.roomId}/messages`, {
@@ -4748,11 +4858,14 @@ function App() {
           reply_to_id: input.replyToId,
           mentions: input.mentions,
           link: input.link,
+          idempotency_key: input.idempotencyKey,
         }),
       })
       await refresh(bootstrap.corp_id, selectedActor.id)
+      return true
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+      return false
     }
   }
 
@@ -4830,6 +4943,29 @@ function App() {
     action: 'pause' | 'resume' | 'reconcile',
   ) => {
     if (!bootstrap || !selectedActor) return
+    const operationStorageKey = `ecorp_factory_control:${controller.id}:${action}`
+    let pendingOperation: { idempotencyKey: string; expectedVersion: number } | null = null
+    try {
+      const stored = window.sessionStorage.getItem(operationStorageKey)
+      if (stored) {
+        pendingOperation = JSON.parse(stored) as {
+          idempotencyKey: string
+          expectedVersion: number
+        }
+      }
+    } catch {
+      window.sessionStorage.removeItem(operationStorageKey)
+    }
+    if (!pendingOperation) {
+      pendingOperation = {
+        idempotencyKey: crypto.randomUUID(),
+        expectedVersion: controller.version,
+      }
+      window.sessionStorage.setItem(
+        operationStorageKey,
+        JSON.stringify(pendingOperation),
+      )
+    }
     setBusy(true)
     setError(null)
     try {
@@ -4839,12 +4975,13 @@ function App() {
           method: 'POST',
           body: JSON.stringify({
             actor_id: selectedActor.id,
-            expected_version: controller.version,
+            expected_version: pendingOperation.expectedVersion,
             action,
-            idempotency_key: crypto.randomUUID(),
+            idempotency_key: pendingOperation.idempotencyKey,
           }),
         },
       )
+      window.sessionStorage.removeItem(operationStorageKey)
       await refresh(bootstrap.corp_id, selectedActor.id)
       setAnnouncement(
         action === 'pause'

@@ -838,19 +838,48 @@ async fn run_connection(
                 });
             }
             ServerToRunner::ControlMessage {
+                command_id,
+                message_id,
                 run_id,
                 actor_id,
-                lease_token: _,
                 text,
                 ..
             } => {
-                if let Some(active) = active_runs.get(&run_id) {
-                    let _ = active
-                        .control
-                        .send(AdapterControl::Steer { actor_id, text });
-                    info!(%run_id, %actor_id, "accepted fenced control message");
+                let duplicate = seen_commands.contains_key(&command_id);
+                let applied = if duplicate {
+                    true
                 } else {
-                    warn!(%run_id, "control message arrived for inactive run");
+                    let applied = active_runs.get(&run_id).is_some_and(|active| {
+                        active
+                            .control
+                            .send(AdapterControl::Steer {
+                                actor_id,
+                                text: text.clone(),
+                            })
+                            .is_ok()
+                    });
+                    if applied {
+                        seen_commands.insert(command_id, ());
+                    }
+                    applied
+                };
+                outbound.send(RunnerToServer::CommandAck {
+                    runner_id: args.runner_id.clone(),
+                    connection_epoch,
+                    command_id,
+                    applied,
+                    detail: if duplicate {
+                        format!("control message {message_id} was already applied")
+                    } else if applied {
+                        format!("control message {message_id} was applied")
+                    } else {
+                        format!("control message {message_id} has no active run")
+                    },
+                });
+                if applied {
+                    info!(%run_id, %actor_id, %message_id, duplicate, "accepted durable control message");
+                } else {
+                    warn!(%run_id, %message_id, "durable control message arrived for inactive run");
                 }
             }
             ServerToRunner::StopRun { run_id, reason, .. } => {

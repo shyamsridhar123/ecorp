@@ -470,7 +470,9 @@ pub struct MessageOutcome {
     pub delivery: String,
     pub run_id: Option<Uuid>,
     pub runner_id: Option<String>,
-    pub event: DomainEvent,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
+    pub command_queued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -492,7 +494,8 @@ pub struct VerificationDecisionOutcome {
 #[derive(Debug, Clone)]
 pub struct RoomMessageOutcome {
     pub message: RoomMessage,
-    pub event: DomainEvent,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +507,7 @@ pub struct NewRoomMessageInput {
     pub reply_to_id: Option<Uuid>,
     pub mentions: Vec<Uuid>,
     pub link: Option<EntityLink>,
+    pub idempotency_key: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -6661,7 +6665,7 @@ impl PgStore {
             UPDATE runner_commands
             SET status = 'dispatched', dispatched_at = now()
             WHERE id = $1 AND runner_id = $2 AND status = 'pending'
-            RETURNING corp_id, run_id
+            RETURNING corp_id, run_id, command_kind, payload
             "#,
         )
         .bind(command_id)
@@ -6674,6 +6678,32 @@ impl PgStore {
         };
         let corp_id: Uuid = command.get("corp_id");
         let run_id: Uuid = command.get("run_id");
+        let command_kind: String = command.get("command_kind");
+        let payload: Value = command.get("payload");
+        let message_id = if command_kind == "control_message" {
+            let message_id = payload
+                .get("message_id")
+                .and_then(Value::as_str)
+                .context("control message command omitted message_id")
+                .and_then(|value| {
+                    Uuid::parse_str(value).context("control message id is invalid")
+                })?;
+            sqlx::query(
+                r#"
+                UPDATE queued_messages
+                SET delivered_at = now()
+                WHERE command_id = $1 AND corp_id = $2 AND id = $3
+                "#,
+            )
+            .bind(command_id)
+            .bind(corp_id)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+            Some(message_id)
+        } else {
+            None
+        };
         let context = sqlx::query(
             r#"
             SELECT task.mission_id, mission.room_id
@@ -6701,7 +6731,12 @@ impl PgStore {
                     "run",
                     run_id,
                     format!("runner-command-ack:{command_id}"),
-                    json!({"command_id": command_id, "runner_id": runner_id}),
+                    json!({
+                        "command_id": command_id,
+                        "runner_id": runner_id,
+                        "command_kind": command_kind,
+                        "message_id": message_id
+                    }),
                 )
             },
         )
@@ -7481,6 +7516,7 @@ impl PgStore {
         actor_id: Uuid,
         lease_token: Option<Uuid>,
         text: &str,
+        idempotency_key: Uuid,
     ) -> Result<MessageOutcome> {
         let text = text.trim();
         if text.is_empty() {
@@ -7492,6 +7528,51 @@ impl PgStore {
 
         let mut tx = self.pool.begin().await?;
         assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("control-message:{corp_id}:{idempotency_key}"))
+            .execute(&mut *tx)
+            .await?;
+        let existing = sqlx::query(
+            r#"
+            SELECT message.id, message.corp_id, message.agent_id, message.actor_id,
+                   message.text, message.status, message.created_at, message.run_id,
+                   message.command_id, run.runner_id, command.status AS command_status
+            FROM queued_messages message
+            LEFT JOIN runs run ON run.id = message.run_id
+            LEFT JOIN runner_commands command ON command.id = message.command_id
+            WHERE message.corp_id = $1 AND message.idempotency_key = $2
+            FOR UPDATE OF message
+            "#,
+        )
+        .bind(corp_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = existing {
+            if row.get::<Uuid, _>("agent_id") != agent_id
+                || row.get::<Uuid, _>("actor_id") != actor_id
+                || row.get::<String, _>("text") != text
+            {
+                return Err(anyhow!(
+                    "control message idempotency key was reused with another request"
+                ));
+            }
+            let command_queued =
+                row.get::<Option<String>, _>("command_status").as_deref() == Some("pending");
+            let run_id = row.get::<Option<Uuid>, _>("run_id");
+            let runner_id = row.get::<Option<String>, _>("runner_id");
+            let message = map_queued_message(row);
+            tx.commit().await?;
+            return Ok(MessageOutcome {
+                delivery: message.status.clone(),
+                message,
+                run_id,
+                runner_id,
+                event: None,
+                replayed: true,
+                command_queued,
+            });
+        }
         let active_lease = sqlx::query(
             r#"
             SELECT agent_id, corp_id, actor_id, token, expires_at
@@ -7546,10 +7627,46 @@ impl PgStore {
             "queued"
         };
         let message_id = Uuid::new_v4();
+        let (run_id, runner_id) = if delivery == "immediate" {
+            active_run
+                .as_ref()
+                .map(|row| (Some(row.get("id")), Some(row.get("runner_id"))))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let command_id = if let (Some(run_id), Some(runner_id)) = (run_id, runner_id.as_ref()) {
+            let command_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO runner_commands
+                    (id, corp_id, runner_id, run_id, command_kind, payload, idempotency_key)
+                VALUES ($1, $2, $3, $4, 'control_message', $5, $6)
+                "#,
+            )
+            .bind(command_id)
+            .bind(corp_id)
+            .bind(runner_id)
+            .bind(run_id)
+            .bind(json!({
+                "message_id": message_id,
+                "agent_id": agent_id,
+                "actor_id": actor_id,
+                "text": text
+            }))
+            .bind(format!("control-message:{message_id}"))
+            .execute(&mut *tx)
+            .await?;
+            Some(command_id)
+        } else {
+            None
+        };
         let row = sqlx::query(
             r#"
-            INSERT INTO queued_messages (id, corp_id, agent_id, actor_id, text, status)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO queued_messages
+                (id, corp_id, agent_id, actor_id, text, status, run_id,
+                 idempotency_key, command_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, corp_id, agent_id, actor_id, text, status, created_at
             "#,
         )
@@ -7559,6 +7676,9 @@ impl PgStore {
         .bind(actor_id)
         .bind(text)
         .bind(delivery)
+        .bind(run_id)
+        .bind(idempotency_key)
+        .bind(command_id)
         .fetch_one(&mut *tx)
         .await?;
         let message = map_queued_message(row);
@@ -7587,15 +7707,14 @@ impl PgStore {
         .context("control message event unexpectedly existed")?;
         tx.commit().await?;
 
-        let (run_id, runner_id) = active_run
-            .map(|row| (Some(row.get("id")), Some(row.get("runner_id"))))
-            .unwrap_or((None, None));
         Ok(MessageOutcome {
             message,
             delivery: delivery.to_owned(),
             run_id,
             runner_id,
-            event,
+            event: Some(event),
+            replayed: false,
+            command_queued: command_id.is_some(),
         })
     }
 
@@ -7651,6 +7770,7 @@ impl PgStore {
             reply_to_id,
             mentions,
             link,
+            idempotency_key,
         } = input;
         let body = body.trim();
         if body.is_empty() {
@@ -7670,6 +7790,46 @@ impl PgStore {
             .collect::<Vec<_>>();
         if mentions.len() > 20 {
             return Err(anyhow!("room message cannot mention more than 20 actors"));
+        }
+        let requested_link_kind = link.as_ref().map(|link| link.kind.as_str());
+        let requested_link_id = link.as_ref().map(|link| link.id);
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("room-message:{corp_id}:{idempotency_key}"))
+            .execute(&mut *tx)
+            .await?;
+        let existing = sqlx::query(
+            r#"
+            SELECT id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
+                   body, mentions, link_kind, link_id, created_at
+            FROM room_messages
+            WHERE corp_id = $1 AND idempotency_key = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(corp_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = existing {
+            if row.get::<Uuid, _>("room_id") != room_id
+                || row.get::<Uuid, _>("actor_id") != actor_id
+                || row.get::<String, _>("body") != body
+                || row.get::<Option<Uuid>, _>("reply_to_id") != reply_to_id
+                || row.get::<Vec<Uuid>, _>("mentions") != mentions
+                || row.get::<Option<String>, _>("link_kind").as_deref() != requested_link_kind
+                || row.get::<Option<Uuid>, _>("link_id") != requested_link_id
+            {
+                return Err(anyhow!(
+                    "conflict: room message idempotency key was reused with another request"
+                ));
+            }
+            let message = map_room_message(row);
+            tx.commit().await?;
+            return Ok(RoomMessageOutcome {
+                message,
+                event: None,
+                replayed: true,
+            });
         }
         for mentioned in &mentions {
             assert_room_membership_tx(&mut tx, corp_id, room_id, *mentioned).await?;
@@ -7702,14 +7862,14 @@ impl PgStore {
         }
 
         let message_id = Uuid::new_v4();
-        let link_kind = link.as_ref().map(|link| link.kind.as_str());
-        let link_id = link.as_ref().map(|link| link.id);
+        let link_kind = requested_link_kind;
+        let link_id = requested_link_id;
         let row = sqlx::query(
             r#"
             INSERT INTO room_messages
                 (id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
-                 body, mentions, link_kind, link_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 body, mentions, link_kind, link_id, idempotency_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id, corp_id, room_id, actor_id, thread_root_id, reply_to_id,
                       body, mentions, link_kind, link_id, created_at
             "#,
@@ -7724,6 +7884,7 @@ impl PgStore {
         .bind(&mentions)
         .bind(link_kind)
         .bind(link_id)
+        .bind(idempotency_key)
         .fetch_one(&mut *tx)
         .await?;
         let message = map_room_message(row);
@@ -7752,7 +7913,11 @@ impl PgStore {
         .await?
         .context("room message event unexpectedly existed")?;
         tx.commit().await?;
-        Ok(RoomMessageOutcome { message, event })
+        Ok(RoomMessageOutcome {
+            message,
+            event: Some(event),
+            replayed: false,
+        })
     }
 
     pub async fn request_interrupt(

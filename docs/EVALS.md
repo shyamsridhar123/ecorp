@@ -280,6 +280,17 @@ The live watcher probe starts `crony factory-watch` against a deterministic GitH
 observes `watching`, applies durable pause and resume, verifies resume requests a reconciliation
 generation, terminates the watcher, and observes `offline` after the heartbeat lease expires.
 
+`tools/e2e_factory_cockpit_reconnect.mjs` drives one factory work item through two independently
+attributed browser-protocol clients. It posts contextual comments, takes and rotates the control
+lease, delivers steering through durable runner commands, restarts the server, resumes each
+browser from its prior sequence cursor, and records Bob's decision after reconnect. Exact replay
+of comment, steer, claim, materialization, and decision operation keys creates no duplicate
+message, provider effect, work item, mission, or run. The same drill proves two durable steer
+acknowledgments, stale-token rejection, controller recovery to `watching`, and final `verified`
+state. A separate rendered two-browser pass exposed and verified the **Reclaim control** recovery
+for a browser that lost its private fencing token. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each

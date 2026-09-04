@@ -146,11 +146,11 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ControlMessage {
-        corp_id: Uuid,
+        command_id: Uuid,
+        message_id: Uuid,
         run_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
-        lease_token: Uuid,
         text: String,
     },
     StopRun {
@@ -262,11 +262,14 @@ pub struct CreateRoomMessageRequest {
     #[serde(default)]
     pub mentions: Vec<Uuid>,
     pub link: Option<EntityLink>,
+    #[serde(default)]
+    pub idempotency_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRoomMessageResponse {
     pub message_id: Uuid,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -848,12 +851,15 @@ pub struct QueueMessageRequest {
     pub actor_id: Uuid,
     pub lease_token: Option<Uuid>,
     pub text: String,
+    #[serde(default)]
+    pub idempotency_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueMessageResponse {
     pub message_id: Uuid,
     pub delivery: String,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

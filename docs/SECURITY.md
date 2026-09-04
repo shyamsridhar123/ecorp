@@ -117,9 +117,16 @@ work-item claim tokens.
 Inline cockpit decisions do not weaken the underlying authorization boundary. Action approvals and
 verification reviews retain their existing role, expiry, requester-exclusion, and idempotency
 rules. Contextual comments remain ordinary durable room messages linked to the mission; comment
-text cannot approve an effect, create a task, or steer a provider session implicitly.
-Cockpit steering uses the existing single-holder agent lease and lease token. It does not add a
-second input path or convert a comment into provider control.
+text cannot approve an effect, create a task, or steer a provider session implicitly. Comment
+operation UUIDs are scoped to the Corp and exact normalized request; replay returns the existing
+message, while changed content under the same key is rejected.
+
+Cockpit steering uses the existing single-holder agent lease and lease token. The token is checked
+before persistence but is never stored in the durable runner command. A separate client operation
+UUID prevents retry from creating another control message, and the runner command ID fences
+duplicate delivery across server reconnect. A browser that lost its private token must reclaim the
+same actor's lease, which rotates the token before another steer. This does not add a second input
+path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

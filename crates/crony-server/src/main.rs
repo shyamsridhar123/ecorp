@@ -45,10 +45,10 @@ use crony_protocol::{
     LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
     MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
     MissionBudgetRevisionResponse, MissionContractRevisionResponse, MissionSource,
-    PreflightFactoryMissionRequest,
-    PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
-    PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
-    QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
+    PreflightFactoryMissionRequest, PreflightFactoryMissionResponse,
+    ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
+    PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
+    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
     RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
@@ -1272,6 +1272,34 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
 
 fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
     match command.command_kind.as_str() {
+        "control_message" => Ok(ServerToRunner::ControlMessage {
+            command_id: command.id,
+            message_id: command
+                .payload
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted message_id")
+                .and_then(|value| Uuid::parse_str(value).context("message id is invalid"))?,
+            run_id: command.run_id,
+            agent_id: command
+                .payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted agent_id")
+                .and_then(|value| Uuid::parse_str(value).context("agent id is invalid"))?,
+            actor_id: command
+                .payload
+                .get("actor_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted actor_id")
+                .and_then(|value| Uuid::parse_str(value).context("actor id is invalid"))?,
+            text: command
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted text")?
+                .to_owned(),
+        }),
         "approval_decision" => Ok(ServerToRunner::ApprovalDecision {
             command_id: command.id,
             run_id: command.run_id,
@@ -2791,12 +2819,16 @@ async fn create_room_message(
             reply_to_id: request.reply_to_id,
             mentions: request.mentions,
             link: request.link,
+            idempotency_key: request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         })
         .await
         .map_err(map_store_error)?;
-    publish(&state, outcome.event);
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
     Ok(Json(CreateRoomMessageResponse {
         message_id: outcome.message.id,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -3689,51 +3721,26 @@ async fn queue_message(
             actor_id,
             request.lease_token,
             &request.text,
+            request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         )
         .await
         .map_err(ApiError::conflict)?;
     let message_id = outcome.message.id;
-    let mut delivery = outcome.delivery.clone();
-    publish(&state, outcome.event);
-
-    if delivery == "immediate" {
-        let sent = if let (Some(run_id), Some(runner_id), Some(lease_token)) =
-            (outcome.run_id, outcome.runner_id, request.lease_token)
-        {
-            state.runners.get(&runner_id).is_some_and(|runner| {
-                runner
-                    .tx
-                    .send(ServerToRunner::ControlMessage {
-                        corp_id,
-                        run_id,
-                        agent_id,
-                        actor_id,
-                        lease_token,
-                        text: request.text.clone(),
-                    })
-                    .is_ok()
-            })
-        } else {
-            false
-        };
-        if !sent {
-            let event = state
-                .store
-                .requeue_control_message(
-                    corp_id,
-                    message_id,
-                    "runner disconnected before live control delivery",
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            publish(&state, event);
-            delivery = "queued".to_owned();
-        }
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.command_queued
+        && let Some(runner_id) = outcome.runner_id.as_deref()
+    {
+        dispatch_pending_runner_commands(&state, runner_id)
+            .await
+            .map_err(ApiError::internal)?;
     }
 
     Ok(Json(QueueMessageResponse {
         message_id,
-        delivery,
+        delivery: outcome.delivery,
+        replayed: outcome.replayed,
     }))
 }
 

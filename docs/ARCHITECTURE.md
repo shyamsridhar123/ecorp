@@ -229,6 +229,8 @@ Room membership is a server-side visibility boundary:
 - replies store both their immediate parent and stable thread root
 - mentions are actor IDs validated against room membership
 - links to missions, tasks, runs, and artifacts are validated against the same room
+- comment writes carry a client operation UUID; exact retry returns the original durable message,
+  while reuse with another request fails closed
 
 The demo includes Eve as a Corp guest without Automation Division membership so isolation can be exercised
 end to end.
@@ -253,9 +255,15 @@ ownership. The request is audited and delivered to the runner. Adapters first re
 turn interruption and are force-terminated after a bounded timeout. The mission, task, and run end
 as cancelled.
 
-Messages from the current controller can be delivered to adapters that support steering. Other
-messages are durably queued, reserved into the next task prompt, and marked delivered only after
-the run starts.
+Messages from the current controller become durable runner commands for adapters that support
+steering. The server checks the private lease token before persistence, stores no copy of that
+token in the command, and assigns both a client operation UUID and runner command ID. Pending
+commands are redispatched after server or runner reconnect, the runner deduplicates command IDs,
+and a runner acknowledgment marks delivery. A browser that reconnects without its private token
+can reclaim the lease as the same actor, which rotates the token and fences its prior copy.
+
+Other messages are durably queued, reserved into the next task prompt, and marked delivered only
+after the run starts.
 
 ## Target module boundaries
 

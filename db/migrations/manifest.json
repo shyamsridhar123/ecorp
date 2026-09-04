@@ -160,6 +160,11 @@
       "version": 32,
       "file": "0032_factory_controllers.sql",
       "sha384": "3b6b13d428da458d7136e831bca9df67c1ca0c145c3f4bba331617d2783d1073d6037d78b4d221cad0c5e81f7c946b7e"
+    },
+    {
+      "version": 33,
+      "file": "0033_cockpit_operation_idempotency.sql",
+      "sha384": "aedd876b57b4b3b4568108ad3a8c3be3ade7e70c1f45c75f3099d8875146e8f00dd0d9954d97d5fed788d5d2003951e8"
     }
   ]
 }

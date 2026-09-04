@@ -301,6 +301,7 @@ async fn main() -> Result<()> {
                     reply_to_id: reply_to,
                     mentions: mention,
                     link,
+                    idempotency_key: Some(Uuid::new_v4()),
                 })?),
             )
             .await?
@@ -416,6 +417,7 @@ async fn main() -> Result<()> {
                     actor_id,
                     lease_token,
                     text,
+                    idempotency_key: Some(Uuid::new_v4()),
                 })?),
             )
             .await?
