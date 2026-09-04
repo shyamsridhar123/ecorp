@@ -159,6 +159,29 @@ pub struct MaterializeFactoryMissionInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreflightFactoryMissionInput {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub policy: Value,
+    pub title: String,
+    pub description: String,
+    pub request: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RejectFactoryMaterializationInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub attempted_version: i64,
+    pub idempotency_key: String,
+    pub failure_detail: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FactoryWorkItemOutcome {
     pub work_item: FactoryWorkItem,
     pub claim_token: Option<Uuid>,
@@ -2654,6 +2677,28 @@ impl PgStore {
         Ok(events)
     }
 
+    pub async fn preflight_factory_mission(
+        &self,
+        input: PreflightFactoryMissionInput,
+        plan: &TaskGraphPlan,
+    ) -> Result<TaskGraphPlan> {
+        normalize_mission_title(&input.title)?;
+        normalize_mission_description(&input.description)?;
+        normalize_factory_operation_request(input.request)?;
+        let constrained_plan = preflight_factory_plan(
+            &input.source_repository_owner,
+            &input.source_repository_name,
+            input.policy,
+            plan,
+        )?;
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        mission_room_for_actor_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        tx.commit().await?;
+        Ok(constrained_plan)
+    }
+
     pub async fn claim_factory_work_item(
         &self,
         input: ClaimFactoryWorkItemInput,
@@ -3380,6 +3425,7 @@ impl PgStore {
             "failure_detail": &failure_detail
         });
         let now = Utc::now();
+        let released_lease_at = now - Duration::seconds(1);
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
         lock_factory_keys_tx(
@@ -3461,8 +3507,12 @@ impl PgStore {
             SET state = $1,
                 version = version + 1,
                 failure_detail = $2,
+                lease_expires_at = CASE
+                    WHEN mission_id IS NULL AND $1 = 'blocked' THEN $3
+                    ELSE lease_expires_at
+                END,
                 updated_at = now()
-            WHERE id = $3 AND corp_id = $4
+            WHERE id = $4 AND corp_id = $5
             RETURNING id, corp_id, source_kind, source_project_owner,
                       source_project_number, source_project_item_id,
                       source_repository_owner, source_repository_name,
@@ -3474,6 +3524,7 @@ impl PgStore {
         )
         .bind(input.state.as_str())
         .bind(&failure_detail)
+        .bind(released_lease_at)
         .bind(input.work_item_id)
         .bind(input.corp_id)
         .fetch_one(&mut *tx)
@@ -3529,6 +3580,177 @@ impl PgStore {
             work_item,
             claim_token: Some(input.claim_token),
             event: Some(event),
+            replayed: false,
+        })
+    }
+
+    pub async fn reject_factory_materialization(
+        &self,
+        input: RejectFactoryMaterializationInput,
+    ) -> Result<FactoryWorkItemOutcome> {
+        if input.attempted_version <= 0 {
+            return Err(anyhow!(
+                "attempted factory work-item version must be positive"
+            ));
+        }
+        let failure_detail = normalize_factory_text(
+            &input.failure_detail,
+            "factory materialization rejection",
+            2_000,
+        )?;
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let operation_request = json!({
+            "work_item_id": input.work_item_id,
+            "attempted_version": input.attempted_version,
+            "failure_detail": &failure_detail
+        });
+        let released_lease_at = Utc::now() - Duration::seconds(1);
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+            ],
+        )
+        .await?;
+
+        if let Some(operation) =
+            factory_operation_tx(&mut tx, input.corp_id, &idempotency_key).await?
+        {
+            ensure_factory_operation_matches(
+                &operation,
+                "materialize_rejected",
+                input.actor_id,
+                Some(input.work_item_id),
+                Some(input.claim_token),
+                &operation_request,
+            )?;
+            let (work_item, current_token) = factory_work_item_tx(
+                &mut tx,
+                input.corp_id,
+                input.work_item_id,
+                false,
+            )
+            .await?
+            .context(
+                "idempotent factory materialization rejection references a missing work item",
+            )?;
+            let claim_token =
+                replayable_factory_claim_token(&work_item, current_token, &operation, Utc::now());
+            tx.commit().await?;
+            return Ok(FactoryWorkItemOutcome {
+                work_item,
+                claim_token,
+                event: None,
+                replayed: true,
+            });
+        }
+
+        let (current, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        if current.claim_owner_id != input.actor_id || current_token != input.claim_token {
+            return Err(anyhow!(
+                "conflict: stale or unauthorized factory claim token"
+            ));
+        }
+        if current.mission_id.is_some() {
+            return Err(anyhow!(
+                "conflict: factory materialization rejection cannot replace an existing mission"
+            ));
+        }
+        if !matches!(
+            current.state,
+            FactoryWorkItemState::Claimed | FactoryWorkItemState::Blocked
+        ) {
+            return Err(anyhow!(
+                "conflict: factory work item {} cannot reject materialization from state {}",
+                current.id,
+                current.state.as_str()
+            ));
+        }
+
+        let (work_item, event) = if current.state == FactoryWorkItemState::Blocked {
+            (current, None)
+        } else {
+            let row = sqlx::query(
+                r#"
+                UPDATE factory_work_items
+                SET state = 'blocked',
+                    version = version + 1,
+                    lease_expires_at = $2,
+                    failure_detail = $1,
+                    updated_at = now()
+                WHERE id = $3 AND corp_id = $4
+                RETURNING id, corp_id, source_kind, source_project_owner,
+                          source_project_number, source_project_item_id,
+                          source_repository_owner, source_repository_name,
+                          source_issue_number, source_issue_node_id, source_issue_url,
+                          source_title, source_revision, state, version, claim_owner_id,
+                          lease_expires_at, policy, mission_id, failure_detail,
+                          created_at, updated_at
+                "#,
+            )
+            .bind(&failure_detail)
+            .bind(released_lease_at)
+            .bind(input.work_item_id)
+            .bind(input.corp_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let work_item = map_factory_work_item(row)?;
+            let event_room_id =
+                factory_event_room_id_tx(&mut tx, input.corp_id, work_item.mission_id).await?;
+            let event = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: event_room_id,
+                    aggregate_version: work_item.version,
+                    correlation_id: work_item.mission_id,
+                    ..NewEvent::new(
+                        input.corp_id,
+                        Some(input.actor_id),
+                        "factory.materialization_rejected",
+                        "factory_work_item",
+                        work_item.id,
+                        format!(
+                            "factory:{}:materialization-rejected:{}",
+                            work_item.id, work_item.version
+                        ),
+                        json!({
+                            "previous_state": current.state.as_str(),
+                            "state": work_item.state.as_str(),
+                            "mission_id": work_item.mission_id,
+                            "failure_detail": &work_item.failure_detail
+                        }),
+                    )
+                },
+            )
+            .await?
+            .context("factory materialization-rejection event unexpectedly existed")?;
+            (work_item, Some(event))
+        };
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "materialize_rejected",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(FactoryWorkItemOutcome {
+            work_item,
+            claim_token: None,
+            event,
             replayed: false,
         })
     }
@@ -7867,13 +8089,7 @@ async fn create_mission_tx(
     let title = normalize_mission_title(title)?;
     let description = normalize_mission_description(description)?;
 
-    let room_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM rooms WHERE corp_id = $1 ORDER BY created_at LIMIT 1")
-            .bind(corp_id)
-            .fetch_one(&mut **tx)
-            .await
-            .context("corp has no room")?;
-    assert_room_membership_tx(tx, corp_id, room_id, requested_by).await?;
+    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
 
     let mission_id = Uuid::new_v4();
     sqlx::query(
@@ -8106,14 +8322,51 @@ fn apply_factory_source_constraints(
     work_item: &FactoryWorkItem,
     plan: &mut TaskGraphPlan,
 ) -> Result<()> {
-    let policy = work_item
-        .policy
+    apply_factory_source_constraints_parts(
+        &work_item.source_repository_owner,
+        &work_item.source_repository_name,
+        &work_item.policy,
+        plan,
+    )
+}
+
+fn preflight_factory_plan(
+    source_repository_owner: &str,
+    source_repository_name: &str,
+    policy: Value,
+    plan: &TaskGraphPlan,
+) -> Result<TaskGraphPlan> {
+    let source_repository_owner =
+        normalize_github_component(source_repository_owner, "source repository owner", 100)?;
+    let source_repository_name =
+        normalize_github_component(source_repository_name, "source repository name", 100)?;
+    let policy = normalize_factory_policy(policy)?;
+    let mut constrained_plan = plan.clone();
+    apply_factory_source_constraints_parts(
+        &source_repository_owner,
+        &source_repository_name,
+        &policy,
+        &mut constrained_plan,
+    )?;
+    validate_factory_plan_against_policy_parts(
+        &source_repository_owner,
+        &source_repository_name,
+        &policy,
+        &constrained_plan,
+    )?;
+    Ok(constrained_plan)
+}
+
+fn apply_factory_source_constraints_parts(
+    source_repository_owner: &str,
+    source_repository_name: &str,
+    policy: &Value,
+    plan: &mut TaskGraphPlan,
+) -> Result<()> {
+    let policy = policy
         .as_object()
         .context("factory policy snapshot must be a JSON object")?;
-    let source_repository = format!(
-        "{}/{}",
-        work_item.source_repository_owner, work_item.source_repository_name
-    );
+    let source_repository = format!("{}/{}", source_repository_owner, source_repository_name);
     let source_base_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
     let source_base_commit =
@@ -8131,8 +8384,21 @@ fn validate_factory_plan_against_policy(
     work_item: &FactoryWorkItem,
     plan: &TaskGraphPlan,
 ) -> Result<()> {
-    let policy = work_item
-        .policy
+    validate_factory_plan_against_policy_parts(
+        &work_item.source_repository_owner,
+        &work_item.source_repository_name,
+        &work_item.policy,
+        plan,
+    )
+}
+
+fn validate_factory_plan_against_policy_parts(
+    source_repository_owner: &str,
+    source_repository_name: &str,
+    policy: &Value,
+    plan: &TaskGraphPlan,
+) -> Result<()> {
+    let policy = policy
         .as_object()
         .context("factory policy snapshot must be a JSON object")?;
     if policy.get("schema_version").and_then(Value::as_i64) != Some(1) {
@@ -8147,10 +8413,7 @@ fn validate_factory_plan_against_policy(
         return Err(anyhow!("factory policy must explicitly disable auto_merge"));
     }
     let repositories = factory_policy_string_array(policy, "repository_allowlist")?;
-    let source_repository = format!(
-        "{}/{}",
-        work_item.source_repository_owner, work_item.source_repository_name
-    );
+    let source_repository = format!("{}/{}", source_repository_owner, source_repository_name);
     if !repositories.contains(&source_repository) {
         return Err(anyhow!(
             "factory policy does not allow source repository {source_repository}"
@@ -9101,6 +9364,29 @@ async fn assert_actor_scope_tx(
         return Err(anyhow!("actor does not belong to the requested Corp"));
     }
     Ok(())
+}
+
+async fn mission_room_for_actor_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    actor_id: Uuid,
+) -> Result<Uuid> {
+    sqlx::query_scalar(
+        r#"
+        SELECT room.id
+        FROM rooms room
+        JOIN room_memberships membership ON membership.room_id = room.id
+        WHERE room.corp_id = $1 AND membership.actor_id = $2
+        ORDER BY room.created_at, room.id
+        LIMIT 1
+        FOR KEY SHARE OF room, membership
+        "#,
+    )
+    .bind(corp_id)
+    .bind(actor_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("forbidden: actor is not a member of any room in this Corp")
 }
 
 async fn assert_room_membership_tx(

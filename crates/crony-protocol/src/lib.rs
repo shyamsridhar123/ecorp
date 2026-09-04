@@ -490,6 +490,41 @@ pub struct MaterializeFactoryMissionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightFactoryMissionRequest {
+    pub actor_id: Uuid,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    #[serde(default)]
+    pub policy: Value,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub preferred_adapter: Option<String>,
+    pub preferred_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub secret_refs: Vec<TaskSecretReference>,
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_microusd: Option<i64>,
+    #[serde(default)]
+    pub deliverable: Option<DeliverableSpec>,
+    #[serde(default)]
+    pub contract: FactoryMissionContract,
+    #[serde(default)]
+    pub verification_policy: Option<VerificationPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightFactoryMissionResponse {
+    pub valid: bool,
+    pub strategy: String,
+    pub task_count: usize,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializeFactoryMissionResponse {
     pub work_item: FactoryWorkItem,
     pub mission_id: Uuid,

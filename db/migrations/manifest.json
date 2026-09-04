@@ -150,6 +150,11 @@
       "version": 30,
       "file": "0030_mission_budget_ceiling.sql",
       "sha384": "2e487067ebf406d0cdc946e36a526c27ae758327ad6a963dde9df87bc23be91986c95d86ca71b1bd40bbcc20b3e5505e"
+    },
+    {
+      "version": 31,
+      "file": "0031_factory_materialization_rejections.sql",
+      "sha384": "15665efcdf43a16d0400827521dc8c9a3943f5b0710ab2ef954d1c8b0ebcac14ab140b2814150159567450c94bdb6282"
     }
   ]
 }

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { execFile as execFileCallback } from 'node:child_process'
+import { execFile as execFileCallback, spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
 import { promisify } from 'node:util'
 import { rm, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -143,7 +145,7 @@ async function createHistoricalFactoryItems(demo, count) {
   }
 }
 
-async function runController(
+function controllerInvocation(
   demo,
   issueNumber,
   dryRun = false,
@@ -156,10 +158,15 @@ async function runController(
     sourceRepositoryPath = root,
     sourceBaseRef = 'HEAD',
     publicationBaseRef,
+    adapter = 'fake-process',
+    model,
+    reasoningEffort,
+    serverOverride = server,
     budgetTokens = 20_000,
     budgetCostMicrousd = 1_000_000,
     writeScope = ['**'],
     verificationPolicyFile,
+    extraEnv = {},
   } = {},
 ) {
   const args = [
@@ -177,7 +184,7 @@ async function runController(
     '--source-base-ref',
     sourceBaseRef,
     '--adapter',
-    'fake-process',
+    adapter,
     '--strategy',
     strategy,
     '--budget-tokens',
@@ -192,26 +199,156 @@ async function runController(
   if (publicationBaseRef) {
     args.push('--publication-base-ref', publicationBaseRef)
   }
+  if (model) {
+    args.push('--model', model)
+  }
+  if (reasoningEffort) {
+    args.push('--reasoning-effort', reasoningEffort)
+  }
   if (verificationPolicyFile) {
     args.push('--verification-policy-file', verificationPolicyFile)
   }
   for (const scope of writeScope) args.push('--write-scope', scope)
   if (issueNumber !== null) args.push('--issue', String(issueNumber))
   if (dryRun) args.push('--dry-run')
-  const { stdout } = await execFile(binary, args, {
-    cwd: root,
-    env: {
-      ...process.env,
-      ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
-      ECORP_FAKE_GITHUB_STATE: statePath,
-      ...(githubTimeoutMs
-        ? { ECORP_GITHUB_COMMAND_TIMEOUT_MS: String(githubTimeoutMs) }
-        : {}),
+  return {
+    args,
+    options: {
+      cwd: root,
+      env: {
+        ...process.env,
+        CRONY_SERVER_HTTP: serverOverride,
+        ECORP_GITHUB_CLI_PREFIX_ARGS_JSON: JSON.stringify([fakeGithub]),
+        ECORP_FAKE_GITHUB_STATE: statePath,
+        ...(githubTimeoutMs
+          ? { ECORP_GITHUB_COMMAND_TIMEOUT_MS: String(githubTimeoutMs) }
+          : {}),
+        ...extraEnv,
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      windowsHide: true,
     },
-    maxBuffer: 4 * 1024 * 1024,
-    windowsHide: true,
+  }
+}
+
+async function runController(
+  demo,
+  issueNumber,
+  dryRun = false,
+  options = {},
+) {
+  const invocation = controllerInvocation(demo, issueNumber, dryRun, options)
+  const { stdout } = await execFile(binary, invocation.args, {
+    ...invocation.options,
   })
   return JSON.parse(stdout)
+}
+
+function startController(demo, issueNumber, dryRun = false, options = {}) {
+  const invocation = controllerInvocation(demo, issueNumber, dryRun, options)
+  return spawn(binary, invocation.args, {
+    cwd: invocation.options.cwd,
+    env: invocation.options.env,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+}
+
+async function expectControllerFailure(
+  demo,
+  issueNumber,
+  dryRun,
+  options,
+  expected,
+) {
+  try {
+    await runController(demo, issueNumber, dryRun, options)
+    assert.fail(`factory controller unexpectedly accepted issue #${issueNumber}`)
+  } catch (error) {
+    const output = [error.message, error.stdout, error.stderr]
+      .filter(Boolean)
+      .join('\n')
+    assert.match(output, expected)
+    return output
+  }
+}
+
+async function createMaterializationBarrierProxy() {
+  let resolveMaterialization
+  const materializationRequested = new Promise((resolve) => {
+    resolveMaterialization = resolve
+  })
+  let blocked = false
+  const sockets = new Set()
+  const proxy = createServer(async (request, response) => {
+    try {
+      const chunks = []
+      for await (const chunk of request) chunks.push(chunk)
+      const requestBody = Buffer.concat(chunks)
+      const pathname = new URL(request.url, 'http://127.0.0.1').pathname
+      if (
+        !blocked &&
+        request.method === 'POST' &&
+        /\/factory\/work-items\/[^/]+\/materialize$/u.test(pathname)
+      ) {
+        blocked = true
+        resolveMaterialization()
+        return
+      }
+
+      const headers = {}
+      for (const name of ['authorization', 'content-type']) {
+        if (request.headers[name]) headers[name] = request.headers[name]
+      }
+      const upstream = await fetch(`${server}${request.url}`, {
+        method: request.method,
+        headers,
+        body: ['GET', 'HEAD'].includes(request.method) ? undefined : requestBody,
+      })
+      response.statusCode = upstream.status
+      const contentType = upstream.headers.get('content-type')
+      if (contentType) response.setHeader('content-type', contentType)
+      response.end(Buffer.from(await upstream.arrayBuffer()))
+    } catch (error) {
+      if (!response.headersSent) response.statusCode = 502
+      response.end(String(error))
+    }
+  })
+  proxy.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
+  await new Promise((resolve, reject) => {
+    proxy.once('error', reject)
+    proxy.listen(0, '127.0.0.1', resolve)
+  })
+  const address = proxy.address()
+  assert.equal(typeof address, 'object')
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    materializationRequested,
+    async close() {
+      for (const socket of sockets) socket.destroy()
+      await new Promise((resolve) => proxy.close(resolve))
+    },
+  }
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+  let timeout
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`timed out waiting for ${label}`)),
+          timeoutMs,
+        )
+      }),
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function waitForMission(demo, missionId, timeoutMs = 180_000) {
@@ -333,6 +470,183 @@ await writeFile(
     null,
     2,
   )}\n`,
+)
+
+const invalidVerificationPolicyPath = path.join(
+  root,
+  'output',
+  'factory-invalid-verification-policy.json',
+)
+await writeFile(
+  invalidVerificationPolicyPath,
+  `${JSON.stringify(
+    {
+      checks: [
+        {
+          type: 'command',
+          program: 'node',
+          args: [],
+          timeout_ms: 60_001,
+        },
+      ],
+      manual_gate: null,
+    },
+    null,
+    2,
+  )}\n`,
+)
+const preflightRejections = [
+  {
+    name: 'budget',
+    options: { budgetTokens: 3_000_000 },
+    expected: /task graph budget is invalid/i,
+  },
+  {
+    name: 'verifier_timeout',
+    options: { verificationPolicyFile: invalidVerificationPolicyPath },
+    expected: /command verifier is invalid/i,
+  },
+  {
+    name: 'model',
+    options: {
+      strategy: 'verification-matrix',
+      model: 'gpt-5.6-sol',
+    },
+    expected: /must preserve policy model/i,
+  },
+  {
+    name: 'reasoning',
+    options: {
+      strategy: 'verification-matrix',
+      reasoningEffort: 'high',
+    },
+    expected: /must preserve policy reasoning effort/i,
+  },
+  {
+    name: 'write_scope',
+    options: { writeScope: ['../outside/**'] },
+    expected: /factory write scope is invalid/i,
+  },
+]
+for (const rejection of preflightRejections) {
+  for (const dryRun of [true, false]) {
+    await expectControllerFailure(
+      demo,
+      issue.number,
+      dryRun,
+      rejection.options,
+      rejection.expected,
+    )
+  }
+  const rejectedSnapshot = await snapshot(demo)
+  assert.equal(rejectedSnapshot.snapshot.factory_work_items.length, 0)
+  assert.equal(rejectedSnapshot.snapshot.missions.length, 0)
+  assert.equal(rejectedSnapshot.snapshot.tasks.length, 0)
+  assert.equal(rejectedSnapshot.snapshot.runs.length, 0)
+  assert.equal(
+    rejectedSnapshot.snapshot.events.some(
+      (event) => event.type === 'factory.work_item_claimed',
+    ),
+    false,
+  )
+  assert.equal(
+    (await lookupFactoryItems(demo, ['PVTI_FAKE_FACTORY_9001'])).total_count,
+    0,
+  )
+  const rejectedProject = JSON.parse(await readFile(statePath, 'utf8'))
+  assert.equal(rejectedProject.items[0].status, 'Todo')
+  assert.equal(rejectedProject.item_edits, 0)
+}
+
+const originalPreflightState = JSON.parse(await readFile(statePath, 'utf8'))
+const invalidDescription = `${issue.body}\u0008`
+await writeFile(
+  statePath,
+  `${JSON.stringify(
+    {
+      ...originalPreflightState,
+      items: originalPreflightState.items.map((item) =>
+        item.id === 'PVTI_FAKE_FACTORY_9001'
+          ? {
+              ...item,
+              content: { ...item.content, body: invalidDescription },
+            }
+          : item,
+      ),
+      issues: {
+        ...originalPreflightState.issues,
+        '9001': { ...issue, body: invalidDescription },
+      },
+    },
+    null,
+    2,
+  )}\n`,
+)
+for (const dryRun of [true, false]) {
+  await expectControllerFailure(
+    demo,
+    issue.number,
+    dryRun,
+    {},
+    /mission description cannot contain unsupported control characters/i,
+  )
+}
+const invalidDescriptionSnapshot = await snapshot(demo)
+assert.equal(invalidDescriptionSnapshot.snapshot.factory_work_items.length, 0)
+assert.equal(invalidDescriptionSnapshot.snapshot.missions.length, 0)
+assert.equal(invalidDescriptionSnapshot.snapshot.tasks.length, 0)
+assert.equal(invalidDescriptionSnapshot.snapshot.runs.length, 0)
+const invalidDescriptionProject = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(invalidDescriptionProject.items[0].status, 'Todo')
+assert.equal(invalidDescriptionProject.item_edits, 0)
+await writeFile(
+  statePath,
+  `${JSON.stringify(originalPreflightState, null, 2)}\n`,
+)
+
+const oversizedDescription = `## Outcome\n\n${'x'.repeat(34_000)}`
+await writeFile(
+  statePath,
+  `${JSON.stringify(
+    {
+      ...originalPreflightState,
+      items: originalPreflightState.items.map((item) =>
+        item.id === 'PVTI_FAKE_FACTORY_9001'
+          ? {
+              ...item,
+              content: { ...item.content, body: oversizedDescription },
+            }
+          : item,
+      ),
+      issues: {
+        ...originalPreflightState.issues,
+        '9001': { ...issue, body: oversizedDescription },
+      },
+    },
+    null,
+    2,
+  )}\n`,
+)
+for (const dryRun of [true, false]) {
+  await expectControllerFailure(
+    demo,
+    issue.number,
+    dryRun,
+    {},
+    /factory operation request snapshot cannot exceed 65536 bytes/i,
+  )
+}
+const oversizedDescriptionSnapshot = await snapshot(demo)
+assert.equal(oversizedDescriptionSnapshot.snapshot.factory_work_items.length, 0)
+assert.equal(oversizedDescriptionSnapshot.snapshot.missions.length, 0)
+assert.equal(oversizedDescriptionSnapshot.snapshot.tasks.length, 0)
+assert.equal(oversizedDescriptionSnapshot.snapshot.runs.length, 0)
+const oversizedDescriptionProject = JSON.parse(await readFile(statePath, 'utf8'))
+assert.equal(oversizedDescriptionProject.items[0].status, 'Todo')
+assert.equal(oversizedDescriptionProject.item_edits, 0)
+await writeFile(
+  statePath,
+  `${JSON.stringify(originalPreflightState, null, 2)}\n`,
 )
 
 const controlCharacterPolicyResponse = await fetch(
@@ -508,7 +822,200 @@ assert.equal(dryRun.selected.issue_number, 9001)
 assert.equal(dryRun.selected.eligible, true)
 assert.deepEqual(dryRun.mutations, [])
 assert.deepEqual(dryRun.verification_policy, explicitVerificationPolicy)
+assert.deepEqual(dryRun.preflight, {
+  valid: true,
+  strategy: 'single',
+  task_count: 1,
+  budget_tokens: 20_000,
+  budget_cost_microusd: 1_000_000,
+})
 assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
+
+const materializationRejectionDemo = await post('/api/demo/reset', {})
+const materializationPolicy = factoryPolicy({
+  writeScope: ['crates/**'],
+})
+const materializationClaimRequest = {
+  actor_id: materializationRejectionDemo.alice_actor_id,
+  source_project_owner: 'acme',
+  source_project_number: 7,
+  source_project_item_id: 'PVTI_FAKE_FACTORY_9099',
+  source_repository_owner: 'shyamsridhar123',
+  source_repository_name: 'ecorp',
+  source_issue_number: 9099,
+  source_issue_node_id: 'I_FAKE_FACTORY_9099',
+  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/9099',
+  source_title: 'Recover a rejected factory materialization',
+  source_revision: '2026-09-03T19:30:00Z',
+  idempotency_key: 'factory-materialization-rejection-claim',
+  lease_seconds: 300,
+  policy: materializationPolicy,
+}
+const materializationClaim = await post(
+  `/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/claim`,
+  materializationClaimRequest,
+)
+const materializationPath =
+  `/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/` +
+  `${materializationClaim.work_item.id}/materialize`
+const rejectedMaterializationResponse = await fetch(`${server}${materializationPath}`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    actor_id: materializationRejectionDemo.alice_actor_id,
+    claim_token: materializationClaim.claim_token,
+    expected_version: materializationClaim.work_item.version,
+    idempotency_key: 'factory-materialization-rejection-invalid-budget',
+    title: 'Reject an invalid factory materialization',
+    description: 'The second planning pass must fail closed without stranding the claim.',
+    preferred_adapter: 'fake-process',
+    strategy: 'single',
+    budget_tokens: 3_000_000,
+    budget_cost_microusd: 1_000_000,
+    contract: {
+      objective: 'Reject invalid post-claim materialization safely.',
+      expected_output: 'A recoverable blocked work item and no mission.',
+      acceptance_tests: ['the original factory work item remains recoverable'],
+      allowed_tools: ['filesystem', 'shell'],
+      prohibited_actions: materializationPolicy.prohibited_actions,
+      references: ['https://github.com/shyamsridhar123/ecorp/issues/128'],
+      write_scope: ['crates/**'],
+    },
+  }),
+})
+const rejectedMaterialization = await rejectedMaterializationResponse.json()
+assert.equal(rejectedMaterializationResponse.status, 400)
+assert.match(rejectedMaterialization.error, /task graph budget is invalid/i)
+const rejectedMaterializationState = await snapshot(materializationRejectionDemo)
+const blockedMaterializationItem =
+  rejectedMaterializationState.snapshot.factory_work_items.find(
+    (item) => item.id === materializationClaim.work_item.id,
+  )
+assert.equal(blockedMaterializationItem.state, 'blocked')
+assert.equal(blockedMaterializationItem.mission_id, null)
+assert.match(blockedMaterializationItem.failure_detail, /materialization rejected/i)
+assert.ok(
+  Date.parse(blockedMaterializationItem.lease_expires_at) <= Date.now() + 30_000,
+)
+assert.equal(rejectedMaterializationState.snapshot.missions.length, 0)
+assert.equal(rejectedMaterializationState.snapshot.tasks.length, 0)
+assert.equal(rejectedMaterializationState.snapshot.runs.length, 0)
+const widenedMaterializationReclaim = await fetch(
+  `${server}/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/claim`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...materializationClaimRequest,
+      actor_id: materializationRejectionDemo.bob_actor_id,
+      idempotency_key: 'factory-materialization-rejection-widened-reclaim',
+      policy: {
+        ...materializationPolicy,
+        write_scope: ['**'],
+      },
+    }),
+  },
+)
+assert.equal(widenedMaterializationReclaim.status, 400)
+const revisedMaterializationReclaim = await fetch(
+  `${server}/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/claim`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...materializationClaimRequest,
+      actor_id: materializationRejectionDemo.bob_actor_id,
+      source_revision: '2026-09-03T19:31:00Z',
+      idempotency_key: 'factory-materialization-rejection-revised-reclaim',
+    }),
+  },
+)
+assert.equal(revisedMaterializationReclaim.status, 400)
+const recoveredMaterializationClaim = await post(
+  `/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/claim`,
+  {
+    ...materializationClaimRequest,
+    actor_id: materializationRejectionDemo.bob_actor_id,
+    idempotency_key: 'factory-materialization-rejection-reclaim',
+  },
+)
+assert.equal(
+  recoveredMaterializationClaim.work_item.id,
+  materializationClaim.work_item.id,
+)
+assert.equal(recoveredMaterializationClaim.work_item.state, 'claimed')
+assert.equal(
+  recoveredMaterializationClaim.work_item.claim_owner_id,
+  materializationRejectionDemo.bob_actor_id,
+)
+const secondRejectedMaterializationResponse = await fetch(
+  `${server}${materializationPath}`,
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      actor_id: materializationRejectionDemo.bob_actor_id,
+      claim_token: recoveredMaterializationClaim.claim_token,
+      expected_version: recoveredMaterializationClaim.work_item.version,
+      idempotency_key: 'factory-materialization-rejection-invalid-budget',
+      title: 'Reject an invalid factory materialization again',
+      description:
+        'A second rejected claim generation must not collide with the first compensation.',
+      preferred_adapter: 'fake-process',
+      strategy: 'single',
+      budget_tokens: 3_000_000,
+      budget_cost_microusd: 1_000_000,
+      contract: {
+        objective: 'Reject the repeated invalid materialization safely.',
+        expected_output: 'The same work item remains recoverable.',
+        acceptance_tests: ['the rejection idempotency key is claim-generation scoped'],
+        allowed_tools: ['filesystem', 'shell'],
+        prohibited_actions: materializationPolicy.prohibited_actions,
+        references: ['https://github.com/shyamsridhar123/ecorp/issues/128'],
+        write_scope: ['crates/**'],
+      },
+    }),
+  },
+)
+assert.equal(secondRejectedMaterializationResponse.status, 400)
+const secondRejectedMaterializationState = await snapshot(
+  materializationRejectionDemo,
+)
+const twiceBlockedMaterializationItem =
+  secondRejectedMaterializationState.snapshot.factory_work_items.find(
+    (item) => item.id === materializationClaim.work_item.id,
+  )
+assert.equal(twiceBlockedMaterializationItem.state, 'blocked')
+assert.equal(twiceBlockedMaterializationItem.mission_id, null)
+const secondRecoveredMaterializationClaim = await post(
+  `/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/claim`,
+  {
+    ...materializationClaimRequest,
+    idempotency_key: 'factory-materialization-rejection-second-reclaim',
+  },
+)
+assert.equal(
+  secondRecoveredMaterializationClaim.work_item.id,
+  materializationClaim.work_item.id,
+)
+const materializationCleanup = await post(
+  `/api/corps/${materializationRejectionDemo.corp_id}/factory/work-items/` +
+    `${materializationClaim.work_item.id}/transition`,
+  {
+    actor_id: materializationRejectionDemo.alice_actor_id,
+    claim_token: secondRecoveredMaterializationClaim.claim_token,
+    expected_version: secondRecoveredMaterializationClaim.work_item.version,
+    idempotency_key: 'factory-materialization-rejection-cleanup',
+    state: 'cancelled',
+    failure_detail: 'Test cleanup after proving exact claim recovery.',
+  },
+)
+assert.equal(materializationCleanup.work_item.state, 'cancelled')
+const recoveredMaterializationState = await snapshot(materializationRejectionDemo)
+assert.equal(recoveredMaterializationState.snapshot.factory_work_items.length, 1)
+assert.equal(recoveredMaterializationState.snapshot.missions.length, 0)
+assert.equal(recoveredMaterializationState.snapshot.tasks.length, 0)
+assert.equal(recoveredMaterializationState.snapshot.runs.length, 0)
 
 const first = await runController(demo, 9001, false, {
   verificationPolicyFile: verificationPolicyPath,
@@ -517,6 +1024,7 @@ assert.equal(first.mode, 'executed')
 assert.equal(first.issue_number, 9001)
 assert.equal(first.project_status, 'In Progress')
 assert.equal(first.materialized_now, true)
+assert.deepEqual(first.preflight, dryRun.preflight)
 assert.equal(first.factory_state, 'running')
 assert.equal(first.auto_merge, false)
 const fencedState = await snapshot(demo)
@@ -627,6 +1135,131 @@ assert.equal(nextIssue.factory_state, 'running')
 await waitForMission(demo, nextIssue.mission_id)
 const nextIssueVerified = await runController(demo, 9003)
 assert.equal(nextIssueVerified.factory_state, 'verified')
+
+const interruptionDemo = await post('/api/demo/reset', {})
+const interruptionIssue = {
+  ...issue,
+  id: 'I_FAKE_FACTORY_9013',
+  number: 9013,
+  title: 'Recover a controller interrupted after claim',
+  url: 'https://github.com/shyamsridhar123/ecorp/issues/9013',
+  createdAt: '2026-09-03T19:32:00Z',
+  updatedAt: '2026-09-03T19:32:00Z',
+}
+await writeFile(
+  statePath,
+  `${JSON.stringify(
+    {
+      repository: 'shyamsridhar123/ecorp',
+      project: fakeState.project,
+      items: [
+        {
+          id: 'PVTI_FAKE_FACTORY_9013',
+          status: 'Todo',
+          content: {
+            body: interruptionIssue.body,
+            number: interruptionIssue.number,
+            repository: 'shyamsridhar123/ecorp',
+            title: interruptionIssue.title,
+            type: 'Issue',
+            url: interruptionIssue.url,
+          },
+        },
+      ],
+      issues: { '9013': interruptionIssue },
+      item_edits: 0,
+    },
+    null,
+    2,
+  )}\n`,
+)
+const interruptionProxy = await createMaterializationBarrierProxy()
+const interruptedController = startController(interruptionDemo, 9013, false, {
+  serverOverride: interruptionProxy.url,
+})
+let interruptedStdout = ''
+let interruptedStderr = ''
+let interruptedSnapshot
+let interruptedItem
+let interruptedProjectBeforeRecovery
+interruptedController.stdout.setEncoding('utf8')
+interruptedController.stderr.setEncoding('utf8')
+interruptedController.stdout.on('data', (chunk) => {
+  interruptedStdout += chunk
+})
+interruptedController.stderr.on('data', (chunk) => {
+  interruptedStderr += chunk
+})
+try {
+  await withTimeout(
+    interruptionProxy.materializationRequested,
+    10_000,
+    'the intercepted factory materialization request',
+  )
+  interruptedSnapshot = await snapshot(interruptionDemo)
+  interruptedItem = interruptedSnapshot.snapshot.factory_work_items.find(
+    (item) => item.source_issue_number === 9013,
+  )
+  assert.ok(interruptedItem)
+  assert.equal(interruptedItem.state, 'claimed')
+  assert.equal(interruptedItem.version, 1)
+  assert.equal(interruptedItem.mission_id, null)
+  assert.equal(Object.hasOwn(interruptedItem, 'claim_token'), false)
+  assert.equal(interruptedSnapshot.snapshot.missions.length, 0)
+  assert.equal(interruptedSnapshot.snapshot.tasks.length, 0)
+  assert.equal(interruptedSnapshot.snapshot.runs.length, 0)
+  interruptedProjectBeforeRecovery = JSON.parse(
+    await readFile(statePath, 'utf8'),
+  )
+  assert.equal(interruptedProjectBeforeRecovery.items[0].status, 'Todo')
+  assert.equal(interruptedProjectBeforeRecovery.item_edits, 0)
+  const interruptedExit = once(interruptedController, 'exit')
+  assert.equal(interruptedController.kill(), true)
+  await withTimeout(interruptedExit, 10_000, 'the interrupted controller to exit')
+} finally {
+  if (
+    interruptedController.exitCode === null &&
+    interruptedController.signalCode === null
+  ) {
+    const forcedExit = once(interruptedController, 'exit')
+    interruptedController.kill()
+    await withTimeout(forcedExit, 10_000, 'controller cleanup')
+  }
+  await interruptionProxy.close()
+}
+assert.doesNotMatch(`${interruptedStdout}\n${interruptedStderr}`, /claim_token/i)
+const interruptionRecovered = await runController(interruptionDemo, 9013)
+assert.equal(
+  interruptionRecovered.factory_work_item_id,
+  interruptedItem.id,
+)
+assert.equal(interruptionRecovered.materialized_now, true)
+await waitForMission(interruptionDemo, interruptionRecovered.mission_id)
+const interruptionVerified = await runController(interruptionDemo, 9013)
+assert.equal(interruptionVerified.factory_state, 'verified')
+const interruptionFinalState = await snapshot(interruptionDemo)
+const interruptionWorkItems =
+  interruptionFinalState.snapshot.factory_work_items.filter(
+    (item) => item.source_issue_number === 9013,
+  )
+const interruptionMissions = interruptionFinalState.snapshot.missions.filter(
+  (mission) => mission.id === interruptionRecovered.mission_id,
+)
+const interruptionTaskIds = new Set(
+  interruptionFinalState.snapshot.tasks
+    .filter((task) => task.mission_id === interruptionRecovered.mission_id)
+    .map((task) => task.id),
+)
+const interruptionRuns = interruptionFinalState.snapshot.runs.filter((run) =>
+  interruptionTaskIds.has(run.task_id),
+)
+assert.equal(interruptionWorkItems.length, 1)
+assert.equal(interruptionMissions.length, 1)
+assert.equal(interruptionRuns.length, 1)
+const interruptionProjectAfterRecovery = JSON.parse(
+  await readFile(statePath, 'utf8'),
+)
+assert.equal(interruptionProjectAfterRecovery.items[0].status, 'In Progress')
 
 const recoveryDemo = await post('/api/demo/reset', {})
 const recoveryIssue = {
@@ -1457,6 +2090,59 @@ const report = {
     controlCharacterPolicyResponse.status,
   non_branch_publication_base_rejected_before_claim:
     invalidPublicationBaseRejected,
+  preflight_boundary: {
+    rejected_cases: [
+      ...preflightRejections.map((rejection) => rejection.name),
+      'unsupported_description_control_character',
+      'oversized_materialization_snapshot',
+    ],
+    dry_run_and_execution_rejected_before_claim: true,
+    project_status: 'Todo',
+    project_mutations: 0,
+    work_item_count: 0,
+    mission_count: 0,
+    task_count: 0,
+    run_count: 0,
+    accepted_preview: dryRun.preflight,
+    execution_reused_preview: JSON.stringify(first.preflight) === JSON.stringify(dryRun.preflight),
+  },
+  materialization_rejection_recovery: {
+    work_item_id: materializationClaim.work_item.id,
+    initial_state: blockedMaterializationItem.state,
+    initial_mission_id: blockedMaterializationItem.mission_id,
+    lease_released: true,
+    widened_policy_status: widenedMaterializationReclaim.status,
+    revised_source_status: revisedMaterializationReclaim.status,
+    first_reclaim_actor: recoveredMaterializationClaim.work_item.claim_owner_id,
+    second_rejection_state: twiceBlockedMaterializationItem.state,
+    second_reclaim_actor:
+      secondRecoveredMaterializationClaim.work_item.claim_owner_id,
+    cleanup_state: materializationCleanup.work_item.state,
+    work_item_count: recoveredMaterializationState.snapshot.factory_work_items.length,
+    mission_count: recoveredMaterializationState.snapshot.missions.length,
+    task_count: recoveredMaterializationState.snapshot.tasks.length,
+    run_count: recoveredMaterializationState.snapshot.runs.length,
+  },
+  controller_interruption_recovery: {
+    issue_number: 9013,
+    work_item_id: interruptedItem.id,
+    interrupted_state: interruptedItem.state,
+    interrupted_version: interruptedItem.version,
+    claim_token_absent_from_snapshot: true,
+    project_status_before_recovery:
+      interruptedProjectBeforeRecovery.items[0].status,
+    project_mutations_before_recovery:
+      interruptedProjectBeforeRecovery.item_edits,
+    recovered_same_work_item:
+      interruptionRecovered.factory_work_item_id === interruptedItem.id,
+    materialized_after_retry: interruptionRecovered.materialized_now,
+    final_factory_state: interruptionVerified.factory_state,
+    work_item_count: interruptionWorkItems.length,
+    mission_count: interruptionMissions.length,
+    run_count: interruptionRuns.length,
+    project_status_after_recovery:
+      interruptionProjectAfterRecovery.items[0].status,
+  },
   queue_progression: {
     next_issue_number: nextIssue.issue_number,
     verified_items_do_not_starve_todo_work: true,

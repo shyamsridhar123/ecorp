@@ -318,28 +318,54 @@ const materializeRequest = {
     write_scope: ['crates/**', 'db/migrations/**', 'tools/**', 'docs/**'],
   },
 }
-const policyBypass = await post(materializePath, {
-  ...materializeRequest,
-  idempotency_key: `factory-e2e-policy-bypass-${nonce}`,
+async function assertRejectedMaterialization(suffix, patch) {
+  const issueNumber = 59_000 + suffix
+  const rejectedClaim = await postOk(claimPath, {
+    ...claimRequest,
+    source_project_item_id: `PVTI_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
+    source_issue_number: issueNumber,
+    source_issue_node_id: `I_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
+    source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${issueNumber}`,
+    source_title: `Reject invalid factory materialization ${suffix}`,
+    source_revision: `2026-09-03T19:${String(30 + suffix).padStart(2, '0')}:00Z`,
+    idempotency_key: `factory-e2e-rejected-claim-${suffix}-${nonce}`,
+  })
+  const rejectedPath =
+    `/api/corps/${demo.corp_id}/factory/work-items/` +
+    `${rejectedClaim.work_item.id}/materialize`
+  const rejected = await post(rejectedPath, {
+    ...materializeRequest,
+    ...patch,
+    actor_id: demo.alice_actor_id,
+    claim_token: rejectedClaim.claim_token,
+    expected_version: rejectedClaim.work_item.version,
+    idempotency_key: `factory-e2e-rejected-materialize-${suffix}-${nonce}`,
+  })
+  assert.equal(rejected.response.status, 400)
+  const rejectedSnapshot = await snapshot(demo)
+  const blocked = rejectedSnapshot.snapshot.factory_work_items.find(
+    (item) => item.id === rejectedClaim.work_item.id,
+  )
+  assert.equal(blocked.state, 'blocked')
+  assert.equal(blocked.mission_id, null)
+  assert.ok(Date.parse(blocked.lease_expires_at) <= Date.now() + 30_000)
+  return rejected
+}
+
+const policyBypass = await assertRejectedMaterialization(1, {
   budget_tokens: 25_000,
   contract: {
     ...materializeRequest.contract,
     write_scope: ['**'],
   },
 })
-assert.equal(policyBypass.response.status, 400)
-const toolBypass = await post(materializePath, {
-  ...materializeRequest,
-  idempotency_key: `factory-e2e-tool-bypass-${nonce}`,
+const toolBypass = await assertRejectedMaterialization(2, {
   contract: {
     ...materializeRequest.contract,
     allowed_tools: ['filesystem', 'shell', 'network'],
   },
 })
-assert.equal(toolBypass.response.status, 400)
-const secretBypass = await post(materializePath, {
-  ...materializeRequest,
-  idempotency_key: `factory-e2e-secret-bypass-${nonce}`,
+const secretBypass = await assertRejectedMaterialization(3, {
   secret_refs: [
     {
       secret_id: crypto.randomUUID(),
@@ -349,7 +375,6 @@ const secretBypass = await post(materializePath, {
     },
   ],
 })
-assert.equal(secretBypass.response.status, 400)
 const materialized = await Promise.all([
   postOk(materializePath, materializeRequest),
   postOk(materializePath, materializeRequest),
@@ -364,7 +389,9 @@ assert.ok(materialized.every((item) => item.work_item.state === 'mission_created
 assert.ok(materialized.every((item) => item.work_item.version === 3))
 
 const afterMaterialize = await snapshot(demo)
-const factoryItems = afterMaterialize.snapshot.factory_work_items
+const factoryItems = afterMaterialize.snapshot.factory_work_items.filter(
+  (item) => item.id === claim.work_item.id,
+)
 assert.equal(factoryItems.length, 1)
 assert.equal(factoryItems[0].mission_id, materialized[0].mission_id)
 assert.equal(
@@ -541,7 +568,65 @@ const blocked = await postOk(blockedTransitionPath, {
   failure_detail: 'pre-materialization dependency check failed',
 })
 assert.equal(blocked.work_item.state, 'blocked')
+const expiredClaimRequest = {
+  ...claimRequest,
+  source_project_item_id: `PVTI_FACTORY_EXPIRED_CLAIMED_${nonce}`,
+  source_issue_number: 61,
+  source_issue_node_id: `I_FACTORY_EXPIRED_CLAIMED_${nonce}`,
+  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/61',
+  source_title: 'Recover an expired claimed factory item',
+  source_revision: '2026-09-01T00:01:30Z',
+  idempotency_key: `factory-e2e-expired-claimed-${nonce}`,
+  lease_seconds: 30,
+}
+const expiredClaim = await postOk(claimPath, expiredClaimRequest)
+assert.equal(expiredClaim.work_item.state, 'claimed')
+assert.equal(expiredClaim.work_item.mission_id, null)
 await new Promise((resolve) => setTimeout(resolve, 31_000))
+const expiredClaimWidened = await post(claimPath, {
+  ...expiredClaimRequest,
+  actor_id: demo.bob_actor_id,
+  idempotency_key: `factory-e2e-expired-claimed-widened-${nonce}`,
+  lease_seconds: 300,
+  policy: {
+    ...expiredClaimRequest.policy,
+    write_scope: ['**'],
+    budget_tokens: 40_000,
+  },
+})
+assert.equal(expiredClaimWidened.response.status, 400)
+const expiredClaimRevised = await post(claimPath, {
+  ...expiredClaimRequest,
+  actor_id: demo.bob_actor_id,
+  source_revision: '2026-09-01T00:02:30Z',
+  idempotency_key: `factory-e2e-expired-claimed-revised-${nonce}`,
+  lease_seconds: 300,
+})
+assert.equal(expiredClaimRevised.response.status, 400)
+const expiredClaimTakeover = await postOk(claimPath, {
+  ...expiredClaimRequest,
+  actor_id: demo.bob_actor_id,
+  idempotency_key: `factory-e2e-expired-claimed-takeover-${nonce}`,
+  lease_seconds: 300,
+})
+assert.equal(expiredClaimTakeover.work_item.id, expiredClaim.work_item.id)
+assert.equal(expiredClaimTakeover.work_item.state, 'claimed')
+assert.equal(expiredClaimTakeover.work_item.claim_owner_id, demo.bob_actor_id)
+assert.equal(expiredClaimTakeover.work_item.source_revision, expiredClaim.work_item.source_revision)
+assert.deepEqual(expiredClaimTakeover.work_item.policy, expiredClaim.work_item.policy)
+const expiredClaimCleanup = await postOk(
+  `/api/corps/${demo.corp_id}/factory/work-items/` +
+    `${expiredClaim.work_item.id}/transition`,
+  {
+    actor_id: demo.bob_actor_id,
+    claim_token: expiredClaimTakeover.claim_token,
+    expected_version: expiredClaimTakeover.work_item.version,
+    idempotency_key: `factory-e2e-expired-claimed-cleanup-${nonce}`,
+    state: 'cancelled',
+    failure_detail: 'Test cleanup after expired claimed takeover.',
+  },
+)
+assert.equal(expiredClaimCleanup.work_item.state, 'cancelled')
 const widenedReclaim = await post(claimPath, {
   ...blockedClaimRequest,
   actor_id: demo.bob_actor_id,
@@ -642,6 +727,13 @@ const report = {
   expired_reclaim_preserved_source_and_policy: true,
   expired_blocked_claim_recovered: true,
   expired_claim_taken_over_by_second_operator: true,
+  expired_claimed_policy_widening_rejected:
+    expiredClaimWidened.response.status === 400,
+  expired_claimed_source_revision_change_rejected:
+    expiredClaimRevised.response.status === 400,
+  expired_claimed_preserved_source_and_policy: true,
+  expired_claimed_taken_over_by_second_operator: true,
+  expired_claimed_cleanup_state: expiredClaimCleanup.work_item.state,
   fencing_token_absent_from_snapshot_and_events: true,
   issue_contract_persisted: true,
   factory_state: finalFactoryItem.state,

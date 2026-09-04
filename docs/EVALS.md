@@ -225,7 +225,9 @@ version, stale token, and duplicate-active operations, proves the fencing token 
 snapshots and events, proves non-operators cannot read source metadata through factory snapshots or
 events, rejects source or policy replacement during an expired pre-materialization reclaim, and
 proves mixed-case GitHub identities collapse onto the same work item before launching the one
-linked mission through the real runner.
+linked mission through the real runner. Rejected materializations use independent claims and prove
+each invalid policy, tool, or secret expansion becomes a recoverable `blocked` item with no mission
+and an immediately released lease rather than contaminating the valid concurrency case.
 
 `tools/e2e_factory_controller.mjs` gives the CLI a deterministic GitHub API boundary and proves
 Project eligibility, dependency parsing, a mutation-free dry run, durable claim-before-dispatch,
@@ -252,7 +254,22 @@ changes. A fresh post-replay lookup and snapshot count every matching work item,
 run to prove there is exactly one of each. Mission discovery uses the deterministic GitHub issue
 title and persisted source marker from the fresh snapshot rather than following the work item's
 mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
-verifies Markdown section boundaries for dependency and acceptance parsing. See
+verifies Markdown section boundaries for dependency and acceptance parsing.
+
+The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
+3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
+scope, unsupported description control characters, and an oversized materialization snapshot. Each
+case proves the Project item remains `Todo` with zero claim, mission, task, run, or Project
+mutation. A positive case proves execution reuses the same accepted preflight shape. The suite also
+kills a real controller after its durable claim but before materialization, verifies the opaque
+token is absent from shared state and controller output, then recovers the same work item with exactly one
+mission and run. Direct post-claim rejection tests prove the server releases a blocked
+pre-materialization lease, rejects source or policy replacement, and safely records a second
+rejection after reclaim without idempotency collision. A separate live Postgres probe removes an
+operator's room membership and proves preflight returns `403` before any durable object exists. See
+`docs/evidence/2026-09-04-factory-preflight-and-recovery.md`.
+
+See
 `docs/evidence/2026-09-01-governed-dark-factory-foundation.md` and
 `docs/evidence/2026-09-01-factory-pagination-safety.md`.
 
