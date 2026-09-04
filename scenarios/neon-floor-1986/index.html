@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta
+      name="description"
+      content="Neon Floor 1986, an original keyboard-playable office infiltration game."
+    >
+    <title>Neon Floor 1986</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <p class="eyebrow">ECORP NIGHT OPERATIONS // SECTOR 86</p>
+        <h1>Neon Floor 1986</h1>
+        <p class="dek">
+          Recover three access keys, evade the deterministic security grid, and reach the uplink.
+        </p>
+      </header>
+
+      <div class="console">
+        <aside class="hud" aria-labelledby="mission-heading">
+          <div>
+            <p class="panel-label">Mission telemetry</p>
+            <h2 id="mission-heading">Operator console</h2>
+          </div>
+
+          <dl class="readouts">
+            <div>
+              <dt>State</dt>
+              <dd><span id="state-value" class="state-badge" data-phase="idle">Idle</span></dd>
+            </div>
+            <div>
+              <dt>Access keys</dt>
+              <dd id="keys-value">0 / 3</dd>
+            </div>
+            <div>
+              <dt>Score</dt>
+              <dd id="score-value">0000</dd>
+            </div>
+            <div>
+              <dt>Uplink</dt>
+              <dd id="uplink-value">Locked</dd>
+            </div>
+          </dl>
+
+          <div class="button-row" aria-label="Game controls">
+            <button id="start-button" type="button">Start</button>
+            <button id="pause-button" type="button" disabled>Pause</button>
+            <button id="restart-button" type="button">Restart</button>
+          </div>
+
+          <p class="control-legend">
+            <strong>Controls</strong>
+            Arrows / WASD move <span aria-hidden="true">·</span> P pause
+            <span aria-hidden="true">·</span> R restart
+          </p>
+
+          <p id="live-status" class="status-message" role="status" aria-live="polite">
+            Idle. Press Start, Enter, Space, or a movement key.
+          </p>
+        </aside>
+
+        <section class="game-panel" aria-labelledby="floor-heading">
+          <div class="game-heading">
+            <div>
+              <p class="panel-label">Live floor projection</p>
+              <h2 id="floor-heading">Data floor A-17</h2>
+            </div>
+            <span class="signal" aria-label="Local simulation, no network">Local signal</span>
+          </div>
+
+          <div class="screen">
+            <canvas
+              id="game-canvas"
+              width="720"
+              height="480"
+              role="img"
+              aria-label="Top-down neon office floor. Guide the square-helmeted operator to three key-shaped access tokens, avoid diamond-shaped security drones, then enter the striped uplink terminal."
+              aria-describedby="canvas-alternative"
+            >
+              Neon Floor 1986 is a grid-based office infiltration game. Use the keyboard controls
+              described below; current progress is reported in the operator console.
+            </canvas>
+          </div>
+
+          <p id="canvas-alternative" class="text-alternative">
+            Symbols: the operator has a square helmet, access keys have teeth, drones are diamonds
+            with an eye, and the uplink is a striped terminal marked U.
+          </p>
+        </section>
+      </div>
+
+      <section class="instructions" aria-labelledby="instructions-heading">
+        <p class="panel-label">Field manual</p>
+        <h2 id="instructions-heading">How to play</h2>
+        <div class="instruction-grid">
+          <p><strong>1. Infiltrate.</strong> Start with Enter, Space, Start, or any move key.</p>
+          <p><strong>2. Recover.</strong> Collect all three key-shaped access tokens.</p>
+          <p><strong>3. Evade.</strong> A collision or tile swap with either drone ends the run.</p>
+          <p><strong>4. Extract.</strong> Enter the cyan uplink only after the HUD shows 3 / 3.</p>
+        </div>
+      </section>
+
+      <footer>
+        Original in-repository canvas art. No external assets, fonts, analytics, or network calls.
+      </footer>
+    </main>
+
+    <script src="game.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
