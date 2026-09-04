@@ -465,9 +465,29 @@ fencing, lease, and recoverable lifecycle fields can change.
 GitHub owner and repository identities are normalized to lowercase before locking and uniqueness
 checks, preventing case variants from creating duplicate work items.
 
-Mission and task creation is atomic with the `claimed -> mission_created` transition. A controller
-that loses its response or restarts can replay the same operation and recover the existing mission;
-it cannot create a duplicate graph.
+Before a new claim or an unmaterialized reclaim, the controller sends the exact issue-derived
+materialization payload and final policy snapshot to a mutation-free factory preflight endpoint.
+Dry run and execution use this same boundary. The server repeats model and reasoning selection,
+task-graph and budget validation, verifier-policy validation, deliverable and write-scope checks,
+policy narrowing, mission title and description normalization, the 65,536-byte operation-snapshot
+limit, and destination-room authorization. A rejected preflight leaves the GitHub Project item in
+`Todo` and creates no factory item, mission, task, or run.
+
+Mission and task creation is atomic with the `claimed -> mission_created` transition. Mission
+placement selects the oldest room in the Corp that actually contains the requesting actor rather
+than assuming that every operator belongs to the Corp's oldest room. A controller that loses its
+response or restarts can replay the same operation and recover the existing mission; it cannot
+create a duplicate graph.
+
+Materialization repeats the full preflight because runner capabilities, room membership, or other
+authority can change between the read-only check and the durable write. If a post-claim
+pre-mission rejection still occurs, a dedicated store operation locks the exact work item, verifies
+the current opaque claim token, records a claim-generation-scoped idempotency key, moves
+`claimed -> blocked`, and releases the lease in the same transaction. It deliberately does not
+require the attempted version or lease to remain current, so a concurrent renewal or controller
+delay cannot strand the claim; a rotated token fences the stale compensation from a newer owner.
+The token remains absent from logs, events, snapshots, and failure text. Recovery must still present
+the exact original source revision and policy snapshot.
 
 The same fenced controller advances explicit `running`, `blocked`, and `verified` states. External
 status failure is persisted before the controller returns an error, and retry reclaims an expired

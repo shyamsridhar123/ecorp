@@ -224,6 +224,7 @@ impl EvaluatedItem {
 pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
     normalize_args(&mut args)?;
     validate_args(&args)?;
+    let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let requested_verification_policy = load_verification_policy(&args)?;
     let project_items = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
     if project_items.items.len() < project_items.total_count {
@@ -299,6 +300,44 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         .collect::<Vec<_>>();
 
     if args.dry_run {
+        let preflight = if let Some(index) = selected_index {
+            let selected = &evaluated[index];
+            let persisted = existing.get(&selected.project_item.id);
+            if persisted.and_then(|item| item.mission_id).is_some() {
+                None
+            } else {
+                let resolved = selected_source_base_commit
+                    .as_ref()
+                    .context("selected factory issue has no resolved source commit")?;
+                let policy = if selected.recovery {
+                    preflight_policy(
+                        &persisted
+                            .context(
+                                "recoverable factory item disappeared from the selected-item lookup",
+                            )?
+                            .policy,
+                        &resolved.commit,
+                    )?
+                } else {
+                    new_factory_policy(
+                        &args,
+                        selected,
+                        &resolved.commit,
+                        &preview_publication_base_ref,
+                        preview_verification_policy.as_ref(),
+                        &adapter_allowlist,
+                    )
+                };
+                let mission_body = factory_mission_body(
+                    &args,
+                    &selected.issue,
+                    preview_verification_policy.as_ref(),
+                );
+                Some(preflight_factory_mission(client, server, &args, policy, mission_body).await?)
+            }
+        } else {
+            None
+        };
         return Ok(json!({
             "mode": "dry_run",
             "source_of_truth": "github_project",
@@ -314,6 +353,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "legacy_source_upgrade_required": selected_source_base_commit
                 .as_ref()
                 .is_some_and(|resolved| resolved.legacy_upgrade_required),
+            "preflight": preflight,
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
             "mutations": [],
@@ -345,7 +385,6 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         commit: source_base_commit,
         legacy_upgrade_required,
     } = source_resolution;
-    let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let publication_base_ref = if refreshed.recovery {
         resolve_recovery_publication_base_ref(
             &args,
@@ -380,48 +419,38 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             .map(|item| item.policy.clone())
             .context("recoverable factory item disappeared from the selected-item lookup")?
     } else {
-        json!({
-            "schema_version": 1,
-            "source_of_truth": "github_project",
-            "project_owner": args.owner,
-            "project_number": args.project_number,
-            "project_status": refreshed.project_item.status,
-            "required_label": "factory:ready",
-            "dependencies": refreshed.dependencies,
-            "repository_allowlist": [args.repository],
-            "source_base_ref": args.source_base_ref,
-            "source_base_commit": source_base_commit,
-            "source_commit_upgrade_required": false,
-            "adapter_allowlist": adapter_allowlist,
-            "strategy_allowlist": [args.strategy],
-            "model": args.model,
-            "reasoning_effort": args.reasoning_effort,
-            "write_scope": args.write_scope,
-            "allowed_tools": ["filesystem", "shell"],
-            "prohibited_actions": [
-                "modify files outside the assigned worktree",
-                "use undeclared long-lived credentials",
-                "merge or deploy without a separate current authorization"
-            ],
-            "secret_ids": [],
-            "verification_required": true,
-            "deliverable_form": "commit_branch",
-            "budget_tokens": args.budget_tokens,
-            "budget_cost_microusd": args.budget_cost_microusd,
-            "auto_merge": false,
-            "publication": {
-                "allowed": true,
-                "repository_allowlist": [args.repository],
-                "base_ref": publication_base_ref,
-                "branch_prefix": "ecorp/",
-                "status_before": "In Progress",
-                "review_status": "In Review",
-                "auto_merge": false,
-                "merge": false,
-                "deploy": false
-            },
-            "verification_policy": verification_policy.clone(),
-        })
+        new_factory_policy(
+            &args,
+            &refreshed,
+            &source_base_commit,
+            &publication_base_ref,
+            verification_policy.as_ref(),
+            &adapter_allowlist,
+        )
+    };
+    let mission_body = factory_mission_body(&args, &refreshed.issue, verification_policy.as_ref());
+    let preflight = if persisted
+        .as_ref()
+        .and_then(|item| item.mission_id)
+        .is_none()
+    {
+        let preflight_policy = if legacy_upgrade_required {
+            preflight_policy(&policy, &source_base_commit)?
+        } else {
+            policy.clone()
+        };
+        Some(
+            preflight_factory_mission(
+                client,
+                server,
+                &args,
+                preflight_policy,
+                mission_body.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
     };
     let claim_generation = persisted.as_ref().map(|item| item.version).unwrap_or(0);
     let claim_body = json!({
@@ -495,48 +524,22 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     }
     let mut materialized = false;
     if mission_id.is_none() {
-        let materialize_body = json!({
-            "actor_id": args.actor_id,
-            "claim_token": control_token,
-            "expected_version": work_item_version,
-            "idempotency_key": format!("{stable_prefix}:materialize"),
-            "title": bounded_title(refreshed.issue.number, &refreshed.issue.title),
-            "description": &refreshed.issue.body,
-            "preferred_adapter": args.adapter,
-            "preferred_model": args.model,
-            "reasoning_effort": args.reasoning_effort,
-            "strategy": args.strategy,
-            "budget_tokens": args.budget_tokens,
-            "budget_cost_microusd": args.budget_cost_microusd,
-            "deliverable": {
-                "form": "commit_branch",
-                "commit_after_verification": true,
-                "paths": [],
-            },
-            "contract": {
-                "objective": issue_objective(&refreshed.issue),
-                "expected_output": format!(
-                    "A complete, verified repository implementation for GitHub issue #{}.",
-                    refreshed.issue.number
-                ),
-                "acceptance_tests": acceptance_tests(&refreshed.issue.body),
-                "allowed_tools": ["filesystem", "shell"],
-                "prohibited_actions": [
-                    "modify files outside the assigned worktree",
-                    "use undeclared long-lived credentials",
-                    "merge or deploy without a separate current authorization"
-                ],
-                "references": [
-                    refreshed.issue.url,
-                    format!(
-                        "https://github.com/users/{}/projects/{}",
-                        args.owner, args.project_number
-                    )
-                ],
-                "write_scope": args.write_scope,
-            },
-            "verification_policy": verification_policy,
-        });
+        let mut materialize_body = mission_body;
+        let materialize_fields = materialize_body
+            .as_object_mut()
+            .context("factory mission request must be a JSON object")?;
+        materialize_fields.insert(
+            "claim_token".to_owned(),
+            Value::String(control_token.to_string()),
+        );
+        materialize_fields.insert(
+            "expected_version".to_owned(),
+            Value::Number(work_item_version.into()),
+        );
+        materialize_fields.insert(
+            "idempotency_key".to_owned(),
+            Value::String(format!("{stable_prefix}:materialize")),
+        );
         let materialize = server_json(
             client,
             Method::POST,
@@ -840,9 +843,162 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "factory_version": work_item_version,
         "mission_id": mission_id,
         "materialized_now": materialized,
+        "preflight": preflight,
         "launch": launch,
         "auto_merge": false,
     }))
+}
+
+fn new_factory_policy(
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    source_base_commit: &str,
+    publication_base_ref: &str,
+    verification_policy: Option<&VerificationPolicy>,
+    adapter_allowlist: &[String],
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "source_of_truth": "github_project",
+        "project_owner": args.owner,
+        "project_number": args.project_number,
+        "project_status": selected.project_item.status,
+        "required_label": "factory:ready",
+        "dependencies": selected.dependencies,
+        "repository_allowlist": [args.repository],
+        "source_base_ref": args.source_base_ref,
+        "source_base_commit": source_base_commit,
+        "source_commit_upgrade_required": false,
+        "adapter_allowlist": adapter_allowlist,
+        "strategy_allowlist": [args.strategy],
+        "model": args.model,
+        "reasoning_effort": args.reasoning_effort,
+        "write_scope": args.write_scope,
+        "allowed_tools": ["filesystem", "shell"],
+        "prohibited_actions": [
+            "modify files outside the assigned worktree",
+            "use undeclared long-lived credentials",
+            "merge or deploy without a separate current authorization"
+        ],
+        "secret_ids": [],
+        "verification_required": true,
+        "deliverable_form": "commit_branch",
+        "budget_tokens": args.budget_tokens,
+        "budget_cost_microusd": args.budget_cost_microusd,
+        "auto_merge": false,
+        "publication": {
+            "allowed": true,
+            "repository_allowlist": [args.repository],
+            "base_ref": publication_base_ref,
+            "branch_prefix": "ecorp/",
+            "status_before": "In Progress",
+            "review_status": "In Review",
+            "auto_merge": false,
+            "merge": false,
+            "deploy": false
+        },
+        "verification_policy": verification_policy,
+    })
+}
+
+fn preflight_policy(policy: &Value, source_base_commit: &str) -> Result<Value> {
+    let mut policy = policy.clone();
+    let policy = policy
+        .as_object_mut()
+        .context("recoverable factory policy must be a JSON object")?;
+    policy.insert(
+        "source_base_commit".to_owned(),
+        Value::String(source_base_commit.to_ascii_lowercase()),
+    );
+    policy.insert(
+        "source_commit_upgrade_required".to_owned(),
+        Value::Bool(false),
+    );
+    Ok(Value::Object(policy.clone()))
+}
+
+fn factory_mission_body(
+    args: &FactoryArgs,
+    issue: &IssueView,
+    verification_policy: Option<&VerificationPolicy>,
+) -> Value {
+    json!({
+        "actor_id": args.actor_id,
+        "title": bounded_title(issue.number, &issue.title),
+        "description": issue.body,
+        "preferred_adapter": args.adapter,
+        "preferred_model": args.model,
+        "reasoning_effort": args.reasoning_effort,
+        "strategy": args.strategy,
+        "budget_tokens": args.budget_tokens,
+        "budget_cost_microusd": args.budget_cost_microusd,
+        "deliverable": {
+            "form": "commit_branch",
+            "commit_after_verification": true,
+            "paths": [],
+        },
+        "contract": {
+            "objective": issue_objective(issue),
+            "expected_output": format!(
+                "A complete, verified repository implementation for GitHub issue #{}.",
+                issue.number
+            ),
+            "acceptance_tests": acceptance_tests(&issue.body),
+            "allowed_tools": ["filesystem", "shell"],
+            "prohibited_actions": [
+                "modify files outside the assigned worktree",
+                "use undeclared long-lived credentials",
+                "merge or deploy without a separate current authorization"
+            ],
+            "references": [
+                issue.url,
+                format!(
+                    "https://github.com/users/{}/projects/{}",
+                    args.owner, args.project_number
+                )
+            ],
+            "write_scope": args.write_scope,
+        },
+        "verification_policy": verification_policy,
+    })
+}
+
+fn factory_preflight_body(
+    args: &FactoryArgs,
+    policy: Value,
+    mut mission_body: Value,
+) -> Result<Value> {
+    let (source_repository_owner, source_repository_name) = repository_parts(&args.repository)?;
+    let fields = mission_body
+        .as_object_mut()
+        .context("factory mission request must be a JSON object")?;
+    fields.insert(
+        "source_repository_owner".to_owned(),
+        Value::String(source_repository_owner.to_owned()),
+    );
+    fields.insert(
+        "source_repository_name".to_owned(),
+        Value::String(source_repository_name.to_owned()),
+    );
+    fields.insert("policy".to_owned(), policy);
+    Ok(mission_body)
+}
+
+async fn preflight_factory_mission(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    policy: Value,
+    mission_body: Value,
+) -> Result<Value> {
+    server_json(
+        client,
+        Method::POST,
+        format!("{server}/api/corps/{}/factory/preflight", args.corp_id),
+        Some(factory_preflight_body(args, policy, mission_body)?),
+    )
+    .await
+    .context("factory plan preflight rejected before claim")
 }
 
 fn validate_args(args: &FactoryArgs) -> Result<()> {

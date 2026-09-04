@@ -23,7 +23,7 @@ and linked repository evidence for implemented behavior.
   - Local research checkout: `C:\Users\shyamsridhar\code\_research\buzz3`
   - Reviewed commit: `00e61eafa917d296104006576b7a2ddbfd58bb5a`
 
-### Implementation checkpoint - September 3, 2026
+### Implementation checkpoint - September 4, 2026
 
 - The greenfield repository, ADR set, Postgres event journal, server, runner, CLI, React client, and
   thin Tauri 2 desktop shell are operational.
@@ -70,6 +70,10 @@ and linked repository evidence for implemented behavior.
   credential-owning publisher. Durable attempts recover matching branch, pull-request, and Project
   effects after duplicate calls, restart, timeout, or partial remote success; merge, auto-merge, and
   deployment remain separately unauthorized.
+- Factory dry runs and executions now validate the exact mission payload, policy, provider
+  selection, graph budgets, verifier policy, write scope, operation size, and room authorization
+  before a durable Project claim. A post-claim validation race moves the exact claim generation to a
+  recoverable blocked state and releases its lease without exposing the fencing token.
 
 ---
 

@@ -43,7 +43,8 @@ use crony_protocol::{
     LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
     LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
     MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, ProposeMissionBudgetRevisionRequest,
+    MissionContractRevisionResponse, PreflightFactoryMissionRequest,
+    PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
@@ -58,11 +59,11 @@ use crony_store::{
     ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
     DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
     MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
-    PendingRunnerCommand, PgStore, ProposeMissionBudgetRevisionInput,
+    PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
-    RecordPullRequestPublicationCheckpointInput, RenewFactoryWorkItemInput,
-    RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput, RunnerEventInput,
-    StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
+    RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
+    RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
+    RunnerEventInput, StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
     UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
@@ -438,6 +439,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/preflight",
+            post(preflight_factory_mission),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/claim",
@@ -1875,13 +1880,75 @@ async fn transition_factory_work_item(
     }))
 }
 
-async fn materialize_factory_mission(
+#[allow(clippy::too_many_arguments)]
+fn factory_materialization_operation_request(
+    title: &str,
+    description: &str,
+    preferred_adapter: Option<&str>,
+    preferred_model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    strategy: Option<&str>,
+    secret_refs: &[TaskSecretReference],
+    budget_tokens: Option<i64>,
+    budget_cost_microusd: Option<i64>,
+    deliverable: Option<&crony_domain::DeliverableSpec>,
+    contract: &FactoryMissionContract,
+    verification_policy: Option<&VerificationPolicy>,
+) -> serde_json::Value {
+    json!({
+        "title": title,
+        "description": description,
+        "preferred_adapter": preferred_adapter,
+        "preferred_model": preferred_model,
+        "reasoning_effort": reasoning_effort,
+        "strategy": strategy,
+        "secret_refs": secret_refs,
+        "budget_tokens": budget_tokens,
+        "budget_cost_microusd": budget_cost_microusd,
+        "deliverable": deliverable,
+        "contract": contract,
+        "verification_policy": verification_policy
+    })
+}
+
+fn factory_materialization_failure_detail(rejection: &str) -> String {
+    let sanitized = rejection
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = if sanitized.is_empty() {
+        "unspecified pre-mission validation error"
+    } else {
+        sanitized.as_str()
+    };
+    let mut detail =
+        format!("factory materialization rejected before mission creation: {sanitized}");
+    if detail.len() > 2_000 {
+        let mut end = 2_000;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+async fn preflight_factory_mission(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
-    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<MaterializeFactoryMissionRequest>,
-) -> Result<Json<MaterializeFactoryMissionResponse>, ApiError> {
-    let actor_id = authorize_actor(
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<PreflightFactoryMissionRequest>,
+) -> Result<Json<PreflightFactoryMissionResponse>, ApiError> {
+    authorize_actor(
         &state,
         &principal,
         corp_id,
@@ -1889,46 +1956,6 @@ async fn materialize_factory_mission(
         Permission::Operate,
     )
     .await?;
-    let operation_request = json!({
-        "title": &request.title,
-        "description": &request.description,
-        "preferred_adapter": &request.preferred_adapter,
-        "preferred_model": &request.preferred_model,
-        "reasoning_effort": &request.reasoning_effort,
-        "strategy": &request.strategy,
-        "secret_refs": &request.secret_refs,
-        "budget_tokens": request.budget_tokens,
-        "budget_cost_microusd": request.budget_cost_microusd,
-        "deliverable": &request.deliverable,
-        "contract": &request.contract,
-        "verification_policy": &request.verification_policy
-    });
-    let materialize_input = MaterializeFactoryMissionInput {
-        corp_id,
-        work_item_id,
-        actor_id,
-        claim_token: request.claim_token,
-        expected_version: request.expected_version,
-        idempotency_key: request.idempotency_key.clone(),
-        title: request.title.clone(),
-        description: request.description.clone(),
-        request: operation_request,
-    };
-    if let Some(outcome) = state
-        .store
-        .replay_factory_materialization(&materialize_input)
-        .await
-        .map_err(map_store_error)?
-    {
-        return Ok(Json(MaterializeFactoryMissionResponse {
-            mission_id: outcome.ids.mission_id,
-            task_id: outcome.ids.task_ids[0],
-            task_ids: outcome.ids.task_ids,
-            strategy: outcome.strategy,
-            work_item: outcome.work_item,
-            replayed: true,
-        }));
-    }
     let plan = plan_mission(
         &state,
         corp_id,
@@ -1949,11 +1976,149 @@ async fn materialize_factory_mission(
         },
     )
     .await?;
-    let outcome = state
+    let operation_request = factory_materialization_operation_request(
+        &request.title,
+        &request.description,
+        request.preferred_adapter.as_deref(),
+        request.preferred_model.as_deref(),
+        request.reasoning_effort.as_deref(),
+        request.strategy.as_deref(),
+        &request.secret_refs,
+        request.budget_tokens,
+        request.budget_cost_microusd,
+        request.deliverable.as_ref(),
+        &request.contract,
+        request.verification_policy.as_ref(),
+    );
+    let constrained_plan = state
         .store
-        .materialize_factory_mission(materialize_input, &plan)
+        .preflight_factory_mission(
+            PreflightFactoryMissionInput {
+                corp_id,
+                actor_id: request.actor_id,
+                source_repository_owner: request.source_repository_owner,
+                source_repository_name: request.source_repository_name,
+                policy: request.policy,
+                title: request.title,
+                description: request.description,
+                request: operation_request,
+            },
+            &plan,
+        )
         .await
         .map_err(map_store_error)?;
+    Ok(Json(PreflightFactoryMissionResponse {
+        valid: true,
+        strategy: constrained_plan.strategy,
+        task_count: constrained_plan.tasks.len(),
+        budget_tokens: constrained_plan.budget_tokens,
+        budget_cost_microusd: constrained_plan.budget_cost_microusd,
+    }))
+}
+
+async fn materialize_factory_mission(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MaterializeFactoryMissionRequest>,
+) -> Result<Json<MaterializeFactoryMissionResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let operation_request = factory_materialization_operation_request(
+        &request.title,
+        &request.description,
+        request.preferred_adapter.as_deref(),
+        request.preferred_model.as_deref(),
+        request.reasoning_effort.as_deref(),
+        request.strategy.as_deref(),
+        &request.secret_refs,
+        request.budget_tokens,
+        request.budget_cost_microusd,
+        request.deliverable.as_ref(),
+        &request.contract,
+        request.verification_policy.as_ref(),
+    );
+    let materialize_input = MaterializeFactoryMissionInput {
+        corp_id,
+        work_item_id,
+        actor_id,
+        claim_token: request.claim_token,
+        expected_version: request.expected_version,
+        idempotency_key: request.idempotency_key.clone(),
+        title: request.title.clone(),
+        description: request.description.clone(),
+        request: operation_request,
+    };
+    let replay = match state
+        .store
+        .replay_factory_materialization(&materialize_input)
+        .await
+    {
+        Ok(replay) => replay,
+        Err(error) => {
+            let error = map_store_error(error);
+            return Err(
+                reject_factory_materialization_error(&state, &materialize_input, error).await,
+            );
+        }
+    };
+    if let Some(outcome) = replay {
+        return Ok(Json(MaterializeFactoryMissionResponse {
+            mission_id: outcome.ids.mission_id,
+            task_id: outcome.ids.task_ids[0],
+            task_ids: outcome.ids.task_ids,
+            strategy: outcome.strategy,
+            work_item: outcome.work_item,
+            replayed: true,
+        }));
+    }
+    let plan = match plan_mission(
+        &state,
+        corp_id,
+        MissionPlanInput {
+            title: &request.title,
+            description: &request.description,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            deliverable: request.deliverable.as_ref(),
+            contract: Some(&request.contract),
+            verification_policy: request.verification_policy.as_ref(),
+            require_factory_manual_gate: true,
+        },
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(
+                reject_factory_materialization_error(&state, &materialize_input, error).await,
+            );
+        }
+    };
+    let outcome = match state
+        .store
+        .materialize_factory_mission(materialize_input.clone(), &plan)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error = map_store_error(error);
+            return Err(
+                reject_factory_materialization_error(&state, &materialize_input, error).await,
+            );
+        }
+    };
     for event in outcome.events {
         publish(&state, event);
     }
@@ -1965,6 +2130,64 @@ async fn materialize_factory_mission(
         work_item: outcome.work_item,
         replayed: outcome.replayed,
     }))
+}
+
+async fn reject_factory_materialization_error(
+    state: &AppState,
+    input: &MaterializeFactoryMissionInput,
+    error: ApiError,
+) -> ApiError {
+    if error.status == StatusCode::CONFLICT {
+        return error;
+    }
+    match persist_factory_materialization_rejection(state, input, &error.message).await {
+        Ok(()) => error,
+        Err(compensation) if compensation.status == StatusCode::CONFLICT => {
+            warn!(
+                work_item_id = %input.work_item_id,
+                original_error = %error.message,
+                compensation_error = %compensation.message,
+                "factory materialization rejection raced with a newer claim or mission"
+            );
+            error
+        }
+        Err(compensation) => ApiError::internal(format!(
+            "{}; additionally failed to persist materialization rejection: {}",
+            error.message, compensation.message
+        )),
+    }
+}
+
+async fn persist_factory_materialization_rejection(
+    state: &AppState,
+    input: &MaterializeFactoryMissionInput,
+    rejection: &str,
+) -> Result<(), ApiError> {
+    let request_digest = hex::encode(Sha256::digest(input.idempotency_key.as_bytes()));
+    let claim_digest = hex::encode(Sha256::digest(input.claim_token.as_bytes()));
+    let failure_detail = factory_materialization_failure_detail(rejection);
+    let outcome = state
+        .store
+        .reject_factory_materialization(RejectFactoryMaterializationInput {
+            corp_id: input.corp_id,
+            work_item_id: input.work_item_id,
+            actor_id: input.actor_id,
+            claim_token: input.claim_token,
+            attempted_version: input.expected_version,
+            idempotency_key: format!(
+                "materialize-rejected:{}:{}:{}",
+                input.expected_version,
+                &request_digest[..16],
+                &claim_digest[..16]
+            ),
+            failure_detail,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(state, event);
+    }
+    Ok(())
 }
 
 async fn get_pull_request_publication(
@@ -4474,7 +4697,8 @@ mod tests {
 
     use super::{
         apply_mission_contract, apply_mission_description, artifact_content_disposition,
-        capability_satisfies_requirement, enforce_factory_manual_gate, runner_requirement_mismatch,
+        capability_satisfies_requirement, enforce_factory_manual_gate,
+        factory_materialization_failure_detail, runner_requirement_mismatch,
     };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
@@ -4701,6 +4925,17 @@ mod tests {
             "line one\nline two\n\nTASK-SPECIFIC OBJECTIVE:\nProduce the role-specific output."
         );
         assert!(apply_mission_description(&mut plan, "bad\u{0007}value").is_err());
+    }
+
+    #[test]
+    fn factory_materialization_failure_detail_is_bounded_single_line_text() {
+        let detail =
+            factory_materialization_failure_detail(&format!("bad\r\n{}\u{0007}", "🙂".repeat(800)));
+        assert!(
+            detail.starts_with("factory materialization rejected before mission creation: bad ")
+        );
+        assert!(detail.len() <= 2_000);
+        assert!(!detail.chars().any(char::is_control));
     }
 
     #[test]
