@@ -542,7 +542,10 @@ recovery flow and executable evidence for both supported modes.
   record the defect, and do not claim recovery succeeded.
 - **Verifier-only recovery:** use this when the source and preserved checkpoint are correct. ECorp
   creates one provider-free verification run, checks the exact workspace fingerprint, reuses the
-  durable provider artifact, and preserves the existing head commit. A preserved run created before
+  durable provider artifact, and preserves the existing head commit. Automated checks run in a
+  bounded, ephemeral physical snapshot that excludes the worktree's `.git` control file; command or
+  test side effects are discarded with that snapshot. The runner fingerprints the preserved source
+  worktree again after verification and rejects a mismatch. A preserved run created before
   fingerprints existed first receives a runner-owned checkpoint command. That command verifies the
   managed worktree and head, records the full physical-workspace fingerprint, and starts no provider.
 - **Source-correction recovery:** use this when source bytes must change. First store a versioned
@@ -592,6 +595,13 @@ Publication is allowed only after:
 - current role, room membership, budget, breaker, source, and publication policy still authorize
   the effect; and
 - an owner or admin has created a short-lived publisher credential for the trusted publisher.
+
+For a result completed through verification recovery, review the source-issue provenance as two
+separate facts: `claimed_revision` is the immutable revision from the original factory claim, while
+`revision` is the effective reviewed revision from the completed recovery and `recovery_id` links
+that recovery. Without a completed recovery, `revision` equals `claimed_revision` and
+`recovery_id` is null. Do not rewrite the original claim or present the reviewed recovery revision
+as if it were the initially claimed source.
 
 ### Create a short-lived publisher credential
 

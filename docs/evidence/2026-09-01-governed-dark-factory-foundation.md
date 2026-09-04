@@ -197,6 +197,26 @@ and that a stalled GitHub mutation could outlive its lease. Provider-backed fact
 a manual verification gate, factory state exposes `awaiting_approval`, GitHub subprocesses are
 bounded, and the controller renews again immediately before each effect.
 
+## September 4, 2026 verification-recovery review hardening
+
+This narrow update records the regression coverage added during PR #143 review. It does not claim a
+new full repository gate or a completed recovery-to-publication remote-effect run.
+
+- Runner unit regression
+  `verifier_snapshot_is_physical_isolated_and_excludes_git_control` creates a physical snapshot,
+  verifies that `.git` is excluded, copies untracked and ignored source files, mutates the snapshot
+  without changing the preserved worktree, and verifies cleanup when the snapshot is dropped.
+- `tools/e2e_factory_verification_recovery.mjs` adds a direct-command verifier side effect. The
+  original run writes the source file once; verifier-only recovery runs the same command in the
+  ephemeral snapshot, and the assertion confirms the preserved source still contains the original
+  value. The runner fingerprints that preserved source after verification.
+- Store unit regression `publication_source_revision_links_completed_recovery` selects the reviewed
+  source revision and recovery ID for a completed recovery, and falls back to the original claimed
+  revision with a null recovery ID when publication does not follow recovery.
+- Publication provenance retains both `source_issue.claimed_revision` and the effective
+  `source_issue.revision`, plus `source_issue.recovery_id` when applicable. Revalidation compares
+  those fields with the currently selected verified recovery before allowing later effects.
+
 ## Browser evidence
 
 The live web application was exercised at `http://127.0.0.1:5187` in Chromium.

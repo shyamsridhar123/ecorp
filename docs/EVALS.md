@@ -268,11 +268,18 @@ verifies Markdown section boundaries for dependency and acceptance parsing.
 task, branch, and workspace lineage can recover after verification rejection. Its verifier-only
 case rejects evidence through an independent-review gate, replays the keyed decision, creates one
 `verification_only` run, emits zero provider session/output/artifact events, preserves the exact
-head commit, and reaches one verified factory item. Before recovery, the test removes the source
-run's fingerprint and provider-artifact relative path to reproduce a pre-0032 preserved run. It
-then proves the owning runner checkpoints the workspace without provider execution and resolves
-the legacy artifact by exact file name, bytes, and digest. Its source-correction case starts with an
-automated verifier failure, changes the fake GitHub issue revision, proves ordinary controller
+head commit, and reaches one verified factory item. A direct-command verifier writes a side-effect
+file during the original run and attempts to increment it during verifier-only recovery; the
+regression asserts the preserved source still contains the original value after recovery because
+the second command ran in the ephemeral physical snapshot. The runner then fingerprints the
+preserved source after verification. The
+`verifier_snapshot_is_physical_isolated_and_excludes_git_control` unit regression separately checks
+snapshot isolation, `.git` exclusion, cleanup, and copying of untracked and ignored source files.
+Before recovery, the E2E removes the source run's fingerprint and provider-artifact relative path
+to reproduce a pre-0032 preserved run. It then proves the owning runner checkpoints the workspace
+without provider execution and resolves the legacy artifact by exact file name, bytes, and digest.
+Its source-correction case starts with an automated verifier failure, changes the fake GitHub issue
+revision, proves ordinary controller
 replay is mutation-free and rejected, restarts only the test-owned server, stores a versioned
 contract revision, then injects a revoked scoped secret before dispatch. It proves that failure
 terminalizes the run and recovery, clears the active-recovery uniqueness fence, restores
@@ -404,6 +411,12 @@ Project-stage renewal is detected after Project refresh and before any Project m
 coverage detaches worktree HEAD and proves the validated branch still produces an importable bundle
 with no temporary ref left behind. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
+
+The `publication_source_revision_links_completed_recovery` store unit regression covers the
+recovery-aware provenance selection added during issue #113 review: a completed recovery selects
+its reviewed source revision and recovery ID, while a non-recovery publication retains the original
+claimed revision with a null recovery ID. This is unit coverage of provenance selection, not a new
+recovery-to-publication remote-effect claim.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,

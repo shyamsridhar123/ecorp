@@ -326,6 +326,13 @@ For a preserved run created before fingerprints existed, an authorized durable c
 first asks the owning runner to verify the managed worktree and verification-linked head, compute
 the fingerprint without starting a provider, and persist it on the original run.
 
+Verifier-only recovery executes automated checks against a bounded, ephemeral physical snapshot,
+not the preserved source worktree. The runner copies the admitted worktree contents into a unique
+temporary directory while excluding the worktree's `.git` control file and enforcing entry and byte
+ceilings. Command and test side effects therefore remain inside the snapshot, which is removed after
+verification. The runner fingerprints the preserved source worktree again after the checks and
+rejects the recovery if that authoritative checkpoint no longer matches.
+
 ## Planning and scheduling
 
 Mission decomposition is a replaceable server-side strategy, not a privileged singleton agent.
@@ -405,9 +412,10 @@ policy, attempt ceiling, and remaining budgets. `verification_failed -> running`
 through the generic transition endpoint.
 
 - `verifier_only` creates a run with `execution_mode=verification_only`, reuses the stored provider
-  artifact, starts no provider process, verifies the preserved workspace, and preserves an existing
-  commit when the source already has one. Legacy provider artifacts without relative-path metadata
-  are resolved only inside the preserved worktree by file name, exact byte count, and SHA-256.
+  artifact, and starts no provider process. It runs the verifier in the bounded physical snapshot,
+  fingerprints the preserved source worktree after verification, and preserves an existing commit
+  when the source already has one. Legacy provider artifacts without relative-path metadata are
+  resolved only inside the preserved worktree by file name, exact byte count, and SHA-256.
 - `source_correction` requires a versioned `resume` contract revision and resumes the exact provider
   session, branch, and workspace lineage. The revision can update reviewed issue text and verifier
   metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
@@ -643,6 +651,13 @@ links one verified factory work item and one ready commit/branch deliverable to 
 repository, base ref, branch, commit, pull-request title/body, source issue, explicit human
 authorization snapshot, and effect key. Attempts have independent publisher leases and fencing
 tokens; tokens never enter snapshots or events.
+
+When the selected verified run completed through factory verification recovery, publication
+provenance keeps the original claim and the reviewed recovery source distinct. The source issue's
+`claimed_revision` remains the revision captured by the factory claim, while `revision` records the
+effective reviewed revision observed by the completed recovery and `recovery_id` links that
+recovery. Without a completed recovery, both revisions are the claimed revision and `recovery_id`
+is null. Publication authority revalidation checks this tuple before later effects.
 
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
