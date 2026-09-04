@@ -540,7 +540,9 @@ The Factory workbench is also the selected work item's operational cockpit. It r
 item's mission, tasks, runs, pending action approvals, verification decisions, artifacts, and
 room messages into one context. Comments are persisted as room messages with a structured mission
 link; approval and verification actions continue to use their existing durable, role-gated
-decision endpoints rather than being inferred from conversation.
+decision endpoints rather than being inferred from conversation. When the selected item has an
+active run, the cockpit resolves its agent and control lease: an operator must explicitly take
+control before sending live direction, while collaborators without the lease can still comment.
 
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.

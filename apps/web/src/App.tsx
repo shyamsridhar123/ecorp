@@ -1460,6 +1460,9 @@ function FactoryPanel({
   room,
   messages,
   actors,
+  agents,
+  leases,
+  leaseTokens,
   selectedActor,
   actionApprovals,
   verificationRequests,
@@ -1469,6 +1472,8 @@ function FactoryPanel({
   onPostComment,
   onActionDecision,
   onVerificationDecision,
+  onClaimLease,
+  onSteer,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
@@ -1480,6 +1485,9 @@ function FactoryPanel({
   room: { id: string; name: string; purpose: string } | undefined
   messages: RoomMessage[]
   actors: Actor[]
+  agents: Agent[]
+  leases: Lease[]
+  leaseTokens: Record<string, string>
   selectedActor: Actor
   actionApprovals: ActionApproval[]
   verificationRequests: VerificationRequest[]
@@ -1498,8 +1506,11 @@ function FactoryPanel({
   }) => Promise<void>
   onActionDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
+  onClaimLease: (agent: Agent) => Promise<void>
+  onSteer: (agent: Agent, text: string, token: string | undefined) => Promise<void>
 }) {
   const [commentBody, setCommentBody] = useState('')
+  const [steerText, setSteerText] = useState('')
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
     if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
@@ -1519,6 +1530,18 @@ function FactoryPanel({
   const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
   const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
   const selectedRuns = runs.filter((run) => selectedTaskIds.has(run.task_id))
+  const activeRun = selectedRuns.find((run) =>
+    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval'].includes(
+      run.status,
+    ),
+  )
+  const activeAgent = agents.find((agent) => agent.id === activeRun?.agent_id)
+  const activeLease = leases.find((lease) => lease.agent_id === activeAgent?.id)
+  const activeLeaseToken = activeAgent
+    ? leaseTokens[leaseTokenKey(selectedActor.id, activeAgent.id)]
+    : undefined
+  const leaseHeldBySelectedActor =
+    activeLease?.actor_id === selectedActor.id && Boolean(activeLeaseToken)
   const selectedRunIds = new Set(selectedRuns.map((run) => run.id))
   const pendingActions = actionApprovals.filter(
     (approval) => selectedRunIds.has(approval.run_id) && approval.status === 'pending',
@@ -1877,6 +1900,70 @@ function FactoryPanel({
                             </button>
                           </form>
                         ) : null}
+                      </section>
+                      <section className="work-item-steer" aria-label="Live agent direction">
+                        <div className="factory-cockpit-heading">
+                          <span>Steer</span>
+                          <strong>{activeAgent?.name ?? 'No active agent'}</strong>
+                        </div>
+                        {activeAgent && activeRun ? (
+                          <>
+                            <p>
+                              Run {shortId(activeRun.id)} · {statusLabel(activeRun.status)}
+                            </p>
+                            {!activeLease ? (
+                              <button
+                                type="button"
+                                className="button button-secondary"
+                                disabled={busy}
+                                onClick={() => void onClaimLease(activeAgent)}
+                              >
+                                Take control
+                              </button>
+                            ) : leaseHeldBySelectedActor ? (
+                              <form
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  if (!steerText.trim()) return
+                                  void onSteer(
+                                    activeAgent,
+                                    steerText.trim(),
+                                    activeLeaseToken,
+                                  ).then(() => setSteerText(''))
+                                }}
+                              >
+                                <label htmlFor={`factory-steer-${selected.id}`}>
+                                  Direction from {selectedActor.name}
+                                </label>
+                                <textarea
+                                  id={`factory-steer-${selected.id}`}
+                                  rows={3}
+                                  value={steerText}
+                                  onChange={(event) => setSteerText(event.target.value)}
+                                  placeholder="Send live direction under your control lease."
+                                />
+                                <button
+                                  type="submit"
+                                  className="button button-primary"
+                                  disabled={busy || !steerText.trim()}
+                                >
+                                  Send direction
+                                </button>
+                              </form>
+                            ) : (
+                              <p className="factory-cockpit-empty">
+                                Controlled by{' '}
+                                {actors.find((actor) => actor.id === activeLease.actor_id)?.name ??
+                                  'another operator'}
+                                . Comments remain available without the control lease.
+                              </p>
+                            )}
+                          </>
+                        ) : (
+                          <p className="factory-cockpit-empty">
+                            Live direction appears here while an agent is running.
+                          </p>
+                        )}
                       </section>
                     </div>
                   ) : null}
@@ -5063,6 +5150,9 @@ function App() {
           room={room}
           messages={data.snapshot.room_messages}
           actors={data.snapshot.actors}
+          agents={data.snapshot.agents}
+          leases={data.snapshot.leases}
+          leaseTokens={leaseTokens}
           selectedActor={selectedActor}
           actionApprovals={data.snapshot.action_approvals}
           verificationRequests={data.snapshot.verification_requests}
@@ -5072,6 +5162,8 @@ function App() {
           onPostComment={postRoomMessage}
           onActionDecision={decideActionApproval}
           onVerificationDecision={decideVerification}
+          onClaimLease={claimLease}
+          onSteer={sendMessage}
         />
       </div>
 

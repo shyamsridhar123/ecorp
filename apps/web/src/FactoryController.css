@@ -108,7 +108,8 @@
 }
 
 .work-item-decisions,
-.work-item-comms {
+.work-item-comms,
+.work-item-steer {
   min-width: 0;
   padding: 14px;
   border: 1px solid var(--line);
@@ -176,9 +177,25 @@
   margin-top: 12px;
 }
 
-.work-item-comms textarea {
+.work-item-comms textarea,
+.work-item-steer textarea {
   width: 100%;
   resize: vertical;
+}
+
+.work-item-steer {
+  grid-column: 1 / -1;
+}
+
+.work-item-steer > p {
+  margin: 6px 0 12px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.work-item-steer form {
+  display: grid;
+  gap: 8px;
 }
 
 @media (max-width: 720px) {
