@@ -62,6 +62,20 @@ closed rather than claiming process-group containment. A release candidate must 
 the real Claude parent/grandchild probe recorded in
 `docs/evidence/2026-09-03-external-provider-process-tree.md`; unit success alone is insufficient.
 
+## External provider permission bridge
+
+The Claude Code adapter now uses Claude's supported stream-JSON `can_use_tool` request/response
+protocol, manual permission mode, and required initialize handshake to translate tool requests into
+durable ECorp approvals. Focused tests cover correlated allow/deny responses, bounded hashed
+approval context, contained-path auto-allow behavior, rejected and expired decisions, and
+provider-response write failure. See
+`docs/evidence/2026-09-03-claude-permission-bridge.md`.
+
+Together, the permission-bridge and process-tree evidence prove mediated tool authorization and
+fail-closed Windows descendant cleanup. Issue #51 continues to track isolated provider homes,
+inherited-environment allowlisting, stronger container isolation, and remaining real-provider
+recovery drills.
+
 ## Quality gates
 
 ```powershell
@@ -163,8 +177,12 @@ On September 1, 2026, one operator ran three enterprise-application scenarios th
 browser-to-server-to-runner path. VendorGuard passed 13 tests and its browser workflow; Incident
 Command passed 12 tests and its browser workflow; Credit Exception remained incomplete with 84
 failures and two errors. The pass exposed hard-breaker, budget-recovery, provider-isolation,
-permission-bridging, mission-contract, and portable-deliverable gaps. It is internal systems
-dogfood and does not satisfy the three-external-team requirement in GitHub issue #27. See
+permission-bridging, mission-contract, and portable-deliverable gaps at that time. Subsequent
+evidence below covers the landed breaker, budget-recovery, mission-contract, and portable-deliverable
+work. Claude permission mediation and fail-closed process-tree teardown have also landed.
+Provider-home isolation and the remaining real-world recovery drills remain tracked in #51.
+This is internal systems dogfood and does not satisfy the three-external-team requirement in GitHub
+issue #27. See
 `docs/evidence/2026-09-01-enterprise-application-dogfood.md`.
 
 The runner unit suite applies one provider-independent lifecycle conformance harness to the

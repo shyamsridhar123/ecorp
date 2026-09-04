@@ -13,7 +13,8 @@ Known development-only shortcuts:
 - fake process runs with the local user's permissions
 - no network sandbox
 
-These are explicit backlog items, not production claims.
+These gaps are tracked in ECorp Build GitHub Project #3 and linked issues, not in
+`docs/BACKLOG.md`, which is historical seed material only. They are not production claims.
 
 Claude Code is launched in safe mode without user plugins, hooks, MCP servers, browser integration,
 slash commands, or auto-memory. OpenCode uses its plugin-free `--pure` mode. These controls prevent

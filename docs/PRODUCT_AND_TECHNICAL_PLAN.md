@@ -4,7 +4,15 @@
 
 **Product name:** ECorp
 **Research snapshot:** August 29, 2026  
-**Recommendation:** Build a new greenfield repository. Do not fork either source project as the primary base.
+**Architecture decision:** ECorp is a greenfield modular monolith; neither reviewed source project
+is the primary base.
+**Operational planning:** [ECorp Build GitHub Project #3](https://github.com/users/shyamsridhar123/projects/3)
+and its linked issues are the current source of priorities, dependencies, and status.
+`docs/BACKLOG.md` is historical seed material only.
+
+The sections below preserve the product contract and original sequencing. Future-tense language
+describes design intent, not current implementation status. Use the dated implementation checkpoint
+and linked repository evidence for implemented behavior.
 
 ### Repositories reviewed
 
@@ -15,13 +23,15 @@
   - Local research checkout: `C:\Users\shyamsridhar\code\_research\buzz3`
   - Reviewed commit: `00e61eafa917d296104006576b7a2ddbfd58bb5a`
 
-### Implementation checkpoint — August 29, 2026
+### Implementation checkpoint - September 3, 2026
 
-- The greenfield repository, ADR set, Postgres event journal, server, runner, CLI, and React client
-  are operational.
+- The greenfield repository, ADR set, Postgres event journal, server, runner, CLI, React client, and
+  thin Tauri 2 desktop shell are operational.
 - The multiplayer vertical slice has durable rooms, replay, fenced control leases, runner grace,
   reconciliation, and duplicate-delivery protection.
-- The shared adapter contract and first real OpenAI Codex app-server adapter are implemented.
+- The shared adapter contract and current runner registry are implemented: deterministic
+  `fake-process`, OpenAI Codex app-server, GitHub Copilot through the official Rust SDK, and
+  normalized Claude Code and OpenCode external-CLI adapters.
 - Authenticated probes have validated live steer, interrupt, emergency stop, resume, usage, and
   evidence across the browser/server/runner/provider boundary.
 - Per-task Git worktree isolation now provisions deterministic branches, reuses the exact worktree
@@ -657,21 +667,25 @@ trait AgentAdapter {
 }
 ```
 
-## 8.3 Adapter order
+## 8.3 Adapter implementation preference
 
 1. Native protocol adapter
-2. ACP adapter
-3. Provider SDK adapter
-4. PTY adapter
+2. Official provider SDK adapter
+3. Structured external-CLI adapter
+4. PTY adapter when no structured interface exists
 5. Terminal-output parsing only as a degraded fallback
 
-Initial adapters:
+ACP remains the compatible client/editor boundary described in section 9. It is not ranked ahead
+of a richer provider-native runner interface.
 
-- OpenAI Codex — implemented with the native app-server JSON-RPC protocol
-- Claude Code
-- OpenCode
+Current runner adapters:
 
-Add Gemini, Copilot, Cursor, and others after the lifecycle contract is stable.
+- OpenAI Codex - implemented with the native app-server JSON-RPC protocol
+- GitHub Copilot - implemented with the official Rust SDK
+- Claude Code and OpenCode - implemented through the normalized external-CLI lifecycle contract
+- `fake-process` - deterministic offline systems fixture, not an inference provider
+
+Add Gemini, Cursor, and others after the lifecycle contract is stable.
 
 ## 8.4 Isolation
 
@@ -1110,9 +1124,12 @@ ecorp/
 
 ---
 
-# 17. Delivery plan
+# 17. Original delivery plan
 
 Assumption: one primary developer using coding agents, with periodic design and security review.
+
+This section preserves the initial sequencing baseline. It is not the live implementation queue;
+use the implementation checkpoint and ECorp Build Project #3 issues for current status.
 
 ## Phase 0: foundation decisions — week 1
 
@@ -1419,18 +1436,15 @@ This scenario proves implementation, multiplayer delivery, agent coordination, h
 
 ---
 
-# 23. Immediate next actions
+# 23. Operational planning
 
-1. Complete legal review of the ECorp name and original governance-slash mark.
-2. Approve the greenfield/modular-monolith direction.
-3. Create the `ecorp` repository.
-4. Initialize the repository with the structure in section 15.
-5. Add the eight ADRs before implementation.
-6. Build the fake-agent vertical slice before any provider-specific adapter.
-7. Implement the server-runner lease and event-resume path.
-8. Add one real Codex or Claude Code adapter.
-9. Demonstrate the two-browser control-leasing scenario.
-10. Only then implement the full office artwork and additional providers.
+ECorp Build GitHub Project #3 and its linked issues are the operational source of truth for current
+priorities, dependencies, and status. This document records the durable product and technical
+contract plus dated implementation checkpoints; it is not a live work queue.
+
+`docs/BACKLOG.md` remains historical seed material only. When an older checklist conflicts with a
+linked issue or current repository evidence, verify the implementation and update the Project or
+issue rather than treating the checklist as current status.
 
 ---
 
