@@ -983,6 +983,80 @@ body {
   white-space: pre-wrap;
 }
 
+.verification-policy-editor {
+  border-color: var(--line);
+  border-radius: 7px;
+  background: var(--surface-muted);
+}
+
+.verification-check-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 2px 0 4px;
+  overflow-x: auto;
+}
+
+.verification-check-tabs button {
+  display: grid;
+  grid-template-columns: auto auto;
+  flex: 0 0 auto;
+  min-height: 40px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px !important;
+  background: var(--paper-light);
+  box-shadow: none;
+}
+
+.verification-check-tabs button:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+
+.verification-check-tabs button span {
+  color: var(--cobalt-dark);
+  font-family: var(--mono) !important;
+  font-size: 10px !important;
+  font-weight: 650;
+}
+
+.verification-check-tabs button strong {
+  font-family: var(--body) !important;
+  font-size: 12px !important;
+  font-weight: 620;
+}
+
+.verification-check-tabs .check-tab-active,
+.verification-check-tabs button[aria-pressed="true"] {
+  color: var(--ink);
+  border-color: #d3a5ae;
+  background: var(--surface-selected);
+  box-shadow: inset 0 -3px 0 var(--cobalt) !important;
+}
+
+.verification-check-tabs .check-tab-active span,
+.verification-check-tabs button[aria-pressed="true"] span {
+  color: var(--cobalt-dark);
+}
+
+.verification-check-editor {
+  border-color: var(--line);
+  border-radius: 6px;
+  background: var(--paper-light);
+}
+
+.verification-check-editor legend {
+  color: var(--ink-soft);
+  font-family: var(--body) !important;
+  font-size: 12px !important;
+  font-weight: 620;
+  text-transform: none;
+}
+
 .task-graph-list {
   padding: 8px;
 }
