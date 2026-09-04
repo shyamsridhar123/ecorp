@@ -101,6 +101,13 @@ incompatible task contracts, and any mission that has already produced a run. Ne
 requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
 Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
 match the persisted policy ref before resolving or storing a commit.
+
+Factory-wide pause, resume, and reconciliation controls require an owner, admin, or manager and an
+expected controller version plus idempotency key. Members may inspect controller health but cannot
+change Corp-wide intake. Controller heartbeats are fenced by a rotating connection epoch, bounded
+lease, service actor, and Corp. A stale process cannot extend the active lease or complete another
+process's reconciliation generation. Controller status never exposes GitHub credentials or
+work-item claim tokens.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 

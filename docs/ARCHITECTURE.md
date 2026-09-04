@@ -523,6 +523,13 @@ ECorp Build GitHub Project #3 and its linked issues remain the planning and stat
 ECorp transitions. Pull-request publication, merge, and deployment are separate effects with
 separate authorization and idempotency boundaries. See ADR 0020.
 
+Factory controller configuration and health are persisted separately from individual work-item
+leases. A controller records its Project and repository scope, desired running or paused state,
+connection epoch, heartbeat lease, monotonic reconciliation generation, active work item, last
+result, and bounded failure detail. The browser derives `offline`, `watching`, `working`,
+`blocked`, and `needs decision` from this authoritative record and exposes versioned pause, resume,
+and reconciliation controls. Pausing intake never interrupts an existing mission.
+
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
 It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded

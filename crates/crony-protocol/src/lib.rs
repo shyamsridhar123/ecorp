@@ -1,8 +1,8 @@
 use crony_domain::{
-    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction,
-    PullRequestPublication, SourceDeliverable, TaskContract, TaskSecretReference,
-    VerificationPolicy,
+    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryController, FactoryWorkItem,
+    FactoryWorkItemState, MissionBudgetRevision, MissionContractRevision,
+    MissionContractRevisionAction, PullRequestPublication, SourceDeliverable, TaskContract,
+    TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -434,6 +434,68 @@ pub struct FactoryWorkItemResponse {
     pub work_item: FactoryWorkItem,
     pub claim_token: Option<Uuid>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureFactoryControllerRequest {
+    pub actor_id: Uuid,
+    pub controller_id: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub connection_epoch: Uuid,
+    #[serde(default = "default_factory_controller_lease_seconds")]
+    pub lease_seconds: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryControllerHeartbeatRequest {
+    pub actor_id: Uuid,
+    pub connection_epoch: Uuid,
+    #[serde(default = "default_factory_controller_lease_seconds")]
+    pub lease_seconds: i64,
+    pub active_work_item_id: Option<Uuid>,
+    pub completed_reconcile_generation: Option<i64>,
+    pub reconcile_result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryControllerControlAction {
+    Pause,
+    Resume,
+    Reconcile,
+}
+
+impl FactoryControllerControlAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlFactoryControllerRequest {
+    pub actor_id: Uuid,
+    pub expected_version: i64,
+    pub action: FactoryControllerControlAction,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryControllerResponse {
+    pub controller: FactoryController,
+    pub replayed: bool,
+}
+
+const fn default_factory_controller_lease_seconds() -> i64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

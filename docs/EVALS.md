@@ -264,6 +264,11 @@ title and persisted source marker from the fresh snapshot rather than following 
 mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
 verifies Markdown section boundaries for dependency and acceptance parsing.
 
+`tools/e2e_factory_controller_service.mjs` verifies durable controller registration and exact
+idempotent replay, owner-only configuration, manager-capable control, member denial, pause/resume,
+monotonic reconciliation generations, bounded failure text, blocked and watching projections,
+lease-expiry offline state, stale connection-epoch rejection, and reconnect recovery.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each

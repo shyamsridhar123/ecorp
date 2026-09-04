@@ -1,0 +1,116 @@
+.factory-controller-strip {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.25fr) minmax(260px, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin: 0 20px 18px;
+  padding: 16px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-left: 5px solid #64748b;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.factory-controller-strip > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.factory-controller-kicker {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.factory-controller-strip strong {
+  font-size: 18px;
+}
+
+.factory-controller-strip small {
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.factory-controller-strip dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(76px, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.factory-controller-strip dl div {
+  display: grid;
+  gap: 3px;
+}
+
+.factory-controller-strip dt {
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.factory-controller-strip dd {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.factory-controller-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.factory-controller-actions .button {
+  min-height: 44px;
+}
+
+.factory-controller-watching {
+  border-left-color: #16835b;
+}
+
+.factory-controller-working,
+.factory-controller-needs_decision {
+  border-left-color: #b66a00;
+}
+
+.factory-controller-blocked,
+.factory-controller-offline {
+  border-left-color: #b42318;
+}
+
+.factory-controller-paused {
+  border-left-color: #7356a5;
+}
+
+.factory-controller-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  color: #7a271a;
+  border: 1px solid #f0a69a;
+  border-radius: 8px;
+  background: #fff1ef;
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .factory-controller-strip {
+    grid-template-columns: 1fr;
+    margin: 0 12px 14px;
+  }
+
+  .factory-controller-actions {
+    justify-content: stretch;
+  }
+
+  .factory-controller-actions .button {
+    flex: 1 1 160px;
+  }
+}

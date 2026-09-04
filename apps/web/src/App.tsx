@@ -411,6 +411,27 @@ type FactoryWorkItem = {
   failure_detail: string | null
 }
 
+type FactoryController = {
+  id: string
+  service_actor_id: string
+  configured_by: string
+  source_project_owner: string
+  source_project_number: number
+  source_repository_owner: string
+  source_repository_name: string
+  desired_state: 'running' | 'paused'
+  status: 'offline' | 'watching' | 'working' | 'blocked' | 'needs_decision'
+  version: number
+  lease_expires_at: string
+  last_heartbeat_at: string
+  reconcile_generation: number
+  completed_reconcile_generation: number
+  active_work_item_id: string | null
+  last_reconciled_at: string | null
+  last_reconcile_result: 'succeeded' | 'failed' | null
+  last_error: string | null
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -500,6 +521,7 @@ type SnapshotResponse = {
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
+    factory_controllers?: FactoryController[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -1432,11 +1454,22 @@ function FactoryPanel({
   missions,
   publications,
   publicationAttempts,
+  controllers,
+  canControlFactory,
+  busy,
+  onControllerControl,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
   publications: PullRequestPublication[]
   publicationAttempts: PullRequestPublicationAttempt[]
+  controllers: FactoryController[]
+  canControlFactory: boolean
+  busy: boolean
+  onControllerControl: (
+    controller: FactoryController,
+    action: 'pause' | 'resume' | 'reconcile',
+  ) => void
 }) {
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
@@ -1460,6 +1493,10 @@ function FactoryPanel({
   const selectedAttempts = publicationAttempts
     .filter((attempt) => attempt.publication_id === selectedPublication?.id)
     .sort((left, right) => right.attempt - left.attempt)
+  const controller = controllers[0]
+  const controllerState = controller?.desired_state === 'paused'
+    ? 'paused'
+    : controller?.status ?? 'not_configured'
 
   return (
     <section
@@ -1482,6 +1519,78 @@ function FactoryPanel({
           <span>auto-merge off</span>
         </div>
       </div>
+      <section
+        className={`factory-controller-strip factory-controller-${controllerState}`}
+        aria-label="Factory controller status"
+      >
+        <div>
+          <span className="factory-controller-kicker">Controller</span>
+          <strong>{statusLabel(controllerState)}</strong>
+          <small>
+            {controller
+              ? `${controller.source_project_owner} / Project #${controller.source_project_number} · ${controller.source_repository_owner}/${controller.source_repository_name}`
+              : 'No trusted factory watcher has registered with this Corp.'}
+          </small>
+        </div>
+        {controller ? (
+          <>
+            <dl>
+              <div>
+                <dt>Heartbeat</dt>
+                <dd>{time(controller.last_heartbeat_at)}</dd>
+              </div>
+              <div>
+                <dt>Reconciled</dt>
+                <dd>
+                  {controller.last_reconciled_at
+                    ? time(controller.last_reconciled_at)
+                    : 'Not yet'}
+                </dd>
+              </div>
+              <div>
+                <dt>Generation</dt>
+                <dd>
+                  {controller.completed_reconcile_generation}/
+                  {controller.reconcile_generation}
+                </dd>
+              </div>
+            </dl>
+            <div className="factory-controller-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                disabled={busy || !canControlFactory}
+                onClick={() =>
+                  onControllerControl(
+                    controller,
+                    controller.desired_state === 'paused' ? 'resume' : 'pause',
+                  )
+                }
+              >
+                {controller.desired_state === 'paused' ? 'Resume intake' : 'Pause intake'}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={busy || !canControlFactory}
+                onClick={() => onControllerControl(controller, 'reconcile')}
+              >
+                Reconcile now
+              </button>
+            </div>
+          </>
+        ) : (
+          <p>
+            Configure the trusted controller process to make Factory actively watch GitHub
+            Project intake.
+          </p>
+        )}
+        {controller?.last_error ? (
+          <p className="factory-controller-error" role="alert">
+            {controller.last_error}
+          </p>
+        ) : null}
+      </section>
       <div className={`factory-console ${items.length ? '' : 'factory-console-empty'}`}>
         {items.length ? (
           <>
@@ -4305,6 +4414,41 @@ function App() {
     }
   }
 
+  const controlFactoryController = async (
+    controller: FactoryController,
+    action: 'pause' | 'resume' | 'reconcile',
+  ) => {
+    if (!bootstrap || !selectedActor) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(
+        `/api/corps/${bootstrap.corp_id}/factory/controllers/${controller.id}/control`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            actor_id: selectedActor.id,
+            expected_version: controller.version,
+            action,
+            idempotency_key: crypto.randomUUID(),
+          }),
+        },
+      )
+      await refresh(bootstrap.corp_id, selectedActor.id)
+      setAnnouncement(
+        action === 'pause'
+          ? 'Factory intake paused. Active missions continue.'
+          : action === 'resume'
+            ? 'Factory intake resumed and reconciliation requested.'
+            : 'Factory reconciliation requested.',
+      )
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const connectProduction = async (event: FormEvent) => {
     event.preventDefault()
     const corpId = connectionCorpId.trim()
@@ -4717,6 +4861,10 @@ function App() {
           missions={data.snapshot.missions}
           publications={data.snapshot.pull_request_publications}
           publicationAttempts={data.snapshot.pull_request_publication_attempts}
+          controllers={data.snapshot.factory_controllers ?? []}
+          canControlFactory={['owner', 'admin', 'manager'].includes(selectedActor.role)}
+          busy={busy}
+          onControllerControl={controlFactoryController}
         />
       </div>
 

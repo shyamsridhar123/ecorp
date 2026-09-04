@@ -334,6 +334,32 @@ pub struct FactoryWorkItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryController {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub service_actor_id: Uuid,
+    pub configured_by: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub desired_state: String,
+    pub status: String,
+    pub version: i64,
+    pub lease_expires_at: DateTime<Utc>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub reconcile_generation: i64,
+    pub completed_reconcile_generation: i64,
+    pub active_work_item_id: Option<Uuid>,
+    pub reconcile_started_at: Option<DateTime<Utc>>,
+    pub last_reconciled_at: Option<DateTime<Utc>>,
+    pub last_reconcile_result: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContract {
     pub objective: String,
     pub expected_output: String,
@@ -909,6 +935,8 @@ pub struct CorpSnapshot {
     pub circuit_breaker_incidents: Vec<CircuitBreakerIncident>,
     #[serde(default)]
     pub factory_work_items: Vec<FactoryWorkItem>,
+    #[serde(default)]
+    pub factory_controllers: Vec<FactoryController>,
     pub events: Vec<DomainEvent>,
 }
 

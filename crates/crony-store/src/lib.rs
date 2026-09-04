@@ -4,10 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
-    Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem,
-    FactoryWorkItemState, ManualVerificationGate, Mission, MissionBudgetRevision,
-    MissionContractRevision, MissionContractRevisionAction, MissionStatus, NewEvent,
-    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink,
+    FactoryController, FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, Mission,
+    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction, MissionStatus,
+    NewEvent, PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
     VerificationRequest, VerifierCheck, repository_relative_path_is_valid, write_scope_allows_path,
@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod budget_revision;
 mod contract_revision;
+mod factory_controller;
 mod publication;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -99,6 +100,50 @@ pub struct FactorySourceInput {
     pub issue_url: String,
     pub title: String,
     pub revision: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigureFactoryControllerInput {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub controller_id: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub connection_epoch: Uuid,
+    pub lease_seconds: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeartbeatFactoryControllerInput {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub controller_id: Uuid,
+    pub connection_epoch: Uuid,
+    pub lease_seconds: i64,
+    pub active_work_item_id: Option<Uuid>,
+    pub completed_reconcile_generation: Option<i64>,
+    pub reconcile_result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlFactoryControllerInput {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub controller_id: Uuid,
+    pub expected_version: i64,
+    pub action: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryControllerOutcome {
+    pub controller: FactoryController,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1202,6 +1247,10 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM factory_controllers WHERE corp_id = $1")
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM factory_work_items WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1733,6 +1782,60 @@ impl PgStore {
         .map(map_factory_work_item)
         .collect::<Result<Vec<_>>>()?;
 
+        let factory_controllers = sqlx::query(
+            r#"
+            SELECT controller.id, controller.corp_id, controller.service_actor_id,
+                   controller.configured_by, controller.source_project_owner,
+                   controller.source_project_number, controller.source_repository_owner,
+                   controller.source_repository_name, controller.desired_state,
+                   controller.version, controller.lease_expires_at,
+                   controller.last_heartbeat_at, controller.reconcile_generation,
+                   controller.completed_reconcile_generation,
+                   controller.active_work_item_id, controller.reconcile_started_at,
+                   controller.last_reconciled_at, controller.last_reconcile_result,
+                   controller.last_error, controller.created_at, controller.updated_at,
+                   EXISTS (
+                       SELECT 1
+                       FROM factory_work_items item
+                       JOIN tasks task ON task.mission_id = item.mission_id
+                       JOIN runs run ON run.task_id = task.id
+                       WHERE item.id = controller.active_work_item_id
+                         AND (
+                             EXISTS (
+                                 SELECT 1
+                                 FROM action_approvals approval
+                                 WHERE approval.run_id = run.id
+                                   AND approval.status = 'pending'
+                             )
+                             OR EXISTS (
+                                 SELECT 1
+                                 FROM verification_requests request
+                                 WHERE request.run_id = run.id
+                                   AND request.status = 'pending'
+                             )
+                         )
+                   ) AS needs_decision
+            FROM factory_controllers controller
+            WHERE controller.corp_id = $1
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $2
+                    AND viewer.corp_id = controller.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            ORDER BY controller.created_at
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(factory_controller::map_factory_controller)
+        .collect();
+
         let mut events = sqlx::query(
             r#"
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
@@ -1781,6 +1884,7 @@ impl PgStore {
             action_approvals,
             circuit_breaker_incidents,
             factory_work_items,
+            factory_controllers,
             events,
         };
         tx.commit().await?;

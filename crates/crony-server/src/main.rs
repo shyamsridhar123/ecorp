@@ -33,17 +33,18 @@ use crony_domain::{
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
+    ConfigureFactoryControllerRequest, ControlFactoryControllerRequest,
     CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
     CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
     CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
     CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
     DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
-    EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
-    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
-    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
-    MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, PreflightFactoryMissionRequest,
+    EmergencyStopResponse, FactoryControllerHeartbeatRequest, FactoryControllerResponse,
+    FactoryMissionContract, FactoryPublicationContextResponse, FactoryWorkItemResponse,
+    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
+    LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    MissionBudgetRevisionResponse, MissionContractRevisionResponse, PreflightFactoryMissionRequest,
     PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
@@ -56,10 +57,11 @@ use crony_protocol::{
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
-    DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
-    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
-    PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
+    ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput, ControlFactoryControllerInput,
+    CreateMissionContractRevisionInput, DecideMissionBudgetRevisionInput, FactorySourceInput,
+    HeartbeatFactoryControllerInput, LaunchRecord, MaterializeFactoryMissionInput,
+    MissionFinishScopeInput, NewRoomMessageInput, PendingRunnerCommand, PgStore,
+    PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
     RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
     RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
@@ -439,6 +441,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers",
+            post(configure_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/heartbeat",
+            post(heartbeat_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/control",
+            post(control_factory_controller),
         )
         .route(
             "/api/corps/{corp_id}/factory/preflight",
@@ -1766,6 +1780,118 @@ async fn lookup_factory_work_items(
         .map_err(map_store_error)?;
     let total_count = items.len();
     Ok(Json(LookupFactoryWorkItemsResponse { items, total_count }))
+}
+
+async fn configure_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<ConfigureFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .configure_factory_controller(ConfigureFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id: request.controller_id,
+            source_project_owner: request.source_project_owner,
+            source_project_number: request.source_project_number,
+            source_repository_owner: request.source_repository_owner,
+            source_repository_name: request.source_repository_name,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn heartbeat_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<FactoryControllerHeartbeatRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .heartbeat_factory_controller(HeartbeatFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            active_work_item_id: request.active_work_item_id,
+            completed_reconcile_generation: request.completed_reconcile_generation,
+            reconcile_result: request.reconcile_result,
+            error: request.error,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: false,
+    }))
+}
+
+async fn control_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ControlFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .control_factory_controller(ControlFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            expected_version: request.expected_version,
+            action: request.action.as_str().to_owned(),
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
 }
 
 async fn renew_factory_work_item(
