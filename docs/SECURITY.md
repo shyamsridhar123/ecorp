@@ -12,7 +12,6 @@ Known development-only shortcuts:
 - permissive CORS
 - fake process runs with the local user's permissions
 - no network sandbox
-- external CLI adapters do not yet have fail-closed, verified complete descendant-process cleanup
 
 These gaps are tracked in ECorp Build GitHub Project #3 and linked issues, not in
 `docs/BACKLOG.md`, which is historical seed material only. They are not production claims.
@@ -23,9 +22,8 @@ the customization leakage observed during the September 1, 2026 enterprise dogfo
 are only a partial boundary. Claude's supported stdio permission control protocol, manual
 permission mode, and required initialize handshake now translate
 tool requests to durable ECorp approvals without permission bypass, terminal scraping, or custom
-stdin messages. GitHub issue #51 still tracks isolated provider homes and inherited-environment
-allowlisting. Issue #124 tracks bounded fail-closed teardown, truthful terminal claims, and
-complete process-tree verification.
+stdin messages. GitHub issue #51 still tracks isolated provider homes, inherited-environment
+allowlisting, stronger container isolation, and remaining real-provider recovery drills.
 
 Production mode validates OIDC bearer tokens against the configured issuer's UserInfo endpoint and
 maps `(issuer, subject)` to a Corp-local human actor. Claimed actor IDs cannot override that mapping.
@@ -124,6 +122,19 @@ approval text records bounded field metadata and SHA-256 hashes. Approval return
 input only to the correlated provider request. Rejection and expiry return a bounded denial;
 duplicate, unknown, cancelled, or mismatched requests fail closed, and a failed control-response
 write fails the provider run.
+
+External CLI provider roots are owned as complete process scopes rather than supervised as single
+PIDs. Windows uses a private kill-on-close Job Object assigned while the provider is still
+suspended. If assignment or resume setup fails, the suspended child remains under cleanup
+supervision until its death is verified. Every terminal path invokes the same bounded
+terminate-and-verify attempt and retries without dropping ownership when verification is uncertain.
+The adapter does not return until the provider root is reaped and the owned scope reports no active
+descendants. This prevents provider tools, plugin processes, or grandchildren from surviving an
+interrupt while ECorp reports `provider_process_alive=false`. Unix external CLI adapters are
+disabled because `setsid` or `setpgid` alone cannot prevent descendants from escaping the owned
+scope. Timed-out availability probes retain one shared cleanup guardian per adapter and reject
+duplicate probes until that guardian finishes, preventing unbounded detached cleanup tasks. This is
+host-process containment, not a network or filesystem sandbox.
 
 Mission descriptions, task contracts, and verifier policies are authority-bearing records.
 Creation validates their bounds before persistence, and every revision stores both prior and

@@ -6067,6 +6067,27 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            "run.teardown_uncertain" => {
+                let process_state = payload
+                    .get("provider_process_state")
+                    .and_then(Value::as_str);
+                if process_state != Some("unverified") {
+                    return Err(anyhow!(
+                        "teardown uncertainty must report an unverified provider process state"
+                    ));
+                }
+                let detail = payload
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .context("teardown uncertainty omitted detail")?;
+                sqlx::query(
+                    "UPDATE runs SET workspace_disposition = 'preserved', workspace_detail = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(detail)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             "run.workspace_preserved" | "run.workspace_removed" => {
                 let disposition = if event_type == "run.workspace_removed" {
                     "removed"
@@ -10723,6 +10744,7 @@ mod tests {
             for event_type in [
                 "run.output",
                 "run.usage",
+                "run.teardown_uncertain",
                 "run.session_terminated",
                 "run.failed",
                 "run.cancelled",

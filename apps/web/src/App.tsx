@@ -4,6 +4,8 @@ import './App.css'
 import './Arcade.css'
 import './Cabinet.css'
 import './World.css'
+import './Accessible.css'
+import { AgentSprite } from './AgentSprite'
 
 type Actor = {
   id: string
@@ -638,15 +640,6 @@ const OFFICE_POSITIONS = [
   { x: 78, y: 72 },
 ] as const
 
-const OFF_SHIFT_POSITIONS = [
-  { x: 12, y: 74 },
-  { x: 28, y: 82 },
-  { x: 45, y: 76 },
-  { x: 61, y: 84 },
-  { x: 78, y: 77 },
-  { x: 88, y: 68 },
-] as const
-
 function adapterLabel(adapter: string): string {
   if (adapter === 'github-copilot') return 'GitHub Copilot'
   if (adapter === 'codex') return 'OpenAI Codex'
@@ -666,9 +659,18 @@ function adapterDescription(adapter: string): string {
 }
 
 function agentStatusLabel(agent: Agent): string {
-  if (agent.status === 'idle' && !agent.current_run_id) return 'available · off shift'
+  if (agent.status === 'idle' && !agent.current_run_id) return 'idle'
   if (agent.status === 'offline') return 'runner unavailable'
   return agent.status
+}
+
+function agentVisualStateLabel(agent: Agent): string {
+  if (agent.status === 'idle') return 'Idle'
+  if (agent.status === 'starting') return 'Starting'
+  if (agent.status === 'working') return 'Working'
+  if (agent.status === 'reviewing') return 'Review ready'
+  if (agent.status === 'blocked') return 'Needs approval'
+  return 'Offline'
 }
 
 function statusLabel(value: string): string {
@@ -1468,7 +1470,7 @@ function FactoryPanel({
     >
       <div className="panel-heading factory-heading">
         <div>
-          <span className="section-code">DARK FACTORY / 02</span>
+          <span className="section-code">Factory</span>
           <h2>Governed issue intake</h2>
           <p>
             GitHub work enters one fenced lane, becomes one mission, and advances only on evidence.
@@ -1480,7 +1482,7 @@ function FactoryPanel({
           <span>auto-merge off</span>
         </div>
       </div>
-      <div className="factory-console">
+      <div className={`factory-console ${items.length ? '' : 'factory-console-empty'}`}>
         {items.length ? (
           <>
             <nav className="factory-queue" aria-label="Factory work items">
@@ -1704,23 +1706,7 @@ function AgentAvatar({ agent }: { agent: Agent }) {
       aria-hidden="true"
     >
       <span className="sprite-shadow" />
-      <span className="sprite-person">
-        <span className="sprite-head">
-          <span className="sprite-hair" />
-          <span className="sprite-face">
-            <i className="sprite-eye sprite-eye-left" />
-            <i className="sprite-eye sprite-eye-right" />
-          </span>
-          <span className="sprite-headset" />
-        </span>
-        <span className="sprite-body">
-          <span className="sprite-badge" />
-        </span>
-        <span className="sprite-arm sprite-arm-left" />
-        <span className="sprite-arm sprite-arm-right" />
-        <span className="sprite-leg sprite-leg-left" />
-        <span className="sprite-leg sprite-leg-right" />
-      </span>
+      <AgentSprite agentId={agent.id} />
       <span className="sprite-signal" />
     </div>
   )
@@ -1780,22 +1766,10 @@ function OfficeFloor({
       </div>
       {agents.map((agent) => {
         const index = agents.findIndex((candidate) => candidate.id === agent.id)
-        const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
-        const offShift = OFF_SHIFT_POSITIONS[index % OFF_SHIFT_POSITIONS.length]
-        const destination =
-          agent.status === 'blocked'
-            ? { x: 83, y: 39 }
-            : agent.status === 'reviewing'
-              ? { x: 48 + (index % 2) * 8, y: 38 }
-              : agent.status === 'offline'
-                ? { x: 91, y: 78 - (index % 3) * 7 }
-                : agent.status === 'idle'
-                  ? offShift
-                  : home
+        const destination = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
         const style = {
           '--agent-x': `${destination.x}%`,
           '--agent-y': `${destination.y}%`,
-          '--agent-delay': `${index * -0.37}s`,
         } as CSSProperties
         return (
           <button
@@ -1822,7 +1796,10 @@ function OfficeFloor({
             <AgentAvatar agent={agent} />
             <span className="sprite-name">
               <StatusMark status={agent.status} />
-              {agent.name}
+              <span className="sprite-name-copy">
+                <strong>{agent.name}</strong>
+                <small>{agentVisualStateLabel(agent)}</small>
+              </span>
             </span>
           </button>
         )
@@ -3276,7 +3253,7 @@ function RoomPanel({
       <section className="room-panel panel" id="room" tabIndex={-1}>
         <div className="panel-heading">
           <div>
-            <span className="section-code">SECURE COMMS / 03</span>
+            <span className="section-code">Project room</span>
             <h2>No room access</h2>
             <p>{selectedActor.name} is not a member of this project room.</p>
           </div>
@@ -3345,7 +3322,7 @@ function RoomPanel({
     >
       <div className="panel-heading">
         <div>
-          <span className="section-code">SECURE COMMS / 03</span>
+          <span className="section-code">Project room</span>
           <h2>{room.name} channel</h2>
           <p>Every human and agent message is durable, attributable, and linked to the work.</p>
         </div>
@@ -4493,19 +4470,22 @@ function App() {
 
   return (
     <main className={`app-shell view-${activeWorkspaceView}`} aria-busy={busy}>
+      <a className="skip-link" href={`#${activeWorkspaceView}`}>
+        Skip to workspace
+      </a>
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {announcement}
       </div>
       <header className="topbar">
         <div className="brand-lockup">
-          <span className="brand-kicker">Human + agent operations</span>
+          <span className="brand-kicker">Collaborative agent operations</span>
           <div className="brand-row">
             <span className="brand-mark" aria-hidden="true">
               <span className="brand-e">E</span>
               <span className="brand-slash" />
             </span>
             <h1><span>E</span>CORP</h1>
-            <span className="alpha-stamp">1P READY</span>
+            <span className="alpha-stamp">Local preview</span>
           </div>
         </div>
         <div className="operator-console">
@@ -4562,7 +4542,7 @@ function App() {
 
       <section className="arcade-command-deck" aria-label="Operations overview">
         <div className="arcade-command-focus">
-          <span>Cabinet</span>
+          <span>Workspace</span>
           <strong>{currentWorkspaceView.label}</strong>
           <small>{currentWorkspaceView.description}</small>
         </div>
@@ -4601,7 +4581,7 @@ function App() {
       <section className="journey-panel" hidden={!journeyOpen}>
         <div className="journey-heading">
           <div>
-            <span className="section-code">START HERE</span>
+            <span className="section-code">Getting started</span>
             <h2>From repository to verified result</h2>
           </div>
           <p>
@@ -4756,15 +4736,15 @@ function App() {
         >
           <div className="panel-heading world-titleplate">
             <div>
-              <span className="section-code">LIVE FLOOR</span>
+              <span className="section-code">Live agents</span>
               <h2>{room?.name ?? 'Automation division'}</h2>
               <p>Authoritative crew state. Select a sprite to inspect or take control.</p>
             </div>
             <div className="floor-legend">
-              <span><StatusMark status="idle" /> off shift</span>
-              <span><StatusMark status="working" /> active</span>
-              <span><StatusMark status="reviewing" /> review</span>
-              <span><StatusMark status="blocked" /> blocked</span>
+              <span><StatusMark status="idle" /> idle</span>
+              <span><StatusMark status="working" /> working</span>
+              <span><StatusMark status="reviewing" /> review ready</span>
+              <span><StatusMark status="blocked" /> needs approval</span>
             </div>
           </div>
           <div className="floor-plan">
@@ -4790,7 +4770,10 @@ function App() {
                   }}
                 >
                   <span>{String(index + 1).padStart(2, '0')}</span>
-                  <strong>{agent.name}</strong>
+                  <span className="crew-agent-copy">
+                    <strong>{agent.name}</strong>
+                    <small>{agentVisualStateLabel(agent)}</small>
+                  </span>
                   <StatusMark status={agent.status} />
                 </button>
               ))}
@@ -4804,7 +4787,7 @@ function App() {
                   tabIndex={-1}
                   onClick={() => setFloorInspectorOpen(false)}
                 />
-                <aside className="world-inspector" aria-label={`${selectedAgent.name} command HUD`}>
+                <aside className="world-inspector" aria-label={`${selectedAgent.name} details and controls`}>
                   <button
                     type="button"
                     className="world-inspector-close"
@@ -4842,7 +4825,7 @@ function App() {
         >
           <div className="panel-heading">
             <div>
-              <span className="section-code">MISSION CONTROL / 02</span>
+              <span className="section-code">Missions</span>
               <h2>Authorize work</h2>
               <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
             </div>
@@ -4850,8 +4833,8 @@ function App() {
           {missionComposerCollapsed ? (
             <div className="arcade-new-mission-bar">
               <div>
-                <span>MISSION SLOT READY</span>
-                <strong>Launch another quest</strong>
+                <span>Ready for work</span>
+                <strong>Create another mission</strong>
                 <small>The active mission log stays below.</small>
               </div>
               <button
@@ -4869,9 +4852,9 @@ function App() {
           <form className="mission-form arcade-mission-form" onSubmit={createMission}>
             <div className="arcade-composer-header">
               <div>
-                <span className="arcade-ready">1P READY</span>
+                <span className="arcade-ready">Mission setup</span>
                 <strong>New mission</strong>
-                <small>Brief it. Load it. Prove it.</small>
+                <small>Define the outcome, runtime, and verification.</small>
               </div>
               <div className="arcade-score" aria-label="Mission configuration status">
                 <span>SPEC</span>
@@ -4884,8 +4867,8 @@ function App() {
             <nav className="mission-stage-nav" aria-label="Mission setup stages">
               {[
                 ['brief', '01', 'Mission'],
-                ['loadout', '02', 'Loadout'],
-                ['proof', '03', 'Win conditions'],
+                ['loadout', '02', 'Run setup'],
+                ['proof', '03', 'Verification'],
               ].map(([step, number, label]) => (
                 <button
                   key={step}
@@ -4906,7 +4889,7 @@ function App() {
               {missionComposerStep === 'brief' ? (
                 <div className="mission-stage-content stage-brief">
                   <div className="stage-title">
-                    <span>Mission select</span>
+                    <span>Mission brief</span>
                     <h3>Name the outcome</h3>
                     <p>Give the crew one clear objective, then attach the full specification.</p>
                   </div>
@@ -4955,8 +4938,8 @@ function App() {
               {missionComposerStep === 'loadout' ? (
                 <div className="mission-stage-content stage-loadout">
                   <div className="stage-title">
-                    <span>Choose your fighter</span>
-                    <h3>Set the execution loadout</h3>
+                    <span>Run configuration</span>
+                    <h3>Choose how the work runs</h3>
                     <p>Pick the runtime, budget, delivery format, and orchestration pattern.</p>
                   </div>
                   <div className="loadout-grid">
@@ -5075,7 +5058,7 @@ function App() {
                       </div>
                     ) : null}
                     <div className="mission-field">
-                      <label htmlFor="mission-deliverable">Prize</label>
+                      <label htmlFor="mission-deliverable">Deliverable</label>
                       <select
                         id="mission-deliverable"
                         value={missionDeliverable}
@@ -5096,7 +5079,7 @@ function App() {
                       <small>Portable source bytes, never a runner-local path.</small>
                     </div>
                     <div className="mission-field">
-                      <label htmlFor="mission-strategy">Formation</label>
+                      <label htmlFor="mission-strategy">Execution strategy</label>
                       <select
                         id="mission-strategy"
                         value={missionStrategy}
@@ -5159,7 +5142,7 @@ function App() {
                         }}
                       />
                       <span>
-                        <strong>Debug cartridges</strong>
+                        <strong>Developer fixtures</strong>
                         <small>Expose deterministic lifecycle fixtures.</small>
                       </span>
                     </label>
@@ -5170,8 +5153,8 @@ function App() {
               {missionComposerStep === 'proof' ? (
                 <div className="mission-stage-content stage-proof">
                   <div className="stage-title">
-                    <span>Boss rules</span>
-                    <h3>Define the win conditions</h3>
+                    <span>Verification policy</span>
+                    <h3>Define completion evidence</h3>
                     <p>Only the active contract panel is shown. The persisted plan stays inspectable.</p>
                   </div>
                   <div className="contract-tab-shell">
@@ -5291,7 +5274,7 @@ function App() {
                       }}
                     />
                     <span>
-                      <strong>Custom victory gates</strong>
+                      <strong>Custom verification</strong>
                       <small>Run exact file, test, schema, screenshot, and reviewer checks.</small>
                     </span>
                   </label>
@@ -5307,9 +5290,9 @@ function App() {
                     </small>
                   ) : (
                     <div className="default-gate-callout">
-                      <span>DEFAULT GATE</span>
+                      <span>Default verification</span>
                       <strong>Provider artifact must exist</strong>
-                      <small>Turn on custom victory gates for application-level proof.</small>
+                      <small>Turn on custom verification for application-level proof.</small>
                     </div>
                   )}
                 </div>
@@ -5337,7 +5320,7 @@ function App() {
                   disabled={!missionTitle.trim()}
                   onClick={() => setMissionComposerStep('loadout')}
                 >
-                  Select loadout
+                  Configure run
                 </button>
               ) : null}
               {missionComposerStep === 'loadout' ? (
@@ -5347,7 +5330,7 @@ function App() {
                   disabled={!effectiveMissionAdapter}
                   onClick={() => setMissionComposerStep('proof')}
                 >
-                  Set win conditions
+                  Set verification
                 </button>
               ) : null}
               {missionComposerStep === 'proof' ? (
@@ -5362,7 +5345,7 @@ function App() {
                   }
                 >
                   {busy
-                    ? 'Loading mission'
+                    ? 'Starting mission'
                     : pauseAfterPlanning
                       ? 'Create mission plan'
                       : 'Launch mission'}
@@ -5479,7 +5462,7 @@ function App() {
       >
         <div className="panel-heading operations-heading">
           <div>
-            <span className="section-code">AUDIT NETWORK / 04</span>
+            <span className="section-code">Audit trail</span>
             <h2>Immutable activity</h2>
           </div>
           <div className="operations-summary">

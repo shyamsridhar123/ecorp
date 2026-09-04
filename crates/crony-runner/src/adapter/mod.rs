@@ -3,6 +3,7 @@ mod copilot;
 mod external;
 mod fake;
 mod permission;
+mod process_tree;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -185,6 +186,9 @@ pub enum AdapterEvent {
         signature: String,
         progressed: bool,
         human_conversation: bool,
+    },
+    TeardownUncertain {
+        detail: String,
     },
     Completed {
         summary: String,
