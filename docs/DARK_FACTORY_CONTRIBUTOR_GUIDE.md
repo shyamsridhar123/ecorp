@@ -530,23 +530,51 @@ tab, or provider transcript.
 | Staged or orphaned artifact | Use server reconciliation. Do not manually delete bytes that may be reserved or content-addressed. |
 | Dirty, committed, or unverifiable worktree | Preserve it and create durable recovery provenance before any new execution. |
 
-### Current lessons from issues #50 and #113
+### Recovery after verifier or review failure
 
-[Issue #50](https://github.com/shyamsridhar123/ecorp/issues/50) and
-[issue #113](https://github.com/shyamsridhar123/ecorp/issues/113) are current product-gap records,
-not timeless product guarantees.
+[Issue #50](https://github.com/shyamsridhar123/ecorp/issues/50) remains a reminder that a durable
+API is not proof of an operable recovery path. Issue #113 adds the dedicated factory verification
+recovery flow and executable evidence for both supported modes.
 
 - **Budget recovery:** the presence of a budget-revision API does not prove a suspended mission is
   operationally recoverable. After approval and resume, inspect the resulting mission, task, run,
   and factory states. If the lineage still becomes terminal, preserve the remote checkpoint,
   record the defect, and do not claim recovery succeeded.
-- **Verifier-only recovery:** a failed threshold or metadata check does not make a correct source
-  commit disposable. Preserve the commit and evidence. Until same-lineage governed retry works for
-  the specific failure, a linked recovery issue is a transparent workaround, not proof that the
-  original recovery model is complete.
+- **Verifier-only recovery:** use this when the source and preserved checkpoint are correct. ECorp
+  creates one provider-free verification run, checks the exact workspace fingerprint, reuses the
+  durable provider artifact, and preserves the existing head commit. A preserved run created before
+  fingerprints existed first receives a runner-owned checkpoint command. That command verifies the
+  managed worktree and head, records the full physical-workspace fingerprint, and starts no provider.
+- **Source-correction recovery:** use this when source bytes must change. First store a versioned
+  resume contract revision, then ECorp resumes the exact provider session, branch, and worktree.
+  The revised authority may narrow but cannot silently widen.
 
 These lessons require contributors to report the actual persisted result and to keep correct work
 recoverable even when the control path has a defect.
+
+Ordinary factory polling never restarts `verification_failed` work. An owner, admin, or manager
+must target one issue and state why the recovery is authorized:
+
+```powershell
+crony factory $CorpId $ActorId `
+  --issue 113 `
+  --verification-recovery verifier-only `
+  --verification-recovery-reason "Re-run the corrected verifier metadata against the unchanged checkpoint."
+```
+
+For a bounded source correction:
+
+```powershell
+crony factory $CorpId $ActorId `
+  --issue 113 `
+  --verification-recovery source-correction `
+  --verification-recovery-reason "Resume only to address the recorded independent-review findings."
+```
+
+The trusted controller revalidates the Project item, current issue revision, dependency state,
+persisted source/policy, lease, attempts, budgets, workspace fingerprint, and head commit. A changed
+issue body is stored as reviewed recovery provenance; it is never substituted silently. Project
+status stays `In Progress`, and recovery does not publish, merge, auto-merge, or deploy.
 
 ## Publish a verified result
 

@@ -20,6 +20,7 @@ use clap::Parser;
 use crony_domain::{DeliverableSpec, VerificationPolicy};
 use crony_protocol::{
     ActiveRunClaim, ResolvedSecret, RunnerCapability, RunnerModel, RunnerToServer, ServerToRunner,
+    VerificationArtifactReference,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -169,6 +170,9 @@ struct Assignment {
     write_scope: Vec<String>,
     deliverable: Option<DeliverableSpec>,
     secrets: Vec<ResolvedSecret>,
+    expected_workspace_fingerprint: Option<String>,
+    expected_head_commit: Option<String>,
+    provider_artifact: Option<VerificationArtifactReference>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -628,6 +632,9 @@ async fn run_connection(
                     write_scope,
                     deliverable,
                     secrets,
+                    expected_workspace_fingerprint: None,
+                    expected_head_commit: None,
+                    provider_artifact: None,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
                     send_run_event(
@@ -711,6 +718,7 @@ async fn run_connection(
                 });
             }
             ServerToRunner::ResumeRun {
+                command_id,
                 corp_id,
                 room_id,
                 mission_id,
@@ -728,11 +736,24 @@ async fn run_connection(
                 source_base_ref,
                 source_base_commit,
                 workspace_base_commit,
+                expected_workspace_fingerprint,
+                expected_head_commit,
                 verification_policy,
                 write_scope,
                 deliverable,
                 secrets,
             } => {
+                if command_id.is_some_and(|id| seen_commands.insert(id, ()).is_some()) {
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        command_id,
+                        true,
+                        "factory recovery resume command was already applied",
+                    );
+                    continue;
+                }
                 let assignment = Assignment {
                     corp_id,
                     connection_epoch,
@@ -755,6 +776,9 @@ async fn run_connection(
                     write_scope,
                     deliverable,
                     secrets,
+                    expected_workspace_fingerprint,
+                    expected_head_commit,
+                    provider_artifact: None,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
                     send_run_event(
@@ -763,6 +787,14 @@ async fn run_connection(
                         &assignment,
                         "run.failed",
                         json!({"error": error.to_string()}),
+                    );
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        command_id,
+                        false,
+                        "factory recovery resume source validation failed",
                     );
                     continue;
                 }
@@ -776,11 +808,27 @@ async fn run_connection(
                             "run.failed",
                             json!({"error": error.to_string()}),
                         );
+                        send_command_ack(
+                            &outbound,
+                            &args.runner_id,
+                            connection_epoch,
+                            command_id,
+                            false,
+                            "factory recovery resume secret validation failed",
+                        );
                         continue;
                     }
                 };
                 if active_runs.contains_key(&assignment.run_id) {
                     warn!(run_id = %assignment.run_id, "duplicate resume command ignored");
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        command_id,
+                        true,
+                        "factory recovery resume run was already active",
+                    );
                     continue;
                 }
                 let Some(adapter) = adapters.get(&assignment.adapter) else {
@@ -792,6 +840,14 @@ async fn run_connection(
                         json!({
                             "error": format!("adapter {} is not installed", assignment.adapter)
                         }),
+                    );
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        command_id,
+                        false,
+                        "factory recovery adapter is unavailable",
                     );
                     continue;
                 };
@@ -836,6 +892,235 @@ async fn run_connection(
                     }
                     task_runs.remove(&assignment.run_id);
                 });
+                send_command_ack(
+                    &outbound,
+                    &args.runner_id,
+                    connection_epoch,
+                    command_id,
+                    true,
+                    "factory recovery resume command accepted",
+                );
+            }
+            ServerToRunner::VerifyRun {
+                command_id,
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                workspace_run_id,
+                agent_id,
+                assignment_token,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
+                workspace_base_commit,
+                expected_workspace_fingerprint,
+                expected_head_commit,
+                verification_policy,
+                write_scope,
+                deliverable,
+                provider_artifact,
+            } => {
+                if seen_commands.insert(command_id, ()).is_some() {
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        true,
+                        "verifier-only recovery command was already applied",
+                    );
+                    continue;
+                }
+                let assignment = Assignment {
+                    corp_id,
+                    connection_epoch,
+                    room_id,
+                    mission_id,
+                    task_id,
+                    run_id,
+                    workspace_run_id,
+                    agent_id,
+                    assignment_token,
+                    adapter: "verification-only".to_owned(),
+                    mission_title: "Verifier-only factory recovery".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    source_repository,
+                    source_base_ref,
+                    source_base_commit,
+                    resume_workspace_base_commit: Some(workspace_base_commit),
+                    verification_policy,
+                    write_scope,
+                    deliverable,
+                    secrets: Vec::new(),
+                    expected_workspace_fingerprint: Some(expected_workspace_fingerprint),
+                    expected_head_commit,
+                    provider_artifact,
+                };
+                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({"error": error.to_string()}),
+                    );
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        false,
+                        "verifier-only recovery source validation failed",
+                    );
+                    continue;
+                }
+                if active_runs.contains_key(&assignment.run_id) {
+                    warn!(run_id = %assignment.run_id, "duplicate verification command ignored");
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        true,
+                        "verifier-only recovery run was already active",
+                    );
+                    continue;
+                }
+                let (control_tx, control_rx) = mpsc::unbounded_channel::<AdapterControl>();
+                let (artifact_ack_tx, artifact_ack_rx) = mpsc::unbounded_channel::<ArtifactAck>();
+                active_runs.insert(
+                    assignment.run_id,
+                    ActiveRunControl {
+                        assignment_token,
+                        control: control_tx,
+                        artifact_ack: artifact_ack_tx,
+                    },
+                );
+                let task_workspaces = workspaces.clone();
+                let runner_id = args.runner_id.clone();
+                let task_outbound = outbound.clone();
+                let task_runs = active_runs.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = execute_verification_assignment(
+                        task_workspaces,
+                        runner_id.clone(),
+                        assignment.clone(),
+                        task_outbound.clone(),
+                        AssignmentChannels {
+                            controls: control_rx,
+                            artifact_acks: artifact_ack_rx,
+                        },
+                    )
+                    .await
+                    {
+                        error!(%error, run_id = %assignment.run_id, "verification-only run failed");
+                        send_run_event(
+                            &task_outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": error.to_string()}),
+                        );
+                    }
+                    task_runs.remove(&assignment.run_id);
+                });
+                send_command_ack(
+                    &outbound,
+                    &args.runner_id,
+                    connection_epoch,
+                    Some(command_id),
+                    true,
+                    "verifier-only recovery command accepted",
+                );
+            }
+            ServerToRunner::CheckpointWorkspace {
+                command_id,
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                workspace_run_id,
+                agent_id,
+                assignment_token,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
+                workspace_base_commit,
+                expected_head_commit,
+            } => {
+                if seen_commands.insert(command_id, ()).is_some() {
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        true,
+                        "factory workspace checkpoint command was already applied",
+                    );
+                    continue;
+                }
+                let assignment = Assignment {
+                    corp_id,
+                    connection_epoch,
+                    room_id,
+                    mission_id,
+                    task_id,
+                    run_id,
+                    workspace_run_id,
+                    agent_id,
+                    assignment_token,
+                    adapter: "workspace-checkpoint".to_owned(),
+                    mission_title: "Factory workspace checkpoint".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    source_repository,
+                    source_base_ref,
+                    source_base_commit,
+                    resume_workspace_base_commit: Some(workspace_base_commit),
+                    verification_policy: VerificationPolicy {
+                        checks: Vec::new(),
+                        manual_gate: None,
+                    },
+                    write_scope: Vec::new(),
+                    deliverable: None,
+                    secrets: Vec::new(),
+                    expected_workspace_fingerprint: None,
+                    expected_head_commit: Some(expected_head_commit),
+                    provider_artifact: None,
+                };
+                match checkpoint_preserved_workspace(
+                    workspaces.clone(),
+                    args.runner_id.clone(),
+                    assignment,
+                    outbound.clone(),
+                )
+                .await
+                {
+                    Ok(()) => send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        true,
+                        "factory workspace checkpoint recorded",
+                    ),
+                    Err(error) => {
+                        seen_commands.remove(&command_id);
+                        warn!(%error, run_id = %run_id, "factory workspace checkpoint failed");
+                        send_command_ack(
+                            &outbound,
+                            &args.runner_id,
+                            connection_epoch,
+                            Some(command_id),
+                            false,
+                            "factory workspace checkpoint failed closed",
+                        );
+                    }
+                }
             }
             ServerToRunner::ControlMessage {
                 run_id,
@@ -1069,6 +1354,11 @@ impl AdapterEventSink for RunnerEventSink {
                     if let Ok(mut artifacts) = self.artifacts.lock() {
                         artifacts.push(artifact.clone());
                     }
+                    let workspace_relative_path = artifact
+                        .path
+                        .strip_prefix(&self.workspace.path)
+                        .ok()
+                        .map(|path| path.to_string_lossy().replace('\\', "/"));
                     (
                         "run.artifact_upload",
                         json!({
@@ -1079,6 +1369,7 @@ impl AdapterEventSink for RunnerEventSink {
                             "file_name": artifact.path.file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("artifact.bin"),
+                            "workspace_relative_path": workspace_relative_path,
                             "content_base64": BASE64.encode(bytes),
                         }),
                     )
@@ -1149,6 +1440,7 @@ impl AdapterEventSink for RunnerEventSink {
                     &self.assignment,
                     &self.workspace,
                     &detail,
+                    None,
                 );
                 return;
             }
@@ -1241,6 +1533,22 @@ async fn execute_assignment(
         )
         .await
         .context("prepare isolated task worktree")?;
+    if let Some(expected_fingerprint) = assignment.expected_workspace_fingerprint.as_deref() {
+        let actual_fingerprint = workspaces.fingerprint(&workspace).await?;
+        if actual_fingerprint != expected_fingerprint {
+            return Err(anyhow!(
+                "recovery workspace fingerprint mismatch: expected {expected_fingerprint}, found {actual_fingerprint}"
+            ));
+        }
+    }
+    if let Some(expected_head) = assignment.expected_head_commit.as_deref() {
+        let actual_head = workspaces.head_commit(&workspace).await?;
+        if actual_head != expected_head {
+            return Err(anyhow!(
+                "recovery workspace head mismatch: expected {expected_head}, found {actual_head}"
+            ));
+        }
+    }
     let request = AdapterRunRequest {
         run_id: assignment.run_id,
         mission_id: assignment.mission_id,
@@ -1315,6 +1623,8 @@ async fn execute_assignment(
                     &artifacts,
                     &mut artifact_acks,
                     &summary,
+                    None,
+                    None,
                 )
                 .await;
             }
@@ -1335,19 +1645,264 @@ async fn execute_assignment(
         }
     }
     if teardown_uncertain.load(Ordering::Acquire) {
+        let fingerprint = workspaces.fingerprint(&workspace).await.ok();
         send_teardown_workspace_preserved(
             &outbound,
             &runner_id,
             &assignment,
             &workspace,
             "provider teardown required a verification retry; exact worktree retained",
+            fingerprint.as_deref(),
         );
     } else {
         let cleanup = workspaces.finalize(&workspace).await;
-        send_workspace_cleanup_event(&outbound, &runner_id, &assignment, &workspace, cleanup);
+        let fingerprint = match &cleanup {
+            Ok(cleanup) if cleanup.disposition == WorkspaceDisposition::Preserved => {
+                workspaces.fingerprint(&workspace).await.ok()
+            }
+            Err(_) => workspaces.fingerprint(&workspace).await.ok(),
+            _ => None,
+        };
+        send_workspace_cleanup_event(
+            &outbound,
+            &runner_id,
+            &assignment,
+            &workspace,
+            cleanup,
+            fingerprint.as_deref(),
+        );
     }
     execution?;
     Ok(())
+}
+
+async fn execute_verification_assignment(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+    channels: AssignmentChannels,
+) -> Result<()> {
+    let AssignmentChannels {
+        mut controls,
+        mut artifact_acks,
+    } = channels;
+    validate_assignment_source(&workspaces, &assignment)?;
+    let workspace = workspaces
+        .prepare(
+            assignment.task_id,
+            assignment.workspace_run_id,
+            assignment.source_base_commit.as_deref(),
+            assignment.resume_workspace_base_commit.as_deref(),
+        )
+        .await
+        .context("prepare preserved verifier-only worktree")?;
+    send_run_event(
+        &outbound,
+        &runner_id,
+        &assignment,
+        "run.started",
+        json!({
+            "workspace": workspace.path,
+            "workspace_branch": workspace.branch,
+            "workspace_base_ref": workspace.base_ref,
+            "workspace_base_commit": workspace.base_commit,
+            "execution_mode": "verification_only",
+        }),
+    );
+    let expected_fingerprint = assignment
+        .expected_workspace_fingerprint
+        .as_deref()
+        .context("verifier-only assignment omitted workspace fingerprint")?;
+    let actual_fingerprint = workspaces.fingerprint(&workspace).await?;
+    if actual_fingerprint != expected_fingerprint {
+        return Err(anyhow!(
+            "verifier-only workspace fingerprint mismatch: expected {expected_fingerprint}, found {actual_fingerprint}"
+        ));
+    }
+    if let Some(expected_head) = assignment.expected_head_commit.as_deref() {
+        let actual_head = workspaces.head_commit(&workspace).await?;
+        if actual_head != expected_head {
+            return Err(anyhow!(
+                "verifier-only workspace head mismatch: expected {expected_head}, found {actual_head}"
+            ));
+        }
+    }
+    let artifacts = match assignment.provider_artifact.as_ref() {
+        Some(reference) => vec![verifier_only_artifact(&workspace, reference).await?],
+        None => Vec::new(),
+    };
+    let artifacts = Arc::new(Mutex::new(artifacts));
+    let verification = send_verification_events(
+        &outbound,
+        &runner_id,
+        &assignment,
+        &workspace,
+        &artifacts,
+        &mut artifact_acks,
+        "Verifier-only recovery completed without starting a provider.",
+        Some(expected_fingerprint),
+        assignment.expected_head_commit.as_deref(),
+    );
+    tokio::pin!(verification);
+    loop {
+        tokio::select! {
+            () = &mut verification => break,
+            control = controls.recv() => {
+                match control {
+                    Some(AdapterControl::Interrupt { reason })
+                    | Some(AdapterControl::Stop { reason }) => {
+                        send_run_event(
+                            &outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.cancelled",
+                            json!({"reason": reason}),
+                        );
+                        break;
+                    }
+                    Some(AdapterControl::CircuitBreaker { stage, reason })
+                        if matches!(stage.as_str(), "suspend" | "stop") =>
+                    {
+                        send_run_event(
+                            &outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.cancelled",
+                            json!({"reason": format!("circuit breaker {stage}: {reason}")}),
+                        );
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+    let cleanup = workspaces.finalize(&workspace).await;
+    let fingerprint = match &cleanup {
+        Ok(cleanup) if cleanup.disposition == WorkspaceDisposition::Preserved => {
+            workspaces.fingerprint(&workspace).await.ok()
+        }
+        Err(_) => workspaces.fingerprint(&workspace).await.ok(),
+        _ => None,
+    };
+    send_workspace_cleanup_event(
+        &outbound,
+        &runner_id,
+        &assignment,
+        &workspace,
+        cleanup,
+        fingerprint.as_deref(),
+    );
+    Ok(())
+}
+
+async fn checkpoint_preserved_workspace(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+) -> Result<()> {
+    validate_assignment_source(&workspaces, &assignment)?;
+    let workspace = workspaces
+        .prepare(
+            assignment.task_id,
+            assignment.workspace_run_id,
+            assignment.source_base_commit.as_deref(),
+            assignment.resume_workspace_base_commit.as_deref(),
+        )
+        .await
+        .context("prepare preserved workspace checkpoint")?;
+    let expected_head = assignment
+        .expected_head_commit
+        .as_deref()
+        .context("workspace checkpoint omitted expected head commit")?;
+    let actual_head = workspaces.head_commit(&workspace).await?;
+    if actual_head != expected_head {
+        return Err(anyhow!(
+            "workspace checkpoint head mismatch: expected {expected_head}, found {actual_head}"
+        ));
+    }
+    let fingerprint = workspaces.fingerprint(&workspace).await?;
+    send_run_event(
+        &outbound,
+        &runner_id,
+        &assignment,
+        "run.workspace_preserved",
+        json!({
+            "workspace": workspace.path,
+            "workspace_branch": workspace.branch,
+            "workspace_base_ref": workspace.base_ref,
+            "workspace_base_commit": workspace.base_commit,
+            "detail": "preserved legacy workspace fingerprint checkpointed for governed recovery",
+            "dirty": Value::Null,
+            "commits_ahead": Value::Null,
+            "branch_deleted": false,
+            "workspace_fingerprint": fingerprint,
+            "head_commit": actual_head,
+        }),
+    );
+    Ok(())
+}
+
+async fn verifier_only_artifact(
+    workspace: &WorkspaceLease,
+    reference: &VerificationArtifactReference,
+) -> Result<AdapterArtifact> {
+    let requested = PathBuf::from(&reference.path);
+    let allow_legacy_search = !requested.is_absolute() && requested.components().count() == 1;
+    let candidate = if requested.is_absolute() {
+        requested.clone()
+    } else {
+        workspace.path.join(&requested)
+    };
+    let root = tokio::fs::canonicalize(&workspace.path)
+        .await
+        .context("canonicalize verifier-only workspace")?;
+    let path = match tokio::fs::canonicalize(&candidate).await {
+        Ok(path) => path,
+        Err(error) if allow_legacy_search => workspace::find_file_by_digest(
+            &root,
+            &reference.path,
+            &reference.sha256,
+            reference.bytes,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "locate legacy verifier-only artifact after {} could not be resolved: {error}",
+                candidate.display()
+            )
+        })?,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "canonicalize verifier-only artifact {}",
+                    candidate.display()
+                )
+            });
+        }
+    };
+    if !path.starts_with(&root) {
+        return Err(anyhow!(
+            "verifier-only artifact escapes the preserved workspace"
+        ));
+    }
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .context("inspect verifier-only artifact")?;
+    if !metadata.is_file() || metadata.len() as usize != reference.bytes {
+        return Err(anyhow!(
+            "verifier-only artifact metadata does not match the preserved source run"
+        ));
+    }
+    Ok(AdapterArtifact {
+        path,
+        sha256: reference.sha256.clone(),
+        bytes: reference.bytes,
+        media_type: reference.media_type.clone(),
+    })
 }
 
 fn validate_assignment_source(
@@ -1363,6 +1918,7 @@ fn validate_assignment_source(
         .context("reject source assignment")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_verification_events(
     outbound: &OutboundBus,
     runner_id: &str,
@@ -1371,6 +1927,8 @@ async fn send_verification_events(
     artifacts: &Arc<Mutex<Vec<AdapterArtifact>>>,
     artifact_acks: &mut mpsc::UnboundedReceiver<ArtifactAck>,
     completion_summary: &str,
+    expected_workspace_fingerprint: Option<&str>,
+    preserve_head_commit: Option<&str>,
 ) {
     send_run_event(
         outbound,
@@ -1385,8 +1943,29 @@ async fn send_verification_events(
         .lock()
         .map(|artifacts| artifacts.clone())
         .unwrap_or_default();
-    let report =
+    let mut report =
         verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await;
+    if let Some(expected_fingerprint) = expected_workspace_fingerprint {
+        let fingerprint = workspace::fingerprint_path(&workspace.path).await;
+        let mismatch = match fingerprint {
+            Ok(actual) if actual == expected_fingerprint => None,
+            Ok(actual) => Some(format!(
+                "verifier-only workspace changed: expected fingerprint {expected_fingerprint}, found {actual}"
+            )),
+            Err(error) => Some(format!(
+                "verifier-only workspace fingerprint could not be verified: {error:#}"
+            )),
+        };
+        if let Some(error) = mismatch {
+            if let Some(first) = report.checks.first_mut() {
+                first.passed = false;
+                first.summary = error.clone();
+                first.payload = json!({"error": error});
+            }
+            report.passed = false;
+            report.summary = "verifier-only workspace integrity check failed".to_owned();
+        }
+    }
     for check in &report.checks {
         send_run_event(
             outbound,
@@ -1424,6 +2003,7 @@ async fn send_verification_events(
             &report,
             &artifacts,
             &assignment.write_scope,
+            preserve_head_commit,
         )
         .await
         {
@@ -1561,6 +2141,7 @@ fn send_workspace_cleanup_event(
     assignment: &Assignment,
     workspace: &WorkspaceLease,
     cleanup: Result<WorkspaceCleanup>,
+    workspace_fingerprint: Option<&str>,
 ) {
     let (event_type, cleanup) = match cleanup {
         Ok(cleanup) => {
@@ -1596,6 +2177,7 @@ fn send_workspace_cleanup_event(
             "dirty": cleanup.dirty,
             "commits_ahead": cleanup.commits_ahead,
             "branch_deleted": cleanup.branch_deleted,
+            "workspace_fingerprint": workspace_fingerprint,
         }),
     );
 }
@@ -1606,6 +2188,7 @@ fn send_teardown_workspace_preserved(
     assignment: &Assignment,
     workspace: &WorkspaceLease,
     detail: &str,
+    workspace_fingerprint: Option<&str>,
 ) {
     send_run_event(
         outbound,
@@ -1621,6 +2204,7 @@ fn send_teardown_workspace_preserved(
             "dirty": Value::Null,
             "commits_ahead": Value::Null,
             "branch_deleted": false,
+            "workspace_fingerprint": workspace_fingerprint,
         }),
     );
 }
@@ -1647,6 +2231,26 @@ fn send_run_event(
     if event_type == "run.started" && assignment.mission_title.contains("[duplicate-event]") {
         outbound.send(message);
     }
+}
+
+fn send_command_ack(
+    outbound: &OutboundBus,
+    runner_id: &str,
+    connection_epoch: Uuid,
+    command_id: Option<Uuid>,
+    applied: bool,
+    detail: &str,
+) {
+    let Some(command_id) = command_id else {
+        return;
+    };
+    outbound.send(RunnerToServer::CommandAck {
+        runner_id: runner_id.to_owned(),
+        connection_epoch,
+        command_id,
+        applied,
+        detail: detail.to_owned(),
+    });
 }
 
 fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
@@ -1844,6 +2448,9 @@ mod tests {
             write_scope: Vec::new(),
             deliverable: None,
             secrets: Vec::new(),
+            expected_workspace_fingerprint: None,
+            expected_head_commit: None,
+            provider_artifact: None,
         };
         let workspace = WorkspaceLease {
             path: PathBuf::from("worktrees/exact-run"),
@@ -1958,6 +2565,9 @@ mod tests {
             write_scope: Vec::new(),
             deliverable: None,
             secrets: Vec::new(),
+            expected_workspace_fingerprint: None,
+            expected_head_commit: None,
+            provider_artifact: None,
         };
         let uncertain = Arc::new(Notify::new());
         let verified = Arc::new(Notify::new());

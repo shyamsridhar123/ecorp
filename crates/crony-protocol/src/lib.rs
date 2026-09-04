@@ -1,8 +1,8 @@
 use crony_domain::{
-    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction,
-    PullRequestPublication, SourceDeliverable, TaskContract, TaskSecretReference,
-    VerificationPolicy,
+    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryVerificationRecovery,
+    FactoryVerificationRecoveryMode, FactoryWorkItem, FactoryWorkItemState, MissionBudgetRevision,
+    MissionContractRevision, MissionContractRevisionAction, PullRequestPublication,
+    SourceDeliverable, TaskContract, TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,6 +122,8 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ResumeRun {
+        #[serde(default)]
+        command_id: Option<Uuid>,
         corp_id: Uuid,
         room_id: Uuid,
         mission_id: Uuid,
@@ -139,11 +141,53 @@ pub enum ServerToRunner {
         source_base_ref: Option<String>,
         source_base_commit: Option<String>,
         workspace_base_commit: Option<String>,
+        #[serde(default)]
+        expected_workspace_fingerprint: Option<String>,
+        #[serde(default)]
+        expected_head_commit: Option<String>,
         verification_policy: VerificationPolicy,
         #[serde(default)]
         write_scope: Vec<String>,
         deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
+    },
+    VerifyRun {
+        command_id: Uuid,
+        corp_id: Uuid,
+        room_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        workspace_run_id: Uuid,
+        agent_id: Uuid,
+        assignment_token: Uuid,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
+        workspace_base_commit: String,
+        expected_workspace_fingerprint: String,
+        expected_head_commit: Option<String>,
+        verification_policy: VerificationPolicy,
+        #[serde(default)]
+        write_scope: Vec<String>,
+        deliverable: Option<DeliverableSpec>,
+        provider_artifact: Option<VerificationArtifactReference>,
+    },
+    CheckpointWorkspace {
+        command_id: Uuid,
+        corp_id: Uuid,
+        room_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        workspace_run_id: Uuid,
+        agent_id: Uuid,
+        assignment_token: Uuid,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
+        workspace_base_commit: String,
+        expected_head_commit: String,
     },
     ControlMessage {
         corp_id: Uuid,
@@ -178,6 +222,14 @@ pub enum ServerToRunner {
         reason: String,
         reconnect_delay_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationArtifactReference {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: usize,
+    pub media_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +485,65 @@ pub struct UpgradeFactorySourceCommitRequest {
 pub struct FactoryWorkItemResponse {
     pub work_item: FactoryWorkItem,
     pub claim_token: Option<Uuid>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFactoryWorkspaceRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_run_id: Uuid,
+    pub expected_head_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFactoryWorkspaceResponse {
+    pub work_item: FactoryWorkItem,
+    pub claim_token: Option<Uuid>,
+    pub source_run_id: Uuid,
+    pub command_id: Option<Uuid>,
+    pub workspace_fingerprint: Option<String>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryVerificationRecoveryContextResponse {
+    pub work_item: FactoryWorkItem,
+    pub recoveries: Vec<FactoryVerificationRecovery>,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub source_run_id: Uuid,
+    pub remaining_attempts: i32,
+    pub remaining_mission_tokens: i64,
+    pub remaining_mission_cost_microusd: i64,
+    pub workspace_fingerprint: String,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFactoryVerificationRecoveryRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_factory_version: i64,
+    pub idempotency_key: Uuid,
+    pub source_run_id: Uuid,
+    pub mode: FactoryVerificationRecoveryMode,
+    pub reason: String,
+    pub observed_source_revision: String,
+    #[serde(default)]
+    pub reviewed_source_snapshot: Value,
+    pub contract_revision_id: Option<Uuid>,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFactoryVerificationRecoveryResponse {
+    pub recovery: FactoryVerificationRecovery,
+    pub work_item: FactoryWorkItem,
+    pub run_id: Uuid,
     pub replayed: bool,
 }
 
@@ -815,12 +926,15 @@ pub struct VerificationDecisionRequest {
     pub actor_id: Uuid,
     pub approved: bool,
     pub note: String,
+    #[serde(default)]
+    pub decision_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationDecisionResponse {
     pub run_id: Uuid,
     pub status: String,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

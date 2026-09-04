@@ -28,11 +28,14 @@ use axum::{
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::{
-    DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference, VerificationPolicy,
+    DeliverableSpec, DomainEvent, FactoryVerificationRecoveryMode, ManualVerificationGate,
+    TaskGraphPlan, TaskSecretReference, VerificationPolicy,
 };
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
+    CheckpointFactoryWorkspaceRequest, CheckpointFactoryWorkspaceResponse,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
+    CreateFactoryVerificationRecoveryRequest, CreateFactoryVerificationRecoveryResponse,
     CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
     CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
     CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
@@ -53,18 +56,19 @@ use crony_protocol::{
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SetBudgetPolicyRequest, SnapshotResponse, StartPullRequestPublicationRequest,
     TransferLeaseRequest, TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
-    VerificationDecisionRequest, VerificationDecisionResponse,
+    VerificationArtifactReference, VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
-    DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
-    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
+    CheckpointFactoryWorkspaceInput, ClaimFactoryWorkItemInput,
+    CreateFactoryVerificationRecoveryInput, CreateMissionContractRevisionInput,
+    DecideMissionBudgetRevisionInput, FactorySourceInput, FactoryVerificationRecoveryLaunch,
+    LaunchRecord, MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
     PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
     RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
     RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
-    RunnerEventInput, StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
-    UpgradeFactorySourceCommitInput,
+    RunnerEventInput, RunnerEventOutcome, StartPullRequestPublicationInput,
+    TransitionFactoryWorkItemInput, UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -457,8 +461,16 @@ async fn main() -> anyhow::Result<()> {
             post(upgrade_factory_source_commit),
         )
         .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/workspace-checkpoint",
+            post(checkpoint_factory_workspace),
+        )
+        .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
             post(transition_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/verification-recoveries",
+            post(create_factory_verification_recovery),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
@@ -1247,7 +1259,7 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
         return Ok(());
     };
     for command in state.store.pending_runner_commands(runner_id).await? {
-        let outgoing = decode_runner_command(&command)?;
+        let outgoing = decode_runner_command(state, &command).await?;
         if sender.send(outgoing).is_err() {
             break;
         }
@@ -1255,7 +1267,58 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
     Ok(())
 }
 
-fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
+#[derive(Debug, Deserialize)]
+struct FactoryRecoveryRunnerCommandPayload {
+    mode: FactoryVerificationRecoveryMode,
+    corp_id: Uuid,
+    room_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    workspace_run_id: Uuid,
+    agent_id: Uuid,
+    assignment_token: Uuid,
+    adapter: String,
+    provider_session_id: Option<String>,
+    prompt: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
+    workspace_base_commit: String,
+    expected_workspace_fingerprint: String,
+    expected_head_commit: Option<String>,
+    verification_policy: VerificationPolicy,
+    #[serde(default)]
+    write_scope: Vec<String>,
+    deliverable: Option<DeliverableSpec>,
+    #[serde(default)]
+    secret_refs: Vec<TaskSecretReference>,
+    provider_artifact: Option<VerificationArtifactReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FactoryWorkspaceCheckpointRunnerCommandPayload {
+    corp_id: Uuid,
+    room_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    workspace_run_id: Uuid,
+    agent_id: Uuid,
+    assignment_token: Uuid,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
+    workspace_base_commit: String,
+    expected_head_commit: String,
+}
+
+async fn decode_runner_command(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<ServerToRunner> {
     match command.command_kind.as_str() {
         "approval_decision" => Ok(ServerToRunner::ApprovalDecision {
             command_id: command.id,
@@ -1294,6 +1357,113 @@ fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<Serve
                 .context("breaker command omitted reason")?
                 .to_owned(),
         }),
+        "factory_verification_recovery" => {
+            let payload: FactoryRecoveryRunnerCommandPayload =
+                serde_json::from_value(command.payload.clone())
+                    .context("decode factory verification recovery runner command")?;
+            if payload.run_id != command.run_id {
+                return Err(anyhow::anyhow!(
+                    "factory recovery runner command run id mismatch"
+                ));
+            }
+            match payload.mode {
+                FactoryVerificationRecoveryMode::SourceCorrection => {
+                    let secrets = resolve_secret_refs(
+                        state,
+                        payload.corp_id,
+                        payload.task_id,
+                        payload.run_id,
+                        &command.runner_id,
+                        &payload.secret_refs,
+                    )
+                    .await?;
+                    Ok(ServerToRunner::ResumeRun {
+                        command_id: Some(command.id),
+                        corp_id: payload.corp_id,
+                        room_id: payload.room_id,
+                        mission_id: payload.mission_id,
+                        task_id: payload.task_id,
+                        run_id: payload.run_id,
+                        workspace_run_id: payload.workspace_run_id,
+                        agent_id: payload.agent_id,
+                        assignment_token: payload.assignment_token,
+                        adapter: payload.adapter,
+                        provider_session_id: payload
+                            .provider_session_id
+                            .context("source-correction command omitted provider session")?,
+                        prompt: payload.prompt,
+                        model: payload.model,
+                        reasoning_effort: payload.reasoning_effort,
+                        source_repository: payload.source_repository,
+                        source_base_ref: payload.source_base_ref,
+                        source_base_commit: payload.source_base_commit,
+                        workspace_base_commit: Some(payload.workspace_base_commit),
+                        expected_workspace_fingerprint: Some(
+                            payload.expected_workspace_fingerprint,
+                        ),
+                        expected_head_commit: payload.expected_head_commit,
+                        verification_policy: payload.verification_policy,
+                        write_scope: payload.write_scope,
+                        deliverable: payload.deliverable,
+                        secrets,
+                    })
+                }
+                FactoryVerificationRecoveryMode::VerifierOnly => {
+                    if !payload.secret_refs.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "verifier-only recovery cannot receive provider secrets"
+                        ));
+                    }
+                    Ok(ServerToRunner::VerifyRun {
+                        command_id: command.id,
+                        corp_id: payload.corp_id,
+                        room_id: payload.room_id,
+                        mission_id: payload.mission_id,
+                        task_id: payload.task_id,
+                        run_id: payload.run_id,
+                        workspace_run_id: payload.workspace_run_id,
+                        agent_id: payload.agent_id,
+                        assignment_token: payload.assignment_token,
+                        source_repository: payload.source_repository,
+                        source_base_ref: payload.source_base_ref,
+                        source_base_commit: payload.source_base_commit,
+                        workspace_base_commit: payload.workspace_base_commit,
+                        expected_workspace_fingerprint: payload.expected_workspace_fingerprint,
+                        expected_head_commit: payload.expected_head_commit,
+                        verification_policy: payload.verification_policy,
+                        write_scope: payload.write_scope,
+                        deliverable: payload.deliverable,
+                        provider_artifact: payload.provider_artifact,
+                    })
+                }
+            }
+        }
+        "factory_workspace_checkpoint" => {
+            let payload: FactoryWorkspaceCheckpointRunnerCommandPayload =
+                serde_json::from_value(command.payload.clone())
+                    .context("decode factory workspace checkpoint runner command")?;
+            if payload.run_id != command.run_id {
+                return Err(anyhow::anyhow!(
+                    "factory workspace checkpoint command run id mismatch"
+                ));
+            }
+            Ok(ServerToRunner::CheckpointWorkspace {
+                command_id: command.id,
+                corp_id: payload.corp_id,
+                room_id: payload.room_id,
+                mission_id: payload.mission_id,
+                task_id: payload.task_id,
+                run_id: payload.run_id,
+                workspace_run_id: payload.workspace_run_id,
+                agent_id: payload.agent_id,
+                assignment_token: payload.assignment_token,
+                source_repository: payload.source_repository,
+                source_base_ref: payload.source_base_ref,
+                source_base_commit: payload.source_base_commit,
+                workspace_base_commit: payload.workspace_base_commit,
+                expected_head_commit: payload.expected_head_commit,
+            })
+        }
         other => Err(anyhow::anyhow!("unknown runner command kind {other}")),
     }
 }
@@ -1842,6 +2012,52 @@ async fn upgrade_factory_source_commit(
     }))
 }
 
+async fn checkpoint_factory_workspace(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CheckpointFactoryWorkspaceRequest>,
+) -> Result<Json<CheckpointFactoryWorkspaceResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Recover,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .checkpoint_factory_workspace(CheckpointFactoryWorkspaceInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            source_run_id: request.source_run_id,
+            expected_head_commit: request.expected_head_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.command_id.is_some() {
+        dispatch_pending_runner_commands(&state, &outcome.runner_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(Json(CheckpointFactoryWorkspaceResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        source_run_id: outcome.source_run_id,
+        command_id: outcome.command_id,
+        workspace_fingerprint: outcome.workspace_fingerprint,
+        replayed: outcome.replayed,
+    }))
+}
+
 async fn transition_factory_work_item(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1876,6 +2092,62 @@ async fn transition_factory_work_item(
     Ok(Json(FactoryWorkItemResponse {
         work_item: outcome.work_item,
         claim_token: outcome.claim_token,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn create_factory_verification_recovery(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateFactoryVerificationRecoveryRequest>,
+) -> Result<Json<CreateFactoryVerificationRecoveryResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Recover,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .create_factory_verification_recovery(CreateFactoryVerificationRecoveryInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_factory_version: request.expected_factory_version,
+            idempotency_key: request.idempotency_key,
+            source_run_id: request.source_run_id,
+            mode: request.mode,
+            reason: request.reason,
+            observed_source_revision: request.observed_source_revision,
+            reviewed_source_snapshot: request.reviewed_source_snapshot,
+            contract_revision_id: request.contract_revision_id,
+            expected_workspace_fingerprint: request.expected_workspace_fingerprint,
+            expected_head_commit: request.expected_head_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    let (run_id, runner_id) = match &outcome.launch {
+        FactoryVerificationRecoveryLaunch::SourceCorrection(record) => {
+            (record.run_id, record.runner_id.clone())
+        }
+        FactoryVerificationRecoveryLaunch::VerifierOnly(record) => {
+            (record.run_id, record.runner_id.clone())
+        }
+    };
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    dispatch_pending_runner_commands(&state, &runner_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(CreateFactoryVerificationRecoveryResponse {
+        recovery: outcome.recovery,
+        work_item: outcome.work_item,
+        run_id,
         replayed: outcome.replayed,
     }))
 }
@@ -2860,20 +3132,33 @@ async fn resolve_run_secrets(
     record: &LaunchRecord,
     runner_id: &str,
 ) -> anyhow::Result<Vec<ResolvedSecret>> {
+    resolve_secret_refs(
+        state,
+        record.corp_id,
+        record.task_id,
+        record.run_id,
+        runner_id,
+        &record.secret_refs,
+    )
+    .await
+}
+
+async fn resolve_secret_refs(
+    state: &AppState,
+    corp_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    runner_id: &str,
+    secret_refs: &[TaskSecretReference],
+) -> anyhow::Result<Vec<ResolvedSecret>> {
     let (grants, events) = state
         .store
-        .grant_run_secrets(
-            record.corp_id,
-            record.task_id,
-            record.run_id,
-            runner_id,
-            &record.secret_refs,
-        )
+        .grant_run_secrets(corp_id, task_id, run_id, runner_id, secret_refs)
         .await?;
     let mut resolved = Vec::with_capacity(grants.len());
     for grant in grants {
         let plaintext = state.secret_cipher.decrypt(
-            record.corp_id,
+            corp_id,
             grant.secret_id,
             &grant.name,
             &grant.ciphertext,
@@ -3264,6 +3549,7 @@ async fn resume_run(
     };
     if runner_tx
         .send(ServerToRunner::ResumeRun {
+            command_id: None,
             corp_id: record.corp_id,
             room_id: record.room_id,
             mission_id: record.mission_id,
@@ -3281,6 +3567,8 @@ async fn resume_run(
             source_base_ref: record.source_base_ref,
             source_base_commit: record.source_base_commit,
             workspace_base_commit: Some(record.workspace_base_commit),
+            expected_workspace_fingerprint: None,
+            expected_head_commit: None,
             verification_policy: record.verification_policy,
             write_scope: record.write_scope,
             deliverable: record.deliverable,
@@ -3326,11 +3614,20 @@ async fn decide_verification(
     .await?;
     let outcome = state
         .store
-        .decide_verification(corp_id, run_id, actor_id, request.approved, &request.note)
+        .decide_verification(
+            corp_id,
+            run_id,
+            actor_id,
+            request.approved,
+            &request.note,
+            request.decision_key,
+        )
         .await
         .map_err(map_store_error)?;
-    publish(&state, outcome.event);
-    if request.approved {
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    if request.approved && !outcome.replayed {
         schedule_ready_corp(&state, outcome.corp_id)
             .await
             .map_err(ApiError::internal)?;
@@ -3338,6 +3635,7 @@ async fn decide_verification(
     Ok(Json(VerificationDecisionResponse {
         run_id: outcome.run_id,
         status: outcome.status,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -4164,140 +4462,154 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                         .await;
                 }
                 match result {
-                    Ok(Some(event)) => {
-                        if event.event_type == "run.deliverable"
-                            && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
-                                event
-                                    .payload
-                                    .get("artifact_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .and_then(|value| Uuid::parse_str(value).ok()),
-                                event
-                                    .payload
-                                    .get("artifact_role")
-                                    .and_then(serde_json::Value::as_str),
-                                event
-                                    .payload
-                                    .get("sha256")
-                                    .and_then(serde_json::Value::as_str),
-                            )
-                        {
-                            let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                run_id,
-                                artifact_id,
-                                artifact_role: artifact_role.to_owned(),
-                                sha256: sha256.to_owned(),
-                            });
-                        }
-                        let approval_expiry = if applied_event_type == "run.approval_requested" {
-                            event
-                                .payload
-                                .get("approval_id")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|value| Uuid::parse_str(value).ok())
-                                .map(|approval_id| {
-                                    let delay = event
+                    Ok(outcome) => {
+                        let RunnerEventOutcome {
+                            event,
+                            related_events,
+                        } = outcome;
+                        if let Some(event) = event {
+                            if event.event_type == "run.deliverable"
+                                && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
+                                    event
                                         .payload
-                                        .get("expires_in_seconds")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(300)
-                                        .clamp(1, 3_600);
-                                    (approval_id, delay)
-                                })
-                        } else {
-                            None
-                        };
-                        publish(&state, event);
-                        if let Some((approval_id, delay)) = approval_expiry {
-                            let expiry_state = state.clone();
-                            let expiry_runner_id = runner_id.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                                match expiry_state.store.expire_action_approval(approval_id).await {
-                                    Ok(Some(outcome)) => {
-                                        if let Some(event) = outcome.event {
-                                            publish(&expiry_state, event);
-                                        }
-                                        if let Err(error) = dispatch_pending_runner_commands(
-                                            &expiry_state,
-                                            &expiry_runner_id,
-                                        )
+                                        .get("artifact_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .and_then(|value| Uuid::parse_str(value).ok()),
+                                    event
+                                        .payload
+                                        .get("artifact_role")
+                                        .and_then(serde_json::Value::as_str),
+                                    event
+                                        .payload
+                                        .get("sha256")
+                                        .and_then(serde_json::Value::as_str),
+                                )
+                            {
+                                let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                    run_id,
+                                    artifact_id,
+                                    artifact_role: artifact_role.to_owned(),
+                                    sha256: sha256.to_owned(),
+                                });
+                            }
+                            let approval_expiry = if applied_event_type == "run.approval_requested"
+                            {
+                                event
+                                    .payload
+                                    .get("approval_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| Uuid::parse_str(value).ok())
+                                    .map(|approval_id| {
+                                        let delay = event
+                                            .payload
+                                            .get("expires_in_seconds")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(300)
+                                            .clamp(1, 3_600);
+                                        (approval_id, delay)
+                                    })
+                            } else {
+                                None
+                            };
+                            publish(&state, event);
+                            if let Some((approval_id, delay)) = approval_expiry {
+                                let expiry_state = state.clone();
+                                let expiry_runner_id = runner_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                    match expiry_state
+                                        .store
+                                        .expire_action_approval(approval_id)
                                         .await
-                                        {
-                                            warn!(
-                                                %error,
-                                                %approval_id,
-                                                "expired approval command dispatch failed"
-                                            );
+                                    {
+                                        Ok(Some(outcome)) => {
+                                            if let Some(event) = outcome.event {
+                                                publish(&expiry_state, event);
+                                            }
+                                            if let Err(error) = dispatch_pending_runner_commands(
+                                                &expiry_state,
+                                                &expiry_runner_id,
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    %error,
+                                                    %approval_id,
+                                                    "expired approval command dispatch failed"
+                                                );
+                                            }
                                         }
+                                        Ok(None) => {}
+                                        Err(error) => warn!(
+                                            %error,
+                                            %approval_id,
+                                            "action approval expiry failed"
+                                        ),
+                                    }
+                                });
+                            }
+                            if matches!(
+                                applied_event_type.as_str(),
+                                "run.usage" | "run.tool_activity"
+                            ) {
+                                match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
+                                    Ok(outcome) => {
+                                        if let Some(event) = outcome.event {
+                                            publish(&state, event);
+                                        }
+                                        if outcome.command.is_some()
+                                            && let Err(error) =
+                                                dispatch_pending_runner_commands(&state, &runner_id)
+                                                    .await
+                                        {
+                                            warn!(%error, %runner_id, %run_id, "failed to dispatch circuit-breaker command");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(%error, %run_id, "circuit-breaker evaluation failed")
+                                    }
+                                }
+                            }
+                            if matches!(applied_event_type.as_str(), "run.completed" | "run.failed")
+                            {
+                                let schedule_state = state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        schedule_ready_corp(&schedule_state, corp_id).await
+                                    {
+                                        warn!(%error, %corp_id, "automatic Corp scheduling failed");
+                                    }
+                                });
+                            }
+                        } else {
+                            if let Some(sha256) = deliverable_ack_sha {
+                                match state
+                                    .store
+                                    .ready_artifact_for_run_role_digest(
+                                        corp_id,
+                                        run_id,
+                                        "source_deliverable",
+                                        &sha256,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(artifact)) => {
+                                        let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                            run_id,
+                                            artifact_id: artifact.id,
+                                            artifact_role: artifact.artifact_role,
+                                            sha256: artifact.sha256,
+                                        });
                                     }
                                     Ok(None) => {}
-                                    Err(error) => warn!(
-                                        %error,
-                                        %approval_id,
-                                        "action approval expiry failed"
-                                    ),
-                                }
-                            });
-                        }
-                        if matches!(
-                            applied_event_type.as_str(),
-                            "run.usage" | "run.tool_activity"
-                        ) {
-                            match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
-                                Ok(outcome) => {
-                                    if let Some(event) = outcome.event {
-                                        publish(&state, event);
+                                    Err(error) => {
+                                        warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
                                     }
-                                    if outcome.command.is_some()
-                                        && let Err(error) =
-                                            dispatch_pending_runner_commands(&state, &runner_id)
-                                                .await
-                                    {
-                                        warn!(%error, %runner_id, %run_id, "failed to dispatch circuit-breaker command");
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(%error, %run_id, "circuit-breaker evaluation failed")
                                 }
                             }
                         }
-                        if matches!(applied_event_type.as_str(), "run.completed" | "run.failed") {
-                            let schedule_state = state.clone();
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    schedule_ready_corp(&schedule_state, corp_id).await
-                                {
-                                    warn!(%error, %corp_id, "automatic Corp scheduling failed");
-                                }
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        if let Some(sha256) = deliverable_ack_sha {
-                            match state
-                                .store
-                                .ready_artifact_for_run_role_digest(
-                                    corp_id,
-                                    run_id,
-                                    "source_deliverable",
-                                    &sha256,
-                                )
-                                .await
-                            {
-                                Ok(Some(artifact)) => {
-                                    let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                        run_id,
-                                        artifact_id: artifact.id,
-                                        artifact_role: artifact.artifact_role,
-                                        sha256: artifact.sha256,
-                                    });
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
-                                }
-                            }
+                        for related_event in related_events {
+                            publish(&state, related_event);
                         }
                     }
                     Err(error) => {
@@ -4363,7 +4675,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
 async fn process_runner_event(
     state: &AppState,
     input: RunnerEventInput,
-) -> anyhow::Result<Option<DomainEvent>> {
+) -> anyhow::Result<RunnerEventOutcome> {
     if !matches!(
         input.event_type.as_str(),
         "run.artifact_upload" | "run.deliverable_upload"
@@ -4400,7 +4712,10 @@ async fn process_runner_event(
     match prepared.status.as_str() {
         "ready" => {
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
-            Ok(None)
+            Ok(RunnerEventOutcome {
+                event: None,
+                related_events: Vec::new(),
+            })
         }
         "rejected" => {
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
@@ -4459,7 +4774,10 @@ async fn process_runner_event(
                 .finalize_artifact_upload(prepared.artifact.corp_id, prepared.artifact.id)
                 .await?;
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
-            Ok(event)
+            Ok(RunnerEventOutcome {
+                event,
+                related_events: Vec::new(),
+            })
         }
         status => Err(anyhow::anyhow!("unknown prepared artifact status {status}")),
     }

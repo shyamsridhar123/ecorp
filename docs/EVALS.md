@@ -264,6 +264,20 @@ title and persisted source marker from the fresh snapshot rather than following 
 mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
 verifies Markdown section boundaries for dependency and acceptance parsing.
 
+`tools/e2e_factory_verification_recovery.mjs` proves the same source issue, factory item, mission,
+task, branch, and workspace lineage can recover after verification rejection. Its verifier-only
+case rejects evidence through an independent-review gate, replays the keyed decision, creates one
+`verification_only` run, emits zero provider session/output/artifact events, preserves the exact
+head commit, and reaches one verified factory item. Before recovery, the test removes the source
+run's fingerprint and provider-artifact relative path to reproduce a pre-0032 preserved run. It
+then proves the owning runner checkpoints the workspace without provider execution and resolves
+the legacy artifact by exact file name, bytes, and digest. Its source-correction case starts with an
+automated verifier failure, changes the fake GitHub issue revision, proves ordinary controller
+replay is mutation-free and rejected, restarts only the test-owned server, stores a versioned
+contract revision, resumes the exact Codex fixture session/worktree, increments the attempt
+monotonically, and completes after independent approval. The report is written to
+`output/e2e-factory-verification-recovery.json`.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each

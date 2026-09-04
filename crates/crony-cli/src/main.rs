@@ -449,6 +449,7 @@ async fn main() -> Result<()> {
                     actor_id,
                     approved: approve,
                     note,
+                    decision_key: None,
                 })?),
             )
             .await?

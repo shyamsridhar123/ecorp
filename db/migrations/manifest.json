@@ -155,6 +155,11 @@
       "version": 31,
       "file": "0031_factory_materialization_rejections.sql",
       "sha384": "15665efcdf43a16d0400827521dc8c9a3943f5b0710ab2ef954d1c8b0ebcac14ab140b2814150159567450c94bdb6282"
+    },
+    {
+      "version": 32,
+      "file": "0032_factory_verification_recovery.sql",
+      "sha384": "d2decaf366ef548308e60083d253e76cfe1b32a53c7ff021be54a46405618fdd3aa8acfe73c99f6350d2c68fa5683f7e"
     }
   ]
 }

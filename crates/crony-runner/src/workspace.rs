@@ -1,5 +1,7 @@
 use std::{
     ffi::OsString,
+    fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Output, Stdio},
     sync::Arc,
@@ -7,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::Mutex};
 use url::Url;
 use uuid::Uuid;
@@ -403,6 +406,21 @@ impl WorkspaceManager {
         })
     }
 
+    pub async fn fingerprint(&self, workspace: &WorkspaceLease) -> Result<String> {
+        self.verify_managed_path(&workspace.path).await?;
+        fingerprint_path(&workspace.path).await
+    }
+
+    pub async fn head_commit(&self, workspace: &WorkspaceLease) -> Result<String> {
+        self.verify_managed_path(&workspace.path).await?;
+        self.git_text_os(
+            &workspace.path,
+            &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
+        )
+        .await
+        .map(|value| value.trim().to_ascii_lowercase())
+    }
+
     async fn verify_existing(
         &self,
         path: PathBuf,
@@ -586,6 +604,169 @@ impl WorkspaceManager {
     async fn git_exit_success(&self, cwd: &Path, args: &[OsString]) -> Result<bool> {
         Ok(run_git(cwd, args).await?.status.success())
     }
+}
+
+pub async fn fingerprint_path(root: &Path) -> Result<String> {
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || fingerprint_workspace(&root))
+        .await
+        .context("join workspace fingerprint task")?
+}
+
+pub async fn find_file_by_digest(
+    root: &Path,
+    file_name: &str,
+    expected_sha256: &str,
+    expected_bytes: usize,
+) -> Result<PathBuf> {
+    let root = root.to_owned();
+    let file_name = file_name.to_owned();
+    let expected_sha256 = expected_sha256.to_owned();
+    tokio::task::spawn_blocking(move || {
+        find_workspace_file_by_digest(&root, &file_name, &expected_sha256, expected_bytes)
+    })
+    .await
+    .context("join workspace artifact search task")?
+}
+
+fn find_workspace_file_by_digest(
+    root: &Path,
+    file_name: &str,
+    expected_sha256: &str,
+    expected_bytes: usize,
+) -> Result<PathBuf> {
+    if file_name.is_empty()
+        || file_name.len() > 240
+        || file_name.contains(['/', '\\'])
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(anyhow!("legacy workspace artifact identity is invalid"));
+    }
+    const MAX_ENTRIES: usize = 100_000;
+    let mut entries = Vec::<PathBuf>::new();
+    collect_fingerprint_entries(root, root, &mut entries, MAX_ENTRIES)?;
+    entries.sort_by_key(|entry| portable_relative(root, entry));
+    for path in entries {
+        if path.file_name().and_then(|name| name.to_str()) != Some(file_name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect legacy workspace artifact {}", path.display()))?;
+        if !metadata.is_file() || metadata.len() != expected_bytes as u64 {
+            continue;
+        }
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("open legacy workspace artifact {}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read legacy workspace artifact {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        if hex::encode(digest.finalize()) == expected_sha256 {
+            return Ok(path);
+        }
+    }
+    Err(anyhow!(
+        "legacy workspace artifact {file_name} did not match its persisted digest"
+    ))
+}
+
+fn fingerprint_workspace(root: &Path) -> Result<String> {
+    const MAX_ENTRIES: usize = 100_000;
+    let mut entries = Vec::<PathBuf>::new();
+    collect_fingerprint_entries(root, root, &mut entries, MAX_ENTRIES)?;
+    entries.sort_by_key(|entry| portable_relative(root, entry));
+    let mut digest = Sha256::new();
+    for path in entries {
+        let relative = portable_relative(root, &path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect workspace fingerprint path {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)
+                .with_context(|| format!("read workspace symlink {}", path.display()))?;
+            digest.update(b"L\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(target.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+        } else if metadata.is_dir() {
+            digest.update(b"D\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+        } else if metadata.is_file() {
+            digest.update(b"F\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(metadata.len().to_le_bytes());
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("open workspace fingerprint path {}", path.display()))?;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).with_context(|| {
+                    format!("read workspace fingerprint path {}", path.display())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            digest.update(b"\0");
+        } else {
+            return Err(anyhow!(
+                "workspace fingerprint encountered unsupported entry {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn collect_fingerprint_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<PathBuf>,
+    max_entries: usize,
+) -> Result<()> {
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "read workspace fingerprint directory {}",
+            directory.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == root.join(".git") {
+            continue;
+        }
+        entries.push(path.clone());
+        if entries.len() > max_entries {
+            return Err(anyhow!(
+                "workspace fingerprint exceeds {max_entries} entries"
+            ));
+        }
+        if entry.file_type()?.is_dir() {
+            collect_fingerprint_entries(root, &path, entries, max_entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn portable_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn parse_github_repository_identity(remote: &str) -> Option<String> {
@@ -865,6 +1046,79 @@ mod tests {
         assert_eq!(second_cleanup.disposition, WorkspaceDisposition::Preserved);
         assert!(first.path.exists());
         assert!(second.path.exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_covers_tracked_untracked_and_ignored_bytes() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        let initial = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("initial fingerprint");
+        std::fs::write(workspace.path.join("untracked.txt"), "one\n")
+            .expect("write untracked file");
+        let with_untracked = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("untracked fingerprint");
+        assert_ne!(initial, with_untracked);
+        std::fs::write(workspace.path.join("valuable.log"), "ignored\n")
+            .expect("write ignored file");
+        let with_ignored = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("ignored fingerprint");
+        assert_ne!(with_untracked, with_ignored);
+        std::fs::write(workspace.path.join("README.md"), "# changed\n")
+            .expect("change tracked file");
+        let with_tracked = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("tracked fingerprint");
+        assert_ne!(with_ignored, with_tracked);
+        assert_eq!(with_tracked.len(), 64);
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn legacy_artifact_search_is_bounded_by_name_size_and_digest() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        std::fs::create_dir_all(workspace.path.join("nested")).expect("create nested directory");
+        let bytes = b"legacy artifact\n";
+        let artifact = workspace.path.join("nested").join("provider.json");
+        std::fs::write(&artifact, bytes).expect("write legacy artifact");
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        let found = find_file_by_digest(&workspace.path, "provider.json", &sha256, bytes.len())
+            .await
+            .expect("find legacy artifact");
+        assert_eq!(found, artifact);
+        assert!(
+            find_file_by_digest(
+                &workspace.path,
+                "provider.json",
+                &"0".repeat(64),
+                bytes.len(),
+            )
+            .await
+            .expect_err("wrong digest must fail")
+            .to_string()
+            .contains("did not match")
+        );
         cleanup_fixture(&root, &repository);
     }
 

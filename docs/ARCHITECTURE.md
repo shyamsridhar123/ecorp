@@ -318,7 +318,13 @@ After a process ends, cleanup checks the actual Git state. Dirty worktrees, igno
 with commits not integrated into the current base, and any state that cannot be verified are preserved.
 Automatic removal occurs only when the tree is clean and its branch is reachable from or
 tree-equivalent to the base. The runner emits `run.workspace_preserved` or
-`run.workspace_removed`, and Postgres stores the final disposition.
+`run.workspace_removed`, and Postgres stores the final disposition. Preserved worktrees also carry
+a deterministic SHA-256 fingerprint over tracked, untracked, ignored, directory, and symbolic-link
+entries while excluding only the worktree's `.git` control file. Recovery commands must present
+that fingerprint, and the runner rechecks it before provider resume or verifier-only execution.
+For a preserved run created before fingerprints existed, an authorized durable checkpoint command
+first asks the owning runner to verify the managed worktree and verification-linked head, compute
+the fingerprint without starting a provider, and persist it on the original run.
 
 ## Planning and scheduling
 
@@ -383,10 +389,34 @@ The runner buffers an adapter's completion signal, emits one evidence record per
 `run.completed` only after every automated check passes. The server rejects completion events that
 arrive before complete passing evidence or while a manual gate is required.
 
-Failed verification sets the task to `verification_failed` and the mission to failed. A successful
-automated policy can instead enter `waiting_for_approval`. Human-approval gates enforce configured
-roles. Independent-review gates additionally reject the mission requester and producing agent.
-Decisions are durable, actor-attributed, and can release downstream scheduler work.
+Failed verification sets the run to failed, the task to `verification_failed`, and the mission to
+failed. When the mission belongs to a factory item, the same transaction also moves that item to
+`verification_failed`, stores bounded failure detail, and appends the factory event. A successful
+automated policy can instead enter `waiting_for_approval`; the linked factory item moves to
+`awaiting_approval` in that same durable event flow. Human-approval gates enforce configured roles.
+Independent-review gates additionally reject the mission requester and producing agent. Keyed
+decisions replay exactly, and an accepted final gate moves the completed mission and factory item
+to `verified` without requiring a controller polling race.
+
+Factory verification recovery is a dedicated aggregate, not a generic state transition. An owner,
+admin, or manager explicitly chooses `verifier_only` or `source_correction`, supplies a reason, and
+authorizes one new run against the exact failed run, preserved workspace fingerprint, source base,
+policy, attempt ceiling, and remaining budgets. `verification_failed -> running` is forbidden
+through the generic transition endpoint.
+
+- `verifier_only` creates a run with `execution_mode=verification_only`, reuses the stored provider
+  artifact, starts no provider process, verifies the preserved workspace, and preserves an existing
+  commit when the source already has one. Legacy provider artifacts without relative-path metadata
+  are resolved only inside the preserved worktree by file name, exact byte count, and SHA-256.
+- `source_correction` requires a versioned `resume` contract revision and resumes the exact provider
+  session, branch, and workspace lineage. The revision can update reviewed issue text and verifier
+  metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
+  deliverable authority, or widen tools and write scope.
+
+Recovery authorization and its runner command are idempotent and durable. The operation stores the
+reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and
+replacement run IDs, actor, reason, and contract revision. Runner command acknowledgment prevents
+duplicate provider or verifier execution after server reconnect.
 
 ## Agent adapters
 
@@ -503,6 +533,13 @@ The deterministic `fake-process` harness remains gate-free so offline systems te
 without pretending to be production evidence.
 The generic transition endpoint cannot assert `publishing` or `published`; those states are
 reserved for the verifier-gated publication operation in #61.
+
+Verification-failed items are not restarted by ordinary queue polling. The CLI requires an exact
+`--issue`, an explicit `--verification-recovery` mode, and a non-empty recovery reason. A changed
+GitHub issue revision remains ineligible until the explicit recovery path stores the reviewed
+snapshot and, for source correction or verifier-policy change, links the versioned contract
+revision. GitHub Project status remains `In Progress`; only verified publication can move it to
+`In Review`.
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.

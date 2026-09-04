@@ -727,12 +727,12 @@ mod tests {
                     VerifierCheck::Command {
                         program: "node".to_owned(),
                         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
-                        timeout_ms: 5_000,
+                        timeout_ms: 30_000,
                     },
                     VerifierCheck::Test {
                         program: "node".to_owned(),
                         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
-                        timeout_ms: 5_000,
+                        timeout_ms: 30_000,
                     },
                     VerifierCheck::JsonSchema {
                         path: "schema.json".to_owned(),
@@ -888,7 +888,7 @@ mod tests {
             .await
             .expect("create workspace");
         let requested = format!("missing-{}", uuid::Uuid::new_v4());
-        let outcome = verify_command(&workspace, &requested, &[], 5_000).await;
+        let outcome = verify_command(&workspace, &requested, &[], 30_000).await;
 
         assert!(!outcome.passed);
         assert!(outcome.summary.contains("was not found as a regular file"));

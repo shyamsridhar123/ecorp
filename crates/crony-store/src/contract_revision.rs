@@ -125,6 +125,9 @@ impl PgStore {
         );
         validate_revised_contract(&replacement_contract, &input.verification_policy)?;
         let current_policy_value: Value = mission.get("verification_policy");
+        let current_verification_policy: VerificationPolicy =
+            serde_json::from_value(current_policy_value.clone())
+                .context("decode current mission verifier policy")?;
         let mission_status: String = mission.get("status");
         let task_status: String = mission.get("task_status");
         let required_adapter: String = mission.get("required_adapter");
@@ -175,6 +178,22 @@ impl PgStore {
                     &replacement_contract,
                     &required_adapter,
                 )?;
+                let factory_linked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM factory_work_items
+                        WHERE corp_id = $1 AND mission_id = $2
+                    )",
+                )
+                .bind(input.corp_id)
+                .bind(input.mission_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if factory_linked {
+                    ensure_factory_recovery_verification_policy_not_weakened(
+                        &current_verification_policy,
+                        &input.verification_policy,
+                    )?;
+                }
             }
         }
         if required_adapter == "fake-process"

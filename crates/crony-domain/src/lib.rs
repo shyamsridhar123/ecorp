@@ -161,6 +161,22 @@ impl FactoryWorkItemState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FactoryVerificationRecoveryMode {
+    SourceCorrection,
+    VerifierOnly,
+}
+
+impl FactoryVerificationRecoveryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceCorrection => "source_correction",
+            Self::VerifierOnly => "verifier_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PullRequestPublicationState {
     Requested,
     Publishing,
@@ -329,6 +345,28 @@ pub struct FactoryWorkItem {
     pub policy: Value,
     pub mission_id: Option<Uuid>,
     pub failure_detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryVerificationRecovery {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub factory_work_item_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub source_run_id: Uuid,
+    pub replacement_run_id: Option<Uuid>,
+    pub mode: FactoryVerificationRecoveryMode,
+    pub status: String,
+    pub authorized_by: Uuid,
+    pub reason: String,
+    pub observed_source_revision: String,
+    pub reviewed_source_snapshot: Value,
+    pub contract_revision_id: Option<Uuid>,
+    pub previous_verification_policy: VerificationPolicy,
+    pub replacement_verification_policy: VerificationPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -599,6 +637,8 @@ pub struct Run {
     pub workspace_base_commit: Option<String>,
     pub workspace_disposition: Option<String>,
     pub workspace_detail: Option<String>,
+    pub workspace_fingerprint: Option<String>,
+    pub execution_mode: String,
     pub verification_status: String,
     pub verification_summary: Option<String>,
     pub verification_sha256: Option<String>,
@@ -909,6 +949,8 @@ pub struct CorpSnapshot {
     pub circuit_breaker_incidents: Vec<CircuitBreakerIncident>,
     #[serde(default)]
     pub factory_work_items: Vec<FactoryWorkItem>,
+    #[serde(default)]
+    pub factory_verification_recoveries: Vec<FactoryVerificationRecovery>,
     pub events: Vec<DomainEvent>,
 }
 

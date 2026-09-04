@@ -175,6 +175,8 @@ type Run = {
   workspace_base_commit: string | null
   workspace_disposition: string | null
   workspace_detail: string | null
+  workspace_fingerprint: string | null
+  execution_mode: 'provider' | 'verification_only'
   verification_status: string
   verification_summary: string | null
   verification_sha256: string | null
@@ -411,6 +413,23 @@ type FactoryWorkItem = {
   failure_detail: string | null
 }
 
+type FactoryVerificationRecovery = {
+  id: string
+  factory_work_item_id: string
+  mission_id: string
+  task_id: string
+  source_run_id: string
+  replacement_run_id: string | null
+  mode: 'source_correction' | 'verifier_only'
+  status: 'authorized' | 'running' | 'completed' | 'failed'
+  authorized_by: string
+  reason: string
+  observed_source_revision: string
+  contract_revision_id: string | null
+  created_at: string
+  updated_at: string
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -500,6 +519,7 @@ type SnapshotResponse = {
     action_approvals: ActionApproval[]
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
+    factory_verification_recoveries: FactoryVerificationRecovery[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -2672,6 +2692,7 @@ function BudgetRevisionPanel({
 }
 
 function MissionCard({
+  corpId,
   mission,
   tasks,
   runs,
@@ -2683,6 +2704,8 @@ function MissionCard({
   actors,
   verificationRequests,
   actionApprovals,
+  factoryItem,
+  factoryRecoveries,
   actorId,
   actorRole,
   busy,
@@ -2696,6 +2719,7 @@ function MissionCard({
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
+  corpId: string
   mission: Mission
   tasks: Task[]
   runs: Run[]
@@ -2707,6 +2731,8 @@ function MissionCard({
   actors: Actor[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
+  factoryItem: FactoryWorkItem | undefined
+  factoryRecoveries: FactoryVerificationRecovery[]
   actorId: string
   actorRole: string
   busy: boolean
@@ -2732,6 +2758,7 @@ function MissionCard({
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
+  const [copiedRecoveryMode, setCopiedRecoveryMode] = useState<string | null>(null)
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
@@ -2784,6 +2811,28 @@ function MissionCard({
     latestRun && terminalRun(latestRun.status)
       ? latestRun.summary ?? latestRun.verification_summary
       : null
+  const failedTask = tasks.find((task) => task.status === 'verification_failed')
+  const failedRun = failedTask
+    ? runs.find(
+        (run) =>
+          run.task_id === failedTask.id &&
+          run.status === 'failed' &&
+          run.verification_status === 'failed',
+      )
+    : undefined
+  const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
+  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') =>
+    `crony factory ${corpId} ${actorId} --issue ${factoryItem?.source_issue_number ?? ''} --verification-recovery ${mode} --verification-recovery-reason "Explain why this bounded recovery is authorized."`
+  const copyRecoveryCommand = async (
+    mode: 'verifier-only' | 'source-correction',
+  ) => {
+    try {
+      await navigator.clipboard.writeText(recoveryCommand(mode))
+      setCopiedRecoveryMode(mode)
+    } catch {
+      setCopiedRecoveryMode(null)
+    }
+  }
   return (
     <article
       className="mission-card"
@@ -3030,6 +3079,76 @@ function MissionCard({
           ) : null}
         </details>
       ) : null}
+      {factoryItem?.state === 'verification_failed' && failedTask && failedRun ? (
+        <section
+          className="factory-recovery-callout"
+          aria-labelledby={`factory-recovery-${factoryItem.id}`}
+          data-testid="factory-verification-recovery"
+        >
+          <div className="factory-recovery-heading">
+            <div>
+              <span>Governed recovery</span>
+              <strong id={`factory-recovery-${factoryItem.id}`}>
+                The failed work is preserved
+              </strong>
+            </div>
+            <span className="status-chip status-chip-failed">Verification failed</span>
+          </div>
+          <p>
+            Choose a provider-free recheck when the source is correct, or resume the same
+            provider session for a bounded source correction. The trusted controller validates
+            the Project issue, policy, budget, worktree, and lineage before creating one run.
+          </p>
+          <dl>
+            <div>
+              <dt>Attempts remaining</dt>
+              <dd>{Math.max(0, failedTask.max_attempts - failedTask.attempt_count)}</dd>
+            </div>
+            <div>
+              <dt>Workspace</dt>
+              <dd>{failedRun.workspace_disposition ?? 'unknown'}</dd>
+            </div>
+            <div>
+              <dt>Checkpoint</dt>
+              <dd>{failedRun.workspace_fingerprint ? `${shortId(failedRun.workspace_fingerprint)}…` : 'Unavailable'}</dd>
+            </div>
+            <div>
+              <dt>Prior recovery attempts</dt>
+              <dd>{factoryRecoveries.length}</dd>
+            </div>
+          </dl>
+          {canAuthorizeRecovery ? (
+            <div className="factory-recovery-actions">
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('verifier-only')}
+              >
+                {copiedRecoveryMode === 'verifier-only'
+                  ? 'Verifier command copied'
+                  : 'Copy verifier-only command'}
+              </button>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('source-correction')}
+              >
+                {copiedRecoveryMode === 'source-correction'
+                  ? 'Correction command copied'
+                  : 'Copy source-correction command'}
+              </button>
+            </div>
+          ) : (
+            <p className="factory-recovery-role-note">
+              An owner, admin, or manager must authorize the recovery.
+            </p>
+          )}
+          <details>
+            <summary>Show trusted controller command</summary>
+            <code>{recoveryCommand('verifier-only')}</code>
+          </details>
+        </section>
+      ) : null}
       {latestRun && terminalRun(latestRun.status) ? (
         <div className={`terminal-summary terminal-${latestRun.status}`}>
           <strong>{statusLabel(latestRun.status)}</strong>
@@ -3263,25 +3382,29 @@ function RoomPanel({
     )
   }
 
-  const linkedOptions = [
-    ...missions.slice(0, 2).map((mission) => ({
-      value: `mission:${mission.id}`,
-      label: `Mission · ${mission.title}`,
-    })),
-    ...tasks.slice(0, 2).map((task) => ({
-      value: `task:${task.id}`,
-      label: `Task · ${task.title}`,
-    })),
-    ...runs.slice(0, 2).flatMap((run) => [
-      { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
-      ...(run.artifact_sha256 && run.artifact_id
-        ? [{
-            value: `artifact:${run.artifact_id}`,
-            label: `Artifact · ${shortId(run.artifact_sha256)}`,
-          }]
-        : []),
-    ]),
-  ]
+  const linkedOptions = Array.from(
+    new Map(
+      [
+        ...missions.slice(0, 2).map((mission) => ({
+          value: `mission:${mission.id}`,
+          label: `Mission · ${mission.title}`,
+        })),
+        ...tasks.slice(0, 2).map((task) => ({
+          value: `task:${task.id}`,
+          label: `Task · ${task.title}`,
+        })),
+        ...runs.slice(0, 2).flatMap((run) => [
+          { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
+          ...(run.artifact_sha256 && run.artifact_id
+            ? [{
+                value: `artifact:${run.artifact_id}`,
+                label: `Artifact · ${shortId(run.artifact_sha256)}`,
+              }]
+            : []),
+        ]),
+      ].map((option) => [option.value, option] as const),
+    ).values(),
+  )
   const visibleMessages = messages.slice(-40)
   const replyTarget = replyToId
     ? messages.find((message) => message.id === replyToId)
@@ -5401,6 +5524,7 @@ function App() {
               {selectedMission ? (
                 <MissionCard
                   key={selectedMission.id}
+                  corpId={bootstrap.corp_id}
                   mission={selectedMission}
                   tasks={selectedMissionTasks}
                   runs={selectedMissionRuns}
@@ -5416,6 +5540,12 @@ function App() {
                   actors={data.snapshot.actors}
                   verificationRequests={data.snapshot.verification_requests}
                   actionApprovals={data.snapshot.action_approvals}
+                  factoryItem={data.snapshot.factory_work_items.find(
+                    (item) => item.mission_id === selectedMission.id,
+                  )}
+                  factoryRecoveries={data.snapshot.factory_verification_recoveries.filter(
+                    (recovery) => recovery.mission_id === selectedMission.id,
+                  )}
                   actorId={selectedActor.id}
                   actorRole={selectedActor.role}
                   busy={busy}

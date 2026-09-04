@@ -60,6 +60,7 @@ pub async fn export(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
+    preserve_head_commit: Option<&str>,
 ) -> Result<ExportedDeliverable> {
     let workspace_root = tokio::fs::canonicalize(&workspace.path)
         .await
@@ -90,6 +91,7 @@ pub async fn export(
         report,
         provider_artifacts,
         write_scope,
+        preserve_head_commit,
         &temporary_paths,
     )
     .await;
@@ -98,6 +100,7 @@ pub async fn export(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn export_with_index(
     spec: &DeliverableSpec,
     workspace: &WorkspaceLease,
@@ -105,6 +108,7 @@ async fn export_with_index(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
+    preserve_head_commit: Option<&str>,
     temporary_paths: &TemporaryExportPaths<'_>,
 ) -> Result<ExportedDeliverable> {
     git_success(
@@ -175,6 +179,7 @@ async fn export_with_index(
             workspace,
             &verification_sha256,
             &changes,
+            preserve_head_commit,
         )
         .await?
     } else {
@@ -513,6 +518,7 @@ async fn commit_index(
     lease: &WorkspaceLease,
     verification_sha256: &str,
     changes: &[(String, String)],
+    preserve_head_commit: Option<&str>,
 ) -> Result<Option<String>> {
     let tree = git_text(workspace, index, &[OsString::from("write-tree")]).await?;
     let base_tree = git_text(
@@ -530,6 +536,28 @@ async fn commit_index(
         &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
     )
     .await?;
+    if let Some(expected_head) = preserve_head_commit {
+        if old_head != expected_head {
+            return Err(anyhow!(
+                "verifier-only deliverable expected head {expected_head}, found {old_head}"
+            ));
+        }
+        let expected_tree = git_text(
+            workspace,
+            index,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from(format!("{expected_head}^{{tree}}")),
+            ],
+        )
+        .await?;
+        if tree != expected_tree {
+            return Err(anyhow!(
+                "verifier-only deliverable tree changed from preserved head {expected_head}"
+            ));
+        }
+        return Ok(Some(expected_head.to_owned()));
+    }
     let commit = if tree == base_tree {
         lease.base_commit.clone()
     } else {
@@ -902,6 +930,7 @@ mod tests {
             &report,
             std::slice::from_ref(&provider),
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("first export");
@@ -912,6 +941,7 @@ mod tests {
             &report,
             &[provider],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("second export");
@@ -946,6 +976,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("secret-like path must fail");
@@ -974,6 +1005,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("nested secret-like path must fail");
@@ -1022,6 +1054,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("Git pathspec magic must fail");
@@ -1047,6 +1080,7 @@ mod tests {
             &report,
             &[],
             &["src/**".to_owned()],
+            None,
         )
         .await
         .expect_err("out-of-scope source must fail");
@@ -1081,6 +1115,7 @@ mod tests {
             &report,
             &[provider],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("commit export");
@@ -1117,6 +1152,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verifier_only_export_preserves_the_existing_head_commit() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"verified once\n").expect("modify tracked");
+        let spec = DeliverableSpec {
+            form: DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: Vec::new(),
+        };
+        let first = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            None,
+        )
+        .await
+        .expect("initial committed export");
+        let head = first.head_commit.expect("initial head commit");
+        let second = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect("verifier-only committed export");
+        assert_eq!(second.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        fs::write(root.join("tracked.txt"), b"changed after checkpoint\n")
+            .expect("mutate checkpoint");
+        let mismatch = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect_err("changed verifier-only tree must fail");
+        assert!(mismatch.to_string().contains("tree changed"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn commit_form_bundles_validated_branch_when_head_is_detached() {
         let (root, lease, report) = fixture();
         git(&root, &["checkout", "--detach", &lease.base_commit]);
@@ -1133,6 +1219,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("detached commit export");
@@ -1185,6 +1272,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("scoped commit export");
@@ -1223,6 +1311,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("literal scoped commit export");
@@ -1259,6 +1348,7 @@ mod tests {
             &report,
             &[],
             &["tracked.txt".to_owned()],
+            None,
         )
         .await
         .expect("scoped commit export");
@@ -1315,6 +1405,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("symlink must fail");
