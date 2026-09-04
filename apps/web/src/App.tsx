@@ -858,6 +858,41 @@ function storedAccessToken(): string | null {
   return window.sessionStorage.getItem('ecorp_access_token')
 }
 
+class ApiRequestError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
+}
+
+function browserOperationKey(storageKey: string, payload: string): string {
+  try {
+    const stored = window.sessionStorage.getItem(storageKey)
+    if (stored) {
+      const operation = JSON.parse(stored) as { payload?: unknown; key?: unknown }
+      if (
+        operation.payload === payload &&
+        typeof operation.key === 'string' &&
+        operation.key
+      ) {
+        return operation.key
+      }
+    }
+    const key = crypto.randomUUID()
+    window.sessionStorage.setItem(storageKey, JSON.stringify({ payload, key }))
+    return key
+  } catch {
+    return crypto.randomUUID()
+  }
+}
+
+function clearBrowserOperation(storageKey: string) {
+  window.sessionStorage.removeItem(storageKey)
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const token = storedAccessToken()
   const response = await fetch(`${API_URL}${path}`, {
@@ -870,7 +905,10 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   })
   const body = await response.json()
   if (!response.ok) {
-    throw new Error(body.error ?? `${response.status} ${response.statusText}`)
+    throw new ApiRequestError(
+      response.status,
+      body.error ?? `${response.status} ${response.statusText}`,
+    )
   }
   return body as T
 }
@@ -1612,8 +1650,6 @@ function FactoryPanel({
 }) {
   const [commentBody, setCommentBody] = useState('')
   const [steerText, setSteerText] = useState('')
-  const commentOperation = useRef<{ payload: string; key: string } | null>(null)
-  const steerOperation = useRef<{ payload: string; key: string } | null>(null)
   const stateTone = (state: FactoryWorkItem['state']) => {
     if (['verified', 'published'].includes(state)) return 'completed'
     if (['blocked', 'verification_failed', 'failed', 'cancelled'].includes(state)) {
@@ -1985,13 +2021,12 @@ function FactoryPanel({
                                 mentions,
                                 missionId: selectedMission.id,
                               })
-                              if (commentOperation.current?.payload !== payload) {
-                                commentOperation.current = {
-                                  payload,
-                                  key: crypto.randomUUID(),
-                                }
-                              }
-                              const idempotencyKey = commentOperation.current.key
+                              const operationStorageKey =
+                                `ecorp:factory-comment:${selected.id}:${selectedActor.id}`
+                              const idempotencyKey = browserOperationKey(
+                                operationStorageKey,
+                                payload,
+                              )
                               void onPostComment({
                                 roomId: room.id,
                                 body,
@@ -2001,7 +2036,7 @@ function FactoryPanel({
                                 idempotencyKey,
                               }).then((saved) => {
                                 if (saved) {
-                                  commentOperation.current = null
+                                  clearBrowserOperation(operationStorageKey)
                                   setCommentBody('')
                                 }
                               })
@@ -2073,17 +2108,16 @@ function FactoryPanel({
                                         actorId: selectedActor.id,
                                         text: steerText.trim(),
                                       })
-                                      if (steerOperation.current?.payload !== payload) {
-                                        steerOperation.current = {
-                                          payload,
-                                          key: crypto.randomUUID(),
-                                        }
-                                      }
-                                      return steerOperation.current.key
+                                      return browserOperationKey(
+                                        `ecorp:factory-steer:${activeRun.id}:${selectedActor.id}`,
+                                        payload,
+                                      )
                                     })(),
                                   ).then((saved) => {
                                     if (saved) {
-                                      steerOperation.current = null
+                                      clearBrowserOperation(
+                                        `ecorp:factory-steer:${activeRun.id}:${selectedActor.id}`,
+                                      )
                                       setSteerText('')
                                     }
                                   })
@@ -2423,7 +2457,6 @@ function AgentDesk({
 }) {
   const [text, setText] = useState('')
   const [transferActorId, setTransferActorId] = useState('')
-  const messageOperation = useRef<{ payload: string; key: string } | null>(null)
   const ownsLease = lease?.actor_id === actor.id
   const live = Boolean(agent.current_run_id)
   const operator = canOperate(actor.role)
@@ -2454,17 +2487,16 @@ function AgentDesk({
       actorId: actor.id,
       text: normalized,
     })
-    if (messageOperation.current?.payload !== payload) {
-      messageOperation.current = { payload, key: crypto.randomUUID() }
-    }
+    const operationStorageKey = `ecorp:agent-message:${agent.id}:${actor.id}`
+    const idempotencyKey = browserOperationKey(operationStorageKey, payload)
     const saved = await onMessage(
       agent,
       normalized,
       messageToken,
-      messageOperation.current.key,
+      idempotencyKey,
     )
     if (saved) {
-      messageOperation.current = null
+      clearBrowserOperation(operationStorageKey)
       setText('')
     }
   }
@@ -3820,7 +3852,6 @@ function RoomPanel({
   const [body, setBody] = useState('')
   const [replyToId, setReplyToId] = useState<string | null>(null)
   const [linkValue, setLinkValue] = useState('')
-  const messageOperation = useRef<{ payload: string; key: string } | null>(null)
 
   if (!room) {
     return (
@@ -3882,19 +3913,18 @@ function RoomPanel({
       mentions,
       link,
     })
-    if (messageOperation.current?.payload !== payload) {
-      messageOperation.current = { payload, key: crypto.randomUUID() }
-    }
+    const operationStorageKey = `ecorp:room-message:${room.id}:${selectedActor.id}`
+    const idempotencyKey = browserOperationKey(operationStorageKey, payload)
     const saved = await onPost({
       roomId: room.id,
       body: body.trim(),
       replyToId,
       mentions,
       link,
-      idempotencyKey: messageOperation.current.key,
+      idempotencyKey,
     })
     if (saved) {
-      messageOperation.current = null
+      clearBrowserOperation(operationStorageKey)
       setBody('')
       setReplyToId(null)
       setLinkValue('')
@@ -4672,6 +4702,16 @@ function App() {
 
   const decideActionApproval = async (approval: ActionApproval, approved: boolean) => {
     if (!bootstrap || !selectedActor) return
+    const note = approved
+      ? `${selectedActor.name} approved the scoped action.`
+      : `${selectedActor.name} rejected the scoped action.`
+    const operationStorageKey =
+      `ecorp:approval-decision:${bootstrap.corp_id}:${selectedActor.id}:` +
+      `${approval.id}:${approved ? 'approve' : 'reject'}`
+    const decisionKey = browserOperationKey(
+      operationStorageKey,
+      JSON.stringify({ approvalId: approval.id, approved, note }),
+    )
     setBusy(true)
     setError(null)
     try {
@@ -4682,13 +4722,12 @@ function App() {
           body: JSON.stringify({
             actor_id: selectedActor.id,
             approved,
-            note: approved
-              ? `${selectedActor.name} approved the scoped action.`
-              : `${selectedActor.name} rejected the scoped action.`,
-            decision_key: crypto.randomUUID(),
+            note,
+            decision_key: decisionKey,
           }),
         },
       )
+      clearBrowserOperation(operationStorageKey)
       await refresh(bootstrap.corp_id, selectedActor.id)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -4943,7 +4982,9 @@ function App() {
     action: 'pause' | 'resume' | 'reconcile',
   ) => {
     if (!bootstrap || !selectedActor) return
-    const operationStorageKey = `ecorp_factory_control:${controller.id}:${action}`
+    const operationStorageKey =
+      `ecorp:factory-control:${bootstrap.corp_id}:${selectedActor.id}:` +
+      `${controller.id}:${action}`
     let pendingOperation: { idempotencyKey: string; expectedVersion: number } | null = null
     try {
       const stored = window.sessionStorage.getItem(operationStorageKey)
@@ -4991,6 +5032,9 @@ function App() {
             : 'Factory reconciliation requested.',
       )
     } catch (caught) {
+      if (caught instanceof ApiRequestError && caught.status >= 400 && caught.status < 500) {
+        window.sessionStorage.removeItem(operationStorageKey)
+      }
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setBusy(false)

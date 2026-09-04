@@ -286,9 +286,10 @@ lease, delivers steering through durable runner commands, restarts the server, r
 browser from its prior sequence cursor, and records Bob's decision after reconnect. Exact replay
 of comment, steer, claim, materialization, and decision operation keys creates no duplicate
 message, provider effect, work item, mission, or run. The same drill proves two durable steer
-acknowledgments, stale-token rejection, controller recovery to `watching`, and final `verified`
-state. A separate rendered two-browser pass exposed and verified the **Reclaim control** recovery
-for a browser that lost its private fencing token. See
+acknowledgments, stale-token rejection, cancellation of a pending steer after its lease version
+rotates, controller recovery to `watching`, and final `verified` state. A separate rendered
+two-browser pass exposed and verified the **Reclaim control** recovery for a browser that lost its
+private fencing token. See
 `docs/evidence/2026-09-04-factory-cockpit-restart.md`.
 
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid

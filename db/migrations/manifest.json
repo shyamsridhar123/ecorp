@@ -165,6 +165,11 @@
       "version": 33,
       "file": "0033_cockpit_operation_idempotency.sql",
       "sha384": "aedd876b57b4b3b4568108ad3a8c3be3ade7e70c1f45c75f3099d8875146e8f00dd0d9954d97d5fed788d5d2003951e8"
+    },
+    {
+      "version": 34,
+      "file": "0034_durable_control_command_fencing.sql",
+      "sha384": "2149b2098c0c3212cef040431d91df97a38fe9d5bcc7d3961c08cab883b29a86a537972a9d5814dfb87b422188b32e62"
     }
   ]
 }

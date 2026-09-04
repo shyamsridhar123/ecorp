@@ -1254,32 +1254,91 @@ fn valid_scope_component(value: &str) -> bool {
 }
 
 async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> anyhow::Result<()> {
-    let Some(sender) = state
-        .runners
-        .get(runner_id)
-        .map(|connection| connection.tx.clone())
-    else {
+    let Some((sender, durable_control)) = state.runners.get(runner_id).map(|connection| {
+        (
+            connection.tx.clone(),
+            connection
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "durable-control-v1" && capability.available),
+        )
+    }) else {
         return Ok(());
     };
-    for command in state.store.pending_runner_commands(runner_id).await? {
-        let outgoing = decode_runner_command(&command)?;
-        if sender.send(outgoing).is_err() {
+    loop {
+        let commands = state.store.pending_runner_commands(runner_id).await?;
+        let batch_len = commands.len();
+        if batch_len == 0 {
+            break;
+        }
+        let mut dispatched = false;
+        for command in commands {
+            let control_lease_token = if command.command_kind == "control_message" {
+                match state.store.control_command_lease_token(&command).await? {
+                    Some(token) => Some(token),
+                    None => {
+                        if let Some(event) = state
+                            .store
+                            .fail_runner_command(
+                                command.id,
+                                runner_id,
+                                "control lease changed or expired before durable steering dispatch",
+                            )
+                            .await?
+                        {
+                            publish(state, event);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let outgoing = decode_runner_command(&command, control_lease_token, durable_control)?;
+            if sender.send(outgoing).is_err() {
+                return Ok(());
+            }
+            if command.command_kind == "control_message"
+                && !durable_control
+                && let Some(event) = state
+                    .store
+                    .acknowledge_runner_command(command.id, runner_id)
+                    .await?
+            {
+                publish(state, event);
+            }
+            dispatched = true;
+        }
+        if dispatched || batch_len < 100 {
             break;
         }
     }
     Ok(())
 }
 
-fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
+fn decode_runner_command(
+    command: &PendingRunnerCommand,
+    control_lease_token: Option<Uuid>,
+    durable_control: bool,
+) -> anyhow::Result<ServerToRunner> {
     match command.command_kind.as_str() {
         "control_message" => Ok(ServerToRunner::ControlMessage {
-            command_id: command.id,
-            message_id: command
-                .payload
-                .get("message_id")
-                .and_then(serde_json::Value::as_str)
-                .context("control message command omitted message_id")
-                .and_then(|value| Uuid::parse_str(value).context("message id is invalid"))?,
+            command_id: durable_control.then_some(command.id),
+            message_id: if durable_control {
+                Some(
+                    command
+                        .payload
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                        .context("control message command omitted message_id")
+                        .and_then(|value| {
+                            Uuid::parse_str(value).context("message id is invalid")
+                        })?,
+                )
+            } else {
+                None
+            },
+            corp_id: command.corp_id,
             run_id: command.run_id,
             agent_id: command
                 .payload
@@ -1293,6 +1352,8 @@ fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<Serve
                 .and_then(serde_json::Value::as_str)
                 .context("control message command omitted actor_id")
                 .and_then(|value| Uuid::parse_str(value).context("actor id is invalid"))?,
+            lease_token: control_lease_token
+                .context("control message command omitted current lease token")?,
             text: command
                 .payload
                 .get("text")
@@ -4310,6 +4371,17 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 }
                 if !applied {
                     warn!(%runner_id, %command_id, %detail, "runner could not apply durable command");
+                    match state
+                        .store
+                        .fail_runner_command(command_id, &runner_id, &detail)
+                        .await
+                    {
+                        Ok(Some(event)) => publish(&state, event),
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, %runner_id, %command_id, "runner command failure persistence failed")
+                        }
+                    }
                     continue;
                 }
                 match state

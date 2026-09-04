@@ -593,6 +593,7 @@ pub struct ActionApprovalDecisionOutcome {
 #[derive(Debug, Clone)]
 pub struct PendingRunnerCommand {
     pub id: Uuid,
+    pub corp_id: Uuid,
     pub runner_id: String,
     pub run_id: Uuid,
     pub command_kind: String,
@@ -1507,7 +1508,7 @@ impl PgStore {
 
         let leases = sqlx::query(
             r#"
-            SELECT agent_id, corp_id, actor_id, token, expires_at
+            SELECT agent_id, corp_id, actor_id, token, lease_version, expires_at
             FROM control_leases WHERE corp_id = $1 AND expires_at > now()
             ORDER BY agent_id
             "#,
@@ -6633,7 +6634,7 @@ impl PgStore {
     ) -> Result<Vec<PendingRunnerCommand>> {
         Ok(sqlx::query(
             r#"
-            SELECT id, runner_id, run_id, command_kind, payload
+            SELECT id, corp_id, runner_id, run_id, command_kind, payload
             FROM runner_commands
             WHERE runner_id = $1 AND status = 'pending'
             ORDER BY created_at, id
@@ -6646,12 +6647,186 @@ impl PgStore {
         .into_iter()
         .map(|row| PendingRunnerCommand {
             id: row.get("id"),
+            corp_id: row.get("corp_id"),
             runner_id: row.get("runner_id"),
             run_id: row.get("run_id"),
             command_kind: row.get("command_kind"),
             payload: row.get("payload"),
         })
         .collect())
+    }
+
+    pub async fn control_command_lease_token(
+        &self,
+        command: &PendingRunnerCommand,
+    ) -> Result<Option<Uuid>> {
+        if command.command_kind != "control_message" {
+            return Ok(None);
+        }
+        let message_id = command
+            .payload
+            .get("message_id")
+            .and_then(Value::as_str)
+            .context("control message command omitted message_id")
+            .and_then(|value| Uuid::parse_str(value).context("control message id is invalid"))?;
+        let agent_id = command
+            .payload
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .context("control message command omitted agent_id")
+            .and_then(|value| Uuid::parse_str(value).context("control agent id is invalid"))?;
+        let actor_id = command
+            .payload
+            .get("actor_id")
+            .and_then(Value::as_str)
+            .context("control message command omitted actor_id")
+            .and_then(|value| Uuid::parse_str(value).context("control actor id is invalid"))?;
+        let lease_version = command
+            .payload
+            .get("lease_version")
+            .and_then(Value::as_i64)
+            .context("control message command omitted lease_version")?;
+        sqlx::query_scalar(
+            r#"
+            SELECT lease.token
+            FROM runner_commands command
+            JOIN queued_messages message
+              ON message.command_id = command.id
+             AND message.id = $3
+             AND message.agent_id = $4
+             AND message.actor_id = $5
+            JOIN control_leases lease
+              ON lease.corp_id = command.corp_id
+             AND lease.agent_id = message.agent_id
+             AND lease.actor_id = message.actor_id
+             AND lease.lease_version = $6
+             AND lease.expires_at > now()
+            JOIN runs run
+              ON run.id = command.run_id
+             AND run.agent_id = message.agent_id
+             AND run.runner_id = command.runner_id
+             AND run.status IN ('starting', 'running', 'waiting_for_input',
+                                'waiting_for_approval', 'verifying')
+            WHERE command.id = $1
+              AND command.runner_id = $2
+              AND command.corp_id = $7
+              AND command.run_id = $8
+              AND command.status = 'pending'
+            "#,
+        )
+        .bind(command.id)
+        .bind(&command.runner_id)
+        .bind(message_id)
+        .bind(agent_id)
+        .bind(actor_id)
+        .bind(lease_version)
+        .bind(command.corp_id)
+        .bind(command.run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn fail_runner_command(
+        &self,
+        command_id: Uuid,
+        runner_id: &str,
+        detail: &str,
+    ) -> Result<Option<DomainEvent>> {
+        let mut detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        while detail.len() > 1_000 {
+            detail.pop();
+        }
+        if detail.is_empty() {
+            detail = "runner rejected the durable command".to_owned();
+        }
+        let mut tx = self.pool.begin().await?;
+        let command = sqlx::query(
+            r#"
+            UPDATE runner_commands
+            SET status = 'failed', failure_detail = $1, failed_at = now()
+            WHERE id = $2 AND runner_id = $3 AND status = 'pending'
+            RETURNING corp_id, run_id, command_kind, payload
+            "#,
+        )
+        .bind(&detail)
+        .bind(command_id)
+        .bind(runner_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(command) = command else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let corp_id: Uuid = command.get("corp_id");
+        let run_id: Uuid = command.get("run_id");
+        let command_kind: String = command.get("command_kind");
+        let payload: Value = command.get("payload");
+        let message_id = if command_kind == "control_message" {
+            let message_id = payload
+                .get("message_id")
+                .and_then(Value::as_str)
+                .context("control message command omitted message_id")
+                .and_then(|value| {
+                    Uuid::parse_str(value).context("control message id is invalid")
+                })?;
+            sqlx::query(
+                r#"
+                UPDATE queued_messages
+                SET status = 'cancelled'
+                WHERE command_id = $1 AND corp_id = $2 AND id = $3
+                "#,
+            )
+            .bind(command_id)
+            .bind(corp_id)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+            Some(message_id)
+        } else {
+            None
+        };
+        let context = sqlx::query(
+            r#"
+            SELECT task.mission_id, mission.room_id
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mission_id: Uuid = context.get("mission_id");
+        let room_id: Uuid = context.get("room_id");
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "runner.command_failed",
+                    "run",
+                    run_id,
+                    format!("runner-command-failed:{command_id}"),
+                    json!({
+                        "command_id": command_id,
+                        "runner_id": runner_id,
+                        "command_kind": command_kind,
+                        "message_id": message_id,
+                        "detail": detail
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("runner command failure event unexpectedly existed")?;
+        tx.commit().await?;
+        Ok(Some(event))
     }
 
     pub async fn acknowledge_runner_command(
@@ -7027,6 +7202,7 @@ impl PgStore {
         let command_id = Uuid::new_v4();
         let command = PendingRunnerCommand {
             id: command_id,
+            corp_id,
             runner_id: runner_id.clone(),
             run_id,
             command_kind: "circuit_breaker".to_owned(),
@@ -7331,10 +7507,11 @@ impl PgStore {
             SET corp_id = EXCLUDED.corp_id,
                 actor_id = EXCLUDED.actor_id,
                 token = EXCLUDED.token,
+                lease_version = control_leases.lease_version + 1,
                 expires_at = EXCLUDED.expires_at
             WHERE control_leases.expires_at <= now()
                OR control_leases.actor_id = EXCLUDED.actor_id
-            RETURNING agent_id, corp_id, actor_id, token, expires_at
+            RETURNING agent_id, corp_id, actor_id, token, lease_version, expires_at
             "#,
         )
         .bind(agent_id)
@@ -7349,7 +7526,7 @@ impl PgStore {
             (true, map_lease(row))
         } else {
             let row = sqlx::query(
-                "SELECT agent_id, corp_id, actor_id, token, expires_at FROM control_leases WHERE agent_id = $1",
+                "SELECT agent_id, corp_id, actor_id, token, lease_version, expires_at FROM control_leases WHERE agent_id = $1",
             )
             .bind(agent_id)
             .fetch_one(&mut *tx)
@@ -7447,7 +7624,7 @@ impl PgStore {
 
         let existing = sqlx::query(
             r#"
-            SELECT agent_id, corp_id, actor_id, token, expires_at
+            SELECT agent_id, corp_id, actor_id, token, lease_version, expires_at
             FROM control_leases
             WHERE agent_id = $1 AND corp_id = $2
             FOR UPDATE
@@ -7471,9 +7648,9 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             UPDATE control_leases
-            SET actor_id = $1, token = $2, expires_at = $3
+            SET actor_id = $1, token = $2, lease_version = lease_version + 1, expires_at = $3
             WHERE agent_id = $4 AND corp_id = $5
-            RETURNING agent_id, corp_id, actor_id, token, expires_at
+            RETURNING agent_id, corp_id, actor_id, token, lease_version, expires_at
             "#,
         )
         .bind(to_actor_id)
@@ -7575,7 +7752,7 @@ impl PgStore {
         }
         let active_lease = sqlx::query(
             r#"
-            SELECT agent_id, corp_id, actor_id, token, expires_at
+            SELECT agent_id, corp_id, actor_id, token, lease_version, expires_at
             FROM control_leases
             WHERE agent_id = $1 AND corp_id = $2
             FOR UPDATE
@@ -7598,6 +7775,10 @@ impl PgStore {
             (None, None) => false,
             _ => return Err(anyhow!("stale or unauthorized control lease token")),
         };
+        let lease_version = active_lease
+            .as_ref()
+            .filter(|lease| lease.actor_id == actor_id)
+            .map(|lease| lease.lease_version);
 
         let active_run = sqlx::query(
             r#"
@@ -7636,6 +7817,8 @@ impl PgStore {
             (None, None)
         };
         let command_id = if let (Some(run_id), Some(runner_id)) = (run_id, runner_id.as_ref()) {
+            let lease_version =
+                lease_version.context("immediate control message omitted its lease fence")?;
             let command_id = Uuid::new_v4();
             sqlx::query(
                 r#"
@@ -7652,6 +7835,7 @@ impl PgStore {
                 "message_id": message_id,
                 "agent_id": agent_id,
                 "actor_id": actor_id,
+                "lease_version": lease_version,
                 "text": text
             }))
             .bind(format!("control-message:{message_id}"))
@@ -7940,7 +8124,7 @@ impl PgStore {
         assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
         let lease = sqlx::query(
             r#"
-            SELECT agent_id, corp_id, actor_id, token, expires_at
+            SELECT agent_id, corp_id, actor_id, token, lease_version, expires_at
             FROM control_leases
             WHERE agent_id = $1 AND corp_id = $2
             FOR UPDATE
@@ -10549,6 +10733,7 @@ fn map_lease(row: sqlx::postgres::PgRow) -> ControlLease {
         corp_id: row.get("corp_id"),
         actor_id: row.get("actor_id"),
         token: row.get("token"),
+        lease_version: row.get("lease_version"),
         expires_at: row.get("expires_at"),
     }
 }

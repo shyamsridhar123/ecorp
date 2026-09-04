@@ -48,11 +48,12 @@ Fresh final result:
 
 ```json
 {
-  "checked_at": "2026-09-04T20:53:04.046Z",
+  "checked_at": "2026-09-04T21:26:07.034Z",
   "alice_replay_events": 23,
   "bob_replay_events": 23,
   "comment_retry_idempotent": true,
   "stale_lease_token_rejected": true,
+  "stale_pending_steer_cancelled": true,
   "steer_retry_idempotent": true,
   "durable_steer_acks": 2,
   "decision_attribution_preserved": true,
@@ -98,10 +99,16 @@ lease; a stale token cannot issue a new command.
 - Steering carries a client operation UUID and becomes a persisted `control_message` runner
   command.
 - The server can redispatch a pending steering command after reconnect.
+- A lease version fences a pending command if control is renewed, released, transferred, or expires
+  before dispatch.
 - The runner deduplicates command IDs, applies the steer at most once for a continuous runner
   process, and acknowledges the durable command.
 - The server records the acknowledgment and marks the control message delivered.
+- A negative runner acknowledgment terminalizes the command and cancels the associated control
+  message instead of leaving it to starve the pending queue.
 - Lease tokens remain private and are not persisted in runner-command payloads.
+- New and previous runner versions retain a compatible control-message wire shape; new runners
+  advertise durable acknowledgment support while older runners retain bounded legacy delivery.
 - Controller pause, resume, and reconcile clicks retain their operation UUID and original expected
   version in browser session storage until a response succeeds.
 

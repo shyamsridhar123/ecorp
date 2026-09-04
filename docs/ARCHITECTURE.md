@@ -257,10 +257,13 @@ as cancelled.
 
 Messages from the current controller become durable runner commands for adapters that support
 steering. The server checks the private lease token before persistence, stores no copy of that
-token in the command, and assigns both a client operation UUID and runner command ID. Pending
+token in the command, and assigns a monotonic lease version, client operation UUID, and runner
+command ID. Dispatch revalidates the actor, lease version, expiry, active run, and runner. Pending
 commands are redispatched after server or runner reconnect, the runner deduplicates command IDs,
-and a runner acknowledgment marks delivery. A browser that reconnects without its private token
-can reclaim the lease as the same actor, which rotates the token and fences its prior copy.
+and a runner acknowledgment marks delivery. A changed lease or negative acknowledgment
+terminalizes the command rather than leaving it to block later commands. A browser that reconnects
+without its private token can reclaim the lease as the same actor, which rotates the token and
+lease version and fences its prior copy.
 
 Other messages are durably queued, reserved into the next task prompt, and marked delivered only
 after the run starts.

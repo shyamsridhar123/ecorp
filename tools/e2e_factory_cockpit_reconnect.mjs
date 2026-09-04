@@ -206,17 +206,27 @@ function assertUniqueSequences(events, minimumExclusive) {
 
 const demo = await postOk('/api/demo/reset', {})
 const initial = await snapshot(demo.corp_id, demo.alice_actor_id)
-const workspace = initial.runners
-  .filter((runner) => runner.connected)
-  .flatMap((runner) => runner.capabilities)
-  .find(
-    (capability) =>
-      capability.name === 'workspace-isolation' &&
-      capability.available &&
-      capability.source_repository &&
-      capability.source_base_ref &&
-      capability.source_base_commit,
-  )
+const connectedRunner = initial.runners.find(
+  (runner) =>
+    runner.connected &&
+    runner.capabilities.some(
+      (capability) =>
+        capability.name === 'workspace-isolation' &&
+        capability.available &&
+        capability.source_repository &&
+        capability.source_base_ref &&
+        capability.source_base_commit,
+    ),
+)
+assert.ok(connectedRunner, 'a connected runner must advertise an immutable source checkout')
+const workspace = connectedRunner.capabilities.find(
+  (capability) =>
+    capability.name === 'workspace-isolation' &&
+    capability.available &&
+    capability.source_repository &&
+    capability.source_base_ref &&
+    capability.source_base_commit,
+)
 assert.ok(workspace, 'a connected runner must advertise an immutable source checkout')
 const repositoryParts = workspace.source_repository.split('/')
 assert.equal(repositoryParts.length, 2)
@@ -463,6 +473,63 @@ await waitFor(
         String(event.payload.text).includes(firstSteer),
     ),
   'provider acknowledgement of pre-restart steering',
+)
+
+await postOk(`/api/demo/runners/${connectedRunner.id}/disconnect`, {
+  reconnect_delay_ms: 2_000,
+})
+await waitFor(
+  demo.corp_id,
+  demo.alice_actor_id,
+  (state) =>
+    state.runners.find((runner) => runner.id === connectedRunner.id)?.status ===
+    'grace',
+  'runner disconnect grace before stale steering',
+)
+const stalePendingText = `This pending steer must be fenced before reconnect ${nonce}`
+const stalePending = await postOk(
+  `/api/corps/${demo.corp_id}/agents/${pending.value.run.agent_id}/messages`,
+  {
+    actor_id: demo.bob_actor_id,
+    lease_token: firstBobLease.token,
+    text: stalePendingText,
+    idempotency_key: crypto.randomUUID(),
+  },
+)
+assert.equal(stalePending.delivery, 'immediate')
+const rotatedBeforeReconnect = await postOk(leasePath, {
+  actor_id: demo.bob_actor_id,
+})
+assert.notEqual(rotatedBeforeReconnect.token, firstBobLease.token)
+await waitFor(
+  demo.corp_id,
+  demo.alice_actor_id,
+  (state) => {
+    const runner = state.runners.find(
+      (candidate) => candidate.id === connectedRunner.id,
+    )
+    const failed = state.snapshot.events.find(
+      (event) =>
+        event.type === 'runner.command_failed' &&
+        event.payload.message_id === stalePending.message_id,
+    )
+    const message = state.snapshot.queued_messages.find(
+      (candidate) => candidate.id === stalePending.message_id,
+    )
+    const providerApplied = state.snapshot.events.some(
+      (event) =>
+        event.type === 'run.output' &&
+        event.aggregate_id === launch.run_id &&
+        String(event.payload.text).includes(stalePendingText),
+    )
+    return runner?.status === 'connected' &&
+      failed &&
+      message?.status === 'cancelled' &&
+      !providerApplied
+      ? { failed, message }
+      : null
+  },
+  'stale pending steering to fail closed after runner reconnect',
 )
 
 const aliceCursor = aliceBrowser.cursor()
@@ -825,6 +892,7 @@ const report = {
   comment_retry_idempotent: true,
   lease_rotated_after_browser_reload: true,
   stale_lease_token_rejected: true,
+  stale_pending_steer_cancelled: true,
   pre_restart_steer_delivered: true,
   post_restart_steer_delivered: true,
   steer_retry_idempotent: true,

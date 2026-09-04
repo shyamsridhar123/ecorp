@@ -146,11 +146,15 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ControlMessage {
-        command_id: Uuid,
-        message_id: Uuid,
+        #[serde(default)]
+        command_id: Option<Uuid>,
+        #[serde(default)]
+        message_id: Option<Uuid>,
+        corp_id: Uuid,
         run_id: Uuid,
         agent_id: Uuid,
         actor_id: Uuid,
+        lease_token: Uuid,
         text: String,
     },
     StopRun {
@@ -924,4 +928,35 @@ pub struct SetBudgetPolicyRequest {
     pub corp_cost_microusd_per_24h: i64,
     pub no_progress_event_limit: i32,
     pub repeated_tool_limit: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerToRunner;
+
+    #[test]
+    fn durable_control_message_accepts_the_legacy_wire_shape() {
+        let legacy = serde_json::json!({
+            "type": "control_message",
+            "corp_id": "00000000-0000-4000-8000-000000000001",
+            "run_id": "00000000-0000-4000-8000-000000000002",
+            "agent_id": "00000000-0000-4000-8000-000000000003",
+            "actor_id": "00000000-0000-4000-8000-000000000004",
+            "lease_token": "00000000-0000-4000-8000-000000000005",
+            "text": "Continue within the assigned worktree."
+        });
+        let message: ServerToRunner =
+            serde_json::from_value(legacy).expect("legacy control message");
+        match message {
+            ServerToRunner::ControlMessage {
+                command_id,
+                message_id,
+                ..
+            } => {
+                assert_eq!(command_id, None);
+                assert_eq!(message_id, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }

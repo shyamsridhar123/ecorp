@@ -124,8 +124,11 @@ message, while changed content under the same key is rejected.
 Cockpit steering uses the existing single-holder agent lease and lease token. The token is checked
 before persistence but is never stored in the durable runner command. A separate client operation
 UUID prevents retry from creating another control message, and the runner command ID fences
-duplicate delivery across server reconnect. A browser that lost its private token must reclaim the
-same actor's lease, which rotates the token before another steer. This does not add a second input
+duplicate delivery across server reconnect. A monotonic lease version is persisted with the
+command and rechecked before dispatch, so renewal, release, transfer, or expiry cancels a pending
+stale steer. Negative runner acknowledgments also terminalize the command rather than leaving it
+pending indefinitely. A browser that lost its private token must reclaim the same actor's lease,
+which rotates the token and lease version before another steer. This does not add a second input
 path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
