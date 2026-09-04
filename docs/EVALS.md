@@ -127,6 +127,14 @@ denial, and preserved provider-session/worktree reuse. Desktop and 390-pixel Chr
 exercise the structured contract editor, exact completion-plan preview, revision form/history, and
 responsive layout.
 
+`tools/e2e_mission_repository_routing.mjs` connects two runners advertising different source
+repositories and commits, creates an ordinary mission with one selected tuple, and proves only the
+matching runner receives the run. The task and run retain the exact repository, ref, and commit;
+the unselected runner creates no worktree; a stale commit is rejected before mission persistence;
+and the ECorp checkout remains unchanged. Browser validation selects and confirms a separate local
+dogfood repository, filters its available runtimes, launches through the UI, and verifies the
+resulting worktree remains outside the ECorp repository.
+
 `tools/e2e_identity.mjs` proves production OIDC enforcement, actor-spoof and cross-Corp rejection,
 authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
 rejection, active-run revocation, superseded-socket rejection, and rejection of a current socket

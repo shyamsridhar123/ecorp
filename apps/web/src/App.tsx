@@ -485,6 +485,9 @@ type RunnerCapability = {
   available: boolean
   detail: string | null
   models: RunnerModel[]
+  source_repository?: string | null
+  source_base_ref?: string | null
+  source_base_commit?: string | null
 }
 
 type RunnerNode = {
@@ -497,6 +500,15 @@ type RunnerNode = {
   last_seen_at: string
   grace_expires_at: string | null
   capabilities: RunnerCapability[]
+}
+
+type RepositoryTarget = {
+  key: string
+  repository: string
+  baseRef: string
+  baseCommit: string
+  runnerIds: string[]
+  runnerLabels: string[]
 }
 
 type SnapshotResponse = {
@@ -716,9 +728,92 @@ function terminalRun(status: string): boolean {
   return ['completed', 'failed', 'cancelled', 'lost'].includes(status)
 }
 
-function availableRunnerAdapters(data: SnapshotResponse | null): RunnerCapability[] {
+function workspaceCapability(runner: RunnerNode): RunnerCapability | undefined {
+  return runner.capabilities.find(
+    (capability) =>
+      capability.name === 'workspace-isolation' &&
+      capability.available &&
+      capability.source_repository &&
+      capability.source_base_ref &&
+      capability.source_base_commit,
+  )
+}
+
+function sourceFingerprint(
+  repository: string,
+  baseRef: string,
+  baseCommit: string,
+): string {
+  return JSON.stringify([
+    repository.toLowerCase(),
+    baseRef,
+    baseCommit.toLowerCase(),
+  ])
+}
+
+function repositoryTargets(data: SnapshotResponse | null): RepositoryTarget[] {
   if (!data) return []
-  const connectedRunners = data.runners.filter((runner) => runner.connected)
+  const targets = new Map<string, RepositoryTarget>()
+  for (const runner of data.runners.filter((candidate) => candidate.connected)) {
+    const capability = workspaceCapability(runner)
+    if (
+      !capability?.source_repository ||
+      !capability.source_base_ref ||
+      !capability.source_base_commit
+    ) {
+      continue
+    }
+    const key = sourceFingerprint(
+      capability.source_repository,
+      capability.source_base_ref,
+      capability.source_base_commit,
+    )
+    const existing = targets.get(key)
+    if (existing) {
+      existing.runnerIds.push(runner.id)
+      existing.runnerLabels.push(`${runner.hostname} · ${runner.os}`)
+      continue
+    }
+    targets.set(key, {
+      key,
+      repository: capability.source_repository,
+      baseRef: capability.source_base_ref,
+      baseCommit: capability.source_base_commit,
+      runnerIds: [runner.id],
+      runnerLabels: [`${runner.hostname} · ${runner.os}`],
+    })
+  }
+  return Array.from(targets.values()).sort((left, right) =>
+    left.repository.localeCompare(right.repository),
+  )
+}
+
+function runnerMatchesRepository(
+  runner: RunnerNode,
+  target: RepositoryTarget,
+): boolean {
+  const capability = workspaceCapability(runner)
+  return Boolean(
+    capability?.source_repository?.toLowerCase() ===
+      target.repository.toLowerCase() &&
+      capability.source_base_ref === target.baseRef &&
+      capability.source_base_commit?.toLowerCase() ===
+        target.baseCommit.toLowerCase(),
+  )
+}
+
+function isEcorpRepository(target: RepositoryTarget | undefined): boolean {
+  return target?.repository.toLowerCase().endsWith('/ecorp') ?? false
+}
+
+function availableRunnerAdapters(
+  data: SnapshotResponse | null,
+  target?: RepositoryTarget,
+): RunnerCapability[] {
+  if (!data) return []
+  const connectedRunners = data.runners.filter(
+    (runner) => runner.connected && (!target || runnerMatchesRepository(runner, target)),
+  )
   const agentAdapters = new Set(data.snapshot.agents.map((agent) => agent.adapter))
   return Array.from(
     connectedRunners
@@ -3832,6 +3927,8 @@ function App() {
   const [missionModel, setMissionModel] = useState('')
   const [missionReasoningEffort, setMissionReasoningEffort] = useState('')
   const [missionStrategy, setMissionStrategy] = useState('single')
+  const [missionSourceKey, setMissionSourceKey] = useState('')
+  const [missionSourceConfirmed, setMissionSourceConfirmed] = useState(false)
   const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
   const [missionDeliverable, setMissionDeliverable] =
     useState<NonNullable<TaskContract['deliverable']>['form']>('archive')
@@ -4125,7 +4222,23 @@ function App() {
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
     [data],
   )
-  const availableAdapters = useMemo(() => availableRunnerAdapters(data), [data])
+  const missionRepositoryTargets = useMemo(() => repositoryTargets(data), [data])
+  const selectedMissionSource = useMemo(
+    () =>
+      missionRepositoryTargets.find((target) => target.key === missionSourceKey),
+    [missionRepositoryTargets, missionSourceKey],
+  )
+  const allAvailableAdapters = useMemo(
+    () => availableRunnerAdapters(data),
+    [data],
+  )
+  const availableAdapters = useMemo(
+    () =>
+      selectedMissionSource
+        ? availableRunnerAdapters(data, selectedMissionSource)
+        : [],
+    [data, selectedMissionSource],
+  )
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
   const preferredAdapter =
@@ -4174,7 +4287,15 @@ function App() {
 
   const createMission = async (event: FormEvent) => {
     event.preventDefault()
-    if (!bootstrap || !selectedActor || !missionTitle.trim()) return
+    if (
+      !bootstrap ||
+      !selectedActor ||
+      !missionTitle.trim() ||
+      !selectedMissionSource ||
+      !missionSourceConfirmed
+    ) {
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -4192,6 +4313,11 @@ function App() {
               ? missionReasoningEffort
               : null,
           strategy: missionStrategy,
+          source: {
+            repository: selectedMissionSource.repository,
+            base_ref: selectedMissionSource.baseRef,
+            base_commit: selectedMissionSource.baseCommit,
+          },
           budget_tokens: deterministicHarness ? null : missionBudgetTokens,
           deliverable: {
             form: missionDeliverable,
@@ -4225,6 +4351,8 @@ function App() {
       setMissionProhibitedActions('')
       setMissionReferences('')
       setMissionWriteScope('')
+      setMissionSourceKey('')
+      setMissionSourceConfirmed(false)
       setCustomVerification(false)
       setMissionVerificationPolicy({
         checks: [defaultVerifierCheck('artifact')],
@@ -4850,7 +4978,9 @@ function App() {
   const sourceRepository =
     detailValue(workspaceCapability?.detail, 'repository') ?? 'No source repository reported'
   const sourceBase = detailValue(workspaceCapability?.detail, 'base') ?? 'HEAD'
-  const realAdapters = availableAdapters.filter((adapter) => adapter.name !== 'fake-process')
+  const realAdapters = allAvailableAdapters.filter(
+    (adapter) => adapter.name !== 'fake-process',
+  )
   const pendingApprovals = data.snapshot.action_approvals.filter(
     (approval) => approval.status === 'pending',
   )
@@ -5390,6 +5520,78 @@ function App() {
                     <p>Pick the runtime, budget, delivery format, and orchestration pattern.</p>
                   </div>
                   <div className="loadout-grid">
+                    <div className="mission-field repository-target-field">
+                      <label htmlFor="mission-repository">Target repository</label>
+                      <select
+                        id="mission-repository"
+                        value={missionSourceKey}
+                        aria-describedby="mission-repository-help"
+                        onChange={(event) => {
+                          setMissionSourceKey(event.target.value)
+                          setMissionSourceConfirmed(false)
+                          setMissionAdapter('')
+                          setMissionModel('')
+                          setMissionReasoningEffort('')
+                        }}
+                      >
+                        <option value="">Select a connected repository</option>
+                        {missionRepositoryTargets.map((target) => (
+                          <option key={target.key} value={target.key}>
+                            {target.repository} · {target.baseRef} ·{' '}
+                            {target.baseCommit.slice(0, 12)}
+                          </option>
+                        ))}
+                      </select>
+                      <small id="mission-repository-help">
+                        {missionRepositoryTargets.length
+                          ? 'The exact repository, ref, and commit are persisted in every task.'
+                          : 'Connect a runner configured for the repository you want to change.'}
+                      </small>
+                      {selectedMissionSource ? (
+                        <div className="repository-target-summary">
+                          <strong>{selectedMissionSource.repository}</strong>
+                          <div className="repository-target-metadata">
+                            <span>Ref {selectedMissionSource.baseRef}</span>
+                            <span>
+                              {selectedMissionSource.runnerIds.length} compatible runner
+                              {selectedMissionSource.runnerIds.length === 1 ? '' : 's'}
+                            </span>
+                            <span>
+                              {availableAdapters.length} runtime
+                              {availableAdapters.length === 1 ? '' : 's'}
+                            </span>
+                          </div>
+                          <small>
+                            Runners: {selectedMissionSource.runnerLabels.join(', ')}
+                          </small>
+                          <code className="repository-commit">
+                            {selectedMissionSource.baseCommit}
+                          </code>
+                          {isEcorpRepository(selectedMissionSource) ? (
+                            <p className="repository-target-warning" role="alert">
+                              This is the ECorp product repository. Use a separate dogfood
+                              repository for disposable applications and acceptance probes.
+                            </p>
+                          ) : null}
+                          <label className="repository-confirmation">
+                            <input
+                              type="checkbox"
+                              checked={missionSourceConfirmed}
+                              onChange={(event) =>
+                                setMissionSourceConfirmed(event.target.checked)
+                              }
+                            />
+                            <span>
+                              <strong>Confirm this target</strong>
+                              <small>
+                                Agents may modify only isolated worktrees created from this
+                                immutable commit.
+                              </small>
+                            </span>
+                          </label>
+                        </div>
+                      ) : null}
+                    </div>
                     <div className="mission-field">
                       <label htmlFor="mission-adapter">Agent runtime</label>
                       <select
@@ -5774,7 +5976,11 @@ function App() {
                 <button
                   className="button button-primary"
                   type="button"
-                  disabled={!effectiveMissionAdapter}
+                  disabled={
+                    !selectedMissionSource ||
+                    !missionSourceConfirmed ||
+                    !effectiveMissionAdapter
+                  }
                   onClick={() => setMissionComposerStep('proof')}
                 >
                   Set verification
@@ -5787,6 +5993,8 @@ function App() {
                   disabled={
                     busy ||
                     !missionTitle.trim() ||
+                    !selectedMissionSource ||
+                    !missionSourceConfirmed ||
                     !effectiveMissionAdapter ||
                     missionVerifierErrors.length > 0
                   }

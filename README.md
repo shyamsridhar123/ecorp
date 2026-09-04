@@ -110,6 +110,11 @@ $env:CRONY_SOURCE_BASE_REF = 'HEAD'
 
 The runner validates the repository and base ref before accepting work. Mission worktrees are created beneath `CRONY_RUNNER_WORKSPACE`, never in the configured source checkout.
 
+In the Missions **Run setup** screen, select and confirm the exact repository, ref, and immutable
+commit before launch. ECorp filters runtimes to runners serving that source and persists the tuple
+in every task and run. Use a separate dogfood repository for disposable application scenarios
+rather than selecting the ECorp product repository.
+
 ### Run the repository checks
 
 ```powershell

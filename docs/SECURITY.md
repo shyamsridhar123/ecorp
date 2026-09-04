@@ -88,9 +88,14 @@ GitHub remote matches the claimed repository, then persists the full 40- or 64-h
 Factory tasks and run launch records carry repository, ref, and commit as one all-or-nothing source
 identity. The scheduler accepts only a runner advertising the same structured tuple, and the runner
 independently rejects both start and resume commands before worktree access if any element differs.
-Symbolic refs alone are never sufficient authority for factory write-capable routing. Unpinned
-ordinary tasks continue to resolve the configured ref for each new worktree, while resume is fenced
-to the source run's persisted workspace base commit.
+Symbolic refs alone are never sufficient authority for factory write-capable routing. The browser
+also requires an operator to select and confirm one connected runner's structured repository, ref,
+and immutable commit before creating an ordinary mission. The server canonicalizes the selected
+tuple from live runner capabilities, applies it to every planned task, and rejects adapter, model,
+reasoning, repository, ref, or commit mismatch before mission persistence. Local repositories use
+a stable opaque `local/<name>-<digest>` identity rather than an absolute host path. Legacy API
+clients may omit source selection, but resume is always fenced to the source run's persisted
+workspace base commit.
 
 Pre-commit factory records are migrated only from unambiguous persisted workspace evidence.
 Underivable legacy claims are not guessed or silently widened: migration marks them as requiring an
