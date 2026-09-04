@@ -631,13 +631,56 @@ function usesDeterministicHarness(strategy: string): boolean {
 }
 
 const OFFICE_POSITIONS = [
-  { x: 17, y: 42 },
-  { x: 41, y: 42 },
-  { x: 65, y: 42 },
-  { x: 28, y: 72 },
-  { x: 53, y: 72 },
-  { x: 78, y: 72 },
+  { x: 14, y: 48 },
+  { x: 36, y: 48 },
+  { x: 58, y: 48 },
+  { x: 14, y: 76 },
+  { x: 36, y: 76 },
+  { x: 58, y: 76 },
 ] as const
+
+const COMPACT_OFFICE_POSITIONS = [
+  { x: 24, y: 40 },
+  { x: 72, y: 40 },
+  { x: 24, y: 58 },
+  { x: 72, y: 58 },
+  { x: 24, y: 76 },
+  { x: 72, y: 76 },
+] as const
+
+function officePositionForAgent(agent: Agent, index: number) {
+  const home = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+  if (agent.status === 'starting') {
+    return { x: 91 - (index % 3) * 3, y: 27 + (index % 2) * 5 }
+  }
+  if (agent.status === 'blocked') {
+    return { x: 84 + (index % 2) * 4, y: 65 }
+  }
+  if (agent.status === 'reviewing') {
+    return { x: 82 + (index % 3) * 3, y: 44 }
+  }
+  if (agent.status === 'working' && ['briefing', 'research'].includes(agent.station ?? '')) {
+    return { x: 81 + (index % 3) * 3, y: 44 }
+  }
+  return home
+}
+
+function compactOfficePositionForAgent(agent: Agent, index: number) {
+  const home = COMPACT_OFFICE_POSITIONS[index % COMPACT_OFFICE_POSITIONS.length]
+  if (agent.status === 'starting') {
+    return { x: 88 - (index % 2) * 7, y: 30 + (index % 2) * 5 }
+  }
+  if (agent.status === 'blocked') {
+    return { x: 84, y: 67 }
+  }
+  if (
+    agent.status === 'reviewing' ||
+    (agent.status === 'working' && ['briefing', 'research'].includes(agent.station ?? ''))
+  ) {
+    return { x: 84, y: 48 + (index % 2) * 5 }
+  }
+  return home
+}
 
 function adapterLabel(adapter: string): string {
   if (adapter === 'github-copilot') return 'GitHub Copilot'
@@ -669,6 +712,15 @@ function agentVisualStateLabel(agent: Agent): string {
   if (agent.status === 'working') return 'Working'
   if (agent.status === 'reviewing') return 'Review ready'
   if (agent.status === 'blocked') return 'Needs approval'
+  return 'Offline'
+}
+
+function agentMonitorLabel(agent: Agent): string {
+  if (agent.status === 'idle') return 'Ready'
+  if (agent.status === 'starting') return 'Boot'
+  if (agent.status === 'working') return 'Build'
+  if (agent.status === 'reviewing') return 'Review'
+  if (agent.status === 'blocked') return 'Hold'
   return 'Offline'
 }
 
@@ -1746,17 +1798,17 @@ function OfficeFloor({
         <span className="world-server-rack world-server-rack-left" />
         <span className="world-server-rack world-server-rack-right" />
       </div>
-      <div className="office-zone zone-review">
-        <span className="sr-only">Review table</span>
-        <i />
+      <div className="office-zone zone-review" aria-hidden="true">
+        <span className="office-zone-label">REVIEW ROOM</span>
+        <i><b /><em /></i>
       </div>
-      <div className="office-zone zone-approval">
-        <span className="sr-only">Approval desk</span>
-        <i />
+      <div className="office-zone zone-approval" aria-hidden="true">
+        <span className="office-zone-label">APPROVAL QUEUE</span>
+        <i><b /><em /></i>
       </div>
-      <div className="office-zone zone-lounge">
-        <span className="sr-only">Operator bay</span>
-        <i />
+      <div className="office-zone zone-lounge" aria-hidden="true">
+        <span className="office-zone-label">BREAK ROOM</span>
+        <i><b /><em /></i>
       </div>
       <div className="world-floor-markings" aria-hidden="true">
         <span className="world-lane world-lane-one" />
@@ -1765,10 +1817,13 @@ function OfficeFloor({
       </div>
       {agents.map((agent) => {
         const index = agents.findIndex((candidate) => candidate.id === agent.id)
-        const destination = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+        const destination = officePositionForAgent(agent, index)
+        const compactDestination = compactOfficePositionForAgent(agent, index)
         const style = {
           '--agent-x': `${destination.x}%`,
           '--agent-y': `${destination.y}%`,
+          '--agent-x-compact': `${compactDestination.x}%`,
+          '--agent-y-compact': `${compactDestination.y}%`,
         } as CSSProperties
         return (
           <button
@@ -1811,13 +1866,24 @@ function OfficeFloor({
       ) : null}
       {agents.map((agent, index) => {
         const position = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
+        const compactPosition =
+          COMPACT_OFFICE_POSITIONS[index % COMPACT_OFFICE_POSITIONS.length]
         const style = {
           '--desk-x': `${position.x}%`,
           '--desk-y': `${position.y}%`,
+          '--desk-x-compact': `${compactPosition.x}%`,
+          '--desk-y-compact': `${compactPosition.y}%`,
         } as CSSProperties
         return (
-          <div className="office-desk-mini" style={style} key={`desk-${agent.id}`} aria-hidden="true">
-            <span className="mini-monitor" />
+          <div
+            className={`office-desk-mini office-desk-${agent.status}`}
+            style={style}
+            key={`desk-${agent.id}`}
+            aria-hidden="true"
+          >
+            <span className="mini-monitor">
+              <span className="mini-screen-copy">{agentMonitorLabel(agent)}</span>
+            </span>
             <span className="mini-desk" />
             <span className="mini-chair" />
           </div>
@@ -1845,12 +1911,14 @@ function AgentDesk({
   actor,
   humans,
   queuedCount,
+  pendingApprovalCount,
   onClaim,
   onRelease,
   onTransfer,
   onInterrupt,
   onEmergencyStop,
   onMessage,
+  onReviewApprovals,
 }: {
   agent: Agent
   capability: RunnerCapability | undefined
@@ -1859,12 +1927,14 @@ function AgentDesk({
   actor: Actor
   humans: Actor[]
   queuedCount: number
+  pendingApprovalCount: number
   onClaim: (agent: Agent) => Promise<void>
   onRelease: (agent: Agent, token: string) => Promise<void>
   onTransfer: (agent: Agent, token: string, toActor: Actor) => Promise<void>
   onInterrupt: (agent: Agent, token: string) => Promise<void>
   onEmergencyStop: (agent: Agent) => Promise<void>
   onMessage: (agent: Agent, text: string, token: string | undefined) => Promise<void>
+  onReviewApprovals: () => void
 }) {
   const [text, setText] = useState('')
   const [transferActorId, setTransferActorId] = useState('')
@@ -1913,13 +1983,22 @@ function AgentDesk({
         </div>
       </div>
       <p className="agent-inspector-help">
-        {agent.current_run_id
+        {pendingApprovalCount > 0
+          ? `${agent.name} is waiting for a governed action decision. Open Missions to review the exact request before approving or rejecting it.`
+          : agent.status === 'blocked'
+            ? `${agent.name} is blocked, but no undecided action remains. Inspect the owning mission for the recorded decision and recovery options.`
+          : agent.current_run_id
           ? `${agent.name} is ${agent.station ?? agent.status}. Claim control to steer the live session.`
           : agent.status === 'reviewing'
             ? `${agent.name}'s provider process has ended. The recorded output is awaiting evidence review.`
-          : `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`}
+            : `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`}
       </p>
       <div className="desk-actions">
+        {pendingApprovalCount > 0 ? (
+          <button type="button" className="button button-primary" onClick={onReviewApprovals}>
+            Review approval{pendingApprovalCount === 1 ? '' : 's'}
+          </button>
+        ) : null}
         {canClaim ? (
           <button type="button" className="button button-secondary" onClick={() => onClaim(agent)}>
             {ownsLease && leaseToken ? 'Renew control' : 'Claim live control'}
@@ -3160,6 +3239,10 @@ function MissionCard({
               <div className="mission-approval-item" key={approval.id}>
                 <span>{approval.action}</span>
                 <small>{approval.risk} risk · {approval.rationale}</small>
+                <p className="approval-boundary-note">
+                  Allowed tools make this requestable, not pre-approved. This decision applies only
+                  to the exact action shown.
+                </p>
                 <div>
                   <button
                     className="button button-primary"
@@ -4569,19 +4652,35 @@ function App() {
           <div className={`runner-indicator ${connectedRunners.length ? 'runner-online' : ''}`}>
             {runnerLabel}
           </div>
-          <label>
-            Operating as
-            <select disabled={productionAuthenticated} value={selectedActor.id} onChange={(event) => {
-              const actor = humans.find((candidate) => candidate.id === event.target.value)
-              if (actor) selectActor(actor)
-            }}>
-              {humans.map((actor) => (
-                <option key={actor.id} value={actor.id}>
-                  {actor.name} · {actor.role}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="operator-identity">
+            <span className="operator-identity-mode">
+              {productionAuthenticated ? 'Signed-in identity' : 'Local demo identity'}
+            </span>
+            <label htmlFor="operator-actor">
+              <span className="sr-only">Operating identity</span>
+              <select
+                id="operator-actor"
+                aria-describedby="operator-actor-help"
+                disabled={productionAuthenticated}
+                value={selectedActor.id}
+                onChange={(event) => {
+                  const actor = humans.find((candidate) => candidate.id === event.target.value)
+                  if (actor) selectActor(actor)
+                }}
+              >
+                {humans.map((actor) => (
+                  <option key={actor.id} value={actor.id}>
+                    {actor.name} · {actor.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <small id="operator-actor-help">
+              {productionAuthenticated
+                ? 'Locked to the authenticated account'
+                : 'Switches permissions in this demo'}
+            </small>
+          </div>
         </div>
       </header>
 
@@ -4877,12 +4976,21 @@ function App() {
                     lease={data.snapshot.leases.find((lease) => lease.agent_id === selectedAgent.id)}
                     leaseToken={leaseTokens[leaseTokenKey(selectedActor.id, selectedAgent.id)]}
                     queuedCount={data.snapshot.queued_messages.filter((message) => message.agent_id === selectedAgent.id).length}
+                    pendingApprovalCount={data.snapshot.action_approvals.filter(
+                      (approval) =>
+                        approval.run_id === selectedAgent.current_run_id &&
+                        approval.status === 'pending',
+                    ).length}
                     onClaim={claimLease}
                     onRelease={releaseLease}
                     onTransfer={transferLease}
                     onInterrupt={interruptRun}
                     onEmergencyStop={emergencyStop}
                     onMessage={sendMessage}
+                    onReviewApprovals={() => {
+                      setFloorInspectorOpen(false)
+                      activateWorkspaceView('missions')
+                    }}
                   />
                 </aside>
               </div>
@@ -5179,8 +5287,29 @@ function App() {
                             : 'A deterministic product-behavior fixture.'}
                       </small>
                     </div>
-                  </div>
-                  <div className="loadout-switches">
+                    </div>
+                    <div
+                      className={`mission-approval-expectation ${
+                        missionStrategy === 'parallel-specialists'
+                          ? 'mission-approval-expectation-wide'
+                          : ''
+                      }`}
+                    >
+                      <div>
+                        <span>Approval surface</span>
+                        <strong>
+                          {missionStrategy === 'parallel-specialists'
+                            ? '3 task nodes can request separate approvals'
+                            : '1 task node · fewest approval interruptions'}
+                        </strong>
+                      </div>
+                      <p>
+                        <strong>Allowed tools are not blanket approval.</strong> Direct file work
+                        inside the declared write scope can proceed. Shell, network, external-path,
+                        and ambiguous actions pause for operator review.
+                      </p>
+                    </div>
+                    <div className="loadout-switches">
                     <label className="mission-run-toggle">
                       <input
                         type="checkbox"
