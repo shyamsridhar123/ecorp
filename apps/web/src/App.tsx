@@ -1470,9 +1470,9 @@ function FactoryPanel({
       <div className="panel-heading factory-heading">
         <div>
           <span className="section-code">Factory</span>
-          <h2>Governed issue intake</h2>
+          <h2>Factory queue</h2>
           <p>
-            GitHub work enters one fenced lane, becomes one mission, and advances only on evidence.
+            One GitHub issue, one governed mission, one evidence trail.
           </p>
         </div>
         <div className="operations-summary">
@@ -4551,14 +4551,14 @@ function App() {
       </div>
       <header className="topbar">
         <div className="brand-lockup">
-          <span className="brand-kicker">Collaborative agent operations</span>
+          <span className="brand-kicker">ECORP // OPERATIONS</span>
           <div className="brand-row">
             <span className="brand-mark" aria-hidden="true">
               <span className="brand-e">E</span>
               <span className="brand-slash" />
             </span>
             <h1><span>E</span>CORP</h1>
-            <span className="alpha-stamp">Local preview</span>
+            <span className="alpha-stamp">LOCAL</span>
           </div>
         </div>
         <div className="operator-console">
@@ -4608,7 +4608,7 @@ function App() {
           onClick={() => setJourneyOpen((current) => !current)}
         >
           <span className="workspace-nav-code">?</span>
-          <strong>{journeyOpen ? 'Hide guide' : 'Start guide'}</strong>
+          <strong>{journeyOpen ? 'Hide guide' : 'Guide'}</strong>
           <small>Help</small>
         </button>
       </nav>
@@ -4621,7 +4621,7 @@ function App() {
         </div>
         <div className="arcade-command-meters">
           <button type="button" onClick={() => activateWorkspaceView('floor')}>
-            <span>Live runs</span>
+            <span>Runs</span>
             <strong>{activeRuns.length}</strong>
             <small>Take control</small>
           </button>
@@ -4634,12 +4634,12 @@ function App() {
             }
             onClick={() => activateWorkspaceView('missions')}
           >
-            <span>Decisions</span>
+            <span>Reviews</span>
             <strong>{pendingApprovals.length + pendingVerificationRequests.length}</strong>
             <small>Review gates</small>
           </button>
           <button type="button" onClick={() => activateWorkspaceView('factory')}>
-            <span>Factory</span>
+            <span>Queue</span>
             <strong>{activeFactoryItems.length}</strong>
             <small>Active items</small>
           </button>
@@ -4899,16 +4899,18 @@ function App() {
           <div className="panel-heading">
             <div>
               <span className="section-code">Missions</span>
-              <h2>Authorize work</h2>
-              <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
+              <h2>Mission log</h2>
+              <p>Create work, inspect the contract, and review the evidence.</p>
             </div>
           </div>
           {missionComposerCollapsed ? (
             <div className="arcade-new-mission-bar">
               <div>
-                <span>Ready for work</span>
-                <strong>Create another mission</strong>
-                <small>The active mission log stays below.</small>
+                <span>Mission log</span>
+                <strong>
+                  {latestMissions.length} mission{latestMissions.length === 1 ? '' : 's'}
+                </strong>
+                <small>Select a record or start new work.</small>
               </div>
               <button
                 className="button button-primary"
