@@ -292,6 +292,15 @@ two-browser pass exposed and verified the **Reclaim control** recovery for a bro
 private fencing token. See
 `docs/evidence/2026-09-04-factory-cockpit-restart.md`.
 
+`tools/e2e_factory_cockpit_publication.mjs` continues that operating lane through a verified
+commit/branch deliverable and the trusted publisher. It crashes after the deterministic GitHub
+boundary has created the pull request but before ECorp records the remote checkpoint, restarts the
+server, and concurrently retries publication. The focused drill proves one work item, mission,
+run, branch, pull request, and publication; Project status changes to `In Review` only after pull
+request creation; Alice and Bob resume from independent event cursors; and auto-merge, merge, and
+deployment remain disabled. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each

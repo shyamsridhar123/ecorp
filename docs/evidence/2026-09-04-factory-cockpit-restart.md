@@ -8,8 +8,9 @@
 ## Scope
 
 This validation exercised the selected Factory work-item cockpit across two human actors, a live
-runner, a server restart, browser event-stream reconnects, lease-token recovery, durable steering,
-contextual comments, and an inline action decision.
+runner, server restarts, browser event-stream reconnects, lease-token recovery, durable steering,
+contextual comments, an inline action decision, a verified commit/branch deliverable, and trusted
+pull-request publication.
 
 The source repository was an isolated local fixture outside the ECorp checkout:
 
@@ -112,8 +113,69 @@ lease; a stale token cannot issue a new command.
 - Controller pause, resume, and reconcile clicks retain their operation UUID and original expected
   version in browser session storage until a response succeeds.
 
+## Focused publication restart drill
+
+Command:
+
+```powershell
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:8891'
+$env:DATABASE_URL = 'postgres://crony:crony@127.0.0.1:54329/crony_issue145pub_43ba9414dd'
+$env:ECORP_TEST_SOURCE_REPOSITORY = 'C:\Users\shyamsridhar\.codex\dogfood\issue145-publication-source-20260904-163621'
+$env:ECORP_TEST_ARTIFACT_ROOT = 'C:\Users\shyamsridhar\.codex\dogfood\issue145-publication-artifacts-20260904-163621\publication-test-20260904-1836'
+$env:CRONY_TEST_SERVER_PID_FILE = 'C:\Users\shyamsridhar\.codex\dogfood\issue145-publication-artifacts-20260904-163621\live\pids.json'
+node tools/e2e_factory_cockpit_publication.mjs
+```
+
+The test used the real ECorp server, runner, Factory CLI, verifier, source-deliverable path, and
+trusted publisher. GitHub was represented by the deterministic fake CLI and a local bare remote, so
+the drill created no pull request in the production ECorp repository.
+
+The publisher intentionally exited after the fake GitHub boundary created the pull request but
+before the server recorded that remote checkpoint. The test then restarted the server, resumed
+Alice and Bob from their independent event cursors, recovered the publication, and issued two
+concurrent duplicate publication requests.
+
+Fresh result:
+
+```json
+{
+  "checked_at": "2026-09-04T23:33:10.715Z",
+  "source_base_commit": "62a5b7377b0e1e544d7fab1b4eb5f92b26aa1930",
+  "pull_request_number": 51,
+  "pull_request_create_calls": 1,
+  "project_status": "In Review",
+  "project_after_pull_request": true,
+  "duplicate_work_items": 0,
+  "duplicate_missions": 0,
+  "duplicate_runs": 0,
+  "duplicate_publications": 0,
+  "auto_merge_enabled": false,
+  "merge_authorized": false,
+  "deployment_authorized": false,
+  "alice_replay_events": 9,
+  "bob_replay_events": 9,
+  "final_state": "published"
+}
+```
+
+The complete machine-readable report is written to:
+
+```text
+output/e2e-factory-cockpit-publication.json
+```
+
+The focused drill proves:
+
+- the same Factory lineage reaches a verified commit/branch deliverable and publication;
+- crash recovery does not create another pull request or publication;
+- concurrent retries converge on the persisted publication;
+- the remote base remains unchanged while the review branch points to the verified commit;
+- the Project item moves to `In Review` after, not before, pull-request creation;
+- auto-merge remains off and neither merge nor deployment is authorized.
+
 ## Boundary
 
-This fixture intentionally stopped at verified work and did not create a real GitHub pull request.
-Remote publication idempotency remains covered by `tools/e2e_factory_publication.mjs`; this document
-does not claim that a same-lineage real PR restart drill was rerun here.
+The publication restart drill used a deterministic GitHub boundary and local bare remote. It proves
+the same-lineage ECorp orchestration and recovery behavior without mutating the production ECorp
+repository. It does not claim provider-native GitHub approval handling, a real GitHub pull request,
+merge, auto-merge, deployment, or hosted GitHub Actions evidence.
