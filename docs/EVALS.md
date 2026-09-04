@@ -223,6 +223,16 @@ lane; it must use the official SDK, expose the live account catalog, run a selec
 finish with verified worktree evidence. See
 `docs/evidence/2026-08-30-github-copilot-adapter-validation.md`.
 
+That authenticated lane must also prove that Copilot's native managed permissions resolve ordinary
+worktree-local built-in read, create, and edit operations without duplicating them as ECorp
+approvals. Required build and test commands run through the persisted runner verifier unless an
+operating-system shell boundary is independently proven. The lane must pre-create external and
+credential canaries, assert their bytes and metadata remain unchanged, and inspect provider
+telemetry rather than trusting configured sandbox settings. Any shell execution reporting
+`sandboxApplied: false` fails the containment case. Destructive commands, interpreters,
+network-capable commands, publication or infrastructure commands, sandbox bypass, credential
+access, and external paths must fail closed or suspend through a durable ECorp decision.
+
 `tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
 methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.

@@ -104,12 +104,27 @@ match the persisted policy ref before resolving or storing a commit.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
-The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
-read-only operations it can prove are scoped to that worktree, and reads from the SDK state
-directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.
-External paths, network URLs, sandbox bypass, managed-policy approvals, and ambiguous shell
-commands suspend durably. Shell approval cards include the bounded command text rather than only a
-generic action label.
+GitHub Copilot receives a native SDK managed-settings layer on every create and resume. The runtime
+is told to disable bypass-permissions mode. Native read and write tools may proceed without a
+second ECorp prompt only because built-in filesystem operations are routed through an ECorp
+`SessionFsProvider` that rejects paths outside the worktree and isolated Copilot state directory.
+Every shell command remains an explicit ask. Command-family allowlists are not a filesystem
+boundary: interpreters, build tools, and PowerShell commands can write arbitrary host paths when
+the native sandbox is unavailable. Copilot's sandbox configuration therefore remains
+defense-in-depth rather than authorization. Persisted runner verifier policies execute required
+build and test commands outside the model session. Common ambient credential environment variables
+are removed from the Copilot child process; explicit scoped SDK authentication remains available.
+Credential stores, the user profile, network access, and temporary-directory access are also
+denied through the native sandbox configuration when the installed runtime applies it.
+
+The ECorp handler remains a fail-closed backstop for unresolved requests. It automatically approves
+only writes inside the assigned worktree, read-only operations it can prove are worktree-scoped,
+and reads from the SDK state directory isolated to that worktree. It canonicalizes existing
+ancestors to reject symlink escapes. External paths, network URLs, sandbox bypass,
+managed-policy approvals, shell effects, and ambiguous requests suspend durably. Shell approval
+cards include the bounded command text rather than only a generic action label. Arbitrary shell can
+become approval-free only behind a separately verified operating-system isolation boundary such as
+a restricted identity with ACLs, AppContainer, container, or VM.
 
 Claude permission requests use the same fail-closed worktree containment helper. Only recognized
 read/write tools with an explicit contained path can be allowed locally. Existing ancestors are

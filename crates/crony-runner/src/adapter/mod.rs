@@ -1,5 +1,6 @@
 mod codex;
 mod copilot;
+mod copilot_fs;
 mod external;
 mod fake;
 mod permission;

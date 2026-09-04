@@ -14,7 +14,11 @@ use github_copilot_sdk::{
     MessageOptions, ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig, ToolSet,
     Transport,
     handler::{PermissionHandler, PermissionResult},
-    types::{PermissionRequestData, RequestId},
+    rpc::UserSettingsSetRequest,
+    types::{
+        DisableBypassPermissionsMode, ManagedSettings, ManagedSettingsPermissions,
+        PermissionRequestData, RequestId, SessionFsConfig, SessionFsConventions,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -28,6 +32,7 @@ use super::{
     AdapterArtifact, AdapterCapabilities, AdapterControl, AdapterError, AdapterEvent,
     AdapterEventSink, AdapterExit, AdapterModel, AdapterRunRequest, AgentAdapter, FeatureSupport,
     UsageSnapshot,
+    copilot_fs::ContainedSessionFs,
     permission::{path_is_inside, path_is_inside_workspace},
 };
 
@@ -73,9 +78,10 @@ impl PermissionHandler for CronyPermissionHandler {
         data: PermissionRequestData,
     ) -> PermissionResult {
         let request = data.extra.get("permissionRequest").unwrap_or(&data.extra);
-        if permission_is_automatically_safe(request, &self.workspace, &self.state_directory)
-            && data.managed_approval_required != Some(true)
-        {
+        let managed_approval_required = data.managed_approval_required == Some(true);
+        let automatically_safe =
+            permission_is_automatically_safe(request, &self.workspace, &self.state_directory);
+        if !managed_approval_required && automatically_safe {
             return PermissionResult::approve_once();
         }
 
@@ -131,10 +137,22 @@ impl CopilotSdkAdapter {
     }
 
     async fn client_options(&self, workspace: &Path) -> Result<ClientOptions, AdapterError> {
+        let state_directory = self.state_directory(workspace);
+        let conventions = if cfg!(windows) {
+            SessionFsConventions::Windows
+        } else {
+            SessionFsConventions::Posix
+        };
         let mut options = ClientOptions::new()
             .with_cwd(workspace)
-            .with_base_directory(self.state_directory(workspace))
+            .with_base_directory(&state_directory)
             .with_mode(ClientMode::Empty)
+            .with_session_fs(SessionFsConfig::new(
+                workspace.to_string_lossy(),
+                state_directory.to_string_lossy(),
+                conventions,
+            ))
+            .with_env_remove(copilot_sensitive_environment_names())
             .with_log_level(parse_log_level(&self.config.log_level)?);
 
         if let Some(host) = &self.config.external_host {
@@ -151,6 +169,8 @@ impl CopilotSdkAdapter {
                 .await?,
             });
         } else {
+            options =
+                options.with_extra_args(["--experimental", "--sandbox", "--disallow-temp-dir"]);
             if let Some(path) = &self.config.cli_path {
                 options = options
                     .with_program(CliProgram::Path(path.clone()))
@@ -213,7 +233,12 @@ impl CopilotSdkAdapter {
         let client = Client::start(self.client_options(&request.workspace).await?)
             .await
             .map_err(sdk_error)?;
+        configure_native_sandbox(&client, &request.workspace).await?;
         let pending = Arc::new(DashMap::new());
+        let session_fs = Arc::new(ContainedSessionFs::new(
+            request.workspace.clone(),
+            state_directory.clone(),
+        ));
         let permission_handler = Arc::new(CronyPermissionHandler {
             workspace: request.workspace.clone(),
             state_directory,
@@ -224,14 +249,22 @@ impl CopilotSdkAdapter {
             let mut config = ResumeSessionConfig::new(SessionId::from(session_id));
             apply_resume_config(&mut config, &request);
             client
-                .resume_session(config.with_permission_handler(permission_handler))
+                .resume_session(
+                    config
+                        .with_permission_handler(permission_handler)
+                        .with_session_fs_provider(session_fs),
+                )
                 .await
                 .map_err(sdk_error)?
         } else {
             let mut config = SessionConfig::default();
             apply_session_config(&mut config, &request);
             client
-                .create_session(config.with_permission_handler(permission_handler))
+                .create_session(
+                    config
+                        .with_permission_handler(permission_handler)
+                        .with_session_fs_provider(session_fs),
+                )
                 .await
                 .map_err(sdk_error)?
         };
@@ -559,15 +592,140 @@ fn apply_session_config(config: &mut SessionConfig, request: &AdapterRunRequest)
     config.system_message = Some(
         SystemMessageConfig::new()
             .with_mode("append")
-            .with_content(
-                "You are supervised by ECorp. Work only inside the assigned worktree. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
-            ),
+            .with_content(format!(
+                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Work only inside that worktree. Use Copilot's built-in read, create, and edit tools for file operations; reserve shell commands for build and test programs. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
+                request.workspace.display()
+            )),
     );
     // ECorp owns the worktree lifecycle. Copilot infinite-session workspaces copy
     // files under COPILOT_HOME, which would move writes outside the assigned tree.
     config.infinite_sessions = Some(InfiniteSessionConfig::new().with_enabled(false));
     config.enable_config_discovery = Some(false);
     config.enable_session_store = Some(true);
+    config.managed_settings = Some(copilot_native_managed_settings());
+}
+
+async fn configure_native_sandbox(client: &Client, workspace: &Path) -> Result<(), AdapterError> {
+    let denied_paths = copilot_sandbox_denied_paths(workspace);
+    let result = client
+        .rpc()
+        .user()
+        .settings()
+        .set(UserSettingsSetRequest {
+            settings: json!({
+                "sandbox": {
+                    "enabled": true,
+                    "addCurrentWorkingDirectory": true,
+                    "allowDevToolAccess": true,
+                    "allowBypass": false,
+                    "auth": {
+                        "gh": false,
+                        "git": false
+                    },
+                    "sandboxMcpServers": true,
+                    "sandboxLspServers": true,
+                    "userPolicy": {
+                        "filesystem": {
+                            "clearPolicyOnExit": true,
+                            "deniedPaths": denied_paths,
+                            "readonlyPaths": [],
+                            "readwritePaths": [workspace.to_string_lossy()]
+                        },
+                        "network": {
+                            "allowLocalNetwork": false,
+                            "allowOutbound": false
+                        }
+                    }
+                }
+            }),
+        })
+        .await
+        .map_err(sdk_error)?;
+    if result
+        .shadowed_keys
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case("sandbox"))
+    {
+        return Err(AdapterError::Runtime(anyhow!(
+            "GitHub Copilot sandbox settings are shadowed by legacy configuration"
+        )));
+    }
+    client
+        .rpc()
+        .user()
+        .settings()
+        .reload()
+        .await
+        .map_err(sdk_error)?;
+    let settings = client
+        .rpc()
+        .user()
+        .settings()
+        .get()
+        .await
+        .map_err(sdk_error)?;
+    let sandbox = settings
+        .settings
+        .get("sandbox")
+        .map(|metadata| &metadata.value)
+        .context("GitHub Copilot omitted the required sandbox setting")
+        .map_err(AdapterError::Runtime)?;
+    if sandbox.pointer("/enabled").and_then(Value::as_bool) != Some(true)
+        || sandbox.pointer("/allowBypass").and_then(Value::as_bool) != Some(false)
+        || sandbox
+            .pointer("/userPolicy/network/allowOutbound")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || sandbox
+            .pointer("/userPolicy/network/allowLocalNetwork")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(AdapterError::Runtime(anyhow!(
+            "GitHub Copilot did not retain the required native sandbox restrictions"
+        )));
+    }
+    Ok(())
+}
+
+fn copilot_sandbox_denied_paths(workspace: &Path) -> Vec<String> {
+    let Some(home) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let mut denied = vec![home.to_string_lossy().into_owned()];
+    let candidates = [
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".gnupg",
+        ".mcp-auth",
+        ".copilot",
+        ".claude",
+        ".npmrc",
+        ".git-credentials",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".config/gh",
+        ".codex/auth.json",
+        "AppData/Roaming/GitHub CLI/hosts.yml",
+    ];
+    denied.extend(
+        candidates
+            .into_iter()
+            .map(|relative| {
+                relative
+                    .split('/')
+                    .fold(home.clone(), |path, component| path.join(component))
+            })
+            .filter(|path| path != workspace)
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    denied
 }
 
 fn apply_resume_config(config: &mut ResumeSessionConfig, request: &AdapterRunRequest) {
@@ -588,13 +746,49 @@ fn apply_resume_config(config: &mut ResumeSessionConfig, request: &AdapterRunReq
     config.system_message = Some(
         SystemMessageConfig::new()
             .with_mode("append")
-            .with_content(
-                "You are supervised by ECorp. Continue only inside the assigned worktree. Network access and sandbox bypass require a durable human approval.",
-            ),
+            .with_content(format!(
+                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Continue only inside that worktree. Use Copilot's built-in read, create, and edit tools for file operations; reserve shell commands for build and test programs. Network access and sandbox bypass require a durable human approval.",
+                request.workspace.display()
+            )),
     );
     config.infinite_sessions = Some(InfiniteSessionConfig::new().with_enabled(false));
     config.enable_config_discovery = Some(false);
     config.enable_session_store = Some(true);
+    config.managed_settings = Some(copilot_native_managed_settings());
+}
+
+fn copilot_native_managed_settings() -> ManagedSettings {
+    ManagedSettings::default().with_permissions(
+        ManagedSettingsPermissions::default()
+            .with_disable_bypass_permissions_mode(DisableBypassPermissionsMode::Disable)
+            .with_allow(vec!["read".to_owned(), "write".to_owned()])
+            .with_ask(vec!["shell".to_owned()]),
+    )
+}
+
+fn copilot_sensitive_environment_names() -> [&'static str; 20] {
+    [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_PAT",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "NPM_TOKEN",
+        "NODE_AUTH_TOKEN",
+        "DOCKER_AUTH_CONFIG",
+        "KUBECONFIG",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+    ]
 }
 
 fn model_from_sdk(model: github_copilot_sdk::Model) -> AdapterModel {
@@ -803,12 +997,6 @@ fn permission_is_automatically_safe(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let paths_are_worktree_scoped = !possible_paths.is_empty()
-                && possible_paths.iter().all(|candidate| {
-                    candidate
-                        .as_str()
-                        .is_some_and(|candidate| path_is_inside_workspace(workspace, candidate))
-                });
             let paths_are_read_scoped = !possible_paths.is_empty()
                 && possible_paths.iter().all(|candidate| {
                     candidate.as_str().is_some_and(|candidate| {
@@ -824,8 +1012,7 @@ fn permission_is_automatically_safe(
                     .get("hasWriteFileRedirection")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
-                && (paths_are_worktree_scoped
-                    || command_is_known_pathless_read_only
+                && (command_is_known_pathless_read_only
                     || command_is_scoped_read_only
                     || (commands_read_only && paths_are_read_scoped))
         }
@@ -1241,6 +1428,53 @@ mod tests {
     }
 
     #[test]
+    fn native_managed_permissions_never_pre_authorize_shell() {
+        let managed = copilot_native_managed_settings();
+        let permissions = managed.permissions.expect("managed permissions");
+        assert_eq!(
+            permissions.disable_bypass_permissions_mode,
+            Some(DisableBypassPermissionsMode::Disable)
+        );
+        let allow = permissions.allow.expect("managed allow rules");
+        assert!(allow.contains(&"read".to_owned()));
+        assert!(allow.contains(&"write".to_owned()));
+        assert!(
+            allow.iter().all(|rule| !rule.starts_with("shell")),
+            "managed shell allows bypass the worktree-scoped permission handler"
+        );
+        let ask = permissions.ask.expect("managed ask rules");
+        assert_eq!(ask, vec!["shell".to_owned()]);
+    }
+
+    #[test]
+    fn copilot_cli_does_not_inherit_common_credential_environment() {
+        let names = copilot_sensitive_environment_names();
+        assert!(names.contains(&"GH_TOKEN"));
+        assert!(names.contains(&"OPENAI_API_KEY"));
+        assert!(names.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(names.contains(&"AZURE_CLIENT_SECRET"));
+        assert!(
+            !names.contains(&"COPILOT_SDK_AUTH_TOKEN"),
+            "the SDK must retain its scoped authentication channel"
+        );
+    }
+
+    #[test]
+    fn sandbox_denies_the_user_profile_and_sensitive_stores() {
+        let workspace = std::env::temp_dir()
+            .join("crony-copilot-sandbox")
+            .join("worktree");
+        let denied = copilot_sandbox_denied_paths(&workspace);
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .expect("test home");
+        assert!(denied.contains(&home.to_string_lossy().into_owned()));
+        assert!(denied.iter().any(|path| path.ends_with(".ssh")));
+        assert!(denied.iter().any(|path| path.ends_with(".npmrc")));
+    }
+
+    #[test]
     fn fixture_exposes_every_model_and_policy_state() {
         let models = fixture_models();
         assert_eq!(models.len(), 3);
@@ -1400,6 +1634,54 @@ mod tests {
                 "commands":[{"identifier":"python","readOnly":false}],
                 "possiblePaths":[],
                 "possibleUrls":[]
+            }),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(!permission_is_automatically_safe(
+            &json!({
+                "kind":"shell",
+                "fullCommandText":"node -e \"require('fs').writeFileSync('C:\\\\outside.txt','x')\"",
+                "commands":[{"identifier":"node","readOnly":false}],
+                "possiblePaths":[],
+                "possibleUrls":[]
+            }),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(!permission_is_automatically_safe(
+            &json!({
+                "kind":"shell",
+                "fullCommandText":"Invoke-WebRequest https://example.com",
+                "commands":[{"identifier":"Invoke-WebRequest","readOnly":false}],
+                "possiblePaths":[],
+                "possibleUrls":["https://example.com"]
+            }),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(!permission_is_automatically_safe(
+            &json!({
+                "kind":"shell",
+                "fullCommandText":"Write-Output $env:GITHUB_TOKEN",
+                "commands":[{"identifier":"Write-Output","readOnly":false}],
+                "possiblePaths":[],
+                "possibleUrls":[]
+            }),
+            &workspace,
+            &state_directory,
+        ));
+        assert!(!permission_is_automatically_safe(
+            &json!({
+                "kind":"shell",
+                "fullCommandText":"Get-Content README.md | Set-Content copy.md",
+                "commands":[
+                    {"identifier":"Get-Content","readOnly":true},
+                    {"identifier":"Set-Content","readOnly":false}
+                ],
+                "possiblePaths":[workspace.join("README.md"), workspace.join("copy.md")],
+                "possibleUrls":[],
+                "hasWriteFileRedirection":false
             }),
             &workspace,
             &state_directory,
