@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::Mutex};
 use url::Url;
 use uuid::Uuid;
@@ -89,7 +90,8 @@ impl WorkspaceManager {
             )
             .await
             .ok()
-            .and_then(|remote| parse_github_repository_identity(&remote));
+            .and_then(|remote| parse_github_repository_identity(&remote))
+            .or_else(|| Some(local_repository_identity(&manager.repository)));
         Ok(manager)
     }
 
@@ -618,6 +620,27 @@ fn parse_github_repository_identity(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repository}"))
 }
 
+fn local_repository_identity(repository: &Path) -> String {
+    let canonical = std::fs::canonicalize(repository).unwrap_or_else(|_| repository.to_path_buf());
+    let name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("repository")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let name = name.trim_matches('-');
+    let name = if name.is_empty() { "repository" } else { name };
+    let digest = hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+    format!("local/{name}-{}", &digest[..12])
+}
+
 fn branch_name(task_id: Uuid, workspace_run_id: Uuid) -> String {
     format!(
         "crony/task-{}/run-{}",
@@ -1122,6 +1145,22 @@ mod tests {
         assert_eq!(
             parse_github_repository_identity("https://example.com/acme/repo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn local_repository_identity_is_stable_and_contract_safe() {
+        let repository = std::env::temp_dir().join("ECorp dogfood target");
+        let first = local_repository_identity(&repository);
+        let second = local_repository_identity(&repository);
+        assert_eq!(first, second);
+        assert!(first.starts_with("local/ECorp-dogfood-target-"));
+        assert_eq!(first.split('/').count(), 2);
+        assert!(
+            first
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '/' | '-' | '_' | '.'))
         );
     }
 

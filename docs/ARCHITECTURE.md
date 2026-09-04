@@ -333,6 +333,13 @@ tests, allowed tools, prohibited actions, references, write scope, token budget,
 escalation path. Validation rejects unknown agents, adapter mismatches, missing contract fields,
 cycles, excessive depth, node fan-out, retry counts, and budgets.
 
+Interactive mission creation presents the structured workspace identities advertised by connected
+runners. The operator must select and confirm one exact repository, symbolic ref, and immutable
+commit before launch. The server matches that tuple to a connected runner, copies it into every
+planned task, and validates each task's adapter, model, and reasoning requirements against runners
+advertising the same source. Local repositories without a GitHub remote receive a stable
+`local/<name>-<digest>` identity; the host path is never used as shared routing authority.
+
 The scheduler:
 
 - releases only tasks whose dependencies are completed
@@ -534,11 +541,11 @@ the human-readable source ref to a full immutable Git object ID. Factory policy,
 and run launch records retain the repository, symbolic ref, and resolved commit together.
 Runners resolve that same tuple once at startup and advertise it as structured workspace
 capability data. Scheduling compares the immutable commit rather than trusting a matching `HEAD`
-label, and the runner repeats the check before creating or reusing a worktree. Pinned assignments
-start from their exact authorized commit. Ordinary unpinned assignments preserve the prior behavior
-of resolving the configured symbolic ref under the Git lock for each new worktree. Resume carries
-the source run's persisted workspace base commit and must reuse a preserved branch descending from
-that exact identity.
+label, and the runner repeats the check before creating or reusing a worktree. Factory and
+operator-selected assignments start from their exact authorized commit. Legacy API clients may
+still omit a source tuple, but the browser does not create unpinned missions. Resume carries the
+source run's persisted workspace base commit and must reuse a preserved branch descending from that
+exact identity.
 
 Migration 0022 derives legacy factory commits only when persisted workspace evidence identifies one
 unambiguous commit. Legacy claims or materialized no-run missions without derivable evidence are

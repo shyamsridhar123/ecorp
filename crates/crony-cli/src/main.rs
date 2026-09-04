@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crony_domain::{DeliverableForm, DeliverableSpec, EntityLink};
 use crony_protocol::{
     ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
-    InterruptRunRequest, LaunchMissionRequest, QueueMessageRequest, ReleaseLeaseRequest,
-    ResumeRunRequest, TransferLeaseRequest, VerificationDecisionRequest,
+    InterruptRunRequest, LaunchMissionRequest, MissionSource, QueueMessageRequest,
+    ReleaseLeaseRequest, ResumeRunRequest, TransferLeaseRequest, VerificationDecisionRequest,
 };
 use reqwest::{
     Client, Method,
@@ -56,6 +56,21 @@ enum Command {
         adapter: Option<String>,
         #[arg(long)]
         strategy: Option<String>,
+        #[arg(
+            long,
+            requires_all = ["source_base_ref", "source_base_commit"]
+        )]
+        source_repository: Option<String>,
+        #[arg(
+            long,
+            requires_all = ["source_repository", "source_base_commit"]
+        )]
+        source_base_ref: Option<String>,
+        #[arg(
+            long,
+            requires_all = ["source_repository", "source_base_ref"]
+        )]
+        source_base_commit: Option<String>,
         #[arg(long, value_enum, default_value_t = DeliverableArg::Archive)]
         deliverable: DeliverableArg,
         #[arg(long)]
@@ -211,6 +226,9 @@ async fn main() -> Result<()> {
             actor_id,
             adapter,
             strategy,
+            source_repository,
+            source_base_ref,
+            source_base_commit,
             deliverable,
             commit_after_verification,
             title,
@@ -227,6 +245,12 @@ async fn main() -> Result<()> {
                     preferred_model: None,
                     reasoning_effort: None,
                     strategy,
+                    source: source_repository.map(|repository| MissionSource {
+                        repository,
+                        base_ref: source_base_ref.expect("clap requires the source base ref"),
+                        base_commit: source_base_commit
+                            .expect("clap requires the source base commit"),
+                    }),
                     secret_refs: Vec::new(),
                     budget_tokens: None,
                     budget_cost_microusd: None,

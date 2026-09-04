@@ -270,6 +270,13 @@ pub struct CreateRoomMessageResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionSource {
+    pub repository: String,
+    pub base_ref: String,
+    pub base_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMissionRequest {
     pub title: String,
     #[serde(default)]
@@ -279,6 +286,8 @@ pub struct CreateMissionRequest {
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default)]
+    pub source: Option<MissionSource>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,

@@ -43,7 +43,7 @@ use crony_protocol::{
     LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
     LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
     MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, PreflightFactoryMissionRequest,
+    MissionContractRevisionResponse, MissionSource, PreflightFactoryMissionRequest,
     PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
     PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
     QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
@@ -1443,6 +1443,7 @@ struct MissionPlanInput<'a> {
     preferred_model: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
     strategy: Option<&'a str>,
+    source: Option<&'a MissionSource>,
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
@@ -1473,6 +1474,10 @@ async fn plan_mission(
                 input.reasoning_effort,
             )
         };
+    let source = input
+        .source
+        .map(|source| resolve_mission_source(state, corp_id, source))
+        .transpose()?;
     validate_requested_model(
         state,
         corp_id,
@@ -1505,6 +1510,9 @@ async fn plan_mission(
     if let Some(contract) = input.contract {
         apply_mission_contract(&mut plan, contract)?;
     }
+    if let Some(source) = &source {
+        apply_mission_source(&mut plan, source);
+    }
     apply_mission_description(&mut plan, input.description)?;
     if let Some(policy) = input.verification_policy {
         apply_verification_policy(&mut plan, policy);
@@ -1513,7 +1521,101 @@ async fn plan_mission(
         enforce_factory_manual_gate(&mut plan);
     }
     validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
+    if source.is_some() {
+        validate_plan_runner_compatibility(state, corp_id, &plan)?;
+    }
     Ok(plan)
+}
+
+fn resolve_mission_source(
+    state: &AppState,
+    corp_id: Uuid,
+    requested: &MissionSource,
+) -> Result<MissionSource, ApiError> {
+    if requested.repository.trim().is_empty()
+        || requested.base_ref.trim().is_empty()
+        || requested.base_commit.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "mission source requires repository, base ref, and immutable base commit",
+        ));
+    }
+    state
+        .runners
+        .iter()
+        .filter(|entry| entry.corp_id == corp_id)
+        .flat_map(|entry| entry.capabilities.clone())
+        .find(|capability| {
+            capability.name == "workspace-isolation"
+                && capability.available
+                && capability
+                    .source_repository
+                    .as_deref()
+                    .is_some_and(|repository| {
+                        repository.eq_ignore_ascii_case(requested.repository.trim())
+                    })
+                && capability.source_base_ref.as_deref() == Some(requested.base_ref.trim())
+                && capability
+                    .source_base_commit
+                    .as_deref()
+                    .is_some_and(|commit| commit.eq_ignore_ascii_case(requested.base_commit.trim()))
+        })
+        .and_then(|capability| {
+            Some(MissionSource {
+                repository: capability.source_repository?,
+                base_ref: capability.source_base_ref?,
+                base_commit: capability.source_base_commit?,
+            })
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "selected repository {} @ {} ({}) is not available from a connected runner",
+                requested.repository.trim(),
+                requested.base_ref.trim(),
+                requested.base_commit.trim()
+            ))
+        })
+}
+
+fn apply_mission_source(plan: &mut TaskGraphPlan, source: &MissionSource) {
+    for task in &mut plan.tasks {
+        task.contract.source_repository = Some(source.repository.clone());
+        task.contract.source_base_ref = Some(source.base_ref.clone());
+        task.contract.source_base_commit = Some(source.base_commit.clone());
+    }
+}
+
+fn validate_plan_runner_compatibility(
+    state: &AppState,
+    corp_id: Uuid,
+    plan: &TaskGraphPlan,
+) -> Result<(), ApiError> {
+    for task in &plan.tasks {
+        let requirements = RunnerRequirements {
+            adapter: &task.required_adapter,
+            model: task.contract.model.as_deref(),
+            reasoning_effort: task.contract.reasoning_effort.as_deref(),
+            source_repository: task.contract.source_repository.as_deref(),
+            source_base_ref: task.contract.source_base_ref.as_deref(),
+            source_base_commit: task.contract.source_base_commit.as_deref(),
+        };
+        if select_runner(state, corp_id, &requirements).is_none() {
+            return Err(ApiError::bad_request(format!(
+                "task {} {}",
+                task.key,
+                runner_requirement_mismatch(
+                    &runner_capabilities(state, corp_id),
+                    &task.required_adapter,
+                    task.contract.model.as_deref(),
+                    task.contract.reasoning_effort.as_deref(),
+                    task.contract.source_repository.as_deref(),
+                    task.contract.source_base_ref.as_deref(),
+                    task.contract.source_base_commit.as_deref(),
+                )
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn apply_mission_contract(
@@ -1660,6 +1762,7 @@ async fn create_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: request.source.as_ref(),
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -1966,6 +2069,7 @@ async fn preflight_factory_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: None,
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -2088,6 +2192,7 @@ async fn materialize_factory_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: None,
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -4691,14 +4796,15 @@ mod tests {
         ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan, VerificationPolicy,
         VerifierCheck,
     };
-    use crony_protocol::{FactoryMissionContract, RunnerCapability, RunnerModel};
+    use crony_protocol::{FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel};
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        apply_mission_contract, apply_mission_description, artifact_content_disposition,
-        capability_satisfies_requirement, enforce_factory_manual_gate,
-        factory_materialization_failure_detail, runner_requirement_mismatch,
+        apply_mission_contract, apply_mission_description, apply_mission_source,
+        artifact_content_disposition, capability_satisfies_requirement,
+        enforce_factory_manual_gate, factory_materialization_failure_detail,
+        runner_requirement_mismatch,
     };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
@@ -4925,6 +5031,97 @@ mod tests {
             "line one\nline two\n\nTASK-SPECIFIC OBJECTIVE:\nProduce the role-specific output."
         );
         assert!(apply_mission_description(&mut plan, "bad\u{0007}value").is_err());
+    }
+
+    #[test]
+    fn mission_source_is_pinned_to_every_planned_task() {
+        let mut plan: TaskGraphPlan = serde_json::from_value(json!({
+            "strategy": "parallel-specialists",
+            "max_nodes": 2,
+            "max_depth": 0,
+            "budget_tokens": 2_000,
+            "budget_cost_microusd": 2_000_000,
+            "tasks": [
+                {
+                    "key": "one",
+                    "title": "One",
+                    "contract": {
+                        "objective": "First task",
+                        "expected_output": "Output",
+                        "source_repository": null,
+                        "source_base_ref": null,
+                        "source_base_commit": null,
+                        "acceptance_tests": ["passes"],
+                        "allowed_tools": ["filesystem"],
+                        "prohibited_actions": ["escape"],
+                        "references": [],
+                        "write_scope": ["**"],
+                        "budget_tokens": 1_000,
+                        "budget_cost_microusd": 1_000_000,
+                        "deadline_at": null,
+                        "escalation": "ask",
+                        "secret_refs": [],
+                        "model": null,
+                        "reasoning_effort": null,
+                        "deliverable": null
+                    },
+                    "assigned_agent_id": Uuid::new_v4(),
+                    "required_adapter": "codex",
+                    "depends_on": [],
+                    "depth": 0,
+                    "max_attempts": 1,
+                    "verification_policy": {
+                        "checks": [{"type": "artifact", "min_bytes": 1}],
+                        "manual_gate": null
+                    }
+                },
+                {
+                    "key": "two",
+                    "title": "Two",
+                    "contract": {
+                        "objective": "Second task",
+                        "expected_output": "Output",
+                        "source_repository": null,
+                        "source_base_ref": null,
+                        "source_base_commit": null,
+                        "acceptance_tests": ["passes"],
+                        "allowed_tools": ["filesystem"],
+                        "prohibited_actions": ["escape"],
+                        "references": [],
+                        "write_scope": ["**"],
+                        "budget_tokens": 1_000,
+                        "budget_cost_microusd": 1_000_000,
+                        "deadline_at": null,
+                        "escalation": "ask",
+                        "secret_refs": [],
+                        "model": null,
+                        "reasoning_effort": null,
+                        "deliverable": null
+                    },
+                    "assigned_agent_id": Uuid::new_v4(),
+                    "required_adapter": "claude-code",
+                    "depends_on": [],
+                    "depth": 0,
+                    "max_attempts": 1,
+                    "verification_policy": {
+                        "checks": [{"type": "artifact", "min_bytes": 1}],
+                        "manual_gate": null
+                    }
+                }
+            ]
+        }))
+        .expect("plan");
+        let source = MissionSource {
+            repository: "local/dogfood-1234".to_owned(),
+            base_ref: "HEAD".to_owned(),
+            base_commit: "1".repeat(40),
+        };
+        apply_mission_source(&mut plan, &source);
+        assert!(plan.tasks.iter().all(|task| {
+            task.contract.source_repository.as_deref() == Some(source.repository.as_str())
+                && task.contract.source_base_ref.as_deref() == Some(source.base_ref.as_str())
+                && task.contract.source_base_commit.as_deref() == Some(source.base_commit.as_str())
+        }));
     }
 
     #[test]
