@@ -1,9 +1,13 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, anyhow};
@@ -21,10 +25,20 @@ use super::{
     AdapterArtifact, AdapterCapabilities, AdapterControl, AdapterError, AdapterEvent,
     AdapterEventSink, AdapterExit, AdapterRunRequest, AgentAdapter, FeatureSupport, UsageSnapshot,
     permission::{bounded_text, path_is_inside_workspace},
+    process_tree::{OwnedProcessTree, OwnedProcessTreeSpawn},
 };
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 64 * 1024;
 const APPROVAL_EXPIRY_SECONDS: u64 = 600;
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROTOCOL_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const TERMINAL_PERMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const STDIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+const ROOT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const TEARDOWN_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const AVAILABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const AVAILABILITY_ROOT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 struct ClaudePermissionRequest {
@@ -71,7 +85,22 @@ pub struct ExternalCliAdapter {
     flavor: ExternalFlavor,
     command: PathBuf,
     prefix_args: Vec<OsString>,
-    available: bool,
+    platform_supported: bool,
+    availability_probe_active: Arc<AtomicBool>,
+    #[cfg(test)]
+    probe_verification_failures: usize,
+    #[cfg(test)]
+    probe_root_query_failures: usize,
+}
+
+struct AvailabilityProbeLease {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for AvailabilityProbeLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 impl ExternalCliAdapter {
@@ -88,19 +117,16 @@ impl ExternalCliAdapter {
         command: PathBuf,
         prefix_args: Vec<OsString>,
     ) -> Self {
-        let available = std::process::Command::new(&command)
-            .args(&prefix_args)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
         Self {
             flavor,
             command,
             prefix_args,
-            available,
+            platform_supported: cfg!(windows),
+            availability_probe_active: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe_verification_failures: 0,
+            #[cfg(test)]
+            probe_root_query_failures: 0,
         }
     }
 
@@ -139,6 +165,7 @@ impl ExternalCliAdapter {
                     command.arg(format!("--resume={session_id}"));
                 }
             }
+
             ExternalFlavor::OpenCode => {
                 command.arg("run").arg("--pure").arg("--format").arg("json");
                 if let Some(session_id) = resume_session_id {
@@ -149,6 +176,102 @@ impl ExternalCliAdapter {
         }
     }
 
+    async fn probe_available(&self) -> Result<(), AdapterError> {
+        if !self.platform_supported {
+            return Err(AdapterError::Runtime(anyhow!(unix_unsupported_reason())));
+        }
+        if self
+            .availability_probe_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AdapterError::Runtime(anyhow!(
+                "{} availability probe cleanup is already active",
+                self.display_name()
+            )));
+        }
+        let probe_lease = AvailabilityProbeLease {
+            active: self.availability_probe_active.clone(),
+        };
+        let mut command = self.command();
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(test)]
+        let probe_verification_failures = self.probe_verification_failures;
+        #[cfg(test)]
+        let probe_root_query_failures = self.probe_root_query_failures;
+        let mut guardian = tokio::spawn(async move {
+            let _probe_lease = probe_lease;
+            let spawn = OwnedProcessTree::spawn(&mut command)?;
+            let (mut tree, setup_error) = match spawn {
+                OwnedProcessTreeSpawn::Ready(tree) => (tree, None),
+                OwnedProcessTreeSpawn::CleanupRequired { tree, error } => (tree, Some(error)),
+            };
+            #[cfg(test)]
+            tree.force_verification_failures(probe_verification_failures);
+            #[cfg(test)]
+            tree.force_root_query_failures(probe_root_query_failures);
+            let mut probe_error = setup_error;
+            if probe_error.is_none() {
+                let root_deadline = tokio::time::sleep(AVAILABILITY_ROOT_TIMEOUT);
+                tokio::pin!(root_deadline);
+                let mut root_tick = tokio::time::interval(ROOT_POLL_INTERVAL);
+                root_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = &mut root_deadline => break,
+                        _ = root_tick.tick() => {
+                            match tree.try_wait_root() {
+                                Ok(Some(_)) => break,
+                                Ok(None) => {}
+                                Err(error) => {
+                                    probe_error = Some(std::io::Error::new(
+                                        error.kind(),
+                                        format!("observe availability-probe root: {error}"),
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            loop {
+                match tree.terminate_and_wait().await {
+                    Ok(status) => {
+                        return match probe_error {
+                            Some(error) => Err(error),
+                            None => Ok(status),
+                        };
+                    }
+                    Err(_) => tokio::time::sleep(TEARDOWN_RETRY_INTERVAL).await,
+                }
+            }
+        });
+        match tokio::time::timeout(AVAILABILITY_PROBE_TIMEOUT, &mut guardian).await {
+            Ok(Ok(Ok(status))) if status.success() => Ok(()),
+            Ok(Ok(Ok(status))) => Err(AdapterError::Runtime(anyhow!(
+                "{} availability probe exited with {status}",
+                self.display_name()
+            ))),
+            Ok(Ok(Err(error))) => Err(AdapterError::Runtime(anyhow!(
+                "{} availability probe failed: {error}",
+                self.display_name()
+            ))),
+            Ok(Err(error)) => Err(AdapterError::Runtime(anyhow!(
+                "{} availability guardian failed: {error}",
+                self.display_name()
+            ))),
+            Err(_) => Err(AdapterError::Runtime(anyhow!(
+                "{} availability probe exceeded its deadline; owned cleanup continues",
+                self.display_name()
+            ))),
+        }
+    }
+
     async fn run(
         &self,
         request: AdapterRunRequest,
@@ -156,11 +279,10 @@ impl ExternalCliAdapter {
         mut controls: mpsc::UnboundedReceiver<AdapterControl>,
         sink: Arc<dyn AdapterEventSink>,
     ) -> Result<AdapterExit, AdapterError> {
-        if !self.available {
+        if !self.platform_supported {
             return Err(AdapterError::Runtime(anyhow!(
-                "{} executable is unavailable: {}",
-                self.display_name(),
-                self.command.display()
+                "{}",
+                unix_unsupported_reason()
             )));
         }
         tokio::fs::create_dir_all(&request.workspace).await?;
@@ -175,14 +297,29 @@ impl ExternalCliAdapter {
             .envs(&request.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
+            .stderr(Stdio::piped());
+        let spawn = OwnedProcessTree::spawn(&mut command)
             .with_context(|| format!("spawn {}", self.display_name()))?;
-        let mut stdin = child.stdin.take().context("provider stdin missing")?;
-        let stdout = child.stdout.take().context("provider stdout missing")?;
-        let stderr = child.stderr.take().context("provider stderr missing")?;
+        let mut tree =
+            complete_spawn_ownership(spawn, &mut controls, &sink, self.display_name()).await?;
+        #[cfg(test)]
+        if request
+            .mission_title
+            .contains("[teardown:verification-failure]")
+        {
+            tree.force_verification_failures(1);
+        }
+        let streams = {
+            let child = tree.child_mut();
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        };
+        let (Some(mut stdin), Some(stdout), Some(stderr)) = streams else {
+            teardown_until_verified(&mut tree, &mut controls, &sink).await;
+            sink.emit(AdapterEvent::Failed {
+                error: "provider standard stream missing".to_owned(),
+            });
+            return Ok(AdapterExit::Failed);
+        };
         let stderr_sink = sink.clone();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -196,89 +333,92 @@ impl ExternalCliAdapter {
 
         let mut raw_output = Vec::new();
         let mut lines = BufReader::new(stdout).lines();
-        if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
-            initialize_claude(&mut stdin, &mut lines, &mut raw_output)
-                .await
-                .context("initialize Claude stream protocol")?;
-            send_protocol_frame(
-                &mut stdin,
-                &json!({
-                    "type": "user",
-                    "message": {
-                        "role": "user",
-                        "content": request.mission_title,
-                    },
-                }),
-            )
-            .await
-            .context("send Claude mission frame")?;
-        }
-
         let mut session_id = resume_session_id.map(str::to_owned);
+        let mut terminal_result_seen = false;
         let mut cancelled = None;
         let mut failed = None;
         let mut pending = HashMap::<Uuid, PendingClaudePermission>::new();
         let mut pending_by_request = HashMap::<String, Uuid>::new();
-        loop {
-            tokio::select! {
-                control = controls.recv() => match control {
-                    Some(AdapterControl::Stop { reason })
-                    | Some(AdapterControl::Interrupt { reason }) => {
-                        if let Err(error) = deny_pending_permissions(
-                            &mut stdin,
-                            &mut pending,
-                            &mut pending_by_request,
-                            &reason,
-                        ).await {
-                            failed = Some(format!(
-                                "failed to deliver Claude permission denial: {error}"
-                            ));
-                        }
-                        child.kill().await.context("stop provider process")?;
-                        if failed.is_none() {
-                            cancelled = Some(reason);
+        let mut deferred_controls = VecDeque::new();
+        if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
+            let initialization = initialize_claude(
+                &mut stdin,
+                &mut lines,
+                &mut raw_output,
+                &request.mission_title,
+            );
+            tokio::pin!(initialization);
+            let initialize_deadline = tokio::time::sleep(INITIALIZE_TIMEOUT);
+            tokio::pin!(initialize_deadline);
+            let mut root_tick = tokio::time::interval(ROOT_POLL_INTERVAL);
+            root_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    result = &mut initialization => {
+                        if let Err(error) = result {
+                            failed = Some(format!("initialize Claude stream protocol: {error}"));
                         }
                         break;
                     }
-                    Some(AdapterControl::Steer { actor_id, text }) => {
-                        let frame = if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
-                            json!({
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": format!("Direction from {actor_id}: {text}"),
-                                },
-                            })
-                        } else {
-                            json!({
-                                "type": "user",
-                                "actor_id": actor_id,
-                                "text": text,
-                            })
-                        };
-                        let _ = send_protocol_frame(&mut stdin, &frame).await;
+                    _ = &mut initialize_deadline => {
+                        failed = Some(format!(
+                            "Claude initialization exceeded the {:?} deadline",
+                            INITIALIZE_TIMEOUT
+                        ));
+                        break;
                     }
-                    Some(AdapterControl::ApprovalDecision { approval_id, approved, note }) => {
-                        if let Some(pending_request) = pending.remove(&approval_id) {
-                            pending_by_request.remove(&pending_request.request.request_id);
-                            if let Err(error) = send_claude_permission_response(
-                                &mut stdin,
-                                &pending_request.request,
-                                approved,
-                                &note,
-                            ).await {
+                    _ = root_tick.tick() => {
+                        match tree.try_wait_root() {
+                            Ok(Some(status)) => {
                                 failed = Some(format!(
-                                    "failed to deliver Claude permission response: {error}"
+                                    "{} exited during initialization with {status}",
+                                    self.display_name()
                                 ));
-                                child.kill().await.context(
-                                    "stop provider after permission response delivery failure",
-                                )?;
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                failed = Some(format!("observe provider root during initialization: {error}"));
                                 break;
                             }
                         }
                     }
-                    Some(AdapterControl::CircuitBreaker { stage, reason }) => {
-                        if matches!(stage.as_str(), "suspend" | "stop") {
+                    control = controls.recv() => match control {
+                        Some(AdapterControl::Stop { reason })
+                        | Some(AdapterControl::Interrupt { reason }) => {
+                            cancelled = Some(reason);
+                            break;
+                        }
+                        Some(AdapterControl::CircuitBreaker { stage, reason })
+                            if matches!(stage.as_str(), "suspend" | "stop") =>
+                        {
+                            cancelled = Some(format!(
+                                "Circuit breaker {stage} checkpoint: {reason}"
+                            ));
+                            break;
+                        }
+                        Some(control) => deferred_controls.push_back(control),
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        if failed.is_none() && cancelled.is_none() {
+            let mut root_tick = tokio::time::interval(ROOT_POLL_INTERVAL);
+            root_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut root_exit_observed_at: Option<tokio::time::Instant> = None;
+            'provider: loop {
+                tokio::select! {
+                    control = async {
+                        if let Some(control) = deferred_controls.pop_front() {
+                            Some(control)
+                        } else {
+                            controls.recv().await
+                        }
+                    } => match control {
+                        Some(AdapterControl::Stop { reason })
+                        | Some(AdapterControl::Interrupt { reason }) => {
                             if let Err(error) = deny_pending_permissions(
                                 &mut stdin,
                                 &mut pending,
@@ -289,341 +429,453 @@ impl ExternalCliAdapter {
                                     "failed to deliver Claude permission denial: {error}"
                                 ));
                             }
-                            child.kill().await.context("stop provider at circuit breaker")?;
                             if failed.is_none() {
-                                cancelled = Some(format!(
-                                    "Circuit breaker {stage} checkpoint: {reason}"
-                                ));
+                                cancelled = Some(reason);
                             }
                             break;
                         }
-                        let frame = if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
-                            json!({
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": format!("ECorp circuit breaker {stage}: {reason}"),
-                                },
-                            })
-                        } else {
-                            json!({
-                                "type": "policy",
-                                "stage": stage,
-                                "reason": reason,
-                            })
-                        };
-                        if let Err(error) = send_protocol_frame(&mut stdin, &frame).await {
-                            failed = Some(format!(
-                                "failed to deliver Claude circuit-breaker frame: {error}"
-                            ));
-                            child.kill().await.context(
-                                "stop provider after circuit-breaker delivery failure",
-                            )?;
-                            break;
-                        }
-                    }
-                    None => {}
-                },
-                line = lines.next_line() => {
-                    let Some(line) = line? else { break };
-                    if line.len() > MAX_PROTOCOL_LINE_BYTES {
-                        failed = Some("provider emitted an oversized stream-JSON frame".to_owned());
-                        if let Err(error) = deny_pending_permissions(
-                            &mut stdin,
-                            &mut pending,
-                            &mut pending_by_request,
-                            "Provider protocol frame exceeded the ECorp bound",
-                        ).await {
-                            failed = Some(format!(
-                                "failed to deliver Claude permission denial: {error}"
-                            ));
-                        }
-                        child.kill().await.context("stop provider after oversized frame")?;
-                        break;
-                    }
-                    raw_output.extend_from_slice(line.as_bytes());
-                    raw_output.push(b'\n');
-                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                        if matches!(self.flavor, ExternalFlavor::ClaudeCode)
-                            && value.get("type").and_then(Value::as_str)
-                                == Some("control_cancel_request")
-                        {
-                            let Some(provider_request_id) =
-                                value.get("request_id").and_then(Value::as_str)
-                            else {
-                                failed = Some(
-                                    "Claude emitted a malformed control cancellation".to_owned(),
-                                );
-                                if let Err(error) = deny_pending_permissions(
-                                    &mut stdin,
-                                    &mut pending,
-                                    &mut pending_by_request,
-                                    "Malformed Claude control cancellation",
-                                ).await {
-                                    failed = Some(format!(
-                                        "failed to deliver Claude permission denial: {error}"
-                                    ));
-                                }
-                                child.kill().await.context(
-                                    "stop provider after malformed control cancellation",
-                                )?;
-                                break;
+                        Some(AdapterControl::Steer { actor_id, text }) => {
+                            let frame = if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
+                                json!({
+                                    "type": "user",
+                                    "message": {
+                                        "role": "user",
+                                        "content": format!("Direction from {actor_id}: {text}"),
+                                    },
+                                })
+                            } else {
+                                json!({
+                                    "type": "user",
+                                    "actor_id": actor_id,
+                                    "text": text,
+                                })
                             };
-                            let Some(approval_id) =
-                                pending_by_request.remove(provider_request_id)
-                            else {
-                                failed = Some(
-                                    "Claude cancelled an unknown control request".to_owned(),
-                                );
-                                if let Err(error) = deny_pending_permissions(
-                                    &mut stdin,
-                                    &mut pending,
-                                    &mut pending_by_request,
-                                    "Claude cancelled an unknown control request",
-                                ).await {
-                                    failed = Some(format!(
-                                        "failed to deliver Claude permission denial: {error}"
-                                    ));
-                                }
-                                child.kill().await.context(
-                                    "stop provider after unknown control cancellation",
-                                )?;
-                                break;
-                            };
-                            if pending.remove(&approval_id).is_none() {
-                                failed = Some(
-                                    "Claude cancellation did not match a pending approval".to_owned(),
-                                );
-                                child.kill().await.context(
-                                    "stop provider after mismatched control cancellation",
-                                )?;
-                                break;
-                            }
-                            continue;
-                        }
-                        if matches!(self.flavor, ExternalFlavor::ClaudeCode)
-                            && value.get("type").and_then(Value::as_str)
-                                == Some("control_request")
-                        {
-                            match parse_claude_permission_request(&value) {
-                                Ok(provider_request) => {
-                                    if let Some(existing_id) =
-                                        pending_by_request.get(&provider_request.request_id)
-                                    {
-                                        let duplicate_matches = pending
-                                            .get(existing_id)
-                                            .is_some_and(|existing| {
-                                                existing.request == provider_request
-                                            });
-                                        if duplicate_matches {
-                                            continue;
-                                        }
-                                        failed = Some(
-                                            "Claude reused a pending control request ID".to_owned(),
-                                        );
-                                        if let Err(error) = deny_pending_permissions(
-                                            &mut stdin,
-                                            &mut pending,
-                                            &mut pending_by_request,
-                                            "Claude reused a pending control request ID",
-                                        ).await {
-                                            failed = Some(format!(
-                                                "failed to deliver Claude permission denial: {error}"
-                                            ));
-                                        }
-                                        child.kill().await.context(
-                                            "stop provider after control request ID reuse",
-                                        )?;
-                                        break;
-                                    }
-                                    if claude_permission_is_automatically_safe(
-                                        &provider_request,
-                                        &request.workspace,
-                                    ) {
-                                        if let Err(error) = send_claude_permission_response(
-                                            &mut stdin,
-                                            &provider_request,
-                                            true,
-                                            "",
-                                        ).await {
-                                            failed = Some(format!(
-                                                "failed to deliver Claude permission response: {error}"
-                                            ));
-                                            child.kill().await.context(
-                                                "stop provider after permission response delivery failure",
-                                            )?;
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    let action =
-                                        match claude_permission_action(&provider_request) {
-                                            Ok(action) => action,
-                                            Err(error) => {
-                                                failed = Some(error.to_string());
-                                                if let Err(error) = deny_pending_permissions(
-                                                    &mut stdin,
-                                                    &mut pending,
-                                                    &mut pending_by_request,
-                                                    "Claude permission context exceeded the durable approval bound",
-                                                )
-                                                .await {
-                                                    failed = Some(format!(
-                                                        "failed to deliver Claude permission denial: {error}"
-                                                    ));
-                                                }
-                                                child
-                                                    .kill()
-                                                    .await
-                                                    .context(
-                                                        "stop provider after oversized permission context",
-                                                    )?;
-                                                break;
-                                            }
-                                        };
-                                    let approval_id = Uuid::new_v4();
-                                    sink.emit(AdapterEvent::ApprovalRequested {
-                                        approval_id,
-                                        action_key: format!(
-                                            "claude-code:{}",
-                                            provider_request.request_id
-                                        ),
-                                        action,
-                                        risk: claude_permission_risk(&provider_request).to_owned(),
-                                        rationale: bounded_text(
-                                            provider_request
-                                                .decision_reason
-                                                .as_deref()
-                                                .or(provider_request.description.as_deref())
-                                                .unwrap_or(
-                                                    "Claude Code requested a tool capability outside the automatically allowed worktree-local read/write boundary.",
-                                                ),
-                                            2_000,
-                                        ),
-                                        required_roles: vec![
-                                            "owner".to_owned(),
-                                            "admin".to_owned(),
-                                            "manager".to_owned(),
-                                            "member".to_owned(),
-                                        ],
-                                        expires_in_seconds: APPROVAL_EXPIRY_SECONDS,
-                                    });
-                                    pending_by_request.insert(
-                                        provider_request.request_id.clone(),
-                                        approval_id,
-                                    );
-                                    pending.insert(
-                                        approval_id,
-                                        PendingClaudePermission {
-                                            request: provider_request,
-                                        },
-                                    );
+                            match send_protocol_frame_preemptible(
+                                &mut stdin,
+                                &frame,
+                                &mut controls,
+                                &mut deferred_controls,
+                            )
+                            .await
+                            {
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    cancelled = Some(reason);
+                                    break;
                                 }
                                 Err(error) => {
                                     failed = Some(format!(
-                                        "Claude permission protocol rejected: {error}"
+                                        "failed to deliver Claude steering frame: {error}"
                                     ));
-                                    if let Err(delivery_error) = deny_pending_permissions(
-                                        &mut stdin,
-                                        &mut pending,
-                                        &mut pending_by_request,
-                                        "Malformed or unsupported Claude permission request",
-                                    ).await {
-                                        failed = Some(format!(
-                                            "failed to deliver Claude permission denial: {delivery_error}"
-                                        ));
-                                    }
-                                    child.kill().await.context(
-                                        "stop provider after invalid permission request",
-                                    )?;
                                     break;
                                 }
                             }
-                            continue;
                         }
-                        if matches!(self.flavor, ExternalFlavor::ClaudeCode)
-                            && value.get("type").and_then(Value::as_str) == Some("result")
-                        {
-                            if !pending.is_empty() {
-                                failed = Some(
-                                    "Claude returned a result while a tool permission was still pending"
-                                        .to_owned(),
+                        Some(AdapterControl::ApprovalDecision { approval_id, approved, note }) => {
+                            if let Some(pending_request) = pending.remove(&approval_id) {
+                                pending_by_request.remove(&pending_request.request.request_id);
+                                let frame = claude_permission_response(
+                                    &pending_request.request,
+                                    approved,
+                                    &note,
                                 );
+                                match send_protocol_frame_preemptible(
+                                    &mut stdin,
+                                    &frame,
+                                    &mut controls,
+                                    &mut deferred_controls,
+                                )
+                                .await
+                                {
+                                    Ok(None) => {}
+                                    Ok(Some(reason)) => {
+                                        cancelled = Some(reason);
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        failed = Some(format!(
+                                            "failed to deliver Claude permission response: {error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(AdapterControl::CircuitBreaker { stage, reason }) => {
+                            if matches!(stage.as_str(), "suspend" | "stop") {
                                 if let Err(error) = deny_pending_permissions(
                                     &mut stdin,
                                     &mut pending,
                                     &mut pending_by_request,
-                                    "Claude ended the turn before its permission request was decided",
-                                )
-                                .await
-                                {
+                                    &reason,
+                                ).await {
                                     failed = Some(format!(
                                         "failed to deliver Claude permission denial: {error}"
                                     ));
                                 }
-                                child
-                                    .kill()
-                                    .await
-                                    .context("stop provider after premature Claude result")?;
+                                if failed.is_none() {
+                                    cancelled = Some(format!(
+                                        "Circuit breaker {stage} checkpoint: {reason}"
+                                    ));
+                                }
                                 break;
                             }
-                            if let Err(error) = stdin.shutdown().await {
-                                failed = Some(format!(
-                                    "close Claude stream input after result: {error}"
-                                ));
-                                child
-                                    .kill()
-                                    .await
-                                    .context("stop provider after Claude input close failure")?;
+                            let frame = if matches!(self.flavor, ExternalFlavor::ClaudeCode) {
+                                json!({
+                                    "type": "user",
+                                    "message": {
+                                        "role": "user",
+                                        "content": format!("ECorp circuit breaker {stage}: {reason}"),
+                                    },
+                                })
+                            } else {
+                                json!({
+                                    "type": "policy",
+                                    "stage": stage,
+                                    "reason": reason,
+                                })
+                            };
+                            match send_protocol_frame_preemptible(
+                                &mut stdin,
+                                &frame,
+                                &mut controls,
+                                &mut deferred_controls,
+                            )
+                            .await
+                            {
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    cancelled = Some(reason);
+                                    break;
+                                }
+                                Err(error) => {
+                                    failed = Some(format!(
+                                        "failed to deliver Claude circuit-breaker frame: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        None => {}
+                    },
+                    _ = root_tick.tick() => {
+                        if let Some(observed_at) = root_exit_observed_at {
+                            if observed_at.elapsed() >= STREAM_DRAIN_TIMEOUT {
+                                break 'provider;
+                            }
+                        } else {
+                            match tree.try_wait_root() {
+                                Ok(Some(status)) => {
+                                    if !status.success() {
+                                        failed = Some(format!(
+                                            "{} root exited with {status}",
+                                            self.display_name()
+                                        ));
+                                        break 'provider;
+                                    }
+                                    root_exit_observed_at = Some(tokio::time::Instant::now());
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    failed = Some(format!("observe provider root process: {error}"));
+                                    break 'provider;
+                                }
+                            }
+                        }
+                    }
+                    line = lines.next_line() => {
+                        let line = match line {
+                            Ok(Some(line)) => line,
+                            Ok(None) => break,
+                            Err(error) => {
+                                failed = Some(format!("read provider protocol stream: {error}"));
                                 break;
                             }
-                            break;
-                        }
-                        if session_id.is_none() {
-                            session_id = find_string(&value, &["session_id", "sessionId", "sessionID"]);
-                            if let Some(id) = &session_id {
-                                sink.emit(AdapterEvent::Session { session_id: id.clone() });
-                            }
-                        }
-                        if let Some(usage) = value.get("usage") {
-                            sink.emit(AdapterEvent::Usage(UsageSnapshot {
-                                input_tokens: find_u64(usage, &["input_tokens", "inputTokens"]).unwrap_or_default(),
-                                output_tokens: find_u64(usage, &["output_tokens", "outputTokens"]).unwrap_or_default(),
-                                cost_microusd: find_u64(usage, &["cost_microusd", "costMicrousd"]).unwrap_or_default(),
-                            }));
-                        }
-                        if let Some(text) = find_string(&value, &["text", "content", "message"]) {
-                            sink.emit(AdapterEvent::Output {
-                                stream: "provider".to_owned(),
-                                text,
-                            });
-                        }
-                    } else {
-                        if matches!(self.flavor, ExternalFlavor::ClaudeCode)
-                            && line.contains("control_request")
-                        {
-                            failed = Some(
-                                "Claude emitted malformed stream-JSON control data".to_owned(),
-                            );
+                        };
+                        if line.len() > MAX_PROTOCOL_LINE_BYTES {
+                            failed = Some("provider emitted an oversized stream-JSON frame".to_owned());
                             if let Err(error) = deny_pending_permissions(
                                 &mut stdin,
                                 &mut pending,
                                 &mut pending_by_request,
-                                "Malformed Claude stream-JSON control data",
+                                "Provider protocol frame exceeded the ECorp bound",
                             ).await {
                                 failed = Some(format!(
                                     "failed to deliver Claude permission denial: {error}"
                                 ));
                             }
-                            child.kill().await.context(
-                                "stop provider after malformed stream-JSON control data",
-                            )?;
                             break;
                         }
-                        sink.emit(AdapterEvent::Output {
-                            stream: "provider".to_owned(),
-                            text: line,
-                        });
+                        raw_output.extend_from_slice(line.as_bytes());
+                        raw_output.push(b'\n');
+                        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                            if matches!(self.flavor, ExternalFlavor::ClaudeCode)
+                                && value.get("type").and_then(Value::as_str)
+                                    == Some("control_cancel_request")
+                            {
+                                let Some(provider_request_id) =
+                                    value.get("request_id").and_then(Value::as_str)
+                                else {
+                                    failed = Some(
+                                        "Claude emitted a malformed control cancellation".to_owned(),
+                                    );
+                                    if let Err(error) = deny_pending_permissions(
+                                        &mut stdin,
+                                        &mut pending,
+                                        &mut pending_by_request,
+                                        "Malformed Claude control cancellation",
+                                    ).await {
+                                        failed = Some(format!(
+                                            "failed to deliver Claude permission denial: {error}"
+                                        ));
+                                    }
+                                    break;
+                                };
+                                let Some(approval_id) =
+                                    pending_by_request.remove(provider_request_id)
+                                else {
+                                    failed = Some(
+                                        "Claude cancelled an unknown control request".to_owned(),
+                                    );
+                                    if let Err(error) = deny_pending_permissions(
+                                        &mut stdin,
+                                        &mut pending,
+                                        &mut pending_by_request,
+                                        "Claude cancelled an unknown control request",
+                                    ).await {
+                                        failed = Some(format!(
+                                            "failed to deliver Claude permission denial: {error}"
+                                        ));
+                                    }
+                                    break;
+                                };
+                                if pending.remove(&approval_id).is_none() {
+                                    failed = Some(
+                                        "Claude cancellation did not match a pending approval".to_owned(),
+                                    );
+                                    break;
+                                }
+                                continue;
+                            }
+                            if matches!(self.flavor, ExternalFlavor::ClaudeCode)
+                                && value.get("type").and_then(Value::as_str)
+                                    == Some("control_request")
+                            {
+                                match parse_claude_permission_request(&value) {
+                                    Ok(provider_request) => {
+                                        if let Some(existing_id) =
+                                            pending_by_request.get(&provider_request.request_id)
+                                        {
+                                            let duplicate_matches = pending
+                                                .get(existing_id)
+                                                .is_some_and(|existing| {
+                                                    existing.request == provider_request
+                                                });
+                                            if duplicate_matches {
+                                                continue;
+                                            }
+                                            failed = Some(
+                                                "Claude reused a pending control request ID".to_owned(),
+                                            );
+                                            if let Err(error) = deny_pending_permissions(
+                                                &mut stdin,
+                                                &mut pending,
+                                                &mut pending_by_request,
+                                                "Claude reused a pending control request ID",
+                                            ).await {
+                                                failed = Some(format!(
+                                                    "failed to deliver Claude permission denial: {error}"
+                                                ));
+                                            }
+                                            break;
+                                        }
+                                        if claude_permission_is_automatically_safe(
+                                            &provider_request,
+                                            &request.workspace,
+                                        ) {
+                                            let frame = claude_permission_response(
+                                                &provider_request,
+                                                true,
+                                                "",
+                                            );
+                                            match send_protocol_frame_preemptible(
+                                                &mut stdin,
+                                                &frame,
+                                                &mut controls,
+                                                &mut deferred_controls,
+                                            )
+                                            .await
+                                            {
+                                                Ok(None) => {}
+                                                Ok(Some(reason)) => {
+                                                    cancelled = Some(reason);
+                                                    break;
+                                                }
+                                                Err(error) => {
+                                                    failed = Some(format!(
+                                                        "failed to deliver Claude permission response: {error}"
+                                                    ));
+                                                    break;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        let action =
+                                            match claude_permission_action(&provider_request) {
+                                                Ok(action) => action,
+                                                Err(error) => {
+                                                    failed = Some(error.to_string());
+                                                    if let Err(error) = deny_pending_permissions(
+                                                        &mut stdin,
+                                                        &mut pending,
+                                                        &mut pending_by_request,
+                                                        "Claude permission context exceeded the durable approval bound",
+                                                    )
+                                                    .await {
+                                                        failed = Some(format!(
+                                                            "failed to deliver Claude permission denial: {error}"
+                                                        ));
+                                                    }
+                                                    break;
+                                                }
+                                            };
+                                        let approval_id = Uuid::new_v4();
+                                        sink.emit(AdapterEvent::ApprovalRequested {
+                                            approval_id,
+                                            action_key: format!(
+                                                "claude-code:{}",
+                                                provider_request.request_id
+                                            ),
+                                            action,
+                                            risk: claude_permission_risk(&provider_request).to_owned(),
+                                            rationale: bounded_text(
+                                                provider_request
+                                                    .decision_reason
+                                                    .as_deref()
+                                                    .or(provider_request.description.as_deref())
+                                                    .unwrap_or(
+                                                        "Claude Code requested a tool capability outside the automatically allowed worktree-local read/write boundary.",
+                                                    ),
+                                                2_000,
+                                            ),
+                                            required_roles: vec![
+                                                "owner".to_owned(),
+                                                "admin".to_owned(),
+                                                "manager".to_owned(),
+                                                "member".to_owned(),
+                                            ],
+                                            expires_in_seconds: APPROVAL_EXPIRY_SECONDS,
+                                        });
+                                        pending_by_request.insert(
+                                            provider_request.request_id.clone(),
+                                            approval_id,
+                                        );
+                                        pending.insert(
+                                            approval_id,
+                                            PendingClaudePermission {
+                                                request: provider_request,
+                                            },
+                                        );
+                                    }
+                                    Err(error) => {
+                                        failed = Some(format!(
+                                            "Claude permission protocol rejected: {error}"
+                                        ));
+                                        if let Err(delivery_error) = deny_pending_permissions(
+                                            &mut stdin,
+                                            &mut pending,
+                                            &mut pending_by_request,
+                                            "Malformed or unsupported Claude permission request",
+                                        ).await {
+                                            failed = Some(format!(
+                                                "failed to deliver Claude permission denial: {delivery_error}"
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            if matches!(self.flavor, ExternalFlavor::ClaudeCode)
+                                && value.get("type").and_then(Value::as_str) == Some("result")
+                            {
+                                if !pending.is_empty() {
+                                    failed = Some(
+                                        "Claude returned a result while a tool permission was still pending"
+                                            .to_owned(),
+                                    );
+                                    if let Err(error) = deny_pending_permissions(
+                                        &mut stdin,
+                                        &mut pending,
+                                        &mut pending_by_request,
+                                        "Claude ended the turn before its permission request was decided",
+                                    )
+                                    .await
+                                    {
+                                        failed = Some(format!(
+                                            "failed to deliver Claude permission denial: {error}"
+                                        ));
+                                    }
+                                    break;
+                                }
+                                match validate_claude_result(&value) {
+                                    Ok(()) => terminal_result_seen = true,
+                                    Err(error) => {
+                                        failed = Some(error);
+                                        break;
+                                    }
+                                }
+                                if let Err(error) = shutdown_stdin(&mut stdin).await {
+                                    failed = Some(format!(
+                                        "close Claude stream input after result: {error}"
+                                    ));
+                                    break;
+                                }
+                                break;
+                            }
+                            if session_id.is_none() {
+                                session_id = find_string(&value, &["session_id", "sessionId", "sessionID"]);
+                                if let Some(id) = &session_id {
+                                    sink.emit(AdapterEvent::Session { session_id: id.clone() });
+                                }
+                            }
+                            if let Some(usage) = value.get("usage") {
+                                sink.emit(AdapterEvent::Usage(UsageSnapshot {
+                                    input_tokens: find_u64(usage, &["input_tokens", "inputTokens"]).unwrap_or_default(),
+                                    output_tokens: find_u64(usage, &["output_tokens", "outputTokens"]).unwrap_or_default(),
+                                    cost_microusd: find_u64(usage, &["cost_microusd", "costMicrousd"]).unwrap_or_default(),
+                                }));
+                            }
+                            if let Some(text) = find_string(&value, &["text", "content", "message"]) {
+                                sink.emit(AdapterEvent::Output {
+                                    stream: "provider".to_owned(),
+                                    text,
+                                });
+                            }
+                        } else {
+                            if matches!(self.flavor, ExternalFlavor::ClaudeCode)
+                                && line.contains("control_request")
+                            {
+                                failed = Some(
+                                    "Claude emitted malformed stream-JSON control data".to_owned(),
+                                );
+                                if let Err(error) = deny_pending_permissions(
+                                    &mut stdin,
+                                    &mut pending,
+                                    &mut pending_by_request,
+                                    "Malformed Claude stream-JSON control data",
+                                ).await {
+                                    failed = Some(format!(
+                                        "failed to deliver Claude permission denial: {error}"
+                                    ));
+                                }
+                                break;
+                            }
+                            sink.emit(AdapterEvent::Output {
+                                stream: "provider".to_owned(),
+                                text: line,
+                            });
+                        }
                     }
                 }
             }
@@ -640,9 +892,19 @@ impl ExternalCliAdapter {
                 format!("failed to deliver Claude permission denial: {error}")
             });
         }
+        if let Err(error) = shutdown_stdin(&mut stdin).await {
+            failed.get_or_insert_with(|| format!("close provider protocol input: {error}"));
+        }
         drop(stdin);
-        let status = child.wait().await?;
-        stderr_task.abort();
+        let status = teardown_until_verified(&mut tree, &mut controls, &sink).await;
+        drain_stream_task(stderr_task).await;
+        if matches!(self.flavor, ExternalFlavor::ClaudeCode)
+            && !terminal_result_seen
+            && cancelled.is_none()
+            && failed.is_none()
+        {
+            failed = Some("Claude exited without a terminal result frame".to_owned());
+        }
         if let Some(reason) = cancelled {
             sink.emit(AdapterEvent::Cancelled { reason });
             return Ok(AdapterExit::Cancelled);
@@ -700,11 +962,11 @@ impl AgentAdapter for ExternalCliAdapter {
     }
 
     fn capabilities(&self) -> AdapterCapabilities {
-        let available = if self.available {
+        let available = if self.platform_supported {
             FeatureSupport::Supported
         } else {
             FeatureSupport::Unsupported {
-                reason: format!("{} is not installed", self.command.display()),
+                reason: unix_unsupported_reason().to_owned(),
             }
         };
         AdapterCapabilities {
@@ -719,6 +981,11 @@ impl AgentAdapter for ExternalCliAdapter {
             usage: available.clone(),
             artifacts: available,
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<super::AdapterModel>, AdapterError> {
+        self.probe_available().await?;
+        Ok(Vec::new())
     }
 
     async fn execute(
@@ -743,15 +1010,56 @@ impl AgentAdapter for ExternalCliAdapter {
 
 async fn send_protocol_frame(stdin: &mut ChildStdin, frame: &Value) -> std::io::Result<()> {
     let encoded = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
-    stdin.write_all(&encoded).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await
+    tokio::time::timeout(PROTOCOL_WRITE_TIMEOUT, async {
+        stdin.write_all(&encoded).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "provider protocol write exceeded its deadline",
+        )
+    })?
+}
+
+async fn send_protocol_frame_preemptible(
+    stdin: &mut ChildStdin,
+    frame: &Value,
+    controls: &mut mpsc::UnboundedReceiver<AdapterControl>,
+    deferred_controls: &mut VecDeque<AdapterControl>,
+) -> std::io::Result<Option<String>> {
+    let write = send_protocol_frame(stdin, frame);
+    tokio::pin!(write);
+    let mut controls_open = true;
+    loop {
+        tokio::select! {
+            result = &mut write => return result.map(|()| None),
+            control = controls.recv(), if controls_open => {
+                match control {
+                    Some(AdapterControl::Stop { reason })
+                    | Some(AdapterControl::Interrupt { reason }) => return Ok(Some(reason)),
+                    Some(AdapterControl::CircuitBreaker { stage, reason })
+                        if matches!(stage.as_str(), "suspend" | "stop") =>
+                    {
+                        return Ok(Some(format!(
+                            "Circuit breaker {stage} checkpoint: {reason}"
+                        )));
+                    }
+                    Some(control) => deferred_controls.push_back(control),
+                    None => controls_open = false,
+                }
+            }
+        }
+    }
 }
 
 async fn initialize_claude(
     stdin: &mut ChildStdin,
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     raw_output: &mut Vec<u8>,
+    mission_title: &str,
 ) -> Result<(), AdapterError> {
     let request_id = format!("ecorp-initialize-{}", Uuid::new_v4());
     send_protocol_frame(
@@ -797,6 +1105,18 @@ async fn initialize_claude(
             "Claude initialize response did not match the request"
         )));
     }
+    send_protocol_frame(
+        stdin,
+        &json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": mission_title,
+            },
+        }),
+    )
+    .await
+    .context("send Claude mission frame")?;
     Ok(())
 }
 
@@ -806,6 +1126,15 @@ async fn send_claude_permission_response(
     approved: bool,
     note: &str,
 ) -> std::io::Result<()> {
+    let frame = claude_permission_response(request, approved, note);
+    send_protocol_frame(stdin, &frame).await
+}
+
+fn claude_permission_response(
+    request: &ClaudePermissionRequest,
+    approved: bool,
+    note: &str,
+) -> Value {
     let decision = if approved {
         json!({
             "behavior": "allow",
@@ -817,18 +1146,14 @@ async fn send_claude_permission_response(
             "message": bounded_text(note, 500),
         })
     };
-    send_protocol_frame(
-        stdin,
-        &json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request.request_id,
-                "response": decision,
-            },
-        }),
-    )
-    .await
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request.request_id,
+            "response": decision,
+        },
+    })
 }
 
 async fn deny_pending_permissions(
@@ -842,17 +1167,102 @@ async fn deny_pending_permissions(
         .map(|(_, pending)| pending.request)
         .collect::<Vec<_>>();
     pending_by_request.clear();
-    let mut first_error = None;
-    for request in pending_requests {
-        if let Err(error) = send_claude_permission_response(stdin, &request, false, reason).await {
-            first_error.get_or_insert(error);
+    tokio::time::timeout(TERMINAL_PERMISSION_TIMEOUT, async {
+        let mut first_error = None;
+        for request in pending_requests {
+            if let Err(error) =
+                send_claude_permission_response(stdin, &request, false, reason).await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "terminal permission denial exceeded its deadline",
+        )
+    })?
+}
+
+async fn shutdown_stdin(stdin: &mut ChildStdin) -> std::io::Result<()> {
+    tokio::time::timeout(STDIN_SHUTDOWN_TIMEOUT, stdin.shutdown())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "provider stdin shutdown exceeded its deadline",
+            )
+        })?
+}
+
+async fn teardown_until_verified(
+    tree: &mut OwnedProcessTree,
+    controls: &mut mpsc::UnboundedReceiver<AdapterControl>,
+    sink: &Arc<dyn AdapterEventSink>,
+) -> std::process::ExitStatus {
+    let mut uncertainty_reported = false;
+    let mut controls_open = true;
+    loop {
+        match tree.terminate_and_wait().await {
+            Ok(status) => return status,
+            Err(error) => {
+                if !uncertainty_reported {
+                    uncertainty_reported = true;
+                    sink.emit(AdapterEvent::TeardownUncertain {
+                        detail: format!(
+                            "provider process-scope termination is unverified; cleanup supervision retained: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(TEARDOWN_RETRY_INTERVAL) => {}
+            control = controls.recv(), if controls_open => {
+                if control.is_none() {
+                    controls_open = false;
+                }
+            }
         }
     }
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        Ok(())
+}
+
+async fn complete_spawn_ownership(
+    spawn: OwnedProcessTreeSpawn,
+    controls: &mut mpsc::UnboundedReceiver<AdapterControl>,
+    sink: &Arc<dyn AdapterEventSink>,
+    display_name: &str,
+) -> Result<OwnedProcessTree, AdapterError> {
+    match spawn {
+        OwnedProcessTreeSpawn::Ready(tree) => Ok(tree),
+        OwnedProcessTreeSpawn::CleanupRequired { mut tree, error } => {
+            teardown_until_verified(&mut tree, controls, sink).await;
+            Err(AdapterError::Runtime(anyhow!(
+                "establish {display_name} process ownership: {error}"
+            )))
+        }
     }
+}
+
+async fn drain_stream_task(mut task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(STREAM_DRAIN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn unix_unsupported_reason() -> &'static str {
+    "external CLI providers require a non-escapable process boundary; Unix setsid/setpgid process groups cannot prove complete descendant termination"
 }
 
 fn parse_claude_permission_request(frame: &Value) -> Result<ClaudePermissionRequest, &'static str> {
@@ -896,6 +1306,26 @@ fn parse_claude_permission_request(frame: &Value) -> Result<ClaudePermissionRequ
         return Err("blocked path was empty");
     }
     Ok(parsed)
+}
+
+fn validate_claude_result(frame: &Value) -> Result<(), String> {
+    let subtype = frame
+        .get("subtype")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| "Claude result frame omitted a valid subtype".to_owned())?;
+    let is_error = frame
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Claude result frame omitted is_error".to_owned())?;
+    if subtype != "success" || is_error {
+        return Err(format!(
+            "Claude result reported failure: subtype={subtype}, is_error={is_error}"
+        ));
+    }
+    Ok(())
 }
 
 fn required_bounded_string(
@@ -1057,11 +1487,40 @@ fn find_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn external_capabilities_fail_closed_without_strong_containment() {
+        for flavor in [ExternalFlavor::ClaudeCode, ExternalFlavor::OpenCode] {
+            let adapter =
+                ExternalCliAdapter::new_with_prefix(flavor, PathBuf::from(flavor.id()), Vec::new());
+            let capabilities = adapter.capabilities();
+            for support in [
+                capabilities.spawn,
+                capabilities.stream,
+                capabilities.interrupt,
+                capabilities.stop,
+                capabilities.resume,
+                capabilities.usage,
+                capabilities.artifacts,
+            ] {
+                assert!(!support.supported());
+                assert_eq!(support.reason(), Some(unix_unsupported_reason()));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
+
+    use serde::Deserialize;
 
     use super::*;
+    use crate::adapter::process_tree::process_is_alive;
 
     #[derive(Default)]
     struct RecordingSink {
@@ -1074,18 +1533,38 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Deserialize)]
+    struct FixturePids {
+        parent: u32,
+        grandchild: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TreeControl {
+        Interrupt,
+        Stop,
+    }
+
     fn adapter(flavor: ExternalFlavor) -> ExternalCliAdapter {
-        let script =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fake-external-agent.mjs");
-        ExternalCliAdapter::new_with_prefix(
-            flavor,
-            PathBuf::from("node"),
-            vec![
-                script.into_os_string(),
-                OsString::from("--provider"),
-                OsString::from(flavor.id()),
-            ],
-        )
+        adapter_with_fixture_args(flavor, &[])
+    }
+
+    fn adapter_with_fixture_args(
+        flavor: ExternalFlavor,
+        fixture_args: &[OsString],
+    ) -> ExternalCliAdapter {
+        let script = fixture_script();
+        let mut prefix_args = vec![
+            script.into_os_string(),
+            OsString::from("--provider"),
+            OsString::from(flavor.id()),
+        ];
+        prefix_args.extend_from_slice(fixture_args);
+        ExternalCliAdapter::new_with_prefix(flavor, PathBuf::from("node"), prefix_args)
+    }
+
+    fn fixture_script() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fake-external-agent.mjs")
     }
 
     fn request(provider: &str) -> AdapterRunRequest {
@@ -1237,8 +1716,163 @@ mod tests {
         }
     }
 
+    async fn wait_for_tree_pids(workspace: &Path) -> FixturePids {
+        let pid_file = workspace.join("external-tree-pids.json");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Ok(bytes) = tokio::fs::read(&pid_file).await
+                    && let Ok(pids) = serde_json::from_slice(&bytes)
+                {
+                    return pids;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external tree PID file timeout")
+    }
+
+    async fn wait_for_fixture_ready(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !tokio::fs::try_exists(path).await.unwrap_or(false) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external fixture readiness timeout");
+    }
+
+    async fn wait_until_dead(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_is_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external fixture process remained alive");
+    }
+
+    #[tokio::test]
+    async fn spawn_setup_failure_retains_scope_until_verified() {
+        let test_dir = std::env::temp_dir()
+            .join("crony-external-adapter-tests")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&test_dir).expect("create fixture directory");
+        let pid_file = test_dir.join("external-tree-pids.json");
+        let mut command = Command::new("node");
+        command
+            .arg(fixture_script())
+            .arg("--fixture-tree-parent")
+            .arg(&pid_file)
+            .arg("--stubborn")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let spawn = OwnedProcessTree::spawn(&mut command).expect("spawn owned fixture");
+        let tree = match spawn {
+            OwnedProcessTreeSpawn::Ready(tree) => tree,
+            OwnedProcessTreeSpawn::CleanupRequired { error, .. } => {
+                panic!("fixture ownership setup failed unexpectedly: {error}")
+            }
+        };
+        let pids = wait_for_tree_pids(&test_dir).await;
+        let spawn = OwnedProcessTreeSpawn::CleanupRequired {
+            tree,
+            error: std::io::Error::other("injected ownership setup failure"),
+        };
+        let (_control_tx, mut controls) = mpsc::unbounded_channel();
+        let sink: Arc<dyn AdapterEventSink> = Arc::new(RecordingSink::default());
+
+        let result =
+            complete_spawn_ownership(spawn, &mut controls, &sink, "injected external provider")
+                .await;
+        let Err(error) = result else {
+            panic!("setup failure must remain an adapter error after cleanup");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected ownership setup failure")
+        );
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    async fn assert_control_removes_tree(
+        mission_title: &str,
+        control: TreeControl,
+        descendant_exits_first: bool,
+    ) {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = mission_title.to_owned();
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_adapter = adapter.clone();
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { task_adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        assert!(process_is_alive(pids.parent));
+        if descendant_exits_first {
+            wait_until_dead(pids.grandchild).await;
+        } else {
+            assert!(process_is_alive(pids.grandchild));
+        }
+
+        let reason = match control {
+            TreeControl::Interrupt => "process-tree interrupt",
+            TreeControl::Stop => "process-tree stop",
+        };
+        let command = match control {
+            TreeControl::Interrupt => AdapterControl::Interrupt {
+                reason: reason.to_owned(),
+            },
+            TreeControl::Stop => AdapterControl::Stop {
+                reason: reason.to_owned(),
+            },
+        };
+        control_tx.send(command).expect("send tree control");
+        let exit = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("external adapter termination timeout")
+            .expect("join external adapter")
+            .expect("execute external adapter");
+
+        assert_eq!(exit, AdapterExit::Cancelled);
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        assert!(sink.events.lock().expect("event lock").iter().any(
+            |event| matches!(event, AdapterEvent::Cancelled { reason: actual } if actual == reason)
+        ));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn external_interrupt_removes_stubborn_process_tree() {
+        assert_control_removes_tree(
+            "[process-tree:stubborn] interrupt fixture",
+            TreeControl::Interrupt,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn external_stop_removes_process_tree_after_grandchild_already_exited() {
+        assert_control_removes_tree(
+            "[process-tree:exited-descendant] stop fixture",
+            TreeControl::Stop,
+            true,
+        )
+        .await;
+    }
+
     async fn wait_for_approval(sink: &RecordingSink) -> (Uuid, String, String) {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if let Some(approval) =
                     sink.events
@@ -1452,6 +2086,376 @@ mod tests {
             )
         }));
         assert!(!workspace.join("claude-permission-artifact.txt").exists());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn availability_probe_owns_and_times_out_the_complete_scope() {
+        let mut adapter = adapter_with_fixture_args(
+            ExternalFlavor::ClaudeCode,
+            &[OsString::from("--fixture-stall-version")],
+        );
+        adapter.probe_verification_failures = 20;
+
+        let error = tokio::time::timeout(
+            AVAILABILITY_PROBE_TIMEOUT + Duration::from_secs(5),
+            adapter.probe_available(),
+        )
+        .await
+        .expect("availability probe observation deadline")
+        .expect_err("stalled availability probe must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("availability probe exceeded its deadline")
+        );
+        let duplicate_error = adapter
+            .probe_available()
+            .await
+            .expect_err("a second probe must not create another cleanup supervisor");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("availability probe cleanup is already active")
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while adapter.availability_probe_active.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("availability cleanup guardian did not finish");
+    }
+
+    #[tokio::test]
+    async fn availability_probe_cleans_descendants_after_root_exit() {
+        let test_dir = std::env::temp_dir()
+            .join("crony-external-adapter-tests")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&test_dir).expect("create probe directory");
+        let pid_file = test_dir.join("external-tree-pids.json");
+        let adapter = adapter_with_fixture_args(
+            ExternalFlavor::ClaudeCode,
+            &[
+                OsString::from("--fixture-version-root-exit-with-child"),
+                OsString::from("--fixture-probe-pid-file"),
+                pid_file.clone().into_os_string(),
+            ],
+        );
+        if let Err(error) = adapter.probe_available().await {
+            assert!(
+                error
+                    .to_string()
+                    .contains("availability probe exceeded its deadline"),
+                "unexpected availability error: {error}"
+            );
+        }
+        let pids = wait_for_tree_pids(&test_dir).await;
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn initialization_is_preempted_by_stop_interrupt_and_hard_breaker() {
+        let controls = [
+            AdapterControl::Stop {
+                reason: "stop stalled initialization".to_owned(),
+            },
+            AdapterControl::Interrupt {
+                reason: "interrupt stalled initialization".to_owned(),
+            },
+            AdapterControl::CircuitBreaker {
+                stage: "suspend".to_owned(),
+                reason: "suspend stalled initialization".to_owned(),
+            },
+            AdapterControl::CircuitBreaker {
+                stage: "stop".to_owned(),
+                reason: "stop breaker stalled initialization".to_owned(),
+            },
+        ];
+        for control in controls {
+            let request = request("claude-code");
+            let workspace = request.workspace.clone();
+            let ready_file = workspace.join("initialize-ready");
+            let adapter = adapter_with_fixture_args(
+                ExternalFlavor::ClaudeCode,
+                &[
+                    OsString::from("--fixture-stall-initialize"),
+                    OsString::from("--fixture-ready-file"),
+                    ready_file.clone().into_os_string(),
+                ],
+            );
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let sink = Arc::new(RecordingSink::default());
+            let task =
+                tokio::spawn(async move { adapter.execute(request, control_rx, sink).await });
+            wait_for_fixture_ready(&ready_file).await;
+            control_tx
+                .send(control)
+                .expect("send initialization control");
+            let exit = tokio::time::timeout(INITIALIZE_TIMEOUT + Duration::from_secs(3), task)
+                .await
+                .expect("initialization control deadline")
+                .expect("join adapter")
+                .expect("execute adapter");
+            assert_eq!(exit, AdapterExit::Cancelled);
+            let _ = std::fs::remove_dir_all(workspace);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_preempts_a_blocked_protocol_write() {
+        let mut request = request("claude-code");
+        request.mission_title = "[stall:stdin] blocked protocol writer".to_owned();
+        let workspace = request.workspace.clone();
+        let ready_file = workspace.join("stdin-ready");
+        let adapter = adapter_with_fixture_args(
+            ExternalFlavor::ClaudeCode,
+            &[
+                OsString::from("--fixture-ready-file"),
+                ready_file.clone().into_os_string(),
+            ],
+        );
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { adapter.execute(request, control_rx, task_sink).await });
+
+        wait_for_fixture_ready(&ready_file).await;
+        control_tx
+            .send(AdapterControl::Steer {
+                actor_id: Uuid::new_v4(),
+                text: "x".repeat(4 * 1024 * 1024),
+            })
+            .expect("send blocking protocol write");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        control_tx
+            .send(AdapterControl::Stop {
+                reason: "stop blocked protocol writer".to_owned(),
+            })
+            .expect("send stop");
+
+        let exit = tokio::time::timeout(PROTOCOL_WRITE_TIMEOUT + Duration::from_secs(5), task)
+            .await
+            .expect("blocked protocol stop deadline")
+            .expect("join adapter")
+            .expect("execute adapter");
+        assert_eq!(exit, AdapterExit::Cancelled);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn root_exit_is_observed_without_waiting_for_inherited_pipe_eof() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = "[process-tree:root-exit-inherited-pipe]".to_owned();
+        let workspace = request.workspace.clone();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        let exit = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("root-exit observation deadline")
+            .expect("join adapter")
+            .expect("execute adapter");
+        assert_eq!(exit, AdapterExit::Failed);
+        {
+            let events = sink.events.lock().expect("event lock");
+            assert!(events.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Failed { error }
+                        if error.contains("without a terminal result frame")
+                )
+            }));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AdapterEvent::Completed { .. }))
+            );
+        }
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn terminal_result_is_drained_after_root_exit_before_inherited_pipe_eof() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = "[process-tree:root-exit-inherited-pipe-after-result]".to_owned();
+        let workspace = request.workspace.clone();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        let exit = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("root-exit result-drain deadline")
+            .expect("join adapter")
+            .expect("execute adapter");
+        assert_eq!(exit, AdapterExit::Completed);
+        {
+            let events = sink.events.lock().expect("event lock");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AdapterEvent::Completed { .. }))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AdapterEvent::Failed { .. }))
+            );
+        }
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn claude_error_and_malformed_results_cannot_complete() {
+        for marker in [
+            "[result:error-flag]",
+            "[result:error-subtype]",
+            "[result:missing-is-error]",
+        ] {
+            let adapter = adapter(ExternalFlavor::ClaudeCode);
+            let mut request = request(adapter.id());
+            request.mission_title = marker.to_owned();
+            let workspace = request.workspace.clone();
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let sink = Arc::new(RecordingSink::default());
+            let exit = adapter
+                .execute(request, control_rx, sink.clone())
+                .await
+                .expect("execute adapter");
+
+            assert_eq!(exit, AdapterExit::Failed);
+            {
+                let events = sink.events.lock().expect("event lock");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, AdapterEvent::Failed { .. }))
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, AdapterEvent::Completed { .. }))
+                );
+            }
+            let _ = std::fs::remove_dir_all(workspace);
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_drop_during_runner_shutdown_kills_the_owned_scope() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = "[process-tree:stubborn] runner shutdown".to_owned();
+        let workspace = request.workspace.clone();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task = tokio::spawn(async move { adapter.execute(request, control_rx, sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("adapter task must be cancelled")
+                .is_cancelled()
+        );
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_is_bounded_and_reports_one_terminal_result() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title = "[process-tree:stubborn] repeated stop".to_owned();
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+
+        for reason in ["first stop", "duplicate stop"] {
+            control_tx
+                .send(AdapterControl::Stop {
+                    reason: reason.to_owned(),
+                })
+                .expect("send repeated stop");
+        }
+        let exit = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("repeated stop deadline")
+            .expect("join adapter")
+            .expect("execute adapter");
+        assert_eq!(exit, AdapterExit::Cancelled);
+        assert_eq!(
+            sink.events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .filter(|event| matches!(event, AdapterEvent::Cancelled { .. }))
+                .count(),
+            1
+        );
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn verification_failure_reports_uncertainty_once_and_retries_owned_cleanup() {
+        let adapter = adapter(ExternalFlavor::ClaudeCode);
+        let mut request = request(adapter.id());
+        request.mission_title =
+            "[process-tree:stubborn] [teardown:verification-failure]".to_owned();
+        let workspace = request.workspace.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingSink::default());
+        let task_sink = sink.clone();
+        let task =
+            tokio::spawn(async move { adapter.execute(request, control_rx, task_sink).await });
+        let pids = wait_for_tree_pids(&workspace).await;
+        control_tx
+            .send(AdapterControl::Stop {
+                reason: "force verification retry".to_owned(),
+            })
+            .expect("send stop");
+
+        let exit = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("verification retry deadline")
+            .expect("join adapter")
+            .expect("execute adapter");
+        assert_eq!(exit, AdapterExit::Cancelled);
+        assert_eq!(
+            sink.events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .filter(|event| matches!(event, AdapterEvent::TeardownUncertain { .. }))
+                .count(),
+            1
+        );
+        wait_until_dead(pids.parent).await;
+        wait_until_dead(pids.grandchild).await;
         let _ = std::fs::remove_dir_all(workspace);
     }
 }
