@@ -68,17 +68,17 @@ $env:CRONY_CLI_BINARY='C:\Users\shyamsridhar\.codex\targets\ecorp-issue113\debug
 node tools/e2e_factory_controller.mjs
 ```
 
-Its final report at `2026-09-04T08:19:03.407Z` records one completed mission, one completed run,
+Its final report at `2026-09-04T09:39:33.798Z` records one completed mission, one completed run,
 a preserved workspace, and one `verified` factory item. The controller now waits for terminal
 workspace finalization before moving a completed item to `verified`, including launch-conflict
 replay.
 
 ### Verifier-only recovery
 
-- Factory work item: `c5d3193d-6362-4ba6-b900-4e543a3cb0f2`
-- Mission: `e24c26d0-35bc-4237-88cc-86ce7d804ab8`
-- Source provider run: `a738625a-3db9-4111-b2c1-11e274e12b80`
-- Recovery run: `76639fad-e272-426c-8229-342027d02566`
+- Factory work item: `9a6d61b4-e836-4b16-84fe-1f6fe4934cf9`
+- Mission: `69e0cef9-fd56-424a-af72-9ce50d78cc6e`
+- Source provider run: `714e2581-f847-46da-93b1-4c30f290e3cf`
+- Recovery run: `f1a86f08-a170-4bab-b0db-a0c748da7251`
 - Keyed manual-decision replay: passed
 - Duplicate controller replay returned the same recovery and run: passed
 - Legacy source fingerprint removed before recovery: passed
@@ -92,25 +92,29 @@ replay.
 
 ### Source-correction recovery
 
-- Factory work item: `b8fa4dd2-4642-4892-aef1-e9a7ff933d2c`
-- Mission: `3d4ecfb1-9679-42e5-b3c2-15a8f7fccaac`
-- Source Codex fixture run: `f14b37d8-fce2-46c7-89a3-974526330d46`
-- Recovery run: `bfbcf9f0-6415-469c-b631-6dc50e45cb6d`
-- Contract revision: `df13d575-7a48-467f-8cda-18cd86c34e34`
+- Factory work item: `898345e8-c2b4-40d9-9d1e-b27d0f1710d1`
+- Mission: `62151b0d-4795-4cf4-9884-a5572cf41ff4`
+- Source Codex fixture run: `439a011a-8533-4cc3-b663-8ddd8b375e7d`
+- Failed pre-dispatch recovery run: `d5df4684-758f-461e-9cc4-68268428748c`
+- Failed pre-dispatch recovery: `f7896eba-5388-4f05-8ed6-efa4f8b24deb`
+- Successful recovery run: `67742d76-c54d-4813-a076-74d042c30956`
+- Contract revision: `d9139dff-c80c-4d85-b347-6bd718b3d8a4`
 - Changed issue revision without explicit recovery: rejected
 - Weakened policy that removed the independent-review gate: rejected before revision
 - Test-owned server restart before recovery: passed
+- Revoked scoped secret before runner dispatch: terminalized without an active-recovery wedge
+- New authorization after secret-policy repair: passed
 - Same provider session: passed
 - Same worktree and workspace lineage: passed
-- Contract version: `2`
-- Attempt count: `2`
+- Contract version: `3`
+- Attempt count: `3`
 - Final factory state: `verified`
-- Total runs: `2`
+- Total runs: `3`
 
 ### Attempt exhaustion
 
-- Factory work item: `15f35728-a067-438f-a3a6-0b644b305d43`
-- Mission: `ac308260-8c09-4b75-9762-09fd0adafaec`
+- Factory work item: `db3687f4-e4a3-468a-a892-db0b4e62be4c`
+- Mission: `5db2400e-cbc1-4ded-b108-ff29041c29e2`
 - Attempt count / maximum: `2/2`
 - Third recovery run creation: rejected
 - Final run count: `2`
@@ -128,6 +132,22 @@ A real system Chrome run exercised the recovery card at `1440x900` and `390x844`
 A second real Chrome pass loaded the replay-heavy two-run state at `1440x900` and `390x844`.
 It proved reused provider artifacts produce one structured-link option per durable artifact ID, with
 no duplicate React keys, horizontal overflow, console errors, or page errors.
+
+A third desktop/mobile Chrome pass copied the source-correction command from the recovery callout
+and verified that it contains the persisted Project owner/number, repository, source ref, adapter,
+mission token and cost limits, issue number, recovery mode, and explicit reason. The generated
+command now satisfies every mandatory `crony factory` argument.
+
+## Independent review remediation
+
+A local read-only Codex review found three actionable defects, all corrected before the final gate:
+
+- secret resolution after durable recovery creation could leave an active recovery wedged;
+- pre-start runner rejection could retain the command ID and later acknowledge an unapplied command;
+- browser recovery actions omitted mandatory CLI arguments.
+
+The dispatch-failure E2E and desktop/mobile command-copy browser checks are the regression evidence
+for those fixes.
 
 Screenshots and the browser result were written outside the repository to:
 

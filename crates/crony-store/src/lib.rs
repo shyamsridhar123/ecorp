@@ -594,6 +594,7 @@ pub struct ActionApprovalDecisionOutcome {
 #[derive(Debug, Clone)]
 pub struct PendingRunnerCommand {
     pub id: Uuid,
+    pub corp_id: Uuid,
     pub runner_id: String,
     pub run_id: Uuid,
     pub command_kind: String,
@@ -4850,6 +4851,23 @@ impl PgStore {
         })
     }
 
+    pub async fn factory_verification_recovery_status(
+        &self,
+        corp_id: Uuid,
+        recovery_id: Uuid,
+    ) -> Result<(FactoryVerificationRecovery, FactoryWorkItem)> {
+        let mut tx = self.pool.begin().await?;
+        let recovery = factory_verification_recovery_by_id_tx(&mut tx, corp_id, recovery_id)
+            .await?
+            .context("factory verification recovery was not found")?;
+        let (work_item, _) =
+            factory_work_item_tx(&mut tx, corp_id, recovery.factory_work_item_id, false)
+                .await?
+                .context("factory verification recovery references a missing work item")?;
+        tx.commit().await?;
+        Ok((recovery, work_item))
+    }
+
     pub async fn reject_factory_materialization(
         &self,
         input: RejectFactoryMaterializationInput,
@@ -5965,6 +5983,165 @@ impl PgStore {
         .context("dispatch failure event unexpectedly existed")?;
         tx.commit().await?;
         Ok(event)
+    }
+
+    pub async fn fail_factory_recovery_before_dispatch(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        reason: &str,
+    ) -> Result<Vec<DomainEvent>> {
+        let reason = normalize_factory_text(reason, "factory recovery dispatch failure", 2_000)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT run.task_id, run.agent_id, run.status AS run_status,
+                   task.mission_id, mission.room_id,
+                   recovery.id AS recovery_id, recovery.status AS recovery_status
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN factory_verification_recoveries recovery
+              ON recovery.replacement_run_id = run.id
+             AND recovery.corp_id = run.corp_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            FOR UPDATE OF run, task, mission, recovery
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("factory recovery run not found for dispatch failure")?;
+        let recovery_status: String = row.get("recovery_status");
+        let run_status: String = row.get("run_status");
+        if recovery_status == "failed" && run_status == "failed" {
+            sqlx::query(
+                "UPDATE runner_commands
+                 SET status = 'dispatched', dispatched_at = COALESCE(dispatched_at, now())
+                 WHERE corp_id = $1 AND run_id = $2
+                   AND command_kind = 'factory_verification_recovery'",
+            )
+            .bind(corp_id)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        if !matches!(run_status.as_str(), "provisioning" | "starting") {
+            return Err(anyhow!(
+                "factory recovery dispatch failure cannot terminalize run state {run_status}"
+            ));
+        }
+        let task_id: Uuid = row.get("task_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET status = 'failed',
+                verification_status = 'failed',
+                verification_summary = $1,
+                summary = $1,
+                workspace_detail = 'dispatch_not_started',
+                updated_at = now()
+            WHERE id = $2
+            "#,
+        )
+        .bind(&reason)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE queued_messages
+             SET status = 'queued', run_id = NULL
+             WHERE run_id = $1 AND status = 'reserved'",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE tasks
+             SET status = 'verification_failed',
+                 verification_status = 'failed',
+                 updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1")
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE agents
+             SET status = 'idle', station = NULL, current_run_id = NULL
+             WHERE id = $1 AND current_run_id = $2",
+        )
+        .bind(agent_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE factory_verification_recoveries
+             SET status = 'failed', updated_at = now()
+             WHERE id = $1 AND corp_id = $2",
+        )
+        .bind(row.get::<Uuid, _>("recovery_id"))
+        .bind(corp_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE runner_commands
+             SET status = 'dispatched', dispatched_at = COALESCE(dispatched_at, now())
+             WHERE corp_id = $1 AND run_id = $2
+               AND command_kind = 'factory_verification_recovery'",
+        )
+        .bind(corp_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        let run_event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                ..NewEvent::new(
+                    corp_id,
+                    None,
+                    "run.failed",
+                    "run",
+                    run_id,
+                    format!("run:{run_id}:factory-recovery-dispatch-failed"),
+                    json!({
+                        "error": reason,
+                        "dispatch_not_started": true,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory recovery dispatch-failure event unexpectedly existed")?;
+        let mut events = vec![run_event];
+        if let Some((_, factory_event)) = reconcile_factory_verification_failure_tx(
+            &mut tx,
+            corp_id,
+            mission_id,
+            room_id,
+            run_id,
+            None,
+            &reason,
+            "recovery_dispatch",
+        )
+        .await?
+        {
+            events.push(factory_event);
+        }
+        tx.commit().await?;
+        Ok(events)
     }
 
     pub async fn artifact_context(
@@ -7499,27 +7676,111 @@ impl PgStore {
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("Runner reported failure");
-                sqlx::query(
-                    "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+                let recovery_id: Option<Uuid> = sqlx::query_scalar(
+                    r#"
+                    SELECT id
+                    FROM factory_verification_recoveries
+                    WHERE corp_id = $1 AND replacement_run_id = $2
+                    FOR UPDATE
+                    "#,
                 )
-                .bind(summary)
+                .bind(corp_id)
                 .bind(run_id)
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-                let retry =
-                    should_retry_runner_failure(&breaker_stage, attempt_count, max_attempts);
-                sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
-                    .bind(if retry { "ready" } else { "failed" })
+                if let Some(recovery_id) = recovery_id {
+                    sqlx::query(
+                        r#"
+                        UPDATE runs
+                        SET status = 'failed',
+                            verification_status = 'failed',
+                            verification_summary = $1,
+                            summary = $1,
+                            workspace_detail = CASE
+                                WHEN workspace_path IS NULL THEN 'dispatch_not_started'
+                                ELSE workspace_detail
+                            END,
+                            updated_at = now()
+                        WHERE id = $2
+                        "#,
+                    )
+                    .bind(summary)
+                    .bind(run_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE tasks
+                         SET status = 'verification_failed',
+                             verification_status = 'failed',
+                             updated_at = now()
+                         WHERE id = $1",
+                    )
                     .bind(task_id)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query(
-                    "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
-                )
-                .bind(if retry { "running" } else { "failed" })
-                .bind(mission_id)
-                .execute(&mut *tx)
-                .await?;
+                    sqlx::query(
+                        "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1",
+                    )
+                    .bind(mission_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE factory_verification_recoveries
+                         SET status = 'failed', updated_at = now()
+                         WHERE id = $1 AND corp_id = $2",
+                    )
+                    .bind(recovery_id)
+                    .bind(corp_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE runner_commands
+                         SET status = 'dispatched',
+                             dispatched_at = COALESCE(dispatched_at, now())
+                         WHERE corp_id = $1 AND run_id = $2
+                           AND command_kind = 'factory_verification_recovery'",
+                    )
+                    .bind(corp_id)
+                    .bind(run_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if let Some((_, factory_event)) = reconcile_factory_verification_failure_tx(
+                        &mut tx,
+                        corp_id,
+                        mission_id,
+                        room_id,
+                        run_id,
+                        None,
+                        summary,
+                        "recovery_run_failure",
+                    )
+                    .await?
+                    {
+                        related_events.push(factory_event);
+                    }
+                } else {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(summary)
+                    .bind(run_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let retry =
+                        should_retry_runner_failure(&breaker_stage, attempt_count, max_attempts);
+                    sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
+                        .bind(if retry { "ready" } else { "failed" })
+                        .bind(task_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
+                    )
+                    .bind(if retry { "running" } else { "failed" })
+                    .bind(mission_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
                     "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
                 )
@@ -7839,7 +8100,7 @@ impl PgStore {
     ) -> Result<Vec<PendingRunnerCommand>> {
         Ok(sqlx::query(
             r#"
-            SELECT id, runner_id, run_id, command_kind, payload
+            SELECT id, corp_id, runner_id, run_id, command_kind, payload
             FROM runner_commands
             WHERE runner_id = $1 AND status = 'pending'
             ORDER BY created_at, id
@@ -7852,6 +8113,7 @@ impl PgStore {
         .into_iter()
         .map(|row| PendingRunnerCommand {
             id: row.get("id"),
+            corp_id: row.get("corp_id"),
             runner_id: row.get("runner_id"),
             run_id: row.get("run_id"),
             command_kind: row.get("command_kind"),
@@ -8202,6 +8464,7 @@ impl PgStore {
         let command_id = Uuid::new_v4();
         let command = PendingRunnerCommand {
             id: command_id,
+            corp_id,
             runner_id: runner_id.clone(),
             run_id,
             command_kind: "circuit_breaker".to_owned(),

@@ -274,8 +274,11 @@ then proves the owning runner checkpoints the workspace without provider executi
 the legacy artifact by exact file name, bytes, and digest. Its source-correction case starts with an
 automated verifier failure, changes the fake GitHub issue revision, proves ordinary controller
 replay is mutation-free and rejected, restarts only the test-owned server, stores a versioned
-contract revision, resumes the exact Codex fixture session/worktree, increments the attempt
-monotonically, and completes after independent approval. The report is written to
+contract revision, then injects a revoked scoped secret before dispatch. It proves that failure
+terminalizes the run and recovery, clears the active-recovery uniqueness fence, restores
+`verification_failed`, and permits a newly authorized retry after the secret policy is repaired.
+The retry resumes the exact Codex fixture session/worktree, increments the attempt monotonically,
+and completes after independent approval. The report is written to
 `output/e2e-factory-verification-recovery.json`.
 
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid

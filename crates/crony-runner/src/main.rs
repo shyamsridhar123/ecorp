@@ -781,6 +781,9 @@ async fn run_connection(
                     provider_artifact: None,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                    if let Some(command_id) = command_id {
+                        seen_commands.remove(&command_id);
+                    }
                     send_run_event(
                         &outbound,
                         &args.runner_id,
@@ -801,6 +804,9 @@ async fn run_connection(
                 let secret_ttl = match secret_expiry_delay(&assignment.secrets) {
                     Ok(ttl) => ttl,
                     Err(error) => {
+                        if let Some(command_id) = command_id {
+                            seen_commands.remove(&command_id);
+                        }
                         send_run_event(
                             &outbound,
                             &args.runner_id,
@@ -832,6 +838,9 @@ async fn run_connection(
                     continue;
                 }
                 let Some(adapter) = adapters.get(&assignment.adapter) else {
+                    if let Some(command_id) = command_id {
+                        seen_commands.remove(&command_id);
+                    }
                     send_run_event(
                         &outbound,
                         &args.runner_id,
@@ -960,6 +969,7 @@ async fn run_connection(
                     provider_artifact,
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                    seen_commands.remove(&command_id);
                     send_run_event(
                         &outbound,
                         &args.runner_id,

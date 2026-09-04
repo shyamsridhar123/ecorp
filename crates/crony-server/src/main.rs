@@ -1259,7 +1259,27 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
         return Ok(());
     };
     for command in state.store.pending_runner_commands(runner_id).await? {
-        let outgoing = decode_runner_command(state, &command).await?;
+        let outgoing = match decode_runner_command(state, &command).await {
+            Ok(outgoing) => outgoing,
+            Err(error) if command.command_kind == "factory_verification_recovery" => {
+                let detail = factory_recovery_dispatch_failure_detail(&error);
+                for event in state
+                    .store
+                    .fail_factory_recovery_before_dispatch(command.corp_id, command.run_id, &detail)
+                    .await?
+                {
+                    publish(state, event);
+                }
+                warn!(
+                    %error,
+                    run_id = %command.run_id,
+                    command_id = %command.id,
+                    "factory recovery command failed before runner dispatch"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if sender.send(outgoing).is_err() {
             break;
         }
@@ -2138,17 +2158,24 @@ async fn create_factory_verification_recovery(
             (record.run_id, record.runner_id.clone())
         }
     };
+    let recovery_id = outcome.recovery.id;
+    let replayed = outcome.replayed;
     for event in outcome.events {
         publish(&state, event);
     }
     dispatch_pending_runner_commands(&state, &runner_id)
         .await
         .map_err(ApiError::internal)?;
+    let (recovery, work_item) = state
+        .store
+        .factory_verification_recovery_status(corp_id, recovery_id)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(CreateFactoryVerificationRecoveryResponse {
-        recovery: outcome.recovery,
-        work_item: outcome.work_item,
+        recovery,
+        work_item,
         run_id,
-        replayed: outcome.replayed,
+        replayed,
     }))
 }
 
@@ -2204,6 +2231,37 @@ fn factory_materialization_failure_detail(rejection: &str) -> String {
     };
     let mut detail =
         format!("factory materialization rejected before mission creation: {sanitized}");
+    if detail.len() > 2_000 {
+        let mut end = 2_000;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+fn factory_recovery_dispatch_failure_detail(error: &anyhow::Error) -> String {
+    let sanitized = error
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = if sanitized.is_empty() {
+        "unspecified recovery dispatch error"
+    } else {
+        sanitized.as_str()
+    };
+    let mut detail = format!("factory recovery failed before runner dispatch: {sanitized}");
     if detail.len() > 2_000 {
         let mut end = 2_000;
         while !detail.is_char_boundary(end) {

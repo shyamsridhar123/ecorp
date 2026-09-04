@@ -416,7 +416,10 @@ through the generic transition endpoint.
 Recovery authorization and its runner command are idempotent and durable. The operation stores the
 reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and
 replacement run IDs, actor, reason, and contract revision. Runner command acknowledgment prevents
-duplicate provider or verifier execution after server reconnect.
+duplicate provider or verifier execution after server reconnect. Command decode, secret-broker,
+source-validation, adapter, or other pre-start rejection terminalizes the replacement run and
+recovery, returns the factory item to `verification_failed`, consumes the failed command, and leaves
+the preserved source checkpoint eligible for a separately authorized retry.
 
 ## Agent adapters
 

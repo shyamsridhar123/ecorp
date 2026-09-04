@@ -2821,8 +2821,46 @@ function MissionCard({
       )
     : undefined
   const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
-  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') =>
-    `crony factory ${corpId} ${actorId} --issue ${factoryItem?.source_issue_number ?? ''} --verification-recovery ${mode} --verification-recovery-reason "Explain why this bounded recovery is authorized."`
+  const recoveryAgent = failedTask?.assigned_agent_id
+    ? agents.find((agent) => agent.id === failedTask.assigned_agent_id)
+    : undefined
+  const recoveryAdapter = failedTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
+  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
+    if (!factoryItem || !failedTask || !recoveryAdapter) return ''
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+    const command = [
+      'crony factory',
+      quote(corpId),
+      quote(actorId),
+      '--owner',
+      quote(factoryItem.source_project_owner),
+      '--project-number',
+      String(factoryItem.source_project_number),
+      '--repository',
+      quote(`${factoryItem.source_repository_owner}/${factoryItem.source_repository_name}`),
+      '--source-base-ref',
+      quote(failedTask.contract.source_base_ref ?? 'HEAD'),
+      '--adapter',
+      quote(recoveryAdapter),
+      '--budget-tokens',
+      String(mission.budget_tokens),
+      '--budget-cost-microusd',
+      String(mission.budget_cost_microusd),
+      '--issue',
+      String(factoryItem.source_issue_number),
+      '--verification-recovery',
+      mode,
+      '--verification-recovery-reason',
+      quote('Explain why this bounded recovery is authorized.'),
+    ]
+    if (failedTask.contract.model) {
+      command.push('--model', quote(failedTask.contract.model))
+    }
+    if (failedTask.contract.reasoning_effort) {
+      command.push('--reasoning-effort', quote(failedTask.contract.reasoning_effort))
+    }
+    return command.join(' ')
+  }
   const copyRecoveryCommand = async (
     mode: 'verifier-only' | 'source-correction',
   ) => {
@@ -3117,7 +3155,7 @@ function MissionCard({
               <dd>{factoryRecoveries.length}</dd>
             </div>
           </dl>
-          {canAuthorizeRecovery ? (
+          {canAuthorizeRecovery && recoveryAdapter ? (
             <div className="factory-recovery-actions">
               <button
                 className="button button-secondary"
@@ -3140,7 +3178,9 @@ function MissionCard({
             </div>
           ) : (
             <p className="factory-recovery-role-note">
-              An owner, admin, or manager must authorize the recovery.
+              {canAuthorizeRecovery
+                ? 'Recovery command metadata is incomplete; inspect the persisted task contract.'
+                : 'An owner, admin, or manager must authorize the recovery.'}
             </p>
           )}
           <details>

@@ -737,6 +737,101 @@ async function sourceCorrectionRecovery() {
     runsBeforeRestart,
   )
   const restarted = await restartTestServer()
+  const secret = await post(`/api/corps/${demo.corp_id}/secrets`, {
+    actor_id: demo.alice_actor_id,
+    name: `factory-recovery-${randomUUID()}`,
+    value: `recovery-secret-${randomUUID()}`,
+    allowed_actor_ids: [demo.alice_actor_id],
+    allowed_tools: ['filesystem'],
+    resource_prefix: 'workspace:',
+    max_ttl_seconds: 120,
+  })
+  const secretRefs = [
+    {
+      secret_id: secret.secret_id,
+      env_name: 'CRONY_RECOVERY_SECRET',
+      tool: 'filesystem',
+      resource: 'workspace:source-correction',
+    },
+  ]
+  await psql(`
+    UPDATE tasks
+    SET contract = jsonb_set(
+          contract,
+          '{secret_refs}',
+          ${sqlLiteral(JSON.stringify(secretRefs))}::jsonb,
+          true
+        ),
+        max_attempts = 3
+    WHERE id = ${sqlLiteral(failed.value.task.id)}::uuid;
+
+    UPDATE factory_work_items
+    SET policy = jsonb_set(
+          policy,
+          '{secret_ids}',
+          ${sqlLiteral(JSON.stringify([secret.secret_id]))}::jsonb,
+          true
+        )
+    WHERE id = ${sqlLiteral(first.factory_work_item_id)}::uuid;
+  `)
+  await post(`/api/corps/${demo.corp_id}/secrets/${secret.secret_id}/revoke`, {
+    actor_id: demo.alice_actor_id,
+    reason: 'Inject a deterministic recovery-dispatch secret failure.',
+  })
+  const failedDispatchReason =
+    'This recovery must fail before runner dispatch because its scoped secret is revoked.'
+  const failedDispatchError = await controllerFailure(
+    demo,
+    issue.number,
+    statePath,
+    policyPath,
+    {
+      adapter: 'codex',
+      recovery: 'source-correction',
+      recoveryReason: failedDispatchReason,
+    },
+  )
+  assert.match(failedDispatchError, /factory mission .*failed|verification_failed/i)
+  const failedDispatch = await waitFor(
+    demo,
+    (state) => {
+      const task = state.tasks.find((item) => item.id === failed.value.task.id)
+      const item = state.factory_work_items.find(
+        (candidate) => candidate.id === first.factory_work_item_id,
+      )
+      const recovery = state.factory_verification_recoveries.find(
+        (candidate) =>
+          candidate.source_run_id === sourceRun.id &&
+          candidate.status === 'failed',
+      )
+      const run = state.runs.find(
+        (candidate) =>
+          candidate.id === recovery?.replacement_run_id &&
+          candidate.status === 'failed' &&
+          candidate.workspace_detail === 'dispatch_not_started',
+      )
+      return task?.status === 'verification_failed' &&
+        item?.state === 'verification_failed' &&
+        recovery &&
+        run
+        ? { task, item, recovery, run }
+        : null
+    },
+    'terminal recovery dispatch failure',
+  )
+  assert.equal(
+    failedDispatch.state.snapshot.factory_verification_recoveries.filter(
+      (candidate) =>
+        candidate.factory_work_item_id === first.factory_work_item_id &&
+        ['authorized', 'running'].includes(candidate.status),
+    ).length,
+    0,
+  )
+  await psql(`
+    UPDATE secrets
+    SET revoked_at = NULL
+    WHERE id = ${sqlLiteral(secret.secret_id)}::uuid;
+  `)
   const recoveryReason =
     'Resume the same provider session only to create resumed.txt and satisfy the unchanged verification policy.'
   const recovery = await runController(
@@ -775,9 +870,9 @@ async function sourceCorrectionRecovery() {
   assert.equal(recoveryRun.workspace_run_id, sourceRun.workspace_run_id)
   assert.equal(recoveryRun.workspace_path, sourceRun.workspace_path)
   assert.equal(recoveryRun.provider_session_id, sourceRun.provider_session_id)
-  assert.equal(waiting.value.task.contract_version, 2)
-  assert.equal(waiting.value.task.attempt_count, 2)
-  assert.equal(waiting.value.runs.length, runsBeforeRestart + 1)
+  assert.equal(waiting.value.task.contract_version, 3)
+  assert.equal(waiting.value.task.attempt_count, 3)
+  assert.equal(waiting.value.runs.length, runsBeforeRestart + 2)
   const recoveryEvidence = waiting.state.snapshot.verification_evidence.filter(
     (item) => item.run_id === recoveryRun.id,
   )
@@ -807,6 +902,11 @@ async function sourceCorrectionRecovery() {
     },
     'verified source correction',
   )
+  await psql(`
+    UPDATE secrets
+    SET revoked_at = now()
+    WHERE id = ${sqlLiteral(secret.secret_id)}::uuid;
+  `)
   return {
     factory_work_item_id: first.factory_work_item_id,
     mission_id: first.mission_id,
@@ -816,6 +916,10 @@ async function sourceCorrectionRecovery() {
     server_restart_exercised: restarted,
     unaudited_revision_rejected: true,
     weakened_policy_rejected_before_revision: true,
+    secret_dispatch_failure_terminalized: true,
+    failed_dispatch_run_id: failedDispatch.value.run.id,
+    failed_dispatch_recovery_id: failedDispatch.value.recovery.id,
+    retry_after_dispatch_failure: true,
     same_provider_session:
       recoveryRun.provider_session_id === sourceRun.provider_session_id,
     same_workspace: recoveryRun.workspace_path === sourceRun.workspace_path,

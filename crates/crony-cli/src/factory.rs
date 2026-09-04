@@ -2202,6 +2202,7 @@ async fn load_factory_recovery_snapshot(
                 run.get("task_id").and_then(Value::as_str) == Some(task_id.to_string().as_str())
                     && run.get("status").and_then(Value::as_str) == Some("failed")
                     && run.get("verification_status").and_then(Value::as_str) == Some("failed")
+                    && run.get("workspace_disposition").and_then(Value::as_str) == Some("preserved")
             })
             .map(|run| value_uuid(run, "/id"))
             .transpose()?
@@ -2372,6 +2373,7 @@ async fn recover_factory_verification(
         .unwrap_or_else(|| snapshot.verification_policy.clone());
     let source_changed = selected.issue.updated_at != persisted.source_revision;
     let policy_changed = replacement_policy != snapshot.verification_policy;
+    let reason_digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
     let contract_revision_id = if let Some(revision_id) = snapshot.existing_contract_revision_id {
         Some(revision_id)
     } else if mode == FactoryVerificationRecoveryMode::SourceCorrection
@@ -2399,7 +2401,7 @@ async fn recover_factory_verification(
             }
         }
         let revision_key = stable_uuid(&format!(
-            "{stable_prefix}:verification-recovery-contract:{}:{mode_name}",
+            "{stable_prefix}:verification-recovery-contract:{}:{mode_name}:{reason_digest}",
             snapshot.source_run_id,
             mode_name = mode.as_str()
         ));
@@ -2429,7 +2431,6 @@ async fn recover_factory_verification(
     } else {
         None
     };
-    let reason_digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
     let recovery_key = stable_uuid(&format!(
         "{stable_prefix}:verification-recovery:{}:{}:{}",
         snapshot.source_run_id,
@@ -2470,6 +2471,9 @@ async fn recover_factory_verification(
     )
     .await
     .context("authorize factory verification recovery")?;
+    let recovery_status = value_string(&recovery, "/recovery/status")?;
+    let factory_state = value_string(&recovery, "/work_item/state")?;
+    let dispatch_failed = recovery_status == "failed" || factory_state == "verification_failed";
     Ok(json!({
         "recovered": recovery
             .get("replayed")
@@ -2481,11 +2485,14 @@ async fn recover_factory_verification(
         "legacy_workspace_checkpointed": legacy_workspace_checkpointed,
         "run_id": value_uuid(&recovery, "/run_id")?,
         "run_ids": [value_uuid(&recovery, "/run_id")?],
-        "mission_status": "running",
-        "verification_failed": false,
+        "mission_status": if dispatch_failed { "failed" } else { "running" },
+        "verification_failed": dispatch_failed,
         "awaiting_approval": false,
+        "run_summary": recovery
+            .pointer("/work_item/failure_detail")
+            .and_then(Value::as_str),
         "contract_revision_id": contract_revision_id,
-        "factory_state": value_string(&recovery, "/work_item/state")?,
+        "factory_state": factory_state,
         "factory_version": value_i64(&recovery, "/work_item/version")?,
     }))
 }

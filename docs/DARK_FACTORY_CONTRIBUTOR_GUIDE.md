@@ -576,6 +576,11 @@ persisted source/policy, lease, attempts, budgets, workspace fingerprint, and he
 issue body is stored as reviewed recovery provenance; it is never substituted silently. Project
 status stays `In Progress`, and recovery does not publish, merge, auto-merge, or deploy.
 
+If command decoding, secret resolution, source validation, or another pre-start check fails, do not
+leave the recovery active. The replacement run and recovery must become failed, the factory item
+must return to `verification_failed`, and the durable command must stop redelivering. Repair the
+cause, provide a new recovery reason, and reuse the preserved source checkpoint.
+
 ## Publish a verified result
 
 Publication is allowed only after:
