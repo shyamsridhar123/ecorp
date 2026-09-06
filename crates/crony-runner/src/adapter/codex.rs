@@ -1218,6 +1218,7 @@ mod tests {
             workspace: std::env::temp_dir()
                 .join("crony-codex-adapter-tests")
                 .join(run_id.to_string()),
+            write_scope: vec!["**".to_owned()],
             environment: std::collections::HashMap::new(),
         }
     }

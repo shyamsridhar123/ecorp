@@ -78,6 +78,78 @@ recovery drills.
 
 ## Quality gates
 
+### Held mission / launch-admission regression
+
+`tools/e2e_launch_admission.mjs` exercises saved ordinary and materialized factory plans,
+unrelated completion/failure, explicit release, duplicate/concurrent requests, failed first
+dispatch, fresh continuation run IDs, and normal graph dependencies/retries. Its `prepare` and
+`release` phases let an external test supervisor restart the actual server and runner without
+resetting their database or source.
+
+`tools/e2e_launch_admission_browser.mjs` uses the actual mission composer, repository confirmation,
+**Hold at briefing**, and **Dispatch mission** controls. It closes the browser before unrelated
+work completes and checks the saved plan again after the supervisor's restart. It also checks
+390-pixel layout and a successful, nonduplicating launch replay.
+
+Use an explicitly owned isolated stack and independent fixture repository, never the manual
+demo. The scripts reject shared/manual ports. The runner must use the deterministic process and
+the existing Codex/Claude/OpenCode protocol fixtures, not authenticated real providers. Install
+Playwright separately for the browser regression or set `CRONY_PLAYWRIGHT_MODULE` to its installed
+package directory.
+
+```powershell
+$env:CRONY_ADMISSION_TEST = '1'
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:18961'
+$env:CRONY_ADMISSION_WEB = 'http://127.0.0.1:15496'
+$env:CRONY_ADMISSION_OUTPUT = 'C:\path\to\owned-qa-evidence'
+$env:CRONY_ADMISSION_GRAPH_FIXTURES = '1'
+node tools/e2e_launch_admission.mjs --phase prepare
+node tools/e2e_launch_admission_browser.mjs --phase prepare
+# Restart only the owned QA server and runner; preserve database, credentials and source.
+node tools/e2e_launch_admission_browser.mjs --phase release
+node tools/e2e_launch_admission.mjs --phase release
+```
+
+The supervisor must separately record actual old/new process identities and reconnection;
+two invocations alone do not prove a restart. Retain checkpoint IDs after an interrupted phase
+rather than resetting data or silently creating replacement missions. These are deterministic
+control-plane/browser checks, not evidence of real Copilot inference or a three-agent game build.
+
+### Mission staffing regression
+
+`tools/e2e_mission_staffing.mjs` is an explicitly opted-in, isolated-stack regression.
+It requires a fresh owned development database, an independent source repository, a
+real runner using `fake-process`, and the explicit Copilot fixture for read-only
+studio planning. It rejects default/manual ports and preserves every checkpoint.
+
+It proves empty-crew bootstrap, exact mission-owned staffing, held plans, model/source
+and guest rejection without orphan identities, mutation-free factory preflight,
+materialization replay, and terminal worker retirement with historical attribution.
+It executes only one deterministic worker; held studio plans are not a real Copilot
+or concurrency proof.
+
+```powershell
+$env:CRONY_STAFFING_TEST = '1'
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:18962' # independently owned test stack only
+$env:CRONY_STAFFING_OUTPUT = 'C:\path\to\new-evidence-directory'
+node tools/e2e_mission_staffing.mjs
+```
+
+Real studio evidence must separately establish three actual Copilot sessions working
+concurrently, four isolated task worktrees, the selected repository/ref/commit, every
+verified handoff in the integration receipt, persisted application checks and authorized
+review before publication. Development Alice/Bob identities are test principals, not
+evidence of separate human GitHub authentication. Never label a fixture, a planned graph,
+an approval script, or a provider completion claim as that full proof.
+
+`tools/verify_arcade_browser.mjs` is an optional trusted runner verifier for a standalone
+game contract, not a provider tool. It requires a Git worktree and an explicitly supplied
+installed Playwright module, exercises keyboard-activated controls at desktop/390px,
+blocks remote HTTP requests, and produces real screenshots and a structured report.
+Pin its source digest in the persisted command policy when using it for a factory run.
+
+### Workspace command gates
+
 ```powershell
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -230,6 +302,90 @@ resume without requiring an account. `tools/probe_copilot_live.mjs` is the separ
 lane; it must use the official SDK, expose the live account catalog, run a selected real model, and
 finish with verified worktree evidence. See
 `docs/evidence/2026-08-30-github-copilot-adapter-validation.md`.
+
+That authenticated lane must also prove that Copilot's native managed permissions resolve ordinary
+worktree-local built-in read, create, and edit operations without duplicating them as ECorp
+approvals. Required build and test commands run through the persisted runner verifier unless an
+operating-system shell boundary is independently proven. The lane must pre-create external and
+credential canaries, assert their bytes and metadata remain unchanged, and inspect provider
+telemetry rather than trusting configured sandbox settings. Any shell execution reporting
+`sandboxApplied: false` fails the containment case. Destructive commands, interpreters,
+network-capable commands, publication or infrastructure commands, sandbox bypass, credential
+access, and external paths must fail closed or suspend through a durable ECorp decision.
+
+The live probe now enrolls its own runner on a fresh isolated server and injects a synthetic
+`GITHUB_TOKEN` into the actual runner launch. A process-boundary observer asserts that the runner
+inherited it and that each SDK-launched Copilot process did not, before starting the real Copilot
+binary. Missing seeds and unremoved canaries are test failures, not successful absence checks.
+Each negative mission must reach an approval containing its intended boundary action; a model
+refusal or an unrelated approval cannot count as exercised containment.
+
+The same probe asks real Copilot to author Piper Kingdom under `scenarios/piper-kingdom/**`.
+The runner executes the persisted syntax check, generated unit tests, and independently authored
+gameplay assertions, then exports a source archive. The probe requires zero routine approvals,
+the exact retained write scope, and an unchanged source checkout. It does not supply game code.
+`tools/copilot_probe_process.test.mjs` independently verifies the observer's positive and negative
+preconditions without an account. Native filesystem unit tests exercise dangling/ancestor links,
+hard links, root protection, Windows aliases, scope-limited mutations, and Unix executable modes.
+
+Run on a separate development server with no existing connected runner:
+
+```powershell
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:<isolated-server-port>'
+$env:ECORP_TEST_SOURCE_REPOSITORY = 'C:\path\to\clean-disposable-repository'
+$env:CRONY_PROBE_COPILOT_BINARY = 'C:\path\to\real\copilot.exe'
+$env:CRONY_PROBE_OUTPUT = 'C:\path\outside\ecorp\unique-probe-output'
+$env:CRONY_PROBE_MODEL = '<enabled model id from the connected account>'
+node tools/probe_copilot_live.mjs
+```
+
+Set `CRONY_PROBE_BOUNDARY_ONLY=1` to run the negative conformance lane separately. Its report is
+explicitly labeled `boundaries_only` and cannot substitute for an application-build result. This is
+useful when an application model refuses a test prompt before reaching the permission handler; that
+refusal remains inconclusive for handler coverage rather than being counted as a passed probe.
+The probe now settles each case and continues to later independent boundaries after such an
+inconclusive terminal result. `copilot-boundary-progress.json` atomically records callback-only
+progress; it is explicitly partial and does not replace the final sentinel/process/credential
+checks. Final `e2e-copilot-live.json` includes all seven required cases and an explicit
+`boundary_matrix.complete` flag. Any missing, mismatched, un-rejected, or inconclusive permission
+case still makes the invocation exit nonzero. Unexpected transport, containment, and teardown
+failures still stop the probe rather than proceeding with an unsafe active run.
+`node --test tools/copilot_probe_boundaries.test.mjs tools/copilot_probe_process.test.mjs`
+checks that partial/duplicate/cross-run evidence cannot silently become complete coverage.
+Set `CRONY_PROBE_PRESERVE_DEMO=1` to retain earlier test history instead of resetting the specified
+development server.
+
+`CRONY_PROBE_NATIVE_READ_ONLY=1` selects the separate #153 native-read regression. It is mutually
+exclusive with boundary-only and application-resume modes. Use a clean disposable Git source with
+a small committed `native-read-seed.txt` containing one non-secret marker line. The diagnostic
+requires actual successful `view` results for relative and absolute source paths and a newly
+created readback file; provider self-report or final file existence cannot substitute. A
+persisted verifier checks the exact readback hash, source bytes/mtime remain unchanged, no
+routine approvals or shell executions are allowed, and the process observer must see the
+product's no-auto-update flag. The first failed relevant view or unexpected approval stops only
+that diagnostic run rather than burning its remaining budget. A Windows-native CRLF fixture
+tests byte-exact round-trip behavior; the earlier LF-to-CRLF copy failure is retained, not
+normalized into a pass.
+
+`ECORP_COPILOT_FS_WIRE=1` optionally enables the test-only, transparent metadata observer for
+Content-Length-framed `sessionFs.stat` / `sessionFs.exists` exchanges. It forwards original bytes
+unchanged, bounds frame/pending-request memory, and records only response shape, boolean fields,
+identifier type and date validity. Paths, file contents, credentials and unrelated RPC payloads
+are not logged. The native-read and wire-observer Node tests exercise these negative cases and
+exact transport forwarding. See
+`docs/evidence/2026-09-06-copilot-native-read-runtime.md` for the before/after evidence and runtime
+version controls.
+
+For a preserved verification-failed run, `CRONY_PROBE_RECOVER_RUN_ID` plus its original
+`CRONY_COPILOT_EVENT_ROOT` exercises the existing resume API. It retains the source, task, model,
+provider session, worktree, and verifier policy; supplies bounded verifier feedback; and permits at
+most two automatic repair requests per invocation within the original remaining budget. A
+hard-stopped lineage is not resumable. Its evidence must be retained, not represented as recovered.
+
+The probe supervises only its own enrolled runner and keeps logs, worktrees, and the game outside
+the ECorp checkout. It does not publish, merge, deploy, or use hosted GitHub Actions.
+See `docs/evidence/2026-09-06-copilot-native-filesystem.md` for the accepted application, browser
+checks, retained failed lineage, and the explicitly incomplete live negative coverage.
 
 `tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message

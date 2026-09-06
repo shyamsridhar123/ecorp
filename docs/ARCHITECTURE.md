@@ -129,6 +129,16 @@ approval text contains bounded metadata and hashes rather than raw tool input. R
 interrupt, provider cancellation, or breaker termination denies or clears the pending request
 before terminal session reporting. Unknown and duplicate decisions cannot select another request.
 
+## Copilot runtime compatibility
+
+The checked-in Copilot SDK and its verified CLI are one execution dependency pair. Managed
+local processes receive `--no-auto-update`; catalog discovery, new sessions and resume validate
+the connected runtime version before accepting provider work. The current pair is SDK `1.0.11`
+and CLI `1.0.79`. A runtime override is not permission to silently select an unverified CLI.
+Version checks do not replace worktree capabilities, permissions, process ownership or verifier
+evidence. The native-read regression validates real relative/absolute view results and exact
+readback bytes through the server and runner.
+
 ## Budgets and circuit breaking
 
 Run, mission, requester, and Corp token/cost limits are evaluated after usage events. Explicit
@@ -183,6 +193,69 @@ crony-runner
 
 The deterministic process remains the offline systems fixture. The Codex adapter uses app-server
 over stdio JSON-RPC rather than scraping terminal text.
+
+## Mission launch admission
+
+A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
+Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
+materialization leave the mission in that held state. The existing authenticated launch endpoint
+may admit it; normal factory controllers already call that endpoint after claim/source/Project
+revalidation, so unattended intake does not gain another human approval step.
+
+Automatic scheduling selects only `running` missions. The run-creation transaction repeats the
+admission check under the mission/task/agent locks and checks an explicit operator's current role
+and room membership. Its first `ready -> running` transition is atomic with the initial run and
+the actor-attributed `run.requested` event (`mission_launch: true`). Unrelated completion,
+failure, runner reconnect, or server restart cannot admit a held plan. Dependency release and
+bounded retries remain within the already-running mission.
+
+Launch responses identify newly dispatched runs when a call actually advances work. When no new
+run is dispatched, a replay can reference previously started root runs only for a running or
+completed mission. Durable `run.started` journal evidence is required; pre-dispatch failures,
+cancelled/failed missions, and a merely allocated run are not successful replays. Very early
+concurrent requests may still receive a conflict until the runner acknowledges startup, without
+creating another attempt. The optional `replayed` response field distinguishes that result.
+
+The browser renders persisted `ready` state as **Awaiting dispatch**. Its briefing checkbox
+chooses the plan-only flow; keeping the browser open is not what enforces the hold.
+
+## Mission-owned staffing and studio handoffs
+
+Source-selected single/specialist missions and provider-backed factory plans can propose
+their required worker identities from connected runtime capabilities. Proposals are
+read-only: actors, room membership and workers are persisted atomically with the accepted
+mission graph. Factory preflight and materialization replay do not allocate extra workers.
+Workers record their owning mission, pin state and retirement timestamp; history is never
+deleted. A pinned mission worker is reusable only in the same destination room. An active
+worker cannot acquire a second run through resume.
+
+The `studio-swarm` strategy requires three distinct GitHub Copilot workers. Visual,
+gameplay and quality roots produce separate UTF-8 Markdown handoffs under an authorized
+directory; the gameplay identity performs integration only after all three parents have
+accepted completion. Runtime, model, reasoning and immutable repository/ref/commit
+constraints apply to every node. This is three workers and four tasks, not four concurrent
+workers or a hard-coded demo cast.
+
+Each root exports its exact declared file as a typed artifact set, with persisted file,
+artifact and UTF-8/12-KiB checks. Integration reads the latest accepted parent runs' signed,
+unexpired source deliverables—not sibling worktrees or provider prose. It checks the exact
+source tuple, verification digest, file set, regular-file mode, decoded byte counts and
+hashes. Unsupported, missing, aliased, tampered or oversized data fails dispatch rather
+than being silently omitted. The combined dependency text is capped at 64 KiB. A
+`run.dependency_context` receipt records artifact/run/file hashes and the context digest.
+Resume repeats this boundary and records its own receipt.
+
+Unpinned mission workers retire after terminal missions only when there is no active run,
+live control lease, queued message, pending approval, pending command or unresolved
+process-teardown uncertainty. Lease/message grants serialize with retirement. An explicitly
+authorized resume can reactivate its preserved worker but cannot overwrite another active
+assignment. Current office views exclude retired workers; historical missions/runs retain
+their identities.
+
+The development UI bootstraps humans/rooms without the fixed crew. The explicit legacy
+demo/fixture bootstrap remains available. This is a bounded milestone of #48: dedicated
+Clear crew, Pin/Unpin and manual Retire controls, and their complete contributor workflow,
+remain tracked there rather than being implied by the metadata fields.
 
 ## State and events
 
@@ -459,10 +532,14 @@ reported explicitly rather than hidden.
 The GitHub Copilot adapter uses the official Rust SDK. A runner discovers the signed-in account's
 model catalog at registration and advertises policy state, model limits, vision support, reasoning
 levels, and billing multiplier metadata. The selected model and reasoning effort are persisted in
-the task contract and run, survive resume, and participate in runner matching. Copilot may write
-inside the assigned worktree and read its per-worktree isolated SDK state automatically. Network,
-sandbox bypass, external paths, and shell commands that cannot be proven scoped suspend through
-ECorp's durable approval flow.
+the task contract and run, survive resume, and participate in runner matching. Native filesystem
+tools use a capability-scoped `SessionFsProvider`; writes are limited by the persisted task write
+scope, and provider state is isolated per worktree. Linked-path and device-path escapes fail
+before effects. Network, sandbox bypass, external paths, and every model-session shell request
+remain under ECorp's durable approval flow. The adapter does not reimplement a shell-command
+classifier or treat requested sandbox configuration as proof of OS enforcement. Persisted
+runner-owned verifier commands execute after the provider has terminated, without duplicating
+routine tests as model-session approval requests.
 
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.

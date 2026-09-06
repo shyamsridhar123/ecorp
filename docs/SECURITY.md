@@ -133,12 +133,56 @@ path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
-The GitHub Copilot permission handler automatically approves writes inside the assigned worktree,
-read-only operations it can prove are scoped to that worktree, and reads from the SDK state
-directory isolated to that worktree. It canonicalizes existing ancestors to reject symlink escapes.
-External paths, network URLs, sandbox bypass, managed-policy approvals, and ambiguous shell
-commands suspend durably. Shell approval cards include the bounded command text rather than only a
-generic action label.
+Managed local Copilot processes receive `--no-auto-update` during catalog discovery, create, and
+resume. A selected SDK/runtime pair must not silently forward to a downloaded replacement.
+The current verified pair is Rust SDK `1.0.11` with CLI `1.0.79`; the adapter checks the connected
+runtime version before exposing models or starting a session. An incompatible runtime is rejected
+before provider-backed work, including an explicit CLI or remote-runtime override. This version
+check is a compatibility gate, not proof of operating-system isolation or a substitute for the
+filesystem, approval, environment, and verifier boundaries.
+
+Windows ordinary and extended drive/UNC spellings compare by their drive or server/share
+identity before the existing component-by-component boundary check. This does not canonicalize an
+untrusted path with ambient filesystem access or accept another drive, share, sibling prefix,
+device namespace, traversal, Git control path, or alternate data stream. Actual I/O still uses
+the retained directory capabilities and the existing link/opened-file checks.
+
+GitHub Copilot receives a native SDK managed-settings layer on every create and resume. The runtime
+is told to disable bypass-permissions mode. Native read and write tools may proceed without a
+second ECorp prompt only because built-in filesystem operations are routed through an ECorp
+`SessionFsProvider` that rejects paths outside the worktree and isolated Copilot state directory.
+The provider retains capability-directory handles for both trusted roots and performs every
+filesystem operation relative to those handles. It rejects dangling and existing symbolic links,
+multiply-linked regular files, Git control paths, and Windows device/alternate-stream aliases.
+It checks an opened file before truncating or appending, so a hard link cannot modify a file in
+the source checkout. Native mutations also enforce the run's persisted task write scope; a
+directory-create may create only a granted path or an ancestor needed to reach it. This authority
+is rebuilt from the current task on resume. Ordinary Unix executable permission bits are honored;
+privilege bits and invalid modes are rejected before creating a file.
+The SDK-registered `ecorp_mkdir` tool accepts only a relative path and invokes that same scoped
+provider. It is idempotent, cannot delete or chmod, and never starts a command interpreter.
+Its finite directory-creation authority comes from the persisted run contract; the SDK tool
+declaration suppresses a redundant permission prompt for this one guarded primitive, not for
+shell or other tools.
+Every shell command remains an explicit ask. Command-family allowlists are not a filesystem
+boundary: interpreters, build tools, and PowerShell commands can write arbitrary host paths when
+the native sandbox is unavailable. Copilot's sandbox configuration therefore remains
+defense-in-depth rather than authorization. Persisted runner verifier policies execute required
+build and test commands outside the model session. Common ambient credential environment variables
+are removed from the Copilot child process; explicit scoped SDK authentication remains available.
+Credential stores, the user profile, network access, and temporary-directory access are also
+denied through the native sandbox configuration when the installed runtime applies it.
+
+The ECorp handler remains a fail-closed backstop for unresolved requests. It automatically approves
+only native writes inside the assigned worktree, native reads it can prove are worktree-scoped,
+and reads from the SDK state directory isolated to that worktree. It canonicalizes existing
+ancestors without treating a dangling link or inaccessible path as absent. The native filesystem
+provider independently enforces the narrower task write scope. No shell spelling or provider
+`readOnly` flag is interpreted as an ECorp automatic grant. External paths, network URLs, sandbox bypass,
+managed-policy approvals, shell effects, and ambiguous requests suspend durably. Shell approval
+cards include the bounded command text rather than only a generic action label. Arbitrary shell can
+become approval-free only behind a separately verified operating-system isolation boundary such as
+a restricted identity with ACLs, AppContainer, container, or VM.
 
 Claude permission requests use the same fail-closed worktree containment helper. Only recognized
 read/write tools with an explicit contained path can be allowed locally. Existing ancestors are
@@ -177,6 +221,16 @@ the latest terminal preserved provider/worktree checkpoint and reject any lineag
 hard stop. Resume cannot change source identity, secret references, model, reasoning, budget, or
 deliverable authority; it cannot widen tools or write paths or remove a prohibition. The revision
 does not itself dispatch, preventing a contract mutation from implicitly authorizing execution.
+
+A saved `ready` mission is held until an explicit authenticated launch. Automatic scheduling
+cannot create its first run, including from a stale candidate list: the run-creation transaction
+rechecks admission while locking the mission, task and agent. Explicit admission and replay also
+retain the operator's current Corp role and room membership through their transactions. The first
+actor-attributed `run.requested` event identifies the admission transition. Replay requires
+positive persisted runner-start evidence and cannot turn a `dispatch_not_started` failure or a
+terminal failed/cancelled mission into a successful launch response. Normal dependency and retry
+scheduling remains confined to already-running missions; this adds no tool approval or wider
+provider authority.
 
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.

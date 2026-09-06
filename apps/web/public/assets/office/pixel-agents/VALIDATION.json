@@ -1,0 +1,17 @@
+{
+  "checkedOn": "2026-09-06",
+  "sourceCommit": "3537e140c2094761beae748592aeb92ece8edfdd",
+  "characterSheets": 6,
+  "distinctDecodedSheets": 6,
+  "visibleFrames": 126,
+  "frameLookups": 176,
+  "upstreamBlobMatches": true,
+  "sha256Matches": true,
+  "pngCrcAndDecode": true,
+  "frameBoundsValid": true,
+  "deterministicSelection": true,
+  "originalFilesUnmodified": true,
+  "licensesIncluded": true,
+  "furniturePngsCopied": 0,
+  "browserToServerUiAcceptance": "not_run_parent_owned"
+}

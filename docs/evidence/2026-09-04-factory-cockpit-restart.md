@@ -1,8 +1,11 @@
 # Factory cockpit restart and multiplayer evidence
 
-**Date:** September 4, 2026  
-**Issue:** #145  
-**Pull request:** #152  
+**Date:** September 4, 2026
+
+**Issue:** #145
+
+**Pull request:** #152
+
 **Hosted CI:** Not used; monthly GitHub Actions credits were exhausted.
 
 ## Scope

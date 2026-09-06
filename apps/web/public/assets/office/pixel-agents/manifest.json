@@ -1,0 +1,246 @@
+{
+  "schemaVersion": 1,
+  "title": "ECorp legally attributed office character sheets",
+  "curatedOn": "2026-09-06",
+  "source": {
+    "repository": "https://github.com/pixel-agents-hq/pixel-agents",
+    "commit": "3537e140c2094761beae748592aeb92ece8edfdd",
+    "originalCharacterArtist": "JIK-A-4",
+    "originalCharacterPack": "https://jik-a-4.itch.io/metrocity-free-topdown-character-pack",
+    "originalCharacterLicense": "CC0-1.0",
+    "upstreamDistributionLicense": "MIT",
+    "attributionUrl": "/assets/office/pixel-agents/ATTRIBUTION.md",
+    "manifestUrl": "/assets/office/pixel-agents/manifest.json",
+    "commitDate": "2026-08-15T21:33:45Z"
+  },
+  "characterSheet": {
+    "width": 112,
+    "height": 96,
+    "frameWidth": 16,
+    "frameHeight": 32,
+    "columns": 7,
+    "rows": 3,
+    "tileSize": 16,
+    "anchor": {
+      "x": 8,
+      "y": 32
+    },
+    "sittingOffsetY": 6,
+    "walkSpeedPixelsPerSecond": 48
+  },
+  "directions": {
+    "down": {
+      "row": 0,
+      "flipX": false
+    },
+    "up": {
+      "row": 1,
+      "flipX": false
+    },
+    "right": {
+      "row": 2,
+      "flipX": false
+    },
+    "left": {
+      "row": 2,
+      "flipX": true
+    }
+  },
+  "animations": {
+    "idle": {
+      "columns": [
+        1
+      ],
+      "frameDurationMs": 0
+    },
+    "walk": {
+      "columns": [
+        0,
+        1,
+        2,
+        1
+      ],
+      "frameDurationMs": 150
+    },
+    "type": {
+      "columns": [
+        3,
+        4
+      ],
+      "frameDurationMs": 300
+    },
+    "read": {
+      "columns": [
+        5,
+        6
+      ],
+      "frameDurationMs": 300
+    }
+  },
+  "characters": [
+    {
+      "id": "char_0",
+      "label": "Brown hair · blue jacket",
+      "src": "/assets/office/pixel-agents/characters/char_0.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_0.png",
+      "gitBlobSha1": "68a86c5035b77c0a2f752404080b4bfeb023fa2f",
+      "sha256": "9ece93c20765abb876e3dacfe01e0cd1801323eff41c1779be0c47369886c09a",
+      "bytes": 3956,
+      "file": "characters/char_0.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "e19d97a3b1cf41dbe929353379a33d399894be6f3bb8de593749d99ad7a14980",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 1,
+        "y": 3,
+        "width": 14,
+        "height": 28
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_0.png"
+    },
+    {
+      "id": "char_1",
+      "label": "Copper braids · dark jacket",
+      "src": "/assets/office/pixel-agents/characters/char_1.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_1.png",
+      "gitBlobSha1": "13676875af4411e1bc85bc732a16679a82c710e3",
+      "sha256": "f935f033726b06f73dbbe590db5a23cfb20d2d02c1329fd5d67d57a262e9b05e",
+      "bytes": 5022,
+      "file": "characters/char_1.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "2faa04c606200c5643b09353b60878da64cdb7aaea85d5a19e00fad0b5449bb7",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 0,
+        "y": 3,
+        "width": 16,
+        "height": 28
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_1.png"
+    },
+    {
+      "id": "char_2",
+      "label": "Dark hair · warm jacket",
+      "src": "/assets/office/pixel-agents/characters/char_2.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_2.png",
+      "gitBlobSha1": "d07293bd08665ec1b3b4cb91a00022601d06a0fe",
+      "sha256": "9f63ee7be4577e1d60de3b64d198d387d1c09794bed3a608958e77c7b955575d",
+      "bytes": 5221,
+      "file": "characters/char_2.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "6331566e252f914bdc6e4b50a1a899ba38e04b37a9dc86a34b4b986a7266ec06",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 1,
+        "y": 3,
+        "width": 14,
+        "height": 28
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_2.png"
+    },
+    {
+      "id": "char_3",
+      "label": "Silver hair · rose jacket",
+      "src": "/assets/office/pixel-agents/characters/char_3.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_3.png",
+      "gitBlobSha1": "89f858c63939e8f1637e0fffef987a84e69bacc4",
+      "sha256": "ee5ebe0847471e4834e367f8a4108e6caf2f402ed506bbfebd90c64a43a79348",
+      "bytes": 4930,
+      "file": "characters/char_3.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "85b82dfaf50423ff4d43b255b6acd621c7930649f6750753f17113254428fba0",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 1,
+        "y": 3,
+        "width": 14,
+        "height": 28
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_3.png"
+    },
+    {
+      "id": "char_4",
+      "label": "Curly hair · white shirt",
+      "src": "/assets/office/pixel-agents/characters/char_4.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_4.png",
+      "gitBlobSha1": "32dbc619a3b1f724cbf8777175efe9fab4d93a57",
+      "sha256": "fcf72626bbee3045d0f3e10bb87a41dab19a331d1affdfc53b483567f9c083aa",
+      "bytes": 5488,
+      "file": "characters/char_4.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "a1141dceafee4c23d5c5630607de96ae82fc122b41e3528378edb58774d95e82",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 0,
+        "y": 1,
+        "width": 16,
+        "height": 30
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_4.png"
+    },
+    {
+      "id": "char_5",
+      "label": "Black hair · red jacket",
+      "src": "/assets/office/pixel-agents/characters/char_5.png",
+      "upstreamPath": "webview-ui/public/assets/characters/char_5.png",
+      "gitBlobSha1": "b5cfa27e8c4c95be748111bacfabdd1e149be052",
+      "sha256": "4b2c639a50e089a4e3b87be440ffb52b5c5c8cfd6473a386f325b25f99db7381",
+      "bytes": 5071,
+      "file": "characters/char_5.png",
+      "width": 112,
+      "height": 96,
+      "pixelSha256": "90c5e2379320fcd5bb4a8f49b7560346ae9a2d7f0f31d9bceb170f16cf1495e2",
+      "frameCount": 21,
+      "downIdleBounds": {
+        "row": 0,
+        "column": 1,
+        "x": 0,
+        "y": 3,
+        "width": 16,
+        "height": 28
+      },
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/webview-ui/public/assets/characters/char_5.png"
+    }
+  ],
+  "licenses": [
+    {
+      "id": "MIT",
+      "file": "licenses/MIT-Pixel-Agents.txt",
+      "sourceUrl": "https://raw.githubusercontent.com/pixel-agents-hq/pixel-agents/3537e140c2094761beae748592aeb92ece8edfdd/LICENSE",
+      "bytes": 1071,
+      "sha256": "20729e3cb9d06d64cdf78d43070ead3eae96e67a5b35b1aa35b5520906cb8ab5"
+    },
+    {
+      "id": "CC0-1.0",
+      "file": "licenses/CC0-1.0.txt",
+      "sourceUrl": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
+      "bytes": 7048,
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+    }
+  ],
+  "excludedCategories": [
+    "furniture",
+    "floors",
+    "walls",
+    "carpets",
+    "pets",
+    "screenshots",
+    "paid LimeZu packs"
+  ],
+  "validationFile": "VALIDATION.json"
+}

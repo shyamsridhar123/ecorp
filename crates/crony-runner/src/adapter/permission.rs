@@ -80,8 +80,10 @@ fn join_workspace_alias(workspace: &Path, relative: &str) -> PathBuf {
 fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     let mut candidate = Some(path);
     while let Some(current) = candidate {
-        if current.exists() {
-            return Some(current);
+        match std::fs::symlink_metadata(current) {
+            Ok(_) => return Some(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
         candidate = current.parent();
     }

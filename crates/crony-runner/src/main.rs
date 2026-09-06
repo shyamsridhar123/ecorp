@@ -1304,6 +1304,7 @@ async fn execute_assignment(
         model: assignment.model.clone(),
         reasoning_effort: assignment.reasoning_effort.clone(),
         workspace: workspace.path.clone(),
+        write_scope: assignment.write_scope.clone(),
         environment: assignment
             .secrets
             .iter()

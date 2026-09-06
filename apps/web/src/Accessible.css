@@ -2652,6 +2652,46 @@ body::after {
   }
 }
 
+/* Old arcade surfaces must not retain dark fills beneath the light text theme. */
+.app-shell :is(.verification-box, .evidence-box, .evidence-check, .terminal-summary, .usage-box, .workspace-box, .budget-revision-panel) {
+  color: #202b36 !important;
+  background: #f6f7f5 !important;
+  border-color: #c8cec9;
+  overflow-wrap: anywhere;
+}
+
+.app-shell :is(.evidence-box, .workspace-box, .usage-box) :is(strong, span, small, code) {
+  color: #202b36 !important;
+}
+
+.app-shell .artifact-download {
+  min-height: 44px;
+  padding: 8px 12px;
+  color: #870d21 !important;
+  background: #ffffff !important;
+  border-color: #a98d92;
+}
+
+.app-shell .status-chip {
+  color: #343b44 !important;
+  background: #edf0f2 !important;
+}
+
+.app-shell .status-chip-running {
+  color: #17476c !important;
+  background: #e7f2fa !important;
+}
+
+.app-shell .status-chip-completed {
+  color: #175a39 !important;
+  background: #e6f3e9 !important;
+}
+
+.app-shell :is(.status-chip-failed, .status-chip-cancelled) {
+  color: #8e1934 !important;
+  background: #fbe9ed !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .app-shell *,
   .app-shell *::before,

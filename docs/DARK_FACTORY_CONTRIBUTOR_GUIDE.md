@@ -395,6 +395,19 @@ incorrect one. Verify behavior at the scope of the claim.
 
 ## Conflict-free execution
 
+### Saved plans are held until dispatch
+
+Creating or materializing a mission saves a `ready` plan. It does not admit that mission to
+automatic scheduling. The UI displays **Awaiting dispatch**, and a briefing hold survives
+closing the browser and restarting the server or runner.
+
+The controller's existing explicit launch call releases the hold after its source and Project
+revalidation. Human operators can use **Dispatch mission**. This is execution intent, not an
+additional provider-tool approval. Once the mission is running, normal dependency scheduling and
+bounded retries continue automatically. A successful replay is labeled `replayed` and never
+authorizes a new task attempt. Failed/cancelled missions and never-acknowledged starts are not
+reported as successful replays.
+
 ### Isolated worktrees
 
 Write-capable runs never execute in the configured source checkout. Initial runs receive a
