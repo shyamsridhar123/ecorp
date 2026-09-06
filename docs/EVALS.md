@@ -271,6 +271,15 @@ Set `CRONY_PROBE_BOUNDARY_ONLY=1` to run the negative conformance lane separatel
 explicitly labeled `boundaries_only` and cannot substitute for an application-build result. This is
 useful when an application model refuses a test prompt before reaching the permission handler; that
 refusal remains inconclusive for handler coverage rather than being counted as a passed probe.
+The probe now settles each case and continues to later independent boundaries after such an
+inconclusive terminal result. `copilot-boundary-progress.json` atomically records callback-only
+progress; it is explicitly partial and does not replace the final sentinel/process/credential
+checks. Final `e2e-copilot-live.json` includes all seven required cases and an explicit
+`boundary_matrix.complete` flag. Any missing, mismatched, un-rejected, or inconclusive permission
+case still makes the invocation exit nonzero. Unexpected transport, containment, and teardown
+failures still stop the probe rather than proceeding with an unsafe active run.
+`node --test tools/copilot_probe_boundaries.test.mjs tools/copilot_probe_process.test.mjs`
+checks that partial/duplicate/cross-run evidence cannot silently become complete coverage.
 Set `CRONY_PROBE_PRESERVE_DEMO=1` to retain earlier test history instead of resetting the specified
 development server.
 
