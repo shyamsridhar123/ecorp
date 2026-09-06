@@ -186,13 +186,18 @@ crony-server ------ Postgres
     v
 crony-runner
     |
-    +-- deterministic process ---> output/runner/<run-id>/result.md
+    +-- deterministic process ---> <isolated worktree>/result.md
     |
     +-- Codex app-server JSON-RPC ---> provider thread + repository changes
+    |
+    +-- GitHub Copilot Rust SDK ---> scoped native filesystem + provider sessions
+    |
+    +-- Claude Code / OpenCode ---> Windows-owned external CLI process scopes
 ```
 
 The deterministic process remains the offline systems fixture. The Codex adapter uses app-server
-over stdio JSON-RPC rather than scraping terminal text.
+over stdio JSON-RPC rather than scraping terminal text. The Copilot SDK has its own runtime and
+filesystem boundary; external CLI adapters currently refuse Unix execution.
 
 ## Mission launch admission
 
@@ -407,10 +412,16 @@ tree-equivalent to the base. The runner emits `run.workspace_preserved` or
 ## Planning and scheduling
 
 Mission decomposition is a replaceable server-side strategy, not a privileged singleton agent.
-The initial registry includes:
+The current provider-backed strategies are:
 
 - `single`: one bounded delivery task
 - `parallel-specialists`: two independent specialist roots followed by one synthesis task
+- `studio-swarm`: three GitHub Copilot handoff roots followed by one integration task, using three
+  mission workers; see [mission-owned staffing and studio handoffs](#mission-owned-staffing-and-studio-handoffs)
+
+The registry also contains the deterministic `verification-matrix`, `verification-failure`,
+`human-approval`, and `independent-review` fixtures. They exercise system behavior rather than
+provider quality.
 
 Every planned task persists a self-contained contract: objective, expected output, acceptance
 tests, allowed tools, prohibited actions, references, write scope, token budget, deadline, and

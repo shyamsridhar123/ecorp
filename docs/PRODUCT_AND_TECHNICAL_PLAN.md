@@ -23,6 +23,35 @@ and linked repository evidence for implemented behavior.
   - Local research checkout: `C:\Users\shyamsridhar\code\_research\buzz3`
   - Reviewed commit: `00e61eafa917d296104006576b7a2ddbfd58bb5a`
 
+### Implementation checkpoint - September 6, 2026
+
+This checkpoint adds to the September 4 baseline below; it does not turn the original delivery
+plan into a claim that every planned surface has shipped.
+
+- Source-selected missions can now create mission-owned workers atomically with the accepted task
+  graph. Unpinned workers retire after terminal missions only when their operational obligations
+  are settled, while historical attribution remains. Dedicated crew-management controls remain
+  tracked in [#48](https://github.com/shyamsridhar123/ecorp/issues/48).
+- `studio-swarm` uses three real GitHub Copilot workers for visual, gameplay, and quality handoffs,
+  then a fourth task for integration by the gameplay worker. Integration consumes exact signed,
+  verified parent artifacts. The [studio report](evidence/2026-09-06-mission-staffing.md) separates
+  deterministic coverage, real-provider observations, and development-principal review from
+  production human authentication.
+- Saved `ready` missions are held until explicit authenticated launch, including across browser
+  closure and server restart. See the [launch-admission report](evidence/2026-09-06-mission-launch-admission.md).
+- GitHub Copilot native filesystem tools use retained worktree capabilities and persisted write
+  scope. The checked-in SDK 1.0.11 / CLI 1.0.79 pair is validated with automatic updates disabled;
+  shell and other risky effects still need authority. See the
+  [filesystem](evidence/2026-09-06-copilot-native-filesystem.md) and
+  [runtime/readback](evidence/2026-09-06-copilot-native-read-runtime.md) reports.
+- Windows external-CLI process ownership and fail-closed descendant cleanup are implemented.
+  Unix external-CLI adapters refuse execution rather than treating process groups as equivalent
+  containment. Stronger filesystem/network isolation remains separate work; see
+  [the lifecycle report](evidence/2026-09-03-external-provider-fail-closed.md) and [Security](SECURITY.md).
+- The separate [ECorp front office](https://ecorp-front-office.shyam-sridhar16.chatgpt.site) presents
+  the vision and an illustrative interactive tour. It is not an operational control plane and
+  does not launch agents or approve real actions.
+
 ### Implementation checkpoint - September 4, 2026
 
 - The greenfield repository, ADR set, Postgres event journal, server, runner, CLI, React client, and
