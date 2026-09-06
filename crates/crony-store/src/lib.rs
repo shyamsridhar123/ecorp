@@ -4086,6 +4086,69 @@ impl PgStore {
         Ok(outcome)
     }
 
+    pub async fn mission_launch_runs(
+        &self,
+        corp_id: Uuid,
+        mission_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        let mut tx = self.pool.begin().await?;
+        assert_mission_operator_tx(&mut tx, corp_id, actor_id).await?;
+        let mission = sqlx::query(
+            "SELECT room_id, status FROM missions WHERE id = $1 AND corp_id = $2 FOR SHARE",
+        )
+        .bind(mission_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("mission not found in this Corp")?;
+        let room_id: Uuid = mission.get("room_id");
+        assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
+        if !matches!(
+            mission.get::<String, _>("status").as_str(),
+            "running" | "completed"
+        ) {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, runner_id
+            FROM (
+                SELECT DISTINCT ON (task.id)
+                       run.id, run.runner_id, run.created_at
+                FROM tasks task
+                JOIN runs run ON run.task_id = task.id AND run.corp_id = task.corp_id
+                WHERE task.corp_id = $1 AND task.mission_id = $2
+                  AND run.workspace_detail IS DISTINCT FROM 'dispatch_not_started'
+                  AND EXISTS (
+                      SELECT 1 FROM events started
+                      WHERE started.corp_id = run.corp_id
+                        AND started.aggregate_type = 'run'
+                        AND started.aggregate_id = run.id
+                        AND started.type = 'run.started'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_dependencies dependency
+                      WHERE dependency.task_id = task.id
+                  )
+                ORDER BY task.id, run.created_at, run.id
+            ) initial_runs
+            ORDER BY created_at, id
+            "#,
+        )
+        .bind(corp_id)
+        .bind(mission_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let runs = rows
+            .into_iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("runner_id")?)))
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(runs)
+    }
+
     pub async fn schedulable_mission_ids(&self, corp_id: Uuid) -> Result<Vec<Uuid>> {
         sqlx::query_scalar(
             r#"
@@ -4094,7 +4157,7 @@ impl PgStore {
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
             WHERE t.corp_id = $1
-              AND m.status IN ('ready', 'running')
+              AND m.status = 'running'
               AND t.status IN ('pending', 'ready')
               AND a.status = 'idle'
               AND t.attempt_count < t.max_attempts
@@ -4129,6 +4192,7 @@ impl PgStore {
         &self,
         corp_id: Uuid,
         mission_id: Uuid,
+        explicit_dispatch: bool,
     ) -> Result<Vec<SchedulableTask>> {
         sqlx::query(
             r#"
@@ -4143,7 +4207,7 @@ impl PgStore {
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
             WHERE t.corp_id = $1 AND t.mission_id = $2
-              AND m.status IN ('ready', 'running')
+              AND (m.status = 'running' OR ($3 AND m.status = 'ready'))
               AND t.status IN ('pending', 'ready')
               AND a.status = 'idle'
               AND t.attempt_count < t.max_attempts
@@ -4170,6 +4234,7 @@ impl PgStore {
         )
         .bind(corp_id)
         .bind(mission_id)
+        .bind(explicit_dispatch)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -4196,6 +4261,9 @@ impl PgStore {
         runner_id: &str,
     ) -> Result<(LaunchRecord, DomainEvent)> {
         let mut tx = self.pool.begin().await?;
+        if let Some(actor_id) = requested_by {
+            assert_mission_operator_tx(&mut tx, corp_id, actor_id).await?;
+        }
         let row = sqlx::query(
             r#"
             SELECT m.room_id, m.title AS mission_title, m.status AS mission_status,
@@ -4223,11 +4291,12 @@ impl PgStore {
             assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
         }
         let mission_status: String = row.get("mission_status");
-        if matches!(
-            mission_status.as_str(),
-            "completed" | "failed" | "cancelled"
-        ) {
-            return Err(anyhow!("mission is already {mission_status}"));
+        if !mission_allows_dispatch(&mission_status, requested_by.is_some()) {
+            return Err(if mission_status == "ready" {
+                anyhow!("mission is held at briefing until an operator explicitly dispatches it")
+            } else {
+                anyhow!("mission is already {mission_status}")
+            });
         }
         let task_status: String = row.get("task_status");
         if !matches!(task_status.as_str(), "pending" | "ready") {
@@ -4372,6 +4441,7 @@ impl PgStore {
                     run_id,
                     format!("run:{run_id}:requested"),
                     json!({
+                        "mission_launch": mission_status == "ready",
                         "task_id": task_id,
                         "agent_id": agent_id,
                         "runner_id": runner_id,
@@ -9823,6 +9893,29 @@ async fn assert_actor_agent_scope_tx(
     Ok(())
 }
 
+async fn assert_mission_operator_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    actor_id: Uuid,
+) -> Result<()> {
+    // Match Permission::Operate and retain the role through admission or replay.
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM actors WHERE id = $1 AND corp_id = $2 FOR SHARE")
+            .bind(actor_id)
+            .bind(corp_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if !matches!(
+        role.as_deref(),
+        Some("owner" | "admin" | "manager" | "member")
+    ) {
+        return Err(anyhow!(
+            "forbidden: actor cannot dispatch missions in this Corp"
+        ));
+    }
+    Ok(())
+}
+
 async fn assert_actor_scope_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -10917,6 +11010,10 @@ fn breaker_is_hard(stage: &str) -> bool {
     matches!(stage, "suspend" | "stop")
 }
 
+fn mission_allows_dispatch(status: &str, explicit_dispatch: bool) -> bool {
+    status == "running" || (explicit_dispatch && status == "ready")
+}
+
 fn should_retry_runner_failure(stage: &str, attempt_count: i32, max_attempts: i32) -> bool {
     attempt_count < max_attempts && !breaker_is_hard(stage)
 }
@@ -11158,6 +11255,18 @@ fn strongest_breaker_stage<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_missions_require_explicit_dispatch_and_running_graphs_keep_advancing() {
+        assert!(!super::mission_allows_dispatch("ready", false));
+        assert!(super::mission_allows_dispatch("ready", true));
+        assert!(super::mission_allows_dispatch("running", false));
+        assert!(super::mission_allows_dispatch("running", true));
+        for status in ["completed", "failed", "cancelled", "unknown", "READY", ""] {
+            assert!(!super::mission_allows_dispatch(status, false));
+            assert!(!super::mission_allows_dispatch(status, true));
+        }
+    }
+
     use chrono::{Duration, Utc};
     use crony_domain::{
         FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, PlannedTask, TaskContract,

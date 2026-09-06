@@ -743,6 +743,8 @@ pub struct LaunchMissionResponse {
     pub runner_id: String,
     pub run_ids: Vec<Uuid>,
     pub runner_ids: Vec<String>,
+    #[serde(default)]
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -932,6 +934,27 @@ pub struct SetBudgetPolicyRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_replay_flag_is_backward_compatible_with_prior_responses() {
+        let run_id = uuid::Uuid::new_v4();
+        let response: super::LaunchMissionResponse = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "runner_id": "fixture",
+            "run_ids": [run_id],
+            "runner_ids": ["fixture"]
+        }))
+        .expect("an older server response remains readable");
+        assert!(!response.replayed);
+        let replay = super::LaunchMissionResponse {
+            replayed: true,
+            ..response
+        };
+        assert_eq!(
+            serde_json::to_value(replay).expect("serialize replay")["replayed"],
+            true
+        );
+    }
+
     use super::ServerToRunner;
 
     #[test]

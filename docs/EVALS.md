@@ -78,6 +78,45 @@ recovery drills.
 
 ## Quality gates
 
+### Held mission / launch-admission regression
+
+`tools/e2e_launch_admission.mjs` exercises saved ordinary and materialized factory plans,
+unrelated completion/failure, explicit release, duplicate/concurrent requests, failed first
+dispatch, fresh continuation run IDs, and normal graph dependencies/retries. Its `prepare` and
+`release` phases let an external test supervisor restart the actual server and runner without
+resetting their database or source.
+
+`tools/e2e_launch_admission_browser.mjs` uses the actual mission composer, repository confirmation,
+**Hold at briefing**, and **Dispatch mission** controls. It closes the browser before unrelated
+work completes and checks the saved plan again after the supervisor's restart. It also checks
+390-pixel layout and a successful, nonduplicating launch replay.
+
+Use an explicitly owned isolated stack and independent fixture repository, never the manual
+demo. The scripts reject shared/manual ports. The runner must use the deterministic process and
+the existing Codex/Claude/OpenCode protocol fixtures, not authenticated real providers. Install
+Playwright separately for the browser regression or set `CRONY_PLAYWRIGHT_MODULE` to its installed
+package directory.
+
+```powershell
+$env:CRONY_ADMISSION_TEST = '1'
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:18961'
+$env:CRONY_ADMISSION_WEB = 'http://127.0.0.1:15496'
+$env:CRONY_ADMISSION_OUTPUT = 'C:\path\to\owned-qa-evidence'
+$env:CRONY_ADMISSION_GRAPH_FIXTURES = '1'
+node tools/e2e_launch_admission.mjs --phase prepare
+node tools/e2e_launch_admission_browser.mjs --phase prepare
+# Restart only the owned QA server and runner; preserve database, credentials and source.
+node tools/e2e_launch_admission_browser.mjs --phase release
+node tools/e2e_launch_admission.mjs --phase release
+```
+
+The supervisor must separately record actual old/new process identities and reconnection;
+two invocations alone do not prove a restart. Retain checkpoint IDs after an interrupted phase
+rather than resetting data or silently creating replacement missions. These are deterministic
+control-plane/browser checks, not evidence of real Copilot inference or a three-agent game build.
+
+### Workspace gates
+
 ```powershell
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings

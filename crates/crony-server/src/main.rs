@@ -2910,24 +2910,41 @@ async fn launch_mission(
     let outcome = schedule_ready_tasks(&state, corp_id, mission_id, Some(requested_by))
         .await
         .map_err(ApiError::conflict)?;
-    let first = outcome
-        .records
+    if let Some((first, runner_id)) = outcome.records.first() {
+        return Ok(Json(LaunchMissionResponse {
+            run_id: first.run_id,
+            runner_id: runner_id.clone(),
+            run_ids: outcome
+                .records
+                .iter()
+                .map(|(record, _)| record.run_id)
+                .collect(),
+            runner_ids: outcome
+                .records
+                .iter()
+                .map(|(_, runner_id)| runner_id.clone())
+                .collect(),
+            replayed: false,
+        }));
+    }
+    let initial_runs = state
+        .store
+        .mission_launch_runs(corp_id, mission_id, requested_by)
+        .await
+        .map_err(ApiError::conflict)?;
+    let first = initial_runs
         .first()
         .ok_or_else(|| ApiError::conflict(outcome.failure_message()))?;
 
     Ok(Json(LaunchMissionResponse {
-        run_id: first.0.run_id,
+        run_id: first.0,
         runner_id: first.1.clone(),
-        run_ids: outcome
-            .records
-            .iter()
-            .map(|(record, _)| record.run_id)
-            .collect(),
-        runner_ids: outcome
-            .records
+        run_ids: initial_runs.iter().map(|(run_id, _)| *run_id).collect(),
+        runner_ids: initial_runs
             .iter()
             .map(|(_, runner_id)| runner_id.clone())
             .collect(),
+        replayed: true,
     }))
 }
 
@@ -2960,7 +2977,10 @@ async fn schedule_ready_tasks(
     mission_id: Uuid,
     requested_by: Option<Uuid>,
 ) -> anyhow::Result<ScheduleOutcome> {
-    let candidates = state.store.schedulable_tasks(corp_id, mission_id).await?;
+    let candidates = state
+        .store
+        .schedulable_tasks(corp_id, mission_id, requested_by.is_some())
+        .await?;
     let mut outcome = ScheduleOutcome {
         candidate_count: candidates.len(),
         ..ScheduleOutcome::default()

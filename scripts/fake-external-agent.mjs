@@ -256,7 +256,7 @@ async function runClaude() {
     finish(mission)
     process.exit(0)
   }
-  if (mission.includes('[process-tree')) {
+  if (mission.includes('[process-tree') || mission.includes('[slow]')) {
     await new Promise((resolve) => setTimeout(resolve, 10_000))
   }
 

@@ -194,6 +194,31 @@ crony-runner
 The deterministic process remains the offline systems fixture. The Codex adapter uses app-server
 over stdio JSON-RPC rather than scraping terminal text.
 
+## Mission launch admission
+
+A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
+Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
+materialization leave the mission in that held state. The existing authenticated launch endpoint
+may admit it; normal factory controllers already call that endpoint after claim/source/Project
+revalidation, so unattended intake does not gain another human approval step.
+
+Automatic scheduling selects only `running` missions. The run-creation transaction repeats the
+admission check under the mission/task/agent locks and checks an explicit operator's current role
+and room membership. Its first `ready -> running` transition is atomic with the initial run and
+the actor-attributed `run.requested` event (`mission_launch: true`). Unrelated completion,
+failure, runner reconnect, or server restart cannot admit a held plan. Dependency release and
+bounded retries remain within the already-running mission.
+
+Launch responses identify newly dispatched runs when a call actually advances work. When no new
+run is dispatched, a replay can reference previously started root runs only for a running or
+completed mission. Durable `run.started` journal evidence is required; pre-dispatch failures,
+cancelled/failed missions, and a merely allocated run are not successful replays. Very early
+concurrent requests may still receive a conflict until the runner acknowledges startup, without
+creating another attempt. The optional `replayed` response field distinguishes that result.
+
+The browser renders persisted `ready` state as **Awaiting dispatch**. Its briefing checkbox
+chooses the plan-only flow; keeping the browser open is not what enforces the hold.
+
 ## State and events
 
 Configuration and current state use relational tables. Every meaningful mutation also writes an

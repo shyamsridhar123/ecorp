@@ -558,6 +558,7 @@ type CreateMissionResponse = {
 }
 
 type LaunchMissionResponse = {
+  replayed?: boolean
   run_id: string
   runner_id: string
   run_ids: string[]
@@ -694,6 +695,10 @@ function statusLabel(value: string): string {
   return value
     .replaceAll('_', ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function missionStatusLabel(value: string): string {
+  return value === 'ready' ? 'Awaiting dispatch' : statusLabel(value)
 }
 
 function capabilitySupports(
@@ -3254,7 +3259,7 @@ function MissionCard({
       tabIndex={-1}
     >
       <div className="mission-card-top">
-        <span className={`status-chip status-chip-${mission.status}`}>{statusLabel(mission.status)}</span>
+        <span className={`status-chip status-chip-${mission.status}`}>{missionStatusLabel(mission.status)}</span>
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
@@ -4363,8 +4368,10 @@ function App() {
       }
       setAnnouncement(
         pauseAfterPlanning
-          ? 'Mission plan created. Review the task contracts before dispatch.'
-          : 'Mission dispatched. The active worker is selected on the control floor.',
+          ? 'Mission plan saved on the server. It stays held until you dispatch.'
+          : launched?.replayed
+            ? 'This mission was already dispatched. Showing its existing run.'
+            : 'Mission dispatched. The active worker is selected on the control floor.',
       )
       window.setTimeout(() => {
         const card = document.querySelector<HTMLElement>(
@@ -4397,7 +4404,9 @@ function App() {
         (run) => run.id === launched.run_id,
       )
       if (launchedRun) setSelectedAgentId(launchedRun.agent_id)
-      setAnnouncement('Mission dispatched. The active worker is selected.')
+      setAnnouncement(launched.replayed
+        ? 'This mission was already dispatched. No duplicate attempt was created.'
+        : 'Mission dispatched. The active worker is selected.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -5776,7 +5785,7 @@ function App() {
                       />
                       <span>
                         <strong>Hold at briefing</strong>
-                        <small>Review the generated plan before launch.</small>
+                        <small>Saved on the server; stays held even when you close this page.</small>
                       </span>
                     </label>
                     <label className="developer-mode-toggle">
@@ -6042,7 +6051,7 @@ function App() {
                       data-status={mission.status}
                       onClick={() => setSelectedMissionId(mission.id)}
                     >
-                      <span>{statusLabel(mission.status)}</span>
+                      <span>{missionStatusLabel(mission.status)}</span>
                       <strong>{mission.title}</strong>
                       <small>
                         {shortId(mission.id)} · {missionTasks.length} task

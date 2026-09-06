@@ -222,6 +222,16 @@ hard stop. Resume cannot change source identity, secret references, model, reaso
 deliverable authority; it cannot widen tools or write paths or remove a prohibition. The revision
 does not itself dispatch, preventing a contract mutation from implicitly authorizing execution.
 
+A saved `ready` mission is held until an explicit authenticated launch. Automatic scheduling
+cannot create its first run, including from a stale candidate list: the run-creation transaction
+rechecks admission while locking the mission, task and agent. Explicit admission and replay also
+retain the operator's current Corp role and room membership through their transactions. The first
+actor-attributed `run.requested` event identifies the admission transition. Replay requires
+positive persisted runner-start evidence and cannot turn a `dispatch_not_started` failure or a
+terminal failed/cancelled mission into a successful launch response. Normal dependency and retry
+scheduling remains confined to already-running missions; this adds no tool approval or wider
+provider authority.
+
 Budget policies constrain run, mission, requester, and Corp usage. Repeated tools and explicit
 no-progress events feed an auditable circuit breaker; ordinary human conversation does not.
 
