@@ -1,47 +1,81 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="./docs/assets/readme/ecorp-arcade-hero-static.png">
-  <img src="./docs/assets/readme/ecorp-arcade-hero.gif" width="1280" alt="ECorp arcade command center showing the live multiplayer control floor, active agent crew, operational score rail, and the plan, run, approve, verify, publish mission path.">
-</picture>
+<a href="https://ecorp-front-office.shyam-sridhar16.chatgpt.site">
+  <img src="./docs/assets/branding/source/ecorp-software-factory-hero-v2.jpg" width="1280" alt="ECorp — Your software factory. Original pixel-art front office and software factory: one mission, an entire factory at work. Run it together. Build in parallel. Proof before done.">
+</a>
 
-<h1>Turn your repository into a live AI company.</h1>
+<h1>Run an AI company on top of your codebase.</h1>
 
-<p><strong>Agents take the floor. Humans hold the keys. Evidence unlocks the pull request.</strong></p>
+<p><strong>ECorp. An entire factory. A beautiful front office.</strong></p>
 
-<p>Dispatch GitHub Copilot, OpenAI Codex, Claude Code, and OpenCode into isolated worktrees. Watch the crew split the mission, work in parallel, ask for authority, prove the result, and publish the exact source that passed.</p>
+<p>Your repository is the office. Your backlog is the mission board. Your agents are the crew.<br>Bring the mission. Build something bigger. Stay in charge.</p>
 
 <p>
-<a href="#start-locally"><strong>PRESS START</strong></a> |
-<a href="#press-start-on-real-work">WATCH THE MISSION</a> |
-<a href="#bring-your-agents">CHOOSE THE CREW</a> |
-<a href="docs/SECURITY.md">TRUST MODEL</a>
+<a href="https://ecorp-front-office.shyam-sridhar16.chatgpt.site"><strong>ENTER THE FRONT OFFICE</strong></a> ·
+<a href="#start-locally">RUN ECORP</a> ·
+<a href="docs/README.md">READ THE HANDBOOK</a> ·
+<a href="docs/SECURITY.md">TRUST & SAFETY</a>
 </p>
 
-<p><sub><a href="./docs/assets/readme/ecorp-arcade-hero-static.png">Static hero</a> for reduced-motion viewing.</sub></p>
+<p><sub>Active alpha. Real provider sessions. Human authority. Evidence before done.</sub></p>
 
 </div>
 
-Not another agent chat. Not agent theater. ECorp is the durable execution plane behind the arcade: multiplayer control, real provider sessions, human authority, and receipts for every mission.
+**Mr. Robot-scale ambition. World's Best Boss energy.** ECorp brings GitHub Copilot, OpenAI Codex,
+Claude Code, and OpenCode into one shared software factory: scoped missions, isolated worktrees,
+live collaboration, and results that have to prove themselves.
+
+## Meet the front office
+
+**[Explore the interactive ECorp product site →](https://ecorp-front-office.shyam-sridhar16.chatgpt.site)**
+
+Walk through the vision, meet the runtimes, and try the guided mission tour before setting up the
+product. The tour is an illustrative browser experience: it does not start agents, connect to your
+repository, or approve real actions. To run actual missions, [start ECorp locally](#start-locally).
+
+## The vision: a company you can actually run
+
+Give your AI crew a place to work together, not just a place to talk. ECorp's ambition is a
+persistent company around your codebase: people set direction, agents take bounded assignments,
+and the organization retains the work, decisions, and evidence after every session.
+
+**Run it together. Build in parallel. Proof before done.** That is both the promise and the
+engineering contract. Here is what the current alpha can do.
 
 ## Press START on real work
 
 1. **Drop the mission.** Define the outcome, references, write scope, provider, model, budget, and verifier policy.
-2. **Build the crew.** Send one focused worker or unleash two independent specialists followed by dependency-gated synthesis.
+2. **Build the crew.** Choose a solo worker, two specialists followed by synthesis, or a three-worker Copilot studio with verified handoffs before integration.
 3. **Light up isolated worktrees.** Every write-capable run gets its own branch and linked workspace. Parallel agents never pile into the configured source checkout.
 4. **Keep human hands on the controls.** Watch live state, steer the active session, queue direction, review the run, or hit an audited emergency stop.
 5. **Make proof mandatory.** Files, commands, tests, schemas, screenshots, human approval, and independent review can all block completion.
-6. **Launch the verified pull request.** Export the exact patch, archive, typed artifact set, commit and branch bundle, or review report that passed. An authorized publisher opens one recoverable PR from that result.
+6. **Launch the verified pull request.** Export the exact patch, archive, typed artifact set, commit and branch bundle, or review report that passed. For factory missions, a separately authorized publisher opens one recoverable PR from that result.
 
 Publication never enables auto-merge and does not merge or deploy.
 
-## The arcade is operational
+## The office is operational
 
-The floor is not decorative animation. Every sprite, cabinet, alert, approval, and score reflects authoritative server, runner, provider, and verification state.
+The floor makes real work visible. Agent activity, mission status, approvals, and verification
+results are projections of authoritative server, runner, and provider state.
 
 - **State survives the screen.** Missions, messages, task graphs, budgets, approvals, and audit events persist in Postgres. Closing the browser or desktop client does not terminate the run.
 - **Work stays off the source checkout.** An outbound-connected runner owns provider processes, isolated worktrees, verification, and artifact collection. The server never executes agent shell commands.
 - **Proof opens the exit.** A run cannot emit accepted completion until its persisted verifier policy passes. Verified factory results can then enter the separately authorized publication lane.
+
+### Assemble a studio, not a static cast
+
+ECorp creates mission-owned workers from the connected runner's capabilities. Choose **Studio team ·
+3 Copilot agents** for visual, gameplay, and quality specialists working in parallel. Their exact
+verified handoff files feed a later integration pass by the gameplay worker.
+
+That is **three workers, four tasks, and four isolated task worktrees**—not a fourth concurrent
+agent or three agents editing the same checkout. Unpinned mission workers retire when their mission
+is terminal and no live control or cleanup obligations remain; their history stays available.
+The [studio implementation and recorded evidence](docs/evidence/2026-09-06-mission-staffing.md)
+spell out the checks and remaining staffing work.
+
+Want to inspect the plan first? **Hold at briefing** saves it on the server as **Awaiting dispatch**.
+It stays held across browser closure and server restart until an authorized launch.
 
 ## Bring your agents
 
@@ -49,13 +83,22 @@ The floor is not decorative animation. Every sprite, cabinet, alert, approval, a
 | --- | --- |
 | **GitHub Copilot** | Official SDK, live account model discovery, model and reasoning selection, streaming, steering, interruption, durable approvals, usage, evidence, and resumable sessions. |
 | **OpenAI Codex** | Native app-server lifecycle with structured output, live steering, interruption, stop, resume, usage, and repository-change evidence. |
-| **Claude Code** | Plugin-free normalized CLI execution with durable stdio approval mediation, streaming, interruption, stop, resume, usage, and common evidence. |
-| **OpenCode** | Plugin-free normalized CLI execution through the same runner, worktree, budget, and evidence contracts. |
+| **Claude Code** | Windows external-CLI execution with durable stdio approval mediation, streaming, interruption, stop, resume, usage, and common evidence. |
+| **OpenCode** | Windows plugin-free external-CLI execution through the same runner, worktree, budget, and evidence contracts. |
 | **Deterministic harness** | Quota-free lifecycle fixture for orchestration, verification, approvals, budgets, retries, and failure paths. |
 
 The provider is not the control plane. Runners advertise their exact capabilities, and ECorp dispatches only when the requested adapter, model, reasoning effort, and workspace identity are compatible.
 
-Claude Code runs without user plugins, hooks, MCP servers, browser integration, slash commands, or auto-memory. Its supported stream-JSON permission requests are bridged into durable ECorp approvals. Complete descendant cleanup and fail-closed teardown remain tracked in [#51](https://github.com/shyamsridhar123/ecorp/issues/51) and [#124](https://github.com/shyamsridhar123/ecorp/issues/124).
+Claude Code runs without user plugins, hooks, MCP servers, browser integration, slash commands, or
+auto-memory. Its supported stream-JSON permission requests are bridged into durable ECorp approvals.
+Windows external-CLI sessions use owned Job Objects and fail-closed descendant teardown. Those
+adapters currently refuse to start on Unix rather than claim equivalent containment. Provider-home
+isolation and stronger sandboxing remain separate work in
+[#51](https://github.com/shyamsridhar123/ecorp/issues/51); see the
+[process-lifecycle evidence](docs/evidence/2026-09-03-external-provider-fail-closed.md).
+
+ECorp is an independent project. Provider names identify integrations, not ownership, sponsorship,
+or endorsement.
 
 ## Evidence is the finish line
 
@@ -71,7 +114,9 @@ Artifact bytes move through bounded staging, content-addressed storage, signed p
 
 ## Start locally
 
-**Prerequisites:** Rust, Node.js, pnpm, Docker, and Windows PowerShell. Provider credentials are optional. The deterministic harness runs without them.
+**Prerequisites:** repository access, Git, Rust 1.94 or newer, Node.js compatible with the pinned
+pnpm/Vite toolchain, pnpm 11.19.0, Docker with Compose, and Windows PowerShell. Provider credentials
+are optional for the deterministic harness; real-agent work requires the selected provider's access.
 
 ```powershell
 git clone https://github.com/shyamsridhar123/ecorp.git
@@ -81,6 +126,9 @@ pnpm install --frozen-lockfile
 ```
 
 Open **http://127.0.0.1:5187**. The script starts Postgres, the Rust control plane, an enrolled outbound runner, and the React operations console, then checks service health and runner connectivity.
+This is your local ECorp console, not the public product-site tour. Use the
+[five-step mission guide](docs/USER_AND_DEVELOPER_JOURNEY.md) for repository confirmation, staffing,
+verification, and review.
 
 To start the configured trusted GitHub Project watcher with the same stack:
 
@@ -171,9 +219,13 @@ Portable deliverables and publication are implemented, not roadmap promises. See
 
 Current boundaries:
 
-- ECorp is not yet a safe sandbox for fully untrusted child processes. Stronger OS or container isolation and descendant-process verification remain open.
+- ECorp is not yet a safe sandbox for fully untrusted child processes. Worktree isolation and
+  Windows external-CLI process containment do not provide a complete filesystem or network sandbox.
 - Development mode uses fixed demo identities, permissive local CORS, a deterministic process running with the local user's permissions, and no network sandbox.
-- External CLI adapters remain lower assurance than the GitHub Copilot SDK path. Claude's durable stdio permission bridge is implemented; isolated provider homes, inherited-environment allowlisting, and fail-closed process-tree teardown remain tracked in [#51](https://github.com/shyamsridhar123/ecorp/issues/51) and [#124](https://github.com/shyamsridhar123/ecorp/issues/124).
+- External CLI adapters have platform and assurance limits. Claude's durable stdio permission
+  bridge and fail-closed Windows process-tree teardown are implemented. Isolated provider homes,
+  inherited-environment allowlisting, and stronger containment remain in
+  [#51](https://github.com/shyamsridhar123/ecorp/issues/51). Unix external-CLI execution is disabled.
 - Production deployments require OIDC, deployment-managed keys, explicit runner enrollment, private S3-compatible artifact storage, and an intentional network policy.
 - The public product is **ECorp**. Existing `crony-*` binaries, `CRONY_` environment variables, and `X-Crony-*` headers remain for compatibility during the transition.
 
@@ -181,19 +233,21 @@ The September 1, 2026 enterprise dogfood report captures the gaps found on that 
 
 ## Documentation
 
-The September 1, 2026 enterprise-application dogfood pass is recorded in
-[`docs/evidence/2026-09-01-enterprise-application-dogfood.md`](docs/evidence/2026-09-01-enterprise-application-dogfood.md).
-It validated two generated applications and exposed gaps that are now either landed or represented
-by current Project #3 issues.
+**[Open the ECorp documentation hub](docs/README.md)** for the product journey, developer setup,
+architecture decisions, branding, and dated evidence. Implementation, historical results, and
+future intent are kept separate.
 
 | Goal | Read |
 | --- | --- |
+| Explore the vision before setup | [Interactive front office](https://ecorp-front-office.shyam-sridhar16.chatgpt.site) |
 | Contribute without conflicting with another mission | [Contributing](CONTRIBUTING.md) and the [dark-factory contributor guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md) |
 | Operate a first mission | [User and developer journey](docs/USER_AND_DEVELOPER_JOURNEY.md) |
+| Work on the actual console or desktop shell | [Web client](apps/web/README.md) and [desktop shell](apps/desktop/README.md) |
 | Understand the planes and state model | [Architecture](docs/ARCHITECTURE.md) |
 | Review shipped controls and current limits | [Security](docs/SECURITY.md) and [threat model](docs/THREAT_MODEL.md) |
 | Inspect the evidence standard | [Evaluation strategy](docs/EVALS.md) |
 | Understand product intent and technical direction | [Product and technical plan](docs/PRODUCT_AND_TECHNICAL_PLAN.md) |
+| Reuse the approved hero and brand voice | [Brand and product-site guide](docs/BRAND_AND_PRODUCT_SITE.md) |
 | Follow live work | [ECorp Build, GitHub Project #3](https://github.com/users/shyamsridhar123/projects/3) |
 | Read historical planning context | [Backlog seed](docs/BACKLOG.md) |
 
