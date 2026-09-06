@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { openSync, closeSync } from 'node:fs'
 import {
@@ -18,6 +19,11 @@ import {
   classifyBoundaryResult,
   summarizeBoundaryResults,
 } from './copilot_probe_boundaries.mjs'
+import {
+  NATIVE_READ_SEED,
+  NATIVE_READBACK,
+  inspectNativeReads,
+} from './copilot_probe_native_read.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -34,6 +40,11 @@ const execFile = promisify(execFileCallback)
 let selectedSource
 const ownedRunIds = new Set()
 const boundaryResults = []
+const nativeReadOnly = process.env.CRONY_PROBE_NATIVE_READ_ONLY === '1'
+assert.ok(!(nativeReadOnly && process.env.CRONY_PROBE_BOUNDARY_ONLY === '1'),
+  'native-read and boundary-only modes are separate acceptance lanes')
+assert.ok(!(nativeReadOnly && process.env.CRONY_PROBE_RECOVER_RUN_ID),
+  'native-read diagnosis cannot resume an application lineage')
 
 await mkdir(probeOutputDirectory, { recursive: true })
 
@@ -237,6 +248,172 @@ async function runBoundaryProbe(caseId, demo, model, title, rejectionNote, requi
 async function environmentObservations() {
   return (await readFile(observationsPath, 'utf8')).trim().split(/\r?\n/u)
     .filter(Boolean).map((line) => JSON.parse(line))
+}
+
+async function exactSessionEvents(sessionId) {
+  if (!sessionId) return []
+  const matches = []
+  for (const file of await eventFiles(path.resolve(eventRoot))) {
+    const text = await readFile(file, 'utf8')
+    const lines = text.split(/\r?\n/u)
+    if (!text.endsWith('\n')) {
+      const tail = lines.pop()
+      if (tail) {
+        try { JSON.parse(tail); lines.push(tail) } catch { /* In-flight final record. */ }
+      }
+    }
+    const events = lines.filter(Boolean).map((line) => JSON.parse(line))
+    if (events.some((event) => event.type === 'session.start' && event.data?.sessionId === sessionId)) {
+      matches.push(events)
+    }
+  }
+  assert.ok(matches.length <= 1, 'provider session appears in conflicting event files')
+  return matches[0] ?? []
+}
+
+async function probeNativeReads(demo, model) {
+  const seedPath = path.join(process.env.ECORP_TEST_SOURCE_REPOSITORY, NATIVE_READ_SEED)
+  const seed = await readFile(seedPath)
+  assert.ok(seed.length > 0 && seed.length <= 1024, 'use a small non-secret committed read fixture')
+  const expectedText = seed.toString('utf8')
+  assert.equal(expectedText.trimEnd().split(/\r?\n/u).length, 1, 'read fixture is one marker line')
+  const seedMetadata = await stat(seedPath)
+  const digest = createHash('sha256').update(seed).digest('hex')
+  const description = `Exercise only the native Copilot filesystem, without shell or network.
+1. Use the built-in view tool to read ${NATIVE_READ_SEED} using that relative path.
+2. Use view again with the exact absolute path to that same file in your assigned worktree.
+3. Use the built-in create tool to copy its actual contents, including the trailing newline,
+into ${NATIVE_READBACK}. Do not copy view's line-number labels.
+4. Use view to read ${NATIVE_READBACK} back.
+Do not inspect other files, use glob/rg as a substitute, invent the marker, or declare a failed
+read successful. Only create ${NATIVE_READBACK}; the runner writes provider evidence.
+The runner, not the model session, verifies the exact output hash after you finish.`
+  const verifier = `const fs=require('node:fs');const c=require('node:crypto');const a=require('node:assert/strict');a.equal(c.createHash('sha256').update(fs.readFileSync('${NATIVE_READBACK}')).digest('hex'),'${digest}');`
+  const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
+    requested_by: demo.alice_actor_id,
+    title: 'Copilot native view — source read and round-trip acceptance',
+    description,
+    preferred_adapter: 'github-copilot',
+    preferred_model: model.id,
+    strategy: 'single',
+    source: selectedSource,
+    budget_tokens: 100_000,
+    contract: {
+      objective: description,
+      expected_output: 'Exact native source read, absolute/relative views and readback.',
+      acceptance_tests: ['Native tool results contain the source marker', 'Persisted output hash passes'],
+      allowed_tools: ['filesystem'],
+      prohibited_actions: ['Use shell', 'Access network', 'Change the seed or files outside the write scope'],
+      references: [],
+      write_scope: [NATIVE_READBACK],
+    },
+    verification_policy: {
+      checks: [
+        { type: 'artifact', min_bytes: 1 },
+        { type: 'file', path: NATIVE_READBACK, min_bytes: 1 },
+        { type: 'test', program: 'node', args: ['-e', verifier], timeout_ms: 10_000 },
+      ],
+      manual_gate: null,
+    },
+  })
+  const launch = await post(`/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`, {
+    requested_by: demo.alice_actor_id,
+  })
+  ownedRunIds.add(launch.run_id)
+  let settled
+  let diagnosticStop = false
+  const deadline = Date.now() + 360_000
+  while (Date.now() < deadline) {
+    const state = await snapshot(demo)
+    const run = state.snapshot.runs.find((candidate) => candidate.id === launch.run_id)
+    const events = await exactSessionEvents(run?.provider_session_id)
+    const reads = inspectNativeReads(events, {
+      sessionId: run?.provider_session_id,
+      workspace: run?.workspace_path ?? '',
+      expectedText,
+    })
+    const approvals = state.snapshot.action_approvals.filter(
+      (approval) => approval.run_id === launch.run_id,
+    )
+    const terminal = run && ['completed', 'failed', 'cancelled', 'lost'].includes(run.status)
+    if (!terminal && !diagnosticStop &&
+        (reads.calls.some((call) => !call.success || !call.content_matches_expected) ||
+         approvals.length > 0)) {
+      // Stop only this diagnostic's run on observed failure; never burn a fresh
+      // budget trying to turn missing-file responses into a claimed read.
+      for (const approval of approvals.filter((candidate) => candidate.status === 'pending')) {
+        await rejectApproval(demo, approval, 'Native-read fixture never authorizes a fallback effect.')
+      }
+      await post(`/api/corps/${demo.corp_id}/agents/${run.agent_id}/emergency-stop`, {
+        actor_id: demo.alice_actor_id,
+        reason: 'Native-read diagnostic observed a failed native view or unexpected approval.',
+      })
+      diagnosticStop = true
+    }
+    if (terminal && ['preserved', 'removed'].includes(run.workspace_disposition)) {
+      settled = { run, state, reads }
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  assert.ok(settled, 'native-read diagnostic did not settle within its deadline')
+  const events = await exactSessionEvents(settled.run.provider_session_id)
+  const reads = inspectNativeReads(events, {
+    sessionId: settled.run.provider_session_id,
+    workspace: settled.run.workspace_path,
+    expectedText,
+  })
+  assert.ok(events.length > 0, 'native-read evidence requires a real provider event stream')
+  assert.ok(!JSON.stringify(events).includes(credentialCanary),
+    'credential canary leaked into native-read provider events')
+  const output = await readFile(path.join(settled.run.workspace_path, NATIVE_READBACK))
+    .catch((error) => { if (error.code === 'ENOENT') return null; throw error })
+  const approvals = settled.state.snapshot.action_approvals.filter(
+    (approval) => approval.run_id === launch.run_id,
+  )
+  assert.deepEqual(await readFile(seedPath), seed, 'configured source was changed')
+  assert.equal((await stat(seedPath)).mtimeMs, seedMetadata.mtimeMs, 'configured source was touched')
+  const shell = await shellTelemetrySince(probeStartedAt)
+  assert.equal(shell.length, 0, 'native-read diagnostic executed model-session shell')
+  const observations = await environmentObservations()
+  const runnerSpawn = observations.find((entry) => entry.kind === 'runner_spawn' && entry.probe_id === probeId)
+  const providers = observations.filter((entry) => entry.kind === 'copilot_environment' &&
+    entry.probe_id === probeId && entry.parent_pid === runnerSpawn?.child_pid)
+  assert.ok(observations.some((entry) => entry.kind === 'runner_environment' &&
+    entry.probe_id === probeId && entry.canary_present === true))
+  assert.ok(providers.length >= 2, 'catalog and real session environments must be observed')
+  assert.ok(providers.every((entry) => entry.canary_present === false && entry.github_token_present === false))
+  const runtimePinned = providers.every((entry) => entry.auto_update_disabled_by_flag === true)
+  const passed = reads.complete && output?.equals(seed) &&
+    settled.run.status === 'completed' && settled.run.verification_status === 'passed' &&
+    approvals.length === 0 && runtimePinned
+  const report = {
+    checked_at: new Date().toISOString(),
+    mode: 'native_read_only',
+    status: passed ? 'passed' : 'failed',
+    run_id: settled.run.id,
+    provider_session_id: settled.run.provider_session_id,
+    selected_model: model.id,
+    source: selectedSource,
+    source_sha256: digest,
+    output_sha256: output ? createHash('sha256').update(output).digest('hex') : null,
+    source_unchanged: true,
+    native_reads: reads,
+    run_status: settled.run.status,
+    verification_status: settled.run.verification_status,
+    diagnostic_stop: diagnosticStop,
+    durable_approval_count: approvals.length,
+    shell_executions: shell.length,
+    observed_provider_processes: providers.length,
+    auto_update_disabled_by_flag: runtimePinned,
+    source_line_endings: expectedText.endsWith('\r\n') ? 'crlf' : 'lf',
+    input_tokens: settled.run.input_tokens,
+    output_tokens: settled.run.output_tokens,
+  }
+  await writeFile(path.join(probeOutputDirectory, 'e2e-copilot-native-read.json'),
+    `${JSON.stringify(report, null, 2)}\n`)
+  console.log(JSON.stringify(report, null, 2))
+  assert.ok(passed, 'real native view/readback acceptance did not pass')
 }
 
 async function buildBrowserGame(demo, model, recoveryRun = null) {
@@ -524,6 +701,9 @@ const model = requestedModel
 assert.ok(model, `Copilot returned no enabled model matching ${requestedModel ?? 'the default selection'}`)
 if (recoveryRun) assert.equal(model.id, recoveryRun.model, 'resume must retain the original model')
 
+if (nativeReadOnly) {
+  await probeNativeReads(demo, model)
+} else {
 const launch = await launchMission(
   demo,
   model,
@@ -738,6 +918,7 @@ console.log(
 )
 assert.equal(boundaryMatrix.complete, true,
   `live permission coverage is incomplete: ${JSON.stringify(boundaryMatrix)}`)
+}
 } finally {
   // The supervisor retains the live ChildProcess handle. Do not kill historical
   // PIDs from the observation file: they can have exited and been reused.

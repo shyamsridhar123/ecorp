@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
+import { createFsWireObserver } from './copilot_fs_wire_observer.mjs'
 
 const canary = 'ECORP_CREDENTIAL_CANARY_MUST_NOT_REACH_COPILOT'
 const [role, binary, ...args] = process.argv.slice(2)
@@ -23,6 +24,7 @@ appendFileSync(
     parent_pid: process.ppid,
     canary_present: canaryPresent,
     github_token_present: Object.hasOwn(process.env, 'GITHUB_TOKEN'),
+    auto_update_disabled_by_flag: role === 'copilot' && args.includes('--no-auto-update'),
   })}\n`,
 )
 assert.equal(canaryPresent, expected, `${role} canary precondition failed`)
@@ -30,7 +32,34 @@ assert.ok(
   expected ? process.env.GITHUB_TOKEN === canary : !Object.hasOwn(process.env, 'GITHUB_TOKEN'),
   `${role} inherited credential boundary failed`,
 )
-const child = spawn(binary, args, { stdio: 'inherit', windowsHide: true })
+const traceWire = role === 'copilot' && process.env.ECORP_COPILOT_FS_WIRE === '1'
+const child = spawn(binary, args, {
+  stdio: traceWire ? ['pipe', 'pipe', 'inherit'] : 'inherit',
+  windowsHide: true,
+})
+if (traceWire) {
+  const observer = createFsWireObserver((record) => {
+    appendFileSync(process.env.ECORP_COPILOT_ENV_OBSERVATIONS, `${JSON.stringify({
+      kind: 'copilot_fs_wire',
+      probe_id: process.env.ECORP_COPILOT_PROBE_ID,
+      pid: process.pid,
+      ...record,
+    })}\n`)
+  })
+  child.stdout.on('data', observer.fromCli)
+  process.stdin.on('data', observer.fromSdk)
+  process.stdin.pipe(child.stdin)
+  child.stdout.pipe(process.stdout)
+  child.on('close', () => {
+    process.stdin.unpipe(child.stdin)
+    process.stdin.off('data', observer.fromSdk)
+    process.stdin.pause()
+  })
+  child.stdin.on('error', (error) => {
+    if (error.code !== 'EPIPE') console.error('Copilot diagnostic input stream failed')
+    process.stdin.unpipe(child.stdin)
+  })
+}
 appendFileSync(
   process.env.ECORP_COPILOT_ENV_OBSERVATIONS,
   `${JSON.stringify({

@@ -283,6 +283,27 @@ checks that partial/duplicate/cross-run evidence cannot silently become complete
 Set `CRONY_PROBE_PRESERVE_DEMO=1` to retain earlier test history instead of resetting the specified
 development server.
 
+`CRONY_PROBE_NATIVE_READ_ONLY=1` selects the separate #153 native-read regression. It is mutually
+exclusive with boundary-only and application-resume modes. Use a clean disposable Git source with
+a small committed `native-read-seed.txt` containing one non-secret marker line. The diagnostic
+requires actual successful `view` results for relative and absolute source paths and a newly
+created readback file; provider self-report or final file existence cannot substitute. A
+persisted verifier checks the exact readback hash, source bytes/mtime remain unchanged, no
+routine approvals or shell executions are allowed, and the process observer must see the
+product's no-auto-update flag. The first failed relevant view or unexpected approval stops only
+that diagnostic run rather than burning its remaining budget. A Windows-native CRLF fixture
+tests byte-exact round-trip behavior; the earlier LF-to-CRLF copy failure is retained, not
+normalized into a pass.
+
+`ECORP_COPILOT_FS_WIRE=1` optionally enables the test-only, transparent metadata observer for
+Content-Length-framed `sessionFs.stat` / `sessionFs.exists` exchanges. It forwards original bytes
+unchanged, bounds frame/pending-request memory, and records only response shape, boolean fields,
+identifier type and date validity. Paths, file contents, credentials and unrelated RPC payloads
+are not logged. The native-read and wire-observer Node tests exercise these negative cases and
+exact transport forwarding. See
+`docs/evidence/2026-09-06-copilot-native-read-runtime.md` for the before/after evidence and runtime
+version controls.
+
 For a preserved verification-failed run, `CRONY_PROBE_RECOVER_RUN_ID` plus its original
 `CRONY_COPILOT_EVENT_ROOT` exercises the existing resume API. It retains the source, task, model,
 provider session, worktree, and verifier policy; supplies bounded verifier feedback; and permits at

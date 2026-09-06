@@ -133,6 +133,20 @@ path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
+Managed local Copilot processes receive `--no-auto-update` during catalog discovery, create, and
+resume. A selected SDK/runtime pair must not silently forward to a downloaded replacement.
+The current verified pair is Rust SDK `1.0.11` with CLI `1.0.79`; the adapter checks the connected
+runtime version before exposing models or starting a session. An incompatible runtime is rejected
+before provider-backed work, including an explicit CLI or remote-runtime override. This version
+check is a compatibility gate, not proof of operating-system isolation or a substitute for the
+filesystem, approval, environment, and verifier boundaries.
+
+Windows ordinary and extended drive/UNC spellings compare by their drive or server/share
+identity before the existing component-by-component boundary check. This does not canonicalize an
+untrusted path with ambient filesystem access or accept another drive, share, sibling prefix,
+device namespace, traversal, Git control path, or alternate data stream. Actual I/O still uses
+the retained directory capabilities and the existing link/opened-file checks.
+
 GitHub Copilot receives a native SDK managed-settings layer on every create and resume. The runtime
 is told to disable bypass-permissions mode. Native read and write tools may proceed without a
 second ECorp prompt only because built-in filesystem operations are routed through an ECorp

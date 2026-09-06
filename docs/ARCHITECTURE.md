@@ -129,6 +129,16 @@ approval text contains bounded metadata and hashes rather than raw tool input. R
 interrupt, provider cancellation, or breaker termination denies or clears the pending request
 before terminal session reporting. Unknown and duplicate decisions cannot select another request.
 
+## Copilot runtime compatibility
+
+The checked-in Copilot SDK and its verified CLI are one execution dependency pair. Managed
+local processes receive `--no-auto-update`; catalog discovery, new sessions and resume validate
+the connected runtime version before accepting provider work. The current pair is SDK `1.0.11`
+and CLI `1.0.79`. A runtime override is not permission to silently select an unverified CLI.
+Version checks do not replace worktree capabilities, permissions, process ownership or verifier
+evidence. The native-read regression validates real relative/absolute view results and exact
+readback bytes through the server and runner.
+
 ## Budgets and circuit breaking
 
 Run, mission, requester, and Corp token/cost limits are evaluated after usage events. Explicit

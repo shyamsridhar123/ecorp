@@ -12,6 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use github_copilot_sdk::session_fs::{
     DirEntry, DirEntryKind, FileInfo, FsError, FsErrorKind, SessionFsProvider,
 };
+use sha2::{Digest, Sha256};
 
 pub(super) struct ContainedSessionFs {
     workspace: PathBuf,
@@ -80,6 +81,11 @@ impl ContainedSessionFs {
             &state_directory,
             ambient_authority(),
         )?);
+        tracing::debug!(
+            workspace_form = path_form(&workspace),
+            state_form = path_form(&state_directory),
+            "Created Copilot session filesystem capabilities"
+        );
         Ok(Self {
             workspace,
             state_directory,
@@ -158,31 +164,64 @@ impl ContainedSessionFs {
         T: Send + 'static,
         F: FnOnce(ScopedPath) -> Result<T, FsError> + Send + 'static,
     {
-        let path = if mutation {
-            self.resolve_destructive(raw)?
+        let resolved = if mutation {
+            self.resolve_destructive(raw)
         } else {
-            self.resolve(raw)?
+            self.resolve(raw)
         };
-        tokio::task::spawn_blocking(move || {
+        let path = resolved.inspect_err(|_| {
+            // Metadata only: never log paths, file contents or credentials.
+            tracing::debug!(
+                phase = "resolve",
+                mutation,
+                request_form = path_form(Path::new(raw)),
+                workspace_form = path_form(&self.workspace),
+                state_form = path_form(&self.state_directory),
+                "Copilot session filesystem rejected a path"
+            );
+        })?;
+        let result = tokio::task::spawn_blocking(move || {
             path.check_links()?;
             operation(path)
         })
         .await
         .map_err(|_| {
             FsError::with_message(FsErrorKind::Other, "session filesystem worker failed")
-        })?
+        })?;
+        result.inspect_err(|error| {
+            tracing::debug!(
+                phase = "operation",
+                mutation,
+                request_form = path_form(Path::new(raw)),
+                error_class = if matches!(error.kind(), FsErrorKind::NotFound(_)) {
+                    "not_found"
+                } else {
+                    "other"
+                },
+                "Copilot session filesystem operation failed"
+            );
+        })
     }
 }
 
 #[async_trait]
 impl SessionFsProvider for ContainedSessionFs {
     async fn read_file(&self, path: &str) -> Result<String, FsError> {
-        self.access(path, false, |path| {
-            let mut text = String::new();
-            path.open_file(false, false)?.read_to_string(&mut text)?;
-            Ok(text)
-        })
-        .await
+        let result = self
+            .access(path, false, |path| {
+                let mut text = String::new();
+                path.open_file(false, false)?.read_to_string(&mut text)?;
+                Ok(text)
+            })
+            .await;
+        tracing::debug!(
+            operation = "read_file",
+            request_form = path_form(Path::new(path)),
+            path_sha256 = %hex::encode(Sha256::digest(path.as_bytes())),
+            success = result.is_ok(),
+            "Copilot session filesystem response"
+        );
+        result
     }
 
     async fn write_file(
@@ -223,36 +262,56 @@ impl SessionFsProvider for ContainedSessionFs {
     }
 
     async fn exists(&self, path: &str) -> Result<bool, FsError> {
-        self.access(path, false, |path| {
-            match path.dir.symlink_metadata(directory_path(&path.relative)) {
-                Ok(_) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error.into()),
-            }
-        })
-        .await
+        let result = self
+            .access(path, false, |path| {
+                match path.dir.symlink_metadata(directory_path(&path.relative)) {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await;
+        tracing::debug!(
+            operation = "exists",
+            request_form = path_form(Path::new(path)),
+            path_sha256 = %hex::encode(Sha256::digest(path.as_bytes())),
+            exists = ?result.as_ref().ok().copied(),
+            success = result.is_ok(),
+            "Copilot session filesystem response"
+        );
+        result
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo, FsError> {
-        self.access(path, false, |path| {
-            let metadata = path.dir.symlink_metadata(directory_path(&path.relative))?;
-            let modified = metadata
-                .modified()
-                .map(|time| time.into_std())
-                .unwrap_or(UNIX_EPOCH);
-            let created = metadata
-                .created()
-                .map(|time| time.into_std())
-                .unwrap_or(modified);
-            Ok(FileInfo::new(
-                metadata.is_file(),
-                metadata.is_dir(),
-                i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-                timestamp(modified),
-                timestamp(created),
-            ))
-        })
-        .await
+        let result = self
+            .access(path, false, |path| {
+                let metadata = path.dir.symlink_metadata(directory_path(&path.relative))?;
+                let modified = metadata
+                    .modified()
+                    .map(|time| time.into_std())
+                    .unwrap_or(UNIX_EPOCH);
+                let created = metadata
+                    .created()
+                    .map(|time| time.into_std())
+                    .unwrap_or(modified);
+                Ok(FileInfo::new(
+                    metadata.is_file(),
+                    metadata.is_dir(),
+                    i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+                    timestamp(modified),
+                    timestamp(created),
+                ))
+            })
+            .await;
+        tracing::debug!(
+            operation = "stat",
+            request_form = path_form(Path::new(path)),
+            path_sha256 = %hex::encode(Sha256::digest(path.as_bytes())),
+            is_file = ?result.as_ref().ok().map(|info| info.is_file),
+            success = result.is_ok(),
+            "Copilot session filesystem response"
+        );
+        result
     }
 
     async fn mkdir(&self, path: &str, recursive: bool, mode: Option<i64>) -> Result<(), FsError> {
@@ -390,15 +449,27 @@ fn outside_boundary(path: &str) -> FsError {
     )
 }
 
+fn path_form(path: &Path) -> &'static str {
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            std::path::Prefix::Disk(_) => "windows_disk",
+            std::path::Prefix::VerbatimDisk(_) => "windows_verbatim_disk",
+            std::path::Prefix::UNC(_, _) => "windows_unc",
+            std::path::Prefix::VerbatimUNC(_, _) => "windows_verbatim_unc",
+            std::path::Prefix::DeviceNS(_) => "windows_device",
+            std::path::Prefix::Verbatim(_) => "windows_other_verbatim",
+        },
+        Some(Component::RootDir) => "rooted",
+        _ => "relative",
+    }
+}
+
 fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
     let mut path = path.components().filter(|part| *part != Component::CurDir);
     for expected in base.components().filter(|part| *part != Component::CurDir) {
         let actual = path.next()?;
         #[cfg(windows)]
-        let matches = actual
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy());
+        let matches = windows_component_matches(actual, expected);
         #[cfg(not(windows))]
         let matches = actual == expected;
         if !matches {
@@ -406,6 +477,31 @@ fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
         }
     }
     Some(path.collect())
+}
+
+#[cfg(windows)]
+fn windows_component_matches(actual: Component<'_>, expected: Component<'_>) -> bool {
+    use std::path::Prefix;
+
+    let same = |left: &std::ffi::OsStr, right: &std::ffi::OsStr| {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    };
+    match (actual, expected) {
+        (Component::Prefix(left), Component::Prefix(right)) => match (left.kind(), right.kind()) {
+            (
+                Prefix::Disk(left) | Prefix::VerbatimDisk(left),
+                Prefix::Disk(right) | Prefix::VerbatimDisk(right),
+            ) => left.eq_ignore_ascii_case(&right),
+            (
+                Prefix::UNC(left_server, left_share) | Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::UNC(right_server, right_share)
+                | Prefix::VerbatimUNC(right_server, right_share),
+            ) => same(left_server, right_server) && same(left_share, right_share),
+            _ => same(left.as_os_str(), right.as_os_str()),
+        },
+        _ => same(actual.as_os_str(), expected.as_os_str()),
+    }
 }
 
 fn unsafe_component(name: &str) -> bool {
@@ -457,6 +553,89 @@ fn timestamp(value: SystemTime) -> String {
 mod tests {
     use super::*;
     use tokio::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn namespace_spelling_does_not_authorize_another_root_or_device() {
+        let base = Path::new(r"C:\assigned\workspace");
+        for rejected in [
+            r"\\?\D:\assigned\workspace\seed.txt",
+            r"\\?\C:\assigned\workspace-other\seed.txt",
+            r"\\.\C:\assigned\workspace\seed.txt",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\assigned\workspace\seed.txt",
+            r"\\server\share\assigned\workspace\seed.txt",
+        ] {
+            assert!(
+                relative_to(Path::new(rejected), base).is_none(),
+                "{rejected}"
+            );
+        }
+        let unc = Path::new(r"\\server\share\assigned");
+        assert_eq!(
+            relative_to(Path::new(r"\\?\UNC\SERVER\SHARE\assigned\seed.txt"), unc),
+            Some(PathBuf::from("seed.txt")),
+        );
+        for rejected in [
+            r"\\?\UNC\other\share\assigned\seed.txt",
+            r"\\?\UNC\server\other\assigned\seed.txt",
+        ] {
+            assert!(
+                relative_to(Path::new(rejected), unc).is_none(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_windows_namespace_paths_read_the_same_capability_scoped_file() {
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("crony-copilot-namespace-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace with spaces");
+        let state = root.join("state");
+        fs::create_dir_all(&workspace).await.expect("workspace");
+        fs::create_dir_all(&state).await.expect("state");
+        let seed = workspace.join("seed.txt");
+        fs::write(&seed, "native read marker\n")
+            .await
+            .expect("seed");
+        let canonical_workspace = fs::canonicalize(&workspace)
+            .await
+            .expect("canonical workspace");
+        let canonical_seed = fs::canonicalize(&seed).await.expect("canonical seed");
+        assert_eq!(path_form(&canonical_seed), "windows_verbatim_disk");
+        // Compare namespace spellings only, not a short-name alias in TEMP.
+        let ordinary_workspace = PathBuf::from(
+            canonical_workspace
+                .to_string_lossy()
+                .strip_prefix(r"\\?\")
+                .expect("drive namespace"),
+        );
+        let ordinary_seed = ordinary_workspace.join("seed.txt");
+        let provider =
+            ContainedSessionFs::new(ordinary_workspace, state.clone(), vec!["**".to_owned()])
+                .expect("capability roots");
+        let exists = provider.exists(&canonical_seed.to_string_lossy()).await;
+        let read = provider.read_file(&canonical_seed.to_string_lossy()).await;
+        let stat = provider.stat(&canonical_seed.to_string_lossy()).await;
+        drop(provider);
+        let provider = ContainedSessionFs::new(canonical_workspace, state, vec!["**".to_owned()])
+            .expect("canonical capability roots");
+        let reverse = provider.read_file(&ordinary_seed.to_string_lossy()).await;
+        drop(provider);
+        assert!(
+            root.starts_with(&temporary),
+            "fixture cleanup stays in temporary root"
+        );
+        fs::remove_dir_all(&root).await.expect("cleanup");
+        assert!(exists.expect("namespaced existence"));
+        assert_eq!(read.expect("namespaced read"), "native read marker\n");
+        assert!(stat.expect("namespaced metadata").is_file);
+        assert_eq!(
+            reverse.expect("ordinary path against canonical root"),
+            "native read marker\n"
+        );
+    }
 
     #[cfg(any(unix, windows))]
     fn symlink_file(target: &Path, link: &Path) {

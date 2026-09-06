@@ -38,6 +38,10 @@ use super::{
     permission::{path_is_inside, path_is_inside_workspace},
 };
 
+// Keep this aligned with the checked-in SDK/runtime pair and real conformance
+// evidence. The experimental filesystem contract is not safely version-agnostic.
+const SUPPORTED_COPILOT_RUNTIME: &str = "1.0.79";
+
 #[derive(Debug, Clone)]
 pub struct CopilotSdkConfig {
     pub cli_path: Option<PathBuf>,
@@ -224,8 +228,14 @@ impl CopilotSdkAdapter {
                 .await?,
             });
         } else {
-            options =
-                options.with_extra_args(["--experimental", "--sandbox", "--disallow-temp-dir"]);
+            // The selected runtime is part of this governed execution boundary.
+            // Do not silently download/forward to a different CLI mid-run.
+            options = options.with_extra_args([
+                "--no-auto-update",
+                "--experimental",
+                "--sandbox",
+                "--disallow-temp-dir",
+            ]);
             if let Some(path) = &self.config.cli_path {
                 options = options
                     .with_program(CliProgram::Path(path.clone()))
@@ -247,12 +257,31 @@ impl CopilotSdkAdapter {
         self.config.base_directory.join(&digest[..24])
     }
 
+    async fn checked_client(&self, workspace: &Path) -> Result<Client, AdapterError> {
+        let client = Client::start(self.client_options(workspace).await?)
+            .await
+            .map_err(sdk_error)?;
+        let status = match client.get_status().await {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = client.stop().await;
+                return Err(sdk_error(error));
+            }
+        };
+        if !runtime_version_is_supported(&status.version) {
+            let _ = client.stop().await;
+            return Err(AdapterError::Runtime(anyhow!(
+                "Copilot runtime does not match the verified version {SUPPORTED_COPILOT_RUNTIME}; \
+                 use the SDK-bundled runtime or a matching explicit binary"
+            )));
+        }
+        Ok(client)
+    }
+
     async fn sdk_models_uncached(&self) -> Result<Vec<AdapterModel>, AdapterError> {
         let catalog_workspace = self.config.base_directory.join("catalog-workspace");
         tokio::fs::create_dir_all(&catalog_workspace).await?;
-        let client = Client::start(self.client_options(&catalog_workspace).await?)
-            .await
-            .map_err(sdk_error)?;
+        let client = self.checked_client(&catalog_workspace).await?;
         let models = client
             .list_models()
             .await
@@ -285,9 +314,7 @@ impl CopilotSdkAdapter {
         tokio::fs::create_dir_all(&request.workspace).await?;
         let state_directory = self.state_directory(&request.workspace);
         tokio::fs::create_dir_all(&state_directory).await?;
-        let client = Client::start(self.client_options(&request.workspace).await?)
-            .await
-            .map_err(sdk_error)?;
+        let client = self.checked_client(&request.workspace).await?;
         configure_native_sandbox(&client, &request.workspace).await?;
         let pending = Arc::new(DashMap::new());
         let session_fs = Arc::new(ContainedSessionFs::new(
@@ -565,6 +592,10 @@ impl CopilotSdkAdapter {
         });
         Ok(AdapterExit::Completed)
     }
+}
+
+fn runtime_version_is_supported(version: &str) -> bool {
+    version == SUPPORTED_COPILOT_RUNTIME
 }
 
 #[async_trait]
@@ -1305,6 +1336,52 @@ mod tests {
             assert_eq!(sink.events.lock().expect("events").len(), 1);
         }
         tokio::fs::remove_dir_all(root).await.expect("cleanup");
+    }
+
+    #[test]
+    fn unverified_runtime_versions_do_not_advertise_native_filesystem_support() {
+        assert!(runtime_version_is_supported("1.0.79"));
+        for version in [
+            "",
+            "1.0.83",
+            "0.0.394",
+            "1.0.79-preview",
+            "1.0.79\nuntrusted",
+        ] {
+            assert!(!runtime_version_is_supported(version), "{version:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cli_launch_preserves_runtime_and_sandbox_policy() {
+        let root = std::env::temp_dir().join("ecorp-client-options-only");
+        let adapter = CopilotSdkAdapter::new(CopilotSdkConfig {
+            cli_path: None,
+            cli_prefix_args: Vec::new(),
+            external_host: None,
+            external_port: None,
+            github_token_file: None,
+            connection_token_file: None,
+            base_directory: root.join("state"),
+            use_logged_in_user: false,
+            log_level: "error".to_owned(),
+            fixture: false,
+        });
+        for name in ["initial", "resumed"] {
+            let options = adapter
+                .client_options(&root.join(name))
+                .await
+                .expect("local client policy");
+            assert_eq!(
+                options.extra_args,
+                vec![
+                    "--no-auto-update",
+                    "--experimental",
+                    "--sandbox",
+                    "--disallow-temp-dir",
+                ]
+            );
+        }
     }
 
     #[test]
