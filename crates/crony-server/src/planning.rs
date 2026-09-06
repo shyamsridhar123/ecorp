@@ -5,8 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use crony_domain::{
-    Agent, AgentStatus, DeliverableSpec, ManualVerificationGate, PlannedTask, TaskContract,
-    TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
+    Agent, AgentStatus, DeliverableForm, DeliverableSpec, ManualVerificationGate, PlannedTask,
+    TaskContract, TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
     repository_relative_path_is_valid, write_scope_is_valid,
 };
 
@@ -33,6 +33,7 @@ pub struct PlanningRequest<'a> {
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
     pub deliverable: Option<&'a DeliverableSpec>,
+    pub handoff_root: Option<&'a str>,
 }
 
 pub trait ManagerStrategy: Send + Sync {
@@ -50,6 +51,7 @@ impl StrategyRegistry {
         let strategies: Vec<Arc<dyn ManagerStrategy>> = vec![
             Arc::new(SingleTaskStrategy),
             Arc::new(ParallelSpecialistsStrategy),
+            Arc::new(StudioSwarmStrategy),
             Arc::new(VerificationMatrixStrategy),
             Arc::new(VerificationFailureStrategy),
             Arc::new(HumanApprovalStrategy),
@@ -127,6 +129,7 @@ impl ManagerStrategy for SingleTaskStrategy {
             max_depth: 0,
             budget_tokens,
             budget_cost_microusd,
+            staffing: Vec::new(),
             tasks: vec![PlannedTask {
                 key: "deliver".to_owned(),
                 title: "Produce the mission outcome".to_owned(),
@@ -208,6 +211,7 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             max_depth: 1,
             budget_tokens: total_budget,
             budget_cost_microusd: total_cost_budget,
+            staffing: Vec::new(),
             tasks: vec![
                 PlannedTask {
                     key: "specialist-a".to_owned(),
@@ -271,6 +275,241 @@ impl ManagerStrategy for ParallelSpecialistsStrategy {
             ],
         })
     }
+}
+
+struct StudioSwarmStrategy;
+
+impl ManagerStrategy for StudioSwarmStrategy {
+    fn id(&self) -> &'static str {
+        "studio-swarm"
+    }
+
+    fn plan(&self, request: &PlanningRequest<'_>, agents: &[Agent]) -> Result<TaskGraphPlan> {
+        if request
+            .preferred_adapter
+            .is_some_and(|adapter| adapter != "github-copilot")
+        {
+            return Err(anyhow!(
+                "studio-swarm requires github-copilot or an omitted requested adapter"
+            ));
+        }
+        let mut identities = HashSet::new();
+        let candidates = ordered_candidates(agents)
+            .into_iter()
+            .filter(|agent| agent.role != "manager" && agent.adapter == "github-copilot")
+            .filter(|agent| identities.insert(agent.id))
+            .collect::<Vec<_>>();
+        let roles = [
+            (
+                "visual-direction",
+                "visual and interaction direction",
+                "Visual hierarchy, interaction states, accessibility, and responsive layout decisions",
+                "Specify concrete visual tokens, interaction states, keyboard/focus behavior, and responsive layouts that integration can implement.",
+            ),
+            (
+                "gameplay-systems",
+                "gameplay and systems architecture",
+                "Deterministic mechanics, state transitions, data contracts, and module boundaries",
+                "Specify deterministic rules, state transitions, module interfaces, and edge cases with enough detail for implementation without further design work.",
+            ),
+            (
+                "quality-verification",
+                "quality and verification design",
+                "Executable test cases, browser acceptance checks, accessibility, and performance criteria",
+                "Specify reproducible test inputs and expected results, browser acceptance steps, accessibility checks, performance limits, and failure cases; distinguish proposed checks from observed evidence.",
+            ),
+        ];
+        // Reserve every explicit staffing role before a generic worker fills an unmatched role.
+        let mut workers =
+            roles.map(|(key, ..)| candidates.iter().copied().find(|agent| agent.role == key));
+        let mut assigned = workers
+            .iter()
+            .flatten()
+            .map(|agent| agent.id)
+            .collect::<HashSet<_>>();
+        for worker in workers.iter_mut().filter(|worker| worker.is_none()) {
+            *worker = candidates
+                .iter()
+                .copied()
+                .find(|agent| assigned.insert(agent.id));
+        }
+        let [Some(visual), Some(gameplay), Some(quality)] = workers else {
+            return Err(anyhow!(
+                "studio-swarm requires three distinct non-retired github-copilot workers"
+            ));
+        };
+        let workers = [visual, gameplay, quality];
+        let handoff_root = request.handoff_root.unwrap_or("handoffs");
+        let total_budget = request.budget_tokens.unwrap_or(2_000_000);
+        let total_cost_budget = request.budget_cost_microusd.unwrap_or(6_000_000);
+        let (specialist_budget, integration_budget) = studio_budget_split(total_budget)?;
+        let (specialist_cost_budget, integration_cost_budget) =
+            studio_budget_split(total_cost_budget)?;
+        let mut tasks = Vec::with_capacity(4);
+        for ((key, focus, expected_output, acceptance), agent) in roles.into_iter().zip(&workers) {
+            let path = studio_handoff_path(handoff_root, key)?;
+            let mut task_contract = contract(
+                format!(
+                    "Produce only the {focus} technical handoff for this mission: {}\n\
+                     Write exactly one concise UTF-8 Markdown handoff at {path}, at most 12 KiB \
+                     (12288 bytes). Use only Copilot native file tools to read relevant files and \
+                     create or edit the handoff, including scoped directory creation if needed. \
+                     No shell commands are needed or allowed. Do not inspect unrelated repository \
+                     files, implement the final product, modify other files, or create commits. \
+                     The integration task receives the verified handoff contents, not your \
+                     conversational context or access to your worktree.",
+                    request.mission_title
+                ),
+                &format!("{path}: {expected_output}; a self-contained technical Markdown handoff"),
+                specialist_budget,
+            );
+            task_contract.budget_cost_microusd = specialist_cost_budget;
+            task_contract.model = request.preferred_model.map(str::to_owned);
+            task_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+            task_contract.allowed_tools = vec!["filesystem".to_owned()];
+            task_contract.prohibited_actions.extend([
+                "execute shell commands".to_owned(),
+                "modify files outside the exact handoff write scope".to_owned(),
+                "implement the final deliverable before integration".to_owned(),
+                "create commits, publish, merge, or deploy".to_owned(),
+            ]);
+            task_contract.write_scope = vec![path.clone()];
+            task_contract.acceptance_tests.extend([
+                acceptance.to_owned(),
+                "The handoff is non-empty UTF-8 Markdown, at most 12 KiB (12288 bytes), with concrete decisions, constraints, and verification guidance rather than a transcript.".to_owned(),
+                "Only the exact declared handoff file is changed and exported; no implementation files or commits are produced.".to_owned(),
+            ]);
+            task_contract.deliverable = Some(DeliverableSpec {
+                form: DeliverableForm::TypedArtifactSet,
+                commit_after_verification: false,
+                paths: vec![path.clone()],
+            });
+            tasks.push(PlannedTask {
+                key: key.to_owned(),
+                title: format!("{} {focus} pass", agent.name),
+                contract: task_contract,
+                assigned_agent_id: agent.id,
+                required_adapter: agent.adapter.clone(),
+                depends_on: Vec::new(),
+                depth: 0,
+                max_attempts: 2,
+                verification_policy: VerificationPolicy {
+                    checks: vec![
+                        VerifierCheck::File { path: path.clone(), min_bytes: 1 },
+                        VerifierCheck::Artifact { min_bytes: 1 },
+                        VerifierCheck::Command {
+                            program: "node".to_owned(),
+                            args: vec![
+                                "-e".to_owned(),
+                                "const b=require('node:fs').readFileSync(process.argv[1]);new TextDecoder('utf-8',{fatal:true}).decode(b);if(b.length>12288)process.exit(1)".to_owned(),
+                                path,
+                            ],
+                            timeout_ms: 5_000,
+                        },
+                    ],
+                    manual_gate: None,
+                },
+            });
+        }
+
+        let mut integration_contract = contract(
+            format!(
+                "After all three studio specialist tasks complete, consume every verified handoff \
+                 and integrate the final repository deliverable for this mission: {}\n\
+                 Apply the visual-direction, gameplay-systems, and quality-verification decisions \
+                 and acceptance checks. If any verified handoff content is missing or unusable, \
+                 escalate rather than guessing from task names or reading sibling worktrees.",
+                request.mission_title
+            ),
+            "The requested final repository deliverable, incorporating all three technical handoffs and concrete verification evidence",
+            integration_budget,
+        );
+        integration_contract.budget_cost_microusd = integration_cost_budget;
+        integration_contract.model = request.preferred_model.map(str::to_owned);
+        integration_contract.reasoning_effort = request.reasoning_effort.map(str::to_owned);
+        integration_contract.references = tasks
+            .iter()
+            .map(|task| format!("task:{}", task.key))
+            .collect();
+        integration_contract.acceptance_tests.extend([
+            "Consume all three verified handoffs and explain how their decisions and acceptance checks are reflected in the final deliverable.".to_owned(),
+            "Produce the requested final deliverable and report concrete verification results, including any unresolved limitations.".to_owned(),
+        ]);
+        integration_contract.deliverable = request.deliverable.cloned();
+        let dependencies = tasks.iter().map(|task| task.key.clone()).collect();
+        tasks.push(PlannedTask {
+            key: "studio-integration".to_owned(),
+            title: format!("{} studio integration", gameplay.name),
+            contract: integration_contract,
+            assigned_agent_id: gameplay.id,
+            required_adapter: gameplay.adapter.clone(),
+            depends_on: dependencies,
+            depth: 1,
+            max_attempts: 2,
+            verification_policy: artifact_policy(),
+        });
+        Ok(TaskGraphPlan {
+            strategy: self.id().to_owned(),
+            max_nodes: 4,
+            max_depth: 1,
+            budget_tokens: total_budget,
+            budget_cost_microusd: total_cost_budget,
+            staffing: Vec::new(),
+            tasks,
+        })
+    }
+}
+
+fn studio_budget_split(total: i64) -> Result<(i64, i64)> {
+    if total < 4 {
+        return Err(anyhow!("studio-swarm budget must fund all four tasks"));
+    }
+    let specialist = (total
+        .checked_mul(3)
+        .context("studio-swarm budget overflow")?
+        / 20)
+        .max(1);
+    // Assign rounding remainder to integration so the four budgets sum to the request exactly.
+    Ok((specialist, total - specialist * 3))
+}
+
+fn studio_handoff_path(root: &str, role: &str) -> Result<String> {
+    let path = format!("{root}/{role}.md");
+    crate::dependency_source::validate_typed_source_paths(std::slice::from_ref(&path))
+        .context("studio-swarm handoff root cannot be decoded safely")?;
+    if !repository_relative_path_is_valid(root)
+        || !write_scope_is_valid(&path)
+        || root.split('/').any(|component| {
+            let stem = component
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            component.eq_ignore_ascii_case(".git")
+                || component.ends_with([' ', '.'])
+                || component
+                    .chars()
+                    .any(|character| matches!(character, '<' | '>' | '|' | '"'))
+                || matches!(
+                    stem.as_str(),
+                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                )
+                || stem
+                    .strip_prefix("COM")
+                    .or_else(|| stem.strip_prefix("LPT"))
+                    .is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    })
+        })
+    {
+        return Err(anyhow!(
+            "studio-swarm handoff root must be a safe literal repository-relative directory"
+        ));
+    }
+    Ok(path)
 }
 
 struct VerificationMatrixStrategy;
@@ -427,6 +666,7 @@ fn verification_plan(
         max_depth: 0,
         budget_tokens,
         budget_cost_microusd,
+        staffing: Vec::new(),
         tasks: vec![PlannedTask {
             key: "verify".to_owned(),
             title: "Produce verifier evidence".to_owned(),
@@ -458,7 +698,7 @@ fn provider_settings(
 fn ordered_candidates(agents: &[Agent]) -> Vec<&Agent> {
     let mut candidates = agents
         .iter()
-        .filter(|agent| agent.status != AgentStatus::Offline)
+        .filter(|agent| agent.status != AgentStatus::Offline && agent.retired_at.is_none())
         .collect::<Vec<_>>();
     candidates.sort_by_key(|agent| {
         (
@@ -925,6 +1165,9 @@ mod tests {
             current_run_id: None,
             accent: "test".to_owned(),
             created_at: Utc::now(),
+            mission_id: None,
+            pinned: false,
+            retired_at: None,
         }
     }
 
@@ -934,6 +1177,502 @@ mod tests {
             agent("Wally", "engineer", "fake-process"),
             agent("Cody", "engineer", "codex"),
         ]
+    }
+
+    fn copilot_workers() -> Vec<Agent> {
+        (1..=3)
+            .map(|index| agent(&format!("Studio {index}"), "engineer", "github-copilot"))
+            .collect()
+    }
+
+    fn studio_request<'a>() -> PlanningRequest<'a> {
+        PlanningRequest {
+            mission_title: "deliver the bounded repository outcome",
+            preferred_adapter: None,
+            preferred_model: None,
+            reasoning_effort: None,
+            secret_refs: &[],
+            budget_tokens: None,
+            budget_cost_microusd: None,
+            deliverable: None,
+            handoff_root: None,
+        }
+    }
+
+    #[test]
+    fn studio_swarm_uses_three_distinct_copilot_roots_and_gameplay_join() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        let mut roster = agents();
+        roster.extend(workers.clone());
+        roster.push(agent("00 Manager", "manager", "github-copilot"));
+        let mut retired = agent("00 Retired", "engineer", "github-copilot");
+        retired.retired_at = Some(Utc::now());
+        roster.push(retired);
+        let mut offline = agent("00 Offline", "engineer", "github-copilot");
+        offline.status = AgentStatus::Offline;
+        roster.push(offline);
+        let request = studio_request();
+        let plan = registry
+            .plan("studio-swarm", &request, &roster)
+            .expect("three-Copilot studio plan");
+
+        assert_eq!(plan.strategy, "studio-swarm");
+        assert!(!uses_deterministic_harness(&plan.strategy));
+        assert_eq!(plan.tasks.len(), 4);
+        assert_eq!(plan.max_nodes, 4);
+        assert_eq!(plan.max_depth, 1);
+        assert!(plan.staffing.is_empty());
+        let roots = &plan.tasks[..3];
+        let keys = [
+            "visual-direction",
+            "gameplay-systems",
+            "quality-verification",
+        ];
+        assert_eq!(
+            roots
+                .iter()
+                .map(|task| task.key.as_str())
+                .collect::<Vec<_>>(),
+            keys
+        );
+        assert_eq!(
+            roots
+                .iter()
+                .map(|task| task.assigned_agent_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        for root in roots {
+            assert_eq!(root.depth, 0);
+            assert!(root.depends_on.is_empty());
+            assert!(
+                workers
+                    .iter()
+                    .any(|worker| worker.id == root.assigned_agent_id)
+            );
+        }
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.required_adapter == "github-copilot")
+        );
+        let join = &plan.tasks[3];
+        assert_eq!(join.key, "studio-integration");
+        assert_eq!(join.depth, 1);
+        assert_eq!(join.assigned_agent_id, roots[1].assigned_agent_id);
+        assert_eq!(join.depends_on, keys.map(str::to_owned));
+        assert_eq!(
+            join.contract.references,
+            keys.map(|key| format!("task:{key}"))
+        );
+        assert!(join.contract.deliverable.is_none());
+
+        roster.reverse();
+        let reordered = registry
+            .plan("studio-swarm", &request, &roster)
+            .expect("deterministic reordered plan");
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .map(|task| (&task.key, task.assigned_agent_id))
+                .collect::<Vec<_>>(),
+            reordered
+                .tasks
+                .iter()
+                .map(|task| (&task.key, task.assigned_agent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn studio_swarm_prefers_staffing_roles_and_reserves_them_before_fallback() {
+        let registry = StrategyRegistry::new();
+        let workers = vec![
+            agent("Visual designer", "visual-direction", "github-copilot"),
+            agent("Gameplay engineer", "gameplay-systems", "github-copilot"),
+            agent("Quality engineer", "quality-verification", "github-copilot"),
+        ];
+        let mut roster = workers.clone();
+        roster.push(agent("00 Generic engineer", "engineer", "github-copilot"));
+        let request = studio_request();
+        let plan = registry
+            .plan("studio-swarm", &request, &roster)
+            .expect("staffing-role plan");
+        for (task, worker) in plan.tasks[..3].iter().zip(&workers) {
+            assert_eq!(task.key, worker.role);
+            assert_eq!(task.assigned_agent_id, worker.id);
+        }
+        assert_eq!(plan.tasks[3].assigned_agent_id, workers[1].id);
+
+        for generic_index in 0..3 {
+            let mut roster = workers.clone();
+            roster[generic_index].role = "engineer".to_owned();
+            roster[generic_index].name = "ZZ Generic engineer".to_owned();
+            let plan = registry
+                .plan("studio-swarm", &request, &roster)
+                .expect("reserve explicit roles before deterministic fallback");
+            for (task, worker) in plan.tasks[..3].iter().zip(&workers) {
+                assert_eq!(task.assigned_agent_id, worker.id);
+            }
+            assert_eq!(plan.tasks[3].assigned_agent_id, workers[1].id);
+        }
+    }
+
+    #[test]
+    fn studio_swarm_scopes_role_handoffs_and_preserves_final_deliverable() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        let requested = DeliverableSpec {
+            form: DeliverableForm::Archive,
+            commit_after_verification: true,
+            paths: vec!["src".to_owned(), "tests".to_owned()],
+        };
+        let roles = [
+            ("visual-direction", "accessibility", "responsive layouts"),
+            (
+                "gameplay-systems",
+                "state transitions",
+                "deterministic rules",
+            ),
+            (
+                "quality-verification",
+                "browser acceptance",
+                "reproducible test inputs",
+            ),
+        ];
+        for handoff_root in [None, Some("docs/team handoffs")] {
+            let request = PlanningRequest {
+                handoff_root,
+                deliverable: Some(&requested),
+                ..studio_request()
+            };
+            let plan = registry
+                .plan("studio-swarm", &request, &workers)
+                .expect("scoped handoff plan");
+            for (task, (key, expected, acceptance)) in plan.tasks[..3].iter().zip(roles) {
+                let path = format!("{}/{key}.md", handoff_root.unwrap_or("handoffs"));
+                assert_eq!(task.key, key);
+                assert_eq!(task.contract.write_scope, vec![path.clone()]);
+                assert_eq!(task.contract.allowed_tools, vec!["filesystem"]);
+                assert!(task.contract.objective.contains(&path));
+                assert!(task.contract.objective.contains("native file tools"));
+                assert!(task.contract.expected_output.contains(expected));
+                assert!(
+                    task.contract
+                        .acceptance_tests
+                        .iter()
+                        .any(|test| test.contains(acceptance))
+                );
+                assert!(
+                    task.contract
+                        .acceptance_tests
+                        .iter()
+                        .any(|test| test.contains("12288 bytes"))
+                );
+                assert!(
+                    task.contract
+                        .prohibited_actions
+                        .iter()
+                        .any(|action| action == "execute shell commands")
+                );
+                assert_eq!(
+                    task.contract.deliverable,
+                    Some(DeliverableSpec {
+                        form: DeliverableForm::TypedArtifactSet,
+                        commit_after_verification: false,
+                        paths: vec![path.clone()],
+                    })
+                );
+                assert_eq!(
+                    task.verification_policy,
+                    VerificationPolicy {
+                        checks: vec![
+                            VerifierCheck::File { path: path.clone(), min_bytes: 1 },
+                            VerifierCheck::Artifact { min_bytes: 1 },
+                            VerifierCheck::Command {
+                                program: "node".to_owned(),
+                                args: vec![
+                                    "-e".to_owned(),
+                                    "const b=require('node:fs').readFileSync(process.argv[1]);new TextDecoder('utf-8',{fatal:true}).decode(b);if(b.length>12288)process.exit(1)".to_owned(),
+                                    path,
+                                ],
+                                timeout_ms: 5_000,
+                            },
+                        ],
+                        manual_gate: None,
+                    }
+                );
+            }
+            assert_eq!(
+                plan.tasks[3].contract.deliverable.as_ref(),
+                Some(&requested)
+            );
+        }
+    }
+
+    #[test]
+    fn studio_swarm_pins_model_and_reasoning_on_every_task() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        for preferred_adapter in [None, Some("github-copilot")] {
+            let request = PlanningRequest {
+                preferred_adapter,
+                preferred_model: Some("gpt-5.6-sol"),
+                reasoning_effort: Some("high"),
+                ..studio_request()
+            };
+            let plan = registry
+                .plan("studio-swarm", &request, &workers)
+                .expect("model-pinned studio plan");
+            for task in &plan.tasks {
+                assert_eq!(task.required_adapter, "github-copilot");
+                assert_eq!(task.contract.model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(task.contract.reasoning_effort.as_deref(), Some("high"));
+            }
+        }
+    }
+
+    #[test]
+    fn studio_swarm_splits_budgets_and_bounds_attempts() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        for (budget_tokens, budget_cost_microusd, expected_tokens, expected_cost) in [
+            (
+                None,
+                None,
+                [300_000, 300_000, 300_000, 1_100_000],
+                [900_000, 900_000, 900_000, 3_300_000],
+            ),
+            (
+                Some(100_003),
+                Some(1_000_003),
+                [15_000, 15_000, 15_000, 55_003],
+                [150_000, 150_000, 150_000, 550_003],
+            ),
+            (Some(4), Some(4), [1, 1, 1, 1], [1, 1, 1, 1]),
+        ] {
+            let request = PlanningRequest {
+                budget_tokens,
+                budget_cost_microusd,
+                ..studio_request()
+            };
+            let plan = registry
+                .plan("studio-swarm", &request, &workers)
+                .expect("bounded studio budgets");
+            assert_eq!(plan.budget_tokens, expected_tokens.iter().sum::<i64>());
+            assert_eq!(plan.budget_cost_microusd, expected_cost.iter().sum::<i64>());
+            for (index, task) in plan.tasks.iter().enumerate() {
+                assert_eq!(task.contract.budget_tokens, expected_tokens[index]);
+                assert_eq!(task.contract.budget_cost_microusd, expected_cost[index]);
+                assert_eq!(task.max_attempts, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn studio_swarm_rejects_insufficient_or_mixed_provider_workers() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        for count in 0..3 {
+            for preferred_adapter in [None, Some("github-copilot")] {
+                let request = PlanningRequest {
+                    preferred_adapter,
+                    ..studio_request()
+                };
+                let mut roster = workers[..count].to_vec();
+                let error = registry
+                    .plan("studio-swarm", &request, &roster)
+                    .expect_err("fewer than three Copilot workers must fail");
+                assert!(error.to_string().contains("three distinct"));
+                roster.extend(agents());
+                roster.push(agent("Claude", "engineer", "claude-code"));
+                roster.push(agent("Copilot manager", "manager", "github-copilot"));
+                assert!(
+                    registry.plan("studio-swarm", &request, &roster).is_err(),
+                    "must not replace missing Copilot workers with another provider or a manager"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn studio_swarm_rejects_duplicate_manager_retired_or_offline_workers() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        let request = studio_request();
+        for replacement in [
+            workers[0].clone(),
+            Agent {
+                role: "manager".to_owned(),
+                ..workers[2].clone()
+            },
+            Agent {
+                retired_at: Some(Utc::now()),
+                pinned: true,
+                ..workers[2].clone()
+            },
+            Agent {
+                status: AgentStatus::Offline,
+                ..workers[2].clone()
+            },
+        ] {
+            let mut roster = workers.clone();
+            roster[2] = replacement;
+            assert!(registry.plan("studio-swarm", &request, &roster).is_err());
+        }
+    }
+
+    #[test]
+    fn studio_swarm_rejects_non_copilot_adapter_requests() {
+        let registry = StrategyRegistry::new();
+        let mut roster = copilot_workers();
+        roster.extend(agents());
+        roster.push(agent("Claude", "engineer", "claude-code"));
+        for adapter in ["codex", "claude-code", "fake-process", "", "GitHub-Copilot"] {
+            let request = PlanningRequest {
+                preferred_adapter: Some(adapter),
+                ..studio_request()
+            };
+            let error = registry
+                .plan("studio-swarm", &request, &roster)
+                .expect_err("explicit adapter must be github-copilot");
+            assert!(error.to_string().contains("requires github-copilot"));
+        }
+    }
+
+    #[test]
+    fn studio_swarm_rejects_unsafe_handoff_roots() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        let too_long = "a".repeat(500);
+        for root in [
+            "",
+            ".",
+            "..",
+            "../handoffs",
+            "handoffs/../outside",
+            "/handoffs",
+            "C:/handoffs",
+            r"C:\handoffs",
+            r"\\server\share\handoffs",
+            r"handoffs\notes",
+            "handoffs//notes",
+            "handoffs/./notes",
+            "handoffs/",
+            "**",
+            "handoffs/**",
+            "handoffs/*",
+            "handoffs/?",
+            "handoffs/[notes]",
+            ":(exclude)handoffs",
+            ".git",
+            "nested/.GiT/hooks",
+            "nested/.git./hooks",
+            "nested /handoffs",
+            "handoffs/NUL",
+            "con.txt",
+            "nested/COM1",
+            "lpt9/handoffs",
+            "COM¹/notes",
+            "handoffs|outside",
+            "hand<offs",
+            "hand\"offs",
+            " handoffs",
+            "handoffs\nnotes",
+            too_long.as_str(),
+        ] {
+            let request = PlanningRequest {
+                handoff_root: Some(root),
+                ..studio_request()
+            };
+            let error = registry
+                .plan("studio-swarm", &request, &workers)
+                .expect_err("unsafe handoff root must fail");
+            assert!(
+                error.to_string().contains("handoff root"),
+                "{root:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn studio_swarm_preserves_graph_and_budget_bounds() {
+        let registry = StrategyRegistry::new();
+        let workers = copilot_workers();
+        for (budget_tokens, budget_cost_microusd) in [
+            (Some(-1), None),
+            (Some(0), None),
+            (Some(1), None),
+            (Some(2), None),
+            (Some(3), None),
+            (Some(MAX_GRAPH_BUDGET_TOKENS + 1), None),
+            (Some(i64::MAX), None),
+            (None, Some(-1)),
+            (None, Some(0)),
+            (None, Some(1)),
+            (None, Some(2)),
+            (None, Some(3)),
+            (None, Some(20_000_000)),
+            (None, Some(50_000_001)),
+            (None, Some(i64::MAX)),
+        ] {
+            let request = PlanningRequest {
+                budget_tokens,
+                budget_cost_microusd,
+                ..studio_request()
+            };
+            assert!(registry.plan("studio-swarm", &request, &workers).is_err());
+        }
+
+        let plan = registry
+            .plan("studio-swarm", &studio_request(), &workers)
+            .expect("valid studio graph");
+        let mut invalid = plan.clone();
+        invalid.max_nodes = 3;
+        assert!(validate_plan(&invalid, &workers).is_err());
+        let mut invalid = plan.clone();
+        invalid.max_depth = 0;
+        assert!(validate_plan(&invalid, &workers).is_err());
+        let mut invalid = plan.clone();
+        invalid.tasks[3].max_attempts = MAX_TASK_ATTEMPTS + 1;
+        assert!(validate_plan(&invalid, &workers).is_err());
+        let mut invalid = plan.clone();
+        invalid.tasks[0]
+            .depends_on
+            .push("studio-integration".to_owned());
+        assert!(validate_plan(&invalid, &workers).is_err());
+        let mut invalid = plan.clone();
+        invalid
+            .tasks
+            .resize(MAX_GRAPH_NODES + 1, plan.tasks[0].clone());
+        assert!(validate_plan(&invalid, &workers).is_err());
+    }
+
+    #[test]
+    fn ordered_candidates_exclude_retired_agents() {
+        let mut roster = agents();
+        roster[1].retired_at = Some(Utc::now());
+        roster[1].pinned = true;
+        let candidates = ordered_candidates(&roster);
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.id != roster[1].id)
+        );
+        let request = PlanningRequest {
+            preferred_adapter: Some("fake-process"),
+            ..studio_request()
+        };
+        for strategy in ["single", "parallel-specialists", "verification-matrix"] {
+            assert!(
+                StrategyRegistry::new()
+                    .plan(strategy, &request, &roster)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -946,6 +1685,7 @@ mod tests {
                 "independent-review".to_owned(),
                 "parallel-specialists".to_owned(),
                 "single".to_owned(),
+                "studio-swarm".to_owned(),
                 "verification-failure".to_owned(),
                 "verification-matrix".to_owned(),
             ]
@@ -959,6 +1699,7 @@ mod tests {
             budget_tokens: None,
             budget_cost_microusd: None,
             deliverable: None,
+            handoff_root: None,
         };
         let agents = agents();
         let first = registry
@@ -996,6 +1737,7 @@ mod tests {
             budget_tokens: None,
             budget_cost_microusd: None,
             deliverable: None,
+            handoff_root: None,
         };
         let mut plan = registry
             .plan("parallel-specialists", &request, &agents)
@@ -1072,6 +1814,7 @@ mod tests {
                     budget_tokens: None,
                     budget_cost_microusd: None,
                     deliverable: None,
+                    handoff_root: None,
                 },
                 &agents,
             )
@@ -1104,6 +1847,7 @@ mod tests {
                     budget_tokens: None,
                     budget_cost_microusd: None,
                     deliverable: Some(&requested),
+                    handoff_root: None,
                 },
                 &agents,
             )
@@ -1127,6 +1871,7 @@ mod tests {
                         budget_tokens: None,
                         budget_cost_microusd: None,
                         deliverable: Some(&unsafe_requested),
+                        handoff_root: None,
                     },
                     &agents,
                 )
@@ -1150,6 +1895,7 @@ mod tests {
                         budget_tokens: None,
                         budget_cost_microusd: None,
                         deliverable: Some(&magic_requested),
+                        handoff_root: None,
                     },
                     &agents,
                 )
@@ -1177,6 +1923,7 @@ mod tests {
                     budget_tokens: None,
                     budget_cost_microusd: None,
                     deliverable: None,
+                    handoff_root: None,
                 },
                 &agents,
             )
@@ -1214,6 +1961,7 @@ mod tests {
                     budget_tokens: None,
                     budget_cost_microusd: None,
                     deliverable: None,
+                    handoff_root: None,
                 },
                 &agents,
             )
@@ -1237,6 +1985,7 @@ mod tests {
             budget_tokens: None,
             budget_cost_microusd: None,
             deliverable: None,
+            handoff_root: None,
         };
 
         let mut plan = registry

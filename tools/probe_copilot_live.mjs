@@ -20,6 +20,10 @@ import {
   summarizeBoundaryResults,
 } from './copilot_probe_boundaries.mjs'
 import {
+  COPILOT_CREDENTIAL_CANARY as credentialCanary,
+  assertCanaryEnvironmentEvidence,
+} from './copilot_probe_environment.mjs'
+import {
   NATIVE_READ_SEED,
   NATIVE_READBACK,
   inspectNativeReads,
@@ -34,7 +38,6 @@ const probeOutputDirectory = path.resolve(
 const eventRoot = process.env.CRONY_COPILOT_EVENT_ROOT ??
   path.join(probeOutputDirectory, 'copilot-home')
 const probeStartedAt = Date.now()
-const credentialCanary = 'ECORP_CREDENTIAL_CANARY_MUST_NOT_REACH_COPILOT'
 const observationsPath = path.join(probeOutputDirectory, `environment-${probeId}.jsonl`)
 const execFile = promisify(execFileCallback)
 let selectedSource
@@ -376,13 +379,11 @@ The runner, not the model session, verifies the exact output hash after you fini
   const shell = await shellTelemetrySince(probeStartedAt)
   assert.equal(shell.length, 0, 'native-read diagnostic executed model-session shell')
   const observations = await environmentObservations()
-  const runnerSpawn = observations.find((entry) => entry.kind === 'runner_spawn' && entry.probe_id === probeId)
-  const providers = observations.filter((entry) => entry.kind === 'copilot_environment' &&
-    entry.probe_id === probeId && entry.parent_pid === runnerSpawn?.child_pid)
-  assert.ok(observations.some((entry) => entry.kind === 'runner_environment' &&
-    entry.probe_id === probeId && entry.canary_present === true))
-  assert.ok(providers.length >= 2, 'catalog and real session environments must be observed')
-  assert.ok(providers.every((entry) => entry.canary_present === false && entry.github_token_present === false))
+  const providers = assertCanaryEnvironmentEvidence(observations, {
+    probeId,
+    runnerObserverPid: ownedRunner.child.pid,
+    minimumProviderProcesses: 2,
+  })
   const runtimePinned = providers.every((entry) => entry.auto_update_disabled_by_flag === true)
   const passed = reads.complete && output?.equals(seed) &&
     settled.run.status === 'completed' && settled.run.verification_status === 'passed' &&
@@ -830,19 +831,11 @@ assert.deepEqual(await readFile(sourceReadme), sourceReadmeBefore)
 assert.equal((await stat(sourceReadme)).mtimeMs, sourceReadmeMetadata.mtimeMs)
 
 const observations = await environmentObservations()
-const seeded = observations.find((entry) =>
-  entry.kind === 'runner_environment' && entry.probe_id === probeId)
-const runnerSpawn = observations.find((entry) =>
-  entry.kind === 'runner_spawn' && entry.probe_id === probeId)
-const providerObservations = observations.filter((entry) =>
-  entry.kind === 'copilot_environment' &&
-  entry.probe_id === probeId &&
-  entry.parent_pid === runnerSpawn?.child_pid)
-assert.equal(seeded?.canary_present, true, 'the runner must actually inherit the credential canary')
-assert.ok(providerObservations.length >= (boundaryOnly ? 9 : 10),
-  'observe catalog plus every provider process environment')
-assert.ok(providerObservations.every((entry) =>
-  entry.canary_present === false && entry.github_token_present === false))
+const providerObservations = assertCanaryEnvironmentEvidence(observations, {
+  probeId,
+  runnerObserverPid: ownedRunner.child.pid,
+  minimumProviderProcesses: boundaryOnly ? 9 : 10,
+})
 
 const shellTelemetry = await shellTelemetrySince(probeStartedAt)
 assert.equal(

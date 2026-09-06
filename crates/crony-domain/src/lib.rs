@@ -221,6 +221,12 @@ pub struct Agent {
     pub current_run_id: Option<Uuid>,
     pub accent: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub mission_id: Option<Uuid>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,12 +498,38 @@ pub struct PlannedTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedAgent {
+    pub id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub adapter: String,
+    pub accent: String,
+}
+
+pub fn write_scope_is_subset(requested: &str, allowed: &str) -> bool {
+    if !write_scope_is_valid(requested) || !write_scope_is_valid(allowed) {
+        return false;
+    }
+    if requested == "**" {
+        return allowed == "**";
+    }
+    if let Some(prefix) = requested.strip_suffix("/**") {
+        return (allowed == "**" || allowed.ends_with("/**"))
+            && write_scope_allows_path(allowed, prefix);
+    }
+    write_scope_allows_path(allowed, requested)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskGraphPlan {
     pub strategy: String,
     pub max_nodes: i32,
     pub max_depth: i32,
     pub budget_tokens: i64,
     pub budget_cost_microusd: i64,
+    /// Provisional identities. Only mission materialization may persist them.
+    #[serde(default)]
+    pub staffing: Vec<PlannedAgent>,
     pub tasks: Vec<PlannedTask>,
 }
 
@@ -984,5 +1016,12 @@ mod tests {
         assert!(!write_scope_is_valid("src/../secret/**"));
         assert!(write_scope_allows_path("src/**", "src/lib.rs"));
         assert!(!write_scope_allows_path("src/**", "src2/lib.rs"));
+        assert!(write_scope_is_subset("src/handoffs/visual.md", "src/**"));
+        assert!(write_scope_is_subset("src/handoffs/**", "src/**"));
+        assert!(!write_scope_is_subset("src/**", "src/handoffs/**"));
+        assert!(!write_scope_is_subset("src/**", "src"));
+        assert!(!write_scope_is_subset("src2/**", "src/**"));
+        assert!(!write_scope_is_subset("**", "src/**"));
+        assert!(!write_scope_is_subset("src/../private.txt", "**"));
     }
 }

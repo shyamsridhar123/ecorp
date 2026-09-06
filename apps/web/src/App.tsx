@@ -7,6 +7,13 @@ import './World.css'
 import './Accessible.css'
 import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
+import { currentOfficeAgents, selectOfficeAgent } from './office/officeModel'
+import type { OfficeAgent } from './office/officeModel'
+import {
+  availableRunnerAdapters, missionRuntimeError, selectMissionAdapter,
+  STUDIO_STRATEGY, STUDIO_STRATEGY_LABEL, usesDeterministicHarness, workspaceCapability,
+} from './missionRuntime'
+import type { RepositoryTarget, RunnerCapability, RunnerNode } from './missionRuntime'
 
 type Actor = {
   id: string
@@ -15,15 +22,8 @@ type Actor = {
   role: string
 }
 
-type Agent = {
-  id: string
+type Agent = OfficeAgent & {
   actor_id: string
-  name: string
-  role: string
-  adapter: string
-  status: 'idle' | 'starting' | 'working' | 'blocked' | 'reviewing' | 'offline'
-  station: string | null
-  current_run_id: string | null
   accent: string
 }
 
@@ -467,51 +467,6 @@ type BrowserSocketMessage =
 
 type WorkspaceView = 'floor' | 'factory' | 'missions' | 'room' | 'activity'
 
-type RunnerModel = {
-  id: string
-  name: string
-  policy_state: string | null
-  policy_terms: string | null
-  supports_vision: boolean
-  supports_reasoning_effort: boolean
-  max_prompt_tokens: number | null
-  max_context_window_tokens: number | null
-  supported_reasoning_efforts: string[]
-  default_reasoning_effort: string | null
-  billing_multiplier: number | null
-}
-
-type RunnerCapability = {
-  name: string
-  available: boolean
-  detail: string | null
-  models: RunnerModel[]
-  source_repository?: string | null
-  source_base_ref?: string | null
-  source_base_commit?: string | null
-}
-
-type RunnerNode = {
-  id: string
-  corp_id: string
-  hostname: string
-  os: string
-  connected: boolean
-  status: 'connected' | 'grace' | 'offline'
-  last_seen_at: string
-  grace_expires_at: string | null
-  capabilities: RunnerCapability[]
-}
-
-type RepositoryTarget = {
-  key: string
-  repository: string
-  baseRef: string
-  baseCommit: string
-  runnerIds: string[]
-  runnerLabels: string[]
-}
-
 type SnapshotResponse = {
   snapshot: {
     corp: { id: string; name: string }
@@ -589,13 +544,6 @@ const MISSION_EXAMPLES = [
   },
 ] as const
 
-const DETERMINISTIC_HARNESS_STRATEGIES = [
-  'verification-matrix',
-  'verification-failure',
-  'human-approval',
-  'independent-review',
-] as const
-
 const WORKSPACE_VIEWS: {
   id: WorkspaceView
   code: string
@@ -661,12 +609,6 @@ function revealEntityTarget(kind: EntityLink['kind'] | 'room', id: string): bool
   return true
 }
 
-function usesDeterministicHarness(strategy: string): boolean {
-  return DETERMINISTIC_HARNESS_STRATEGIES.includes(
-    strategy as (typeof DETERMINISTIC_HARNESS_STRATEGIES)[number],
-  )
-}
-
 function adapterLabel(adapter: string): string {
   if (adapter === 'github-copilot') return 'GitHub Copilot'
   if (adapter === 'codex') return 'OpenAI Codex'
@@ -714,17 +656,6 @@ function canOperate(role: string): boolean {
 
 function terminalRun(status: string): boolean {
   return ['completed', 'failed', 'cancelled', 'lost'].includes(status)
-}
-
-function workspaceCapability(runner: RunnerNode): RunnerCapability | undefined {
-  return runner.capabilities.find(
-    (capability) =>
-      capability.name === 'workspace-isolation' &&
-      capability.available &&
-      capability.source_repository &&
-      capability.source_base_ref &&
-      capability.source_base_commit,
-  )
 }
 
 function sourceFingerprint(
@@ -776,64 +707,8 @@ function repositoryTargets(data: SnapshotResponse | null): RepositoryTarget[] {
   )
 }
 
-function runnerMatchesRepository(
-  runner: RunnerNode,
-  target: RepositoryTarget,
-): boolean {
-  const capability = workspaceCapability(runner)
-  return Boolean(
-    capability?.source_repository?.toLowerCase() ===
-      target.repository.toLowerCase() &&
-      capability.source_base_ref === target.baseRef &&
-      capability.source_base_commit?.toLowerCase() ===
-        target.baseCommit.toLowerCase(),
-  )
-}
-
 function isEcorpRepository(target: RepositoryTarget | undefined): boolean {
   return target?.repository.toLowerCase().endsWith('/ecorp') ?? false
-}
-
-function availableRunnerAdapters(
-  data: SnapshotResponse | null,
-  target?: RepositoryTarget,
-): RunnerCapability[] {
-  if (!data) return []
-  const connectedRunners = data.runners.filter(
-    (runner) => runner.connected && (!target || runnerMatchesRepository(runner, target)),
-  )
-  const agentAdapters = new Set(data.snapshot.agents.map((agent) => agent.adapter))
-  return Array.from(
-    connectedRunners
-      .flatMap((runner) => runner.capabilities)
-      .filter(
-        (capability) =>
-          capability.available && agentAdapters.has(capability.name),
-      )
-      .reduce((adapters, capability) => {
-        const existing = adapters.get(capability.name)
-        const modelsById = new Map(
-          (existing?.models ?? []).map((model) => [model.id, model]),
-        )
-        for (const model of capability.models) {
-          const prior = modelsById.get(model.id)
-          if (
-            !prior ||
-            (prior.policy_state === 'disabled' &&
-              model.policy_state !== 'disabled')
-          ) {
-            modelsById.set(model.id, model)
-          }
-        }
-        adapters.set(capability.name, {
-          ...capability,
-          detail: existing?.detail ?? capability.detail,
-          models: Array.from(modelsById.values()),
-        })
-        return adapters
-      }, new Map<string, RunnerCapability>())
-      .values(),
-  )
 }
 
 function detailValue(detail: string | null | undefined, key: string): string | null {
@@ -1662,7 +1537,9 @@ function FactoryPanel({
       run.status,
     ),
   )
-  const activeAgent = agents.find((agent) => agent.id === activeRun?.agent_id)
+  const activeAgent = agents.find(
+    (agent) => agent.id === activeRun?.agent_id && agent.retired_at == null,
+  )
   const activeLease = leases.find((lease) => lease.agent_id === activeAgent?.id)
   const activeLeaseToken = activeAgent
     ? leaseTokens[leaseTokenKey(selectedActor.id, activeAgent.id)]
@@ -2320,7 +2197,7 @@ function AgentDesk({
   const [text, setText] = useState('')
   const [transferActorId, setTransferActorId] = useState('')
   const ownsLease = lease?.actor_id === actor.id
-  const live = Boolean(agent.current_run_id)
+  const live = Boolean(agent.current_run_id) && agent.status !== 'idle' && agent.status !== 'offline'
   const operator = canOperate(actor.role)
   const supportsSteer = capabilitySupports(capability, 'steer')
   const supportsInterrupt = capabilitySupports(capability, 'interrupt')
@@ -2375,16 +2252,24 @@ function AgentDesk({
           </div>
           <div className="agent-meta">
             {adapterLabel(agent.adapter)} · run {shortId(agent.current_run_id)}
+            {agent.mission_id ? ` · mission ${shortId(agent.mission_id)}` : ''}
+            {agent.pinned ? ' · pinned' : ''}
           </div>
           <div className={`lease-label ${ownsLease ? 'lease-owned' : ''}`}>{holderLabel}</div>
         </div>
       </div>
       <p className="agent-inspector-help">
-        {agent.current_run_id
-          ? `${agent.name} is ${agent.station ?? agent.status}. Claim control to steer the live session.`
+        {live
+          ? `${agent.name} is ${agent.status === 'working' ? agent.station ?? agent.status : agent.status}. Claim control to steer the live session.`
           : agent.status === 'reviewing'
             ? `${agent.name}'s provider process has ended. The recorded output is awaiting evidence review.`
-          : `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`}
+          : agent.status === 'offline'
+            ? `${agent.name}'s runner is unavailable. Inspect the mission's recorded state and recovery controls.`
+          : agent.mission_id && !agent.pinned
+            ? `${agent.name} reports ${agent.status}. This identity belongs to mission ${shortId(agent.mission_id)}; any next task is assigned by the server.`
+          : agent.status === 'idle'
+            ? `${agent.name} is off shift. No provider process is running; the identity remains available for future ${adapterLabel(agent.adapter)} missions.`
+          : `${agent.name} reports ${agent.status}. No current provider run is reported.`}
       </p>
       <div className="desk-actions">
         {canClaim ? (
@@ -3273,7 +3158,7 @@ function MissionCard({
         </details>
       ) : null}
       <div className="mission-chip-row">
-        <div className="strategy-chip">{statusLabel(mission.strategy)}</div>
+        <div className="strategy-chip">{mission.strategy === STUDIO_STRATEGY ? STUDIO_STRATEGY_LABEL : statusLabel(mission.strategy)}</div>
         <div className="contract-version-chip">Specification v{mission.specification_version}</div>
       </div>
       <dl>
@@ -3337,7 +3222,7 @@ function MissionCard({
                   <span>Contract v{task.contract_version}</span>
                 </div>
                 <dl>
-                  <div><dt>Agent</dt><dd>{assignedAgent?.name ?? 'Unassigned'} · {adapterLabel(task.required_adapter ?? assignedAgent?.adapter ?? 'unknown')}</dd></div>
+                  <div><dt>Agent</dt><dd>{assignedAgent?.name ?? 'Unassigned'}{assignedAgent?.retired_at ? ' · retired' : ''} · {adapterLabel(task.required_adapter ?? assignedAgent?.adapter ?? 'unknown')}</dd></div>
                   <div><dt>Depends on</dt><dd>{dependencies.length ? dependencies.join(', ') : 'Nothing; ready independently'}</dd></div>
                   <div><dt>Expected output</dt><dd>{task.contract.expected_output}</dd></div>
                   <div>
@@ -4118,7 +4003,7 @@ function App() {
         await refresh(corpId, actorId)
         return
       }
-      const result = await api<BootstrapResponse>('/api/demo/bootstrap', {
+      const result = await api<BootstrapResponse>('/api/demo/bootstrap?seed_crew=false', {
         method: 'POST',
         body: '{}',
       })
@@ -4217,6 +4102,10 @@ function App() {
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
     [data],
   )
+  const currentAgents = useMemo(
+    () => currentOfficeAgents(data?.snapshot.agents ?? []),
+    [data],
+  )
   const missionRepositoryTargets = useMemo(() => repositoryTargets(data), [data])
   const selectedMissionSource = useMemo(
     () =>
@@ -4236,17 +4125,12 @@ function App() {
   )
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
-  const preferredAdapter =
-    availableAdapters.find((adapter) => adapter.name === 'github-copilot') ??
-    availableAdapters.find((adapter) => adapter.name === 'codex') ??
-    availableAdapters.find((adapter) => adapter.name === 'claude-code') ??
-    availableAdapters[0]
   const deterministicHarness = usesDeterministicHarness(missionStrategy)
-  const effectiveMissionAdapter = deterministicHarness
-    ? availableAdapters.find((adapter) => adapter.name === 'fake-process')?.name ?? ''
-    : availableAdapters.some((adapter) => adapter.name === missionAdapter)
-      ? missionAdapter
-      : preferredAdapter?.name ?? ''
+  const studioTeam = missionStrategy === STUDIO_STRATEGY
+  const selectedAdapter = selectMissionAdapter(missionStrategy, availableAdapters, missionAdapter)
+  const effectiveMissionAdapter = selectedAdapter?.name ?? ''
+  const selectedModel = selectedAdapter?.models.find((model) => model.id === missionModel)
+  const runtimeError = missionRuntimeError(missionStrategy, selectedAdapter, missionModel)
   const missionContract: MissionContractInput = {
     objective: missionObjective.trim(),
     expected_output: missionExpectedOutput.trim(),
@@ -4287,7 +4171,10 @@ function App() {
       !selectedActor ||
       !missionTitle.trim() ||
       !selectedMissionSource ||
-      !missionSourceConfirmed
+      !missionSourceConfirmed ||
+      busy ||
+      runtimeError ||
+      missionVerifierErrors.length > 0
     ) {
       return
     }
@@ -4364,14 +4251,16 @@ function App() {
         const launchedRun = refreshed.snapshot.runs.find(
           (run) => run.id === launched?.run_id,
         )
-        if (launchedRun) setSelectedAgentId(launchedRun.agent_id)
+        const launchedAgent = currentOfficeAgents(refreshed.snapshot.agents)
+          .find((agent) => agent.id === launchedRun?.agent_id)
+        if (launchedAgent) setSelectedAgentId(launchedAgent.id)
       }
       setAnnouncement(
         pauseAfterPlanning
           ? 'Mission plan saved on the server. It stays held until you dispatch.'
           : launched?.replayed
             ? 'This mission was already dispatched. Showing its existing run.'
-            : 'Mission dispatched. The active worker is selected on the control floor.',
+            : 'Mission dispatched. The control floor reflects its current workers.',
       )
       window.setTimeout(() => {
         const card = document.querySelector<HTMLElement>(
@@ -4403,10 +4292,12 @@ function App() {
       const launchedRun = refreshed.snapshot.runs.find(
         (run) => run.id === launched.run_id,
       )
-      if (launchedRun) setSelectedAgentId(launchedRun.agent_id)
+      const launchedAgent = currentOfficeAgents(refreshed.snapshot.agents)
+        .find((agent) => agent.id === launchedRun?.agent_id)
+      if (launchedAgent) setSelectedAgentId(launchedAgent.id)
       setAnnouncement(launched.replayed
         ? 'This mission was already dispatched. No duplicate attempt was created.'
-        : 'Mission dispatched. The active worker is selected.')
+        : 'Mission dispatched. The control floor reflects its current workers.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -5001,25 +4892,17 @@ function App() {
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
   const room = data.snapshot.rooms[0]
   const connectedRunners = data.runners.filter((runner) => runner.connected)
-  const selectedAdapter = availableAdapters.find(
-    (adapter) => adapter.name === effectiveMissionAdapter,
-  )
-  const selectedModel = selectedAdapter?.models.find(
-    (model) => model.id === missionModel,
-  )
   const runnerLabel = connectedRunners.length
     ? `${connectedRunners.length} runner${connectedRunners.length === 1 ? '' : 's'} online`
     : data.runners.some((runner) => runner.status === 'grace')
       ? 'Runner reconnecting'
       : 'No runner'
-  const selectedAgent =
-    data.snapshot.agents.find((agent) => agent.id === selectedAgentId) ??
-    data.snapshot.agents[0]
+  const selectedAgent = selectOfficeAgent(currentAgents, selectedAgentId)
   const selectedAgentCapability = connectedRunners
     .flatMap((runner) => runner.capabilities)
     .find(
       (capability) =>
-        capability.available && capability.name === selectedAgent.adapter,
+        capability.available && capability.name === selectedAgent?.adapter,
     )
   const workspaceCapability = connectedRunners
     .flatMap((runner) => runner.capabilities)
@@ -5050,7 +4933,7 @@ function App() {
     WORKSPACE_VIEWS.find((view) => view.id === activeWorkspaceView) ??
     WORKSPACE_VIEWS[0]
   const selectedMission =
-    latestMissions.find((mission) => mission.id === selectedMissionId) ??
+    data.snapshot.missions.find((mission) => mission.id === selectedMissionId) ??
     latestMissions[0]
   const selectedMissionTasks = selectedMission
     ? data.snapshot.tasks.filter((task) => task.mission_id === selectedMission.id)
@@ -5369,8 +5252,8 @@ function App() {
           </div>
           <div className="floor-plan">
             {activeWorkspaceView === 'floor' ? <OfficeFloor
-              agents={data.snapshot.agents}
-              selectedAgentId={selectedAgent.id}
+              agents={currentAgents}
+              selectedAgentId={selectedAgent?.id ?? null}
               pendingApprovalRunIds={new Set(pendingApprovals.map((approval) => approval.run_id))}
               pendingReviewRunIds={new Set(pendingVerificationRequests.map((request) => request.run_id))}
               connection={connection}
@@ -5379,12 +5262,20 @@ function App() {
                 setSelectedAgentId(agentId)
                 setFloorInspectorOpen(true)
               }}
-              onMissions={() => activateWorkspaceView('missions')}
+              onMissions={(agentId) => {
+                const agent = currentAgents.find((candidate) => candidate.id === agentId)
+                const run = data.snapshot.runs.find((candidate) => candidate.id === agent?.current_run_id)
+                const task = data.snapshot.tasks.find((candidate) => candidate.id === run?.task_id)
+                const missionId = task?.mission_id ?? agent?.mission_id
+                if (missionId) setSelectedMissionId(missionId)
+                activateWorkspaceView('missions')
+              }}
               onFactory={() => activateWorkspaceView('factory')}
             /> : null}
-            {floorInspectorOpen && activeWorkspaceView === 'floor' ? (
+            {floorInspectorOpen && selectedAgent && activeWorkspaceView === 'floor' ? (
               <OfficeInspector agentName={selectedAgent.name} onClose={() => setFloorInspectorOpen(false)}>
                   <AgentDesk
+                    key={selectedAgent.id}
                     agent={selectedAgent}
                     capability={selectedAgentCapability}
                     actor={selectedActor}
@@ -5607,14 +5498,18 @@ function App() {
                       <select
                         id="mission-adapter"
                         value={effectiveMissionAdapter}
-                        disabled={deterministicHarness}
+                        disabled={deterministicHarness || studioTeam}
+                        aria-describedby="mission-adapter-help"
                         onChange={(event) => {
                           setMissionAdapter(event.target.value)
                           setMissionModel('')
                           setMissionReasoningEffort('')
                         }}
                       >
-                        {availableAdapters.map((adapter) => (
+                        {!effectiveMissionAdapter ? (
+                          <option value="">{studioTeam ? 'GitHub Copilot unavailable for this source' : 'No available runtime'}</option>
+                        ) : null}
+                        {availableAdapters.filter((adapter) => !studioTeam || adapter.name === 'github-copilot').map((adapter) => (
                           <option key={adapter.name} value={adapter.name}>
                             {adapterLabel(adapter.name)}
                             {adapter.name === 'github-copilot'
@@ -5626,6 +5521,7 @@ function App() {
                         ))}
                       </select>
                       <small
+                        id="mission-adapter-help"
                         className={
                           deterministicHarness || effectiveMissionAdapter === 'fake-process'
                             ? 'field-warning'
@@ -5634,17 +5530,19 @@ function App() {
                       >
                         {deterministicHarness
                           ? 'This test fixture owns its runtime settings.'
+                          : studioTeam
+                            ? 'Studio team uses GitHub Copilot for all three workers and the later integration pass. Model and reasoning settings come from the selected source runner.'
                           : selectedAdapter
                             ? adapterDescription(selectedAdapter.name)
                             : 'Connect a runner to unlock an agent runtime.'}
                       </small>
                     </div>
-                    {!deterministicHarness && selectedAdapter?.models.length ? (
+                    {!deterministicHarness && selectedAdapter && (selectedAdapter.models.length > 0 || missionModel) ? (
                       <div className="mission-field">
                         <label htmlFor="mission-model">Model</label>
                         <select
                           id="mission-model"
-                          value={selectedModel ? missionModel : ''}
+                          value={missionModel}
                           onChange={(event) => {
                             const nextModel = selectedAdapter.models.find(
                               (model) => model.id === event.target.value,
@@ -5656,6 +5554,9 @@ function App() {
                           }}
                         >
                           <option value="">Provider default</option>
+                          {missionModel && !selectedModel ? (
+                            <option value={missionModel} disabled>{missionModel} · unavailable</option>
+                          ) : null}
                           {selectedAdapter.models.map((model) => (
                             <option
                               key={model.id}
@@ -5742,10 +5643,22 @@ function App() {
                       <select
                         id="mission-strategy"
                         value={missionStrategy}
-                        onChange={(event) => setMissionStrategy(event.target.value)}
+                        aria-describedby={studioTeam ? 'mission-strategy-help mission-strategy-policy' : 'mission-strategy-help'}
+                        onChange={(event) => {
+                          const strategy = event.target.value
+                          setMissionStrategy(strategy)
+                          if (strategy === STUDIO_STRATEGY) {
+                            setMissionAdapter('github-copilot')
+                            if (effectiveMissionAdapter !== 'github-copilot') {
+                              setMissionModel('')
+                              setMissionReasoningEffort('')
+                            }
+                          }
+                        }}
                       >
                         <option value="single">Solo run</option>
                         <option value="parallel-specialists">Two specialists and synthesis</option>
+                        <option value={STUDIO_STRATEGY}>{STUDIO_STRATEGY_LABEL}</option>
                         {developerMode ? (
                           <optgroup label="Test fixtures">
                             <option value="verification-matrix">Verification matrix</option>
@@ -5755,13 +5668,22 @@ function App() {
                           </optgroup>
                         ) : null}
                       </select>
-                      <small>
-                        {missionStrategy === 'parallel-specialists'
+                      <small id="mission-strategy-help">
+                        {studioTeam
+                          ? 'ECorp provisions 3 distinct mission workers on GitHub Copilot. Verified handoffs from all three gate a later integration pass by one of those workers—not a fourth concurrent worker.'
+                          : missionStrategy === 'parallel-specialists'
                           ? 'Parallel roots converge on one synthesis task.'
                           : missionStrategy === 'single'
                             ? 'One bounded worker owns the outcome.'
                             : 'A deterministic product-behavior fixture.'}
                       </small>
+                      {studioTeam ? (
+                        <small id="mission-strategy-policy">
+                          Native file work stays in isolated worktrees within the approved write scope.
+                          Configure persisted test commands and review gates under Verification.
+                          Shell, network, and other risky effects still require approval.
+                        </small>
+                      ) : null}
                     </div>
                   </div>
                   <div className="loadout-switches">
@@ -5887,11 +5809,21 @@ function App() {
                           <label className="contract-wide-field">
                             Authorized write scope
                             <textarea
+                              id="mission-write-scope"
+                              aria-label="Authorized write scope"
                               rows={4}
                               value={missionWriteScope}
                               onChange={(event) => setMissionWriteScope(event.target.value)}
+                              aria-describedby={studioTeam ? 'studio-write-scope-help' : undefined}
                               placeholder={'apps/web/**\ncrates/crony-server/**'}
                             />
+                            {studioTeam ? (
+                              <small id="studio-write-scope-help">
+                                Include an approved directory scope, such as src/**. The server derives
+                                handoff paths beneath it; integration stays within the mission scope.
+                                Use a separate target repository for disposable apps, not ECorp.
+                              </small>
+                            ) : null}
                           </label>
                         </div>
                       ) : null}
@@ -5950,8 +5882,8 @@ function App() {
                   ) : (
                     <div className="default-gate-callout">
                       <span>Default verification</span>
-                      <strong>Provider artifact must exist</strong>
-                      <small>Turn on custom verification for application-level proof.</small>
+                      <strong>{studioTeam ? 'Handoff files and provider artifacts must exist' : 'Provider artifact must exist'}</strong>
+                      <small>Turn on custom verification for application-level tests and review gates; these are persisted, not inferred from agent claims.</small>
                     </div>
                   )}
                 </div>
@@ -5989,7 +5921,7 @@ function App() {
                   disabled={
                     !selectedMissionSource ||
                     !missionSourceConfirmed ||
-                    !effectiveMissionAdapter
+                    Boolean(runtimeError)
                   }
                   onClick={() => setMissionComposerStep('proof')}
                 >
@@ -6005,7 +5937,7 @@ function App() {
                     !missionTitle.trim() ||
                     !selectedMissionSource ||
                     !missionSourceConfirmed ||
-                    !effectiveMissionAdapter ||
+                    Boolean(runtimeError) ||
                     missionVerifierErrors.length > 0
                   }
                 >
@@ -6019,6 +5951,9 @@ function App() {
             </div>
             {missionVerifierErrors.length ? (
               <p className="contract-error">{missionVerifierErrors[0]}</p>
+            ) : null}
+            {missionComposerStep !== 'brief' && runtimeError ? (
+              <p className="contract-error" role="status">{runtimeError}</p>
             ) : null}
             {missionComposerStep === 'proof' ? (
               <p className="mission-submit-note">

@@ -219,6 +219,44 @@ creating another attempt. The optional `replayed` response field distinguishes t
 The browser renders persisted `ready` state as **Awaiting dispatch**. Its briefing checkbox
 chooses the plan-only flow; keeping the browser open is not what enforces the hold.
 
+## Mission-owned staffing and studio handoffs
+
+Source-selected single/specialist missions and provider-backed factory plans can propose
+their required worker identities from connected runtime capabilities. Proposals are
+read-only: actors, room membership and workers are persisted atomically with the accepted
+mission graph. Factory preflight and materialization replay do not allocate extra workers.
+Workers record their owning mission, pin state and retirement timestamp; history is never
+deleted. A pinned mission worker is reusable only in the same destination room. An active
+worker cannot acquire a second run through resume.
+
+The `studio-swarm` strategy requires three distinct GitHub Copilot workers. Visual,
+gameplay and quality roots produce separate UTF-8 Markdown handoffs under an authorized
+directory; the gameplay identity performs integration only after all three parents have
+accepted completion. Runtime, model, reasoning and immutable repository/ref/commit
+constraints apply to every node. This is three workers and four tasks, not four concurrent
+workers or a hard-coded demo cast.
+
+Each root exports its exact declared file as a typed artifact set, with persisted file,
+artifact and UTF-8/12-KiB checks. Integration reads the latest accepted parent runs' signed,
+unexpired source deliverables—not sibling worktrees or provider prose. It checks the exact
+source tuple, verification digest, file set, regular-file mode, decoded byte counts and
+hashes. Unsupported, missing, aliased, tampered or oversized data fails dispatch rather
+than being silently omitted. The combined dependency text is capped at 64 KiB. A
+`run.dependency_context` receipt records artifact/run/file hashes and the context digest.
+Resume repeats this boundary and records its own receipt.
+
+Unpinned mission workers retire after terminal missions only when there is no active run,
+live control lease, queued message, pending approval, pending command or unresolved
+process-teardown uncertainty. Lease/message grants serialize with retirement. An explicitly
+authorized resume can reactivate its preserved worker but cannot overwrite another active
+assignment. Current office views exclude retired workers; historical missions/runs retain
+their identities.
+
+The development UI bootstraps humans/rooms without the fixed crew. The explicit legacy
+demo/fixture bootstrap remains available. This is a bounded milestone of #48: dedicated
+Clear crew, Pin/Unpin and manual Retire controls, and their complete contributor workflow,
+remain tracked there rather than being implied by the metadata fields.
+
 ## State and events
 
 Configuration and current state use relational tables. Every meaningful mutation also writes an

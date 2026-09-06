@@ -22,6 +22,7 @@ mod budget_revision;
 mod contract_revision;
 mod factory_controller;
 mod publication;
+mod staffing;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
@@ -648,6 +649,9 @@ pub struct DependencyArtifactContext {
     pub plan_key: String,
     pub task_title: String,
     pub run_summary: Option<String>,
+    pub contract: TaskContract,
+    pub source_base_commit: Option<String>,
+    pub verification_sha256: Option<String>,
     pub artifact: StoredArtifact,
 }
 
@@ -1019,17 +1023,28 @@ impl PgStore {
         Ok((grants, events))
     }
 
-    pub async fn agents_for_planning(&self, corp_id: Uuid) -> Result<Vec<Agent>> {
+    pub async fn agents_for_planning(&self, corp_id: Uuid, actor_id: Uuid) -> Result<Vec<Agent>> {
         sqlx::query(
             r#"
             SELECT id, corp_id, actor_id, name, role, adapter, status, station,
-                   current_run_id, accent, created_at
+                   current_run_id, accent, created_at, mission_id, pinned, retired_at
             FROM agents
             WHERE corp_id = $1
+              AND retired_at IS NULL AND (mission_id IS NULL OR pinned)
+              AND (mission_id IS NULL OR EXISTS (
+                SELECT 1 FROM missions m JOIN room_memberships rm ON rm.room_id = m.room_id
+                WHERE m.id = agents.mission_id AND m.corp_id = agents.corp_id AND rm.actor_id = $2
+                  AND m.room_id = (
+                    SELECT r.id FROM rooms r JOIN room_memberships mine ON mine.room_id = r.id
+                    WHERE r.corp_id = $1 AND mine.actor_id = $2
+                    ORDER BY r.created_at, r.id LIMIT 1
+                  )
+              ))
             ORDER BY role, adapter, name, id
             "#,
         )
         .bind(corp_id)
+        .bind(actor_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -1038,6 +1053,13 @@ impl PgStore {
     }
 
     pub async fn bootstrap_demo(&self) -> Result<(DemoIds, Option<DomainEvent>)> {
+        self.bootstrap_demo_with_crew(true).await
+    }
+
+    pub async fn bootstrap_demo_with_crew(
+        &self,
+        seed_crew: bool,
+    ) -> Result<(DemoIds, Option<DomainEvent>)> {
         let ids = DemoIds {
             corp_id: parse_id(DEMO_CORP_ID)?,
             alice_actor_id: parse_id(DEMO_ALICE_ID)?,
@@ -1080,6 +1102,9 @@ impl PgStore {
             (opencode_actor_id, "Opal", "agent", "engineer"),
             (copilot_actor_id, "Piper", "agent", "engineer"),
         ] {
+            if kind == "agent" && !seed_crew {
+                continue;
+            }
             sqlx::query(
                 r#"
                 INSERT INTO actors (id, corp_id, name, kind, role)
@@ -1120,6 +1145,9 @@ impl PgStore {
             opencode_actor_id,
             copilot_actor_id,
         ] {
+            if !seed_crew && actor_id != ids.alice_actor_id && actor_id != ids.bob_actor_id {
+                continue;
+            }
             sqlx::query(
                 r#"
                 INSERT INTO room_memberships (room_id, actor_id, role)
@@ -1183,6 +1211,9 @@ impl PgStore {
                 "violet",
             ),
         ] {
+            if !seed_crew {
+                continue;
+            }
             sqlx::query(
                 r#"
                 INSERT INTO agents
@@ -1215,7 +1246,12 @@ impl PgStore {
                 "demo-bootstrap-v1",
                 json!({
                     "name": "ECorp Operations Network",
-                    "actors": ["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal", "Piper"]
+                    "seed_crew": seed_crew,
+                    "actors": if seed_crew {
+                        vec!["Alice", "Bob", "Eve", "Margo", "Wally", "Cody", "Claudia", "Opal", "Piper"]
+                    } else {
+                        vec!["Alice", "Bob", "Eve"]
+                    }
                 }),
             ),
         )
@@ -1341,12 +1377,19 @@ impl PgStore {
 
         let agents = sqlx::query(
             r#"
-            SELECT id, corp_id, actor_id, name, role, adapter, status, station,
-                   current_run_id, accent, created_at
-            FROM agents WHERE corp_id = $1 ORDER BY role, name
+            SELECT a.id, a.corp_id, a.actor_id, a.name, a.role, a.adapter, a.status, a.station,
+                   a.current_run_id, a.accent, a.created_at, a.mission_id, a.pinned, a.retired_at
+            FROM agents a
+            WHERE a.corp_id = $1
+              AND (a.mission_id IS NULL OR EXISTS (
+                SELECT 1 FROM missions m JOIN room_memberships rm ON rm.room_id = m.room_id
+                WHERE m.id = a.mission_id AND m.corp_id = a.corp_id AND rm.actor_id = $2
+              ))
+            ORDER BY a.role, a.name
             "#,
         )
         .bind(corp_id)
+        .bind(viewer_actor_id)
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
@@ -4159,7 +4202,7 @@ impl PgStore {
             WHERE t.corp_id = $1
               AND m.status = 'running'
               AND t.status IN ('pending', 'ready')
-              AND a.status = 'idle'
+              AND a.status = 'idle' AND a.retired_at IS NULL
               AND t.attempt_count < t.max_attempts
               AND NOT EXISTS (
                 SELECT 1 FROM task_dependencies dependency
@@ -4209,7 +4252,7 @@ impl PgStore {
             WHERE t.corp_id = $1 AND t.mission_id = $2
               AND (m.status = 'running' OR ($3 AND m.status = 'ready'))
               AND t.status IN ('pending', 'ready')
-              AND a.status = 'idle'
+              AND a.status = 'idle' AND a.retired_at IS NULL
               AND t.attempt_count < t.max_attempts
               AND NOT EXISTS (
                 SELECT 1 FROM task_dependencies dependency
@@ -4271,7 +4314,7 @@ impl PgStore {
                    t.status AS task_status,
                    t.assigned_agent_id, t.attempt_count, t.max_attempts,
                    COALESCE(t.required_adapter, a.adapter) AS required_adapter,
-                   a.adapter
+                   a.adapter, a.retired_at
             FROM missions m
             JOIN tasks t ON t.mission_id = m.id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -4299,6 +4342,12 @@ impl PgStore {
             });
         }
         let task_status: String = row.get("task_status");
+        if row
+            .get::<Option<chrono::DateTime<Utc>>, _>("retired_at")
+            .is_some()
+        {
+            return Err(anyhow!("assigned mission worker is retired"));
+        }
         if !matches!(task_status.as_str(), "pending" | "ready") {
             return Err(anyhow!("task is not schedulable from status {task_status}"));
         }
@@ -4421,7 +4470,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE agents SET status = 'starting', station = 'dispatch', current_run_id = $1 WHERE id = $2",
+            "UPDATE agents SET status = 'starting', station = 'dispatch', current_run_id = $1, retired_at = NULL WHERE id = $2",
         )
         .bind(run_id)
         .bind(agent_id)
@@ -4524,7 +4573,7 @@ impl PgStore {
                    m.requested_by, m.title AS mission_title,
                    m.budget_tokens AS mission_budget_tokens,
                    m.budget_cost_microusd AS mission_budget_cost_microusd,
-                   a.adapter
+                   a.adapter, a.retired_at AS agent_retired_at
             FROM runs r
             JOIN tasks t ON t.id = r.task_id
             JOIN missions m ON m.id = t.mission_id
@@ -4639,17 +4688,18 @@ impl PgStore {
             r#"
             SELECT EXISTS(
                 SELECT 1 FROM runs
-                WHERE task_id = $1
+                WHERE (task_id = $1 OR agent_id = $2)
                   AND status IN ('provisioning', 'starting', 'running',
                                  'waiting_for_input', 'waiting_for_approval', 'verifying')
             )
             "#,
         )
         .bind(task_id)
+        .bind(agent_id)
         .fetch_one(&mut *tx)
         .await?;
         if active {
-            return Err(anyhow!("task already has an active run"));
+            return Err(anyhow!("task or assigned agent already has an active run"));
         }
 
         let (mission_tokens_used, mission_cost_used) =
@@ -4728,7 +4778,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE agents SET status = 'starting', station = 'dispatch', current_run_id = $1 WHERE id = $2",
+            "UPDATE agents SET status = 'starting', station = 'dispatch', current_run_id = $1, retired_at = NULL WHERE id = $2",
         )
         .bind(run_id)
         .bind(agent_id)
@@ -4749,6 +4799,7 @@ impl PgStore {
                     format!("run:{run_id}:resume-requested"),
                     json!({
                         "source_run_id": source_run_id,
+                        "mission_worker_reactivated": row.get::<Option<chrono::DateTime<Utc>>, _>("agent_retired_at").is_some(),
                         "workspace_run_id": workspace_run_id,
                         "task_id": task_id,
                         "agent_id": agent_id,
@@ -5456,12 +5507,25 @@ impl PgStore {
         corp_id: Uuid,
         task_id: Uuid,
     ) -> Result<Vec<DependencyArtifactContext>> {
+        let expected: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM task_dependencies dependency
+            JOIN tasks child ON child.id = dependency.task_id
+            WHERE child.id = $1 AND child.corp_id = $2
+            "#,
+        )
+        .bind(task_id)
+        .bind(corp_id)
+        .fetch_one(&self.pool)
+        .await?;
         let rows = sqlx::query(
             r#"
-            WITH ranked AS (
                 SELECT parent.id AS dependency_task_id,
                        parent.plan_key,
                        parent.title AS task_title,
+                       parent.contract AS dependency_contract,
+                       deliverable.base_commit AS source_base_commit,
+                       deliverable.verification_sha256 AS source_verification_sha256,
                        run.summary AS run_summary,
                        artifact.id,
                        artifact.corp_id,
@@ -5479,52 +5543,72 @@ impl PgStore {
                         artifact.file_name,
                         artifact.metadata,
                         artifact.provenance_signature,
-                       artifact.retention_until,
-                       row_number() OVER (
-                           PARTITION BY parent.id
-                           ORDER BY run.created_at DESC
-                       ) AS rank
+                       artifact.retention_until
                 FROM task_dependencies dependency
                 JOIN tasks child ON child.id = dependency.task_id
                 JOIN tasks parent ON parent.id = dependency.depends_on_task_id
-                JOIN runs run ON run.task_id = parent.id AND run.status = 'completed'
+                  AND parent.corp_id = child.corp_id AND parent.mission_id = child.mission_id
+                  AND parent.status = 'completed' AND parent.verification_status = 'passed'
+                JOIN LATERAL (
+                    SELECT r.* FROM runs r
+                    WHERE r.task_id = parent.id AND r.corp_id = parent.corp_id
+                      AND r.status = 'completed'
+                    ORDER BY r.created_at DESC, r.id DESC LIMIT 1
+                ) run ON run.verification_status = 'passed'
+                LEFT JOIN source_deliverables deliverable
+                  ON deliverable.run_id = run.id AND deliverable.task_id = parent.id
+                 AND deliverable.corp_id = parent.corp_id
                 JOIN artifacts artifact
-                  ON artifact.run_id = run.id
+                  ON artifact.id = CASE
+                    WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
+                      THEN deliverable.artifact_id ELSE run.artifact_id END
+                 AND artifact.run_id = run.id AND artifact.task_id = parent.id
+                 AND artifact.corp_id = parent.corp_id
                  AND artifact.status = 'ready'
-                 AND artifact.artifact_role = 'provider_evidence'
+                 AND CASE
+                    WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
+                    THEN artifact.artifact_role = 'source_deliverable'
+                      AND deliverable.form = 'typed_artifact_set'
+                      AND deliverable.verification_sha256 = run.verification_sha256
+                      AND deliverable.base_commit = run.workspace_base_commit
+                      AND artifact.sha256 = run.deliverable_sha256
+                    ELSE artifact.artifact_role = 'provider_evidence' END
                 WHERE child.id = $1 AND child.corp_id = $2
-            )
-            SELECT dependency_task_id, plan_key, task_title, run_summary,
-                   id, corp_id, task_id, run_id, producer_agent_id,
-                    producer_runner_id, verifier, object_key, uri, sha256,
-                    media_type, bytes, artifact_role, file_name, metadata,
-                    provenance_signature, retention_until
-            FROM ranked
-            WHERE rank = 1
-            ORDER BY plan_key
+                ORDER BY parent.plan_key
             "#,
         )
         .bind(task_id)
         .bind(corp_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        if rows.len() as i64 != expected {
+            return Err(anyhow!(
+                "dependency handoff is incomplete or unverified: expected {expected}, found {}",
+                rows.len()
+            ));
+        }
+        rows.into_iter()
             .map(|row| {
                 let dependency_task_id = row.get("dependency_task_id");
                 let plan_key = row.get("plan_key");
                 let task_title = row.get("task_title");
                 let run_summary = row.get("run_summary");
+                let contract = serde_json::from_value(row.get("dependency_contract"))?;
+                let source_base_commit = row.get("source_base_commit");
+                let verification_sha256 = row.get("source_verification_sha256");
                 let artifact = map_stored_artifact(row);
-                DependencyArtifactContext {
+                Ok(DependencyArtifactContext {
                     task_id: dependency_task_id,
                     plan_key,
                     task_title,
                     run_summary,
+                    contract,
+                    source_base_commit,
+                    verification_sha256,
                     artifact,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {
@@ -7567,6 +7651,7 @@ impl PgStore {
     ) -> Result<LeaseOutcome> {
         let mut tx = self.pool.begin().await?;
         assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        lock_agent_for_grant_tx(&mut tx, corp_id, agent_id).await?;
         let token = Uuid::new_v4();
         let expires_at = Utc::now() + Duration::minutes(5);
         let acquired_row = sqlx::query(
@@ -7688,6 +7773,8 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
         assert_actor_scope_tx(&mut tx, corp_id, to_actor_id).await?;
+        assert_actor_agent_scope_tx(&mut tx, corp_id, to_actor_id, agent_id).await?;
+        lock_agent_for_grant_tx(&mut tx, corp_id, agent_id).await?;
         if actor_id == to_actor_id {
             return Err(anyhow!("lease transfer target must be another actor"));
         }
@@ -7775,6 +7862,7 @@ impl PgStore {
 
         let mut tx = self.pool.begin().await?;
         assert_actor_agent_scope_tx(&mut tx, corp_id, actor_id, agent_id).await?;
+        lock_agent_for_grant_tx(&mut tx, corp_id, agent_id).await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("control-message:{corp_id}:{idempotency_key}"))
             .execute(&mut *tx)
@@ -8632,6 +8720,8 @@ async fn create_mission_tx(
 ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
     let title = normalize_mission_title(title)?;
     let description = normalize_mission_description(description)?;
+    assert_mission_operator_tx(tx, corp_id, requested_by).await?;
+    staffing::validate_staffing(plan)?;
 
     let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
 
@@ -8694,22 +8784,36 @@ async fn create_mission_tx(
         task_ids.insert(task.key.clone(), Uuid::new_v4());
     }
     let mut events = vec![mission_event.clone()];
+    events.extend(
+        staffing::persist_staffing_tx(tx, corp_id, mission_id, room_id, requested_by, plan).await?,
+    );
     for task in &plan.tasks {
         let task_id = *task_ids
             .get(&task.key)
             .context("planned task id unexpectedly missing")?;
-        let adapter: String =
-            sqlx::query_scalar("SELECT adapter FROM agents WHERE id = $1 AND corp_id = $2")
-                .bind(task.assigned_agent_id)
-                .bind(corp_id)
-                .fetch_one(&mut **tx)
-                .await
-                .with_context(|| {
-                    format!(
-                        "planned task {} references an agent outside the Corp",
-                        task.key
-                    )
-                })?;
+        let adapter: String = sqlx::query_scalar(
+            r#"SELECT adapter FROM agents
+                   WHERE id = $1 AND corp_id = $2 AND retired_at IS NULL
+                     AND (mission_id IS NULL OR mission_id = $3 OR pinned)
+                     AND (mission_id IS NULL OR mission_id = $3 OR EXISTS (
+                       SELECT 1 FROM missions m JOIN room_memberships rm ON rm.room_id = m.room_id
+                       WHERE m.id = agents.mission_id AND m.corp_id = $2 AND rm.actor_id = $4
+                         AND m.room_id = $5
+                     )) FOR SHARE"#,
+        )
+        .bind(task.assigned_agent_id)
+        .bind(corp_id)
+        .bind(mission_id)
+        .bind(requested_by)
+        .bind(room_id)
+        .fetch_one(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "planned task {} references an agent outside the Corp",
+                task.key
+            )
+        })?;
         if adapter != task.required_adapter {
             return Err(anyhow!(
                 "planned task {} requires adapter {} but assigned agent uses {adapter}",
@@ -9056,7 +9160,11 @@ fn validate_factory_plan_against_policy_parts(
         task.contract
             .write_scope
             .iter()
-            .find(|scope| !write_scope.contains(*scope))
+            .find(|scope| {
+                !write_scope
+                    .iter()
+                    .any(|allowed| crony_domain::write_scope_is_subset(scope, allowed))
+            })
             .map(|scope| (task, scope))
     }) {
         return Err(anyhow!(
@@ -9881,15 +9989,48 @@ async fn assert_actor_agent_scope_tx(
     agent_id: Uuid,
 ) -> Result<()> {
     assert_actor_scope_tx(tx, corp_id, actor_id).await?;
-    let agent_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND corp_id = $2)")
+    let agent =
+        sqlx::query("SELECT mission_id, retired_at FROM agents WHERE id = $1 AND corp_id = $2")
             .bind(agent_id)
             .bind(corp_id)
-            .fetch_one(&mut **tx)
-            .await?;
-    if !agent_exists {
-        return Err(anyhow!("agent does not belong to the requested Corp"));
+            .fetch_optional(&mut **tx)
+            .await?
+            .context("agent does not belong to the requested Corp")?;
+    if agent
+        .get::<Option<chrono::DateTime<Utc>>, _>("retired_at")
+        .is_some()
+    {
+        return Err(anyhow!(
+            "conflict: agent is retired; historical work remains available"
+        ));
     }
+    if let Some(mission_id) = agent.get::<Option<Uuid>, _>("mission_id") {
+        let room_id: Uuid =
+            sqlx::query_scalar("SELECT room_id FROM missions WHERE id = $1 AND corp_id = $2")
+                .bind(mission_id)
+                .bind(corp_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        assert_room_membership_tx(tx, corp_id, room_id, actor_id).await?;
+    }
+    Ok(())
+}
+
+async fn lock_agent_for_grant_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    agent_id: Uuid,
+) -> Result<()> {
+    // Only grant paths take this lock. Interrupt/stop retain their existing
+    // run-first lock order and do not grant new authority to a terminal worker.
+    sqlx::query_scalar::<_, bool>(
+        "SELECT TRUE FROM agents WHERE id = $1 AND corp_id = $2 AND retired_at IS NULL FOR SHARE",
+    )
+    .bind(agent_id)
+    .bind(corp_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("conflict: agent was retired before the authority grant")?;
     Ok(())
 }
 
@@ -10299,6 +10440,9 @@ fn map_agent(row: sqlx::postgres::PgRow) -> Result<Agent> {
         current_run_id: row.get("current_run_id"),
         accent: row.get("accent"),
         created_at: row.get("created_at"),
+        mission_id: row.get("mission_id"),
+        pinned: row.get("pinned"),
+        retired_at: row.get("retired_at"),
     })
 }
 
@@ -11418,6 +11562,7 @@ mod tests {
             max_depth: 0,
             budget_tokens: 1_000,
             budget_cost_microusd: 1_000_000,
+            staffing: Vec::new(),
             tasks: vec![PlannedTask {
                 key: "deliver".to_owned(),
                 title: "Deliver".to_owned(),

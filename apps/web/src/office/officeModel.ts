@@ -6,6 +6,10 @@ export interface OfficeAgent {
   status: 'idle' | 'starting' | 'working' | 'blocked' | 'reviewing' | 'offline'
   station: string | null
   current_run_id: string | null
+  mission_id?: string | null
+  /** Legacy snapshots omit this field; only an explicit true means pinned. */
+  pinned?: boolean
+  retired_at?: string | null
 }
 
 export type OfficeState =
@@ -17,6 +21,10 @@ export type OfficeState =
   | 'approval'
   | 'blocked'
   | 'offline'
+
+export const ACTIVE_OFFICE_STATES: readonly OfficeState[] = [
+  'starting', 'working', 'reading', 'reviewing',
+]
 
 export interface OfficePoint {
   x: number
@@ -32,6 +40,13 @@ export interface OfficePage {
   /** Zero-based studio index; desk indexes restart within each studio. */
   index: number
   agents: OfficeAgent[]
+}
+
+export interface OfficeView {
+  selectedId: string | null
+  selectedPage: number | undefined
+  page: number
+  zoom: number
 }
 
 export const OFFICE_WIDTH = 640
@@ -70,7 +85,7 @@ const STATE_DESCRIPTIONS: Readonly<Record<OfficeState, string>> = {
 }
 
 /**
- * Project reported state only. Offline wins; otherwise exact current-run
+ * Project reported state only. Offline and idle win; otherwise exact current-run
  * approval takes precedence over review. Stale stations never animate an idle,
  * starting, blocked or offline agent, and blocked alone never implies approval.
  */
@@ -79,7 +94,7 @@ export function resolveOfficeState(
   pendingApprovalRunIds: ReadonlySet<string> = new Set<string>(),
   pendingReviewRunIds: ReadonlySet<string> = new Set<string>(),
 ): OfficeState {
-  if (agent.status === 'offline') return 'offline'
+  if (agent.status === 'offline' || agent.status === 'idle') return agent.status
 
   const runId = agent.current_run_id
   if (runId && pendingApprovalRunIds.has(runId)) return 'approval'
@@ -99,6 +114,19 @@ export function stateDescription(state: OfficeState): string {
   return STATE_DESCRIPTIONS[state]
 }
 
+/** Keep the full snapshot intact for historical task/run identity resolution. */
+export function currentOfficeAgents<T extends OfficeAgent>(agents: readonly T[]): T[] {
+  return agents.filter((agent) => agent.retired_at == null)
+}
+
+export function selectOfficeAgent<T extends OfficeAgent>(
+  agents: readonly T[],
+  selectedId: string | null,
+): T | undefined {
+  const current = currentOfficeAgents(agents)
+  return current.find((agent) => agent.id === selectedId) ?? current[0]
+}
+
 /**
  * Sort a copy by persistent identity, not name, status, provider or input order.
  * For the same set of unique agent IDs, snapshot reordering cannot move seats.
@@ -109,9 +137,9 @@ export function sortOfficeAgents(agents: readonly OfficeAgent[]): OfficeAgent[] 
   )
 }
 
-/** Empty input yields no pages. Every agent occupies one seat in one studio. */
+/** Empty/currently retired input yields no pages. Each current agent gets one seat. */
 export function paginateOfficeAgents(agents: readonly OfficeAgent[]): OfficePage[] {
-  const roster = sortOfficeAgents(agents)
+  const roster = sortOfficeAgents(currentOfficeAgents(agents))
   const pages: OfficePage[] = []
   for (let offset = 0; offset < roster.length; offset += DESKS_PER_STUDIO) {
     pages.push({
@@ -120,6 +148,77 @@ export function paginateOfficeAgents(agents: readonly OfficeAgent[]): OfficePage
     })
   }
   return pages
+}
+
+export function officePageForAgent(
+  pages: readonly OfficePage[],
+  selectedId: string | null,
+): number | undefined {
+  const index = pages.findIndex((page) => page.agents.some((agent) => agent.id === selectedId))
+  return index < 0 ? undefined : index
+}
+
+/** Manual browsing survives refreshes, but a new selection always reveals its studio. */
+export function resolveOfficeView(
+  pages: readonly OfficePage[],
+  selectedId: string | null,
+  requested: OfficeView | null,
+): OfficeView {
+  const selectedPage = officePageForAgent(pages, selectedId)
+  const sameSelection = requested?.selectedId === selectedId &&
+    requested?.selectedPage === selectedPage
+  return {
+    selectedId,
+    selectedPage,
+    page: Math.max(0, Math.min(
+      sameSelection ? requested.page : selectedPage ?? 0,
+      pages.length - 1,
+    )),
+    zoom: sameSelection ? requested.zoom : 1,
+  }
+}
+
+/** Initial observation/remount is not a run transition and must never invent an arrival. */
+export function shouldAnimateArrival(
+  previousRunId: string | null | undefined,
+  agent: OfficeAgent,
+  state: OfficeState,
+  motion: boolean,
+): boolean {
+  return motion && agent.retired_at == null && previousRunId !== undefined &&
+    Boolean(agent.current_run_id) && previousRunId !== agent.current_run_id &&
+    ACTIVE_OFFICE_STATES.includes(state)
+}
+
+export function officeNextAction(
+  decisionCount: number,
+  blockedCount: number,
+  activeCount: number,
+): { heading: string; description: string; label: string; attentionState: OfficeState | null } {
+  if (decisionCount) return {
+    heading: `${decisionCount} awaiting approval`,
+    description: 'Open Missions to review the pending decisions.',
+    label: 'Review decisions',
+    attentionState: 'approval',
+  }
+  if (blockedCount) return {
+    heading: `${blockedCount} blocked`,
+    description: 'Inspect the blocked mission and its recovery controls before starting new work.',
+    label: 'Review blocked work',
+    attentionState: 'blocked',
+  }
+  if (activeCount) return {
+    heading: 'Work is in progress.',
+    description: 'Select an agent for its current task, messages and controls.',
+    label: 'Open missions',
+    attentionState: null,
+  }
+  return {
+    heading: 'What are we building?',
+    description: 'Create a mission to staff the office, or open Factory to work through your backlog.',
+    label: 'Open missions',
+    attentionState: null,
+  }
 }
 
 /** Returns a feet-center/chair anchor, never the desk's top-left corner. */

@@ -115,7 +115,40 @@ two invocations alone do not prove a restart. Retain checkpoint IDs after an int
 rather than resetting data or silently creating replacement missions. These are deterministic
 control-plane/browser checks, not evidence of real Copilot inference or a three-agent game build.
 
-### Workspace gates
+### Mission staffing regression
+
+`tools/e2e_mission_staffing.mjs` is an explicitly opted-in, isolated-stack regression.
+It requires a fresh owned development database, an independent source repository, a
+real runner using `fake-process`, and the explicit Copilot fixture for read-only
+studio planning. It rejects default/manual ports and preserves every checkpoint.
+
+It proves empty-crew bootstrap, exact mission-owned staffing, held plans, model/source
+and guest rejection without orphan identities, mutation-free factory preflight,
+materialization replay, and terminal worker retirement with historical attribution.
+It executes only one deterministic worker; held studio plans are not a real Copilot
+or concurrency proof.
+
+```powershell
+$env:CRONY_STAFFING_TEST = '1'
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:18962' # independently owned test stack only
+$env:CRONY_STAFFING_OUTPUT = 'C:\path\to\new-evidence-directory'
+node tools/e2e_mission_staffing.mjs
+```
+
+Real studio evidence must separately establish three actual Copilot sessions working
+concurrently, four isolated task worktrees, the selected repository/ref/commit, every
+verified handoff in the integration receipt, persisted application checks and authorized
+review before publication. Development Alice/Bob identities are test principals, not
+evidence of separate human GitHub authentication. Never label a fixture, a planned graph,
+an approval script, or a provider completion claim as that full proof.
+
+`tools/verify_arcade_browser.mjs` is an optional trusted runner verifier for a standalone
+game contract, not a provider tool. It requires a Git worktree and an explicitly supplied
+installed Playwright module, exercises keyboard-activated controls at desktop/390px,
+blocks remote HTTP requests, and produces real screenshots and a structured report.
+Pin its source digest in the persisted command policy when using it for a factory run.
+
+### Workspace command gates
 
 ```powershell
 cargo fmt --check

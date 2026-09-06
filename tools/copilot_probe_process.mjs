@@ -4,8 +4,8 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { createFsWireObserver } from './copilot_fs_wire_observer.mjs'
+import { COPILOT_CREDENTIAL_CANARY as canary } from './copilot_probe_environment.mjs'
 
-const canary = 'ECORP_CREDENTIAL_CANARY_MUST_NOT_REACH_COPILOT'
 const [role, binary, ...args] = process.argv.slice(2)
 assert.ok(['runner', 'copilot'].includes(role))
 assert.ok(binary)
@@ -14,6 +14,7 @@ assert.ok(process.env.ECORP_COPILOT_PROBE_ID)
 const canaryPresent = Object.values(process.env).some(
   (value) => value?.includes(canary),
 )
+const githubTokenIsCanary = process.env.GITHUB_TOKEN === canary
 const expected = role === 'runner'
 appendFileSync(
   process.env.ECORP_COPILOT_ENV_OBSERVATIONS,
@@ -24,12 +25,13 @@ appendFileSync(
     parent_pid: process.ppid,
     canary_present: canaryPresent,
     github_token_present: Object.hasOwn(process.env, 'GITHUB_TOKEN'),
+    github_token_is_canary: githubTokenIsCanary,
     auto_update_disabled_by_flag: role === 'copilot' && args.includes('--no-auto-update'),
   })}\n`,
 )
 assert.equal(canaryPresent, expected, `${role} canary precondition failed`)
 assert.ok(
-  expected ? process.env.GITHUB_TOKEN === canary : !Object.hasOwn(process.env, 'GITHUB_TOKEN'),
+  expected ? githubTokenIsCanary : !Object.hasOwn(process.env, 'GITHUB_TOKEN'),
   `${role} inherited credential boundary failed`,
 )
 const traceWire = role === 'copilot' && process.env.ECORP_COPILOT_FS_WIRE === '1'

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, RefObject } from 'react'
 import {
-  getArrivalRoute, getDesk, OFFICE_HEIGHT, OFFICE_WIDTH,
-  paginateOfficeAgents, resolveOfficeState, stateDescription, stateLabel,
+  ACTIVE_OFFICE_STATES as ACTIVE_STATES, currentOfficeAgents,
+  getArrivalRoute, getDesk, OFFICE_HEIGHT, OFFICE_WIDTH, officeNextAction,
+  paginateOfficeAgents, resolveOfficeState, resolveOfficeView, shouldAnimateArrival,
+  stateDescription, stateLabel,
 } from './office/officeModel'
-import type { OfficeAgent, OfficePoint, OfficeState } from './office/officeModel'
+import type { OfficeAgent, OfficePoint, OfficeState, OfficeView } from './office/officeModel'
 import {
   getOfficeCharacterAsset, getOfficeCharacterFrame, OFFICE_CHARACTER_ASSETS,
 } from './office/characterAssets'
@@ -20,7 +22,6 @@ type Pose = {
   direction: OfficeCharacterDirection
 }
 
-const ACTIVE_STATES: readonly OfficeState[] = ['starting', 'working', 'reading', 'reviewing']
 const EMPTY_RUN_IDS: ReadonlySet<string> = new Set()
 
 function characterFor(agentId: string) {
@@ -90,7 +91,7 @@ function OfficeCanvas({
 }: {
   people: Person[]
   motion: boolean
-  selectedId: string
+  selectedId: string | null
   buttons: RefObject<Map<string, HTMLButtonElement>>
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -132,13 +133,9 @@ function OfficeCanvas({
     }
     for (const { agent, state, seat } of people) {
       const previous = poses.current.get(agent.id)
-      // A run transition may cause ONE arrival. Reconnects and ordinary snapshot
-      // refreshes do not send every agent walking around the office.
-      const arriving = motion && (
-        (!previous && state === 'starting') ||
-        (previous && previous.runId !== agent.current_run_id &&
-          agent.current_run_id && ACTIVE_STATES.includes(state))
-      )
+      // Only an observed run transition causes an arrival. First paint, page
+      // changes and floor remounts do not imply a new run.
+      const arriving = shouldAnimateArrival(previous?.runId, agent, state, motion)
       const keepRoute = motion && previous?.route && ACTIVE_STATES.includes(state)
       poses.current.set(agent.id, {
         point: getDesk(seat),
@@ -257,43 +254,57 @@ export function OfficeFloor({
   onFactory,
 }: {
   agents: readonly OfficeAgent[]
-  selectedAgentId: string
+  selectedAgentId: string | null
   pendingApprovalRunIds?: ReadonlySet<string>
   pendingReviewRunIds?: ReadonlySet<string>
   connection: string
   runnerCount: number
   onSelect: (agentId: string) => void
-  onMissions: () => void
+  onMissions: (agentId?: string) => void
   onFactory: () => void
 }) {
-  const pages = useMemo(() => paginateOfficeAgents(agents), [agents])
-  const [requestedPage, setRequestedPage] = useState(0)
-  const pageIndex = Math.min(requestedPage, Math.max(0, pages.length - 1))
-  const [zoom, setZoom] = useState(1)
+  const currentAgents = useMemo(() => currentOfficeAgents(agents), [agents])
+  const pages = useMemo(() => paginateOfficeAgents(currentAgents), [currentAgents])
+  const [requestedView, setRequestedView] = useState<OfficeView | null>(null)
+  const view = resolveOfficeView(pages, selectedAgentId, requestedView)
+  const { selectedPage, page: pageIndex, zoom } = view
+  // Remember each selection transition before paint, including A -> B -> A.
+  // Otherwise an old manual page request for A could hide it on the return.
+  if (requestedView?.selectedId !== view.selectedId || requestedView?.selectedPage !== view.selectedPage) {
+    setRequestedView(view)
+  }
   const [backgroundUnavailable, setBackgroundUnavailable] = useState(false)
   const viewportRef = useRef<HTMLDivElement>(null)
   const buttons = useRef(new Map<string, HTMLButtonElement>())
   const preference = useMotionPreference()
+  useEffect(() => {
+    viewportRef.current?.scrollTo(0, 0)
+  }, [selectedAgentId, selectedPage])
   const people = useMemo(() => (pages[pageIndex]?.agents ?? []).map((agent, seat) => ({
     agent, seat, state: resolveOfficeState(agent, pendingApprovalRunIds, pendingReviewRunIds),
   })), [pages, pageIndex, pendingApprovalRunIds, pendingReviewRunIds])
-  const activeCount = agents.filter((agent) =>
+  const activeCount = currentAgents.filter((agent) =>
     ACTIVE_STATES.includes(resolveOfficeState(agent, pendingApprovalRunIds, pendingReviewRunIds)),
   ).length
-  const decisionCount = agents.filter((agent) =>
+  const decisionCount = currentAgents.filter((agent) =>
     resolveOfficeState(agent, pendingApprovalRunIds, pendingReviewRunIds) === 'approval',
   ).length
-  const blockedCount = agents.filter((agent) =>
+  const blockedCount = currentAgents.filter((agent) =>
     resolveOfficeState(agent, pendingApprovalRunIds, pendingReviewRunIds) === 'blocked',
   ).length
+  const nextAction = officeNextAction(decisionCount, blockedCount, activeCount)
+  const attentionAgent = nextAction.attentionState
+    ? currentAgents.find((agent) =>
+        resolveOfficeState(agent, pendingApprovalRunIds, pendingReviewRunIds) === nextAction.attentionState,
+      )
+    : undefined
 
   const changePage = (page: number) => {
-    setRequestedPage(page)
-    setZoom(1)
+    setRequestedView({ ...view, page, zoom: 1 })
     viewportRef.current?.scrollTo(0, 0)
   }
   const fit = () => {
-    setZoom(1)
+    setRequestedView({ ...view, zoom: 1 })
     viewportRef.current?.scrollTo(0, 0)
   }
 
@@ -308,9 +319,9 @@ export function OfficeFloor({
           </div>
           <div className="pixel-office-camera" aria-label="Office view controls">
             <button type="button" onClick={fit} aria-label="Fit office to view">Fit</button>
-            <button type="button" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))} aria-label="Zoom out">−</button>
+            <button type="button" disabled={zoom <= 1} onClick={() => setRequestedView({ ...view, zoom: Math.max(1, zoom - 0.25) })} aria-label="Zoom out">−</button>
             <output aria-label="Office zoom">{Math.round(zoom * 100)}%</output>
-            <button type="button" disabled={zoom >= 2} onClick={() => setZoom((value) => Math.min(2, value + 0.25))} aria-label="Zoom in">+</button>
+            <button type="button" disabled={zoom >= 2} onClick={() => setRequestedView({ ...view, zoom: Math.min(2, zoom + 0.25) })} aria-label="Zoom in">+</button>
           </div>
         </div>
         <div className={`pixel-office-viewport${zoom > 1 ? ' pixel-office-viewport-zoomed' : ''}`} ref={viewportRef} tabIndex={0} aria-label="Office floor. Select an agent or use the crew list. Zoomed views can be scrolled.">
@@ -368,11 +379,11 @@ export function OfficeFloor({
                 </button>
               )
             })}
-            {!agents.length ? (
+            {!currentAgents.length ? (
               <div className="pixel-office-empty">
                 <strong>Your office is ready.</strong>
-                <span>No agents are registered in this Corp yet.</span>
-                <button type="button" onClick={onMissions}>Set up a mission</button>
+                <span>Create a mission to staff the office.</span>
+                <button type="button" onClick={() => onMissions()}>Set up a mission</button>
               </div>
             ) : null}
           </div>
@@ -400,7 +411,7 @@ export function OfficeFloor({
 
       <aside className="pixel-office-roster" aria-label="Available crew">
         <header>
-          <div><h3>Crew</h3><span>{agents.length} {agents.length === 1 ? 'agent' : 'agents'}</span></div>
+          <div><h3>Crew</h3><span>{currentAgents.length} {currentAgents.length === 1 ? 'agent' : 'agents'}</span></div>
           <p>Select anyone to inspect their work.</p>
         </header>
         <div className="pixel-office-roster-list">
@@ -431,9 +442,9 @@ export function OfficeFloor({
           </nav>
         ) : null}
         <div className="pixel-office-next">
-          <strong>{decisionCount ? `${decisionCount} awaiting approval` : activeCount ? 'Work is in progress.' : 'What are we building?'}</strong>
-          <p>{decisionCount ? 'Open Missions to review the pending decisions.' : activeCount ? 'Select an agent for its current task, messages and controls.' : 'Give the crew a mission, or open Factory to work through your backlog.'}</p>
-          <button type="button" className="pixel-office-primary" onClick={onMissions}>{decisionCount ? 'Review decisions' : 'Open missions'}<span aria-hidden="true">↗</span></button>
+          <strong>{nextAction.heading}</strong>
+          <p>{nextAction.description}</p>
+          <button type="button" className="pixel-office-primary" onClick={() => onMissions(attentionAgent?.id)}>{nextAction.label}<span aria-hidden="true">↗</span></button>
           <button type="button" className="pixel-office-factory-link" onClick={onFactory}>Open Factory <span aria-hidden="true">→</span></button>
         </div>
       </aside>

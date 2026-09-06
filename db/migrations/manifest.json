@@ -170,6 +170,11 @@
       "version": 34,
       "file": "0034_durable_control_command_fencing.sql",
       "sha384": "2149b2098c0c3212cef040431d91df97a38fe9d5bcc7d3961c08cab883b29a86a537972a9d5814dfb87b422188b32e62"
+    },
+    {
+      "version": 35,
+      "file": "0035_mission_scoped_staffing.sql",
+      "sha384": "96491e446a1d5182ad7feb3f952fd8282f54d3f37de88d9e2da8ff1937540469366406b3addf78d2c0a2e3943f4ef2a9"
     }
   ]
 }
