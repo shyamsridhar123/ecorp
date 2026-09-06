@@ -249,7 +249,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     validate_args(&args)?;
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let requested_verification_policy = load_verification_policy(&args)?;
-    let project_items = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
+    let project_items = load_requested_project_items(&args)?;
     if project_items.items.len() < project_items.total_count {
         bail!(
             "GitHub Project returned {} of {} items; increase the controller query limit",
@@ -637,21 +637,26 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     .context("renew factory lease immediately before GitHub Project update")?;
     work_item_version = renewed.1;
 
-    let project_update = set_project_in_progress(
-        &args.github_cli,
-        &args.owner,
-        args.project_number,
-        &refreshed.project_item.id,
-    )
-    .and_then(|_| {
-        verify_project_status(
+    let project_update = if refreshed.project_item.status == "In Progress" {
+        // The exact item was just revalidated. No external write is needed.
+        Ok(())
+    } else {
+        set_project_in_progress(
             &args.github_cli,
             &args.owner,
             args.project_number,
             &refreshed.project_item.id,
-            "In Progress",
         )
-    });
+        .and_then(|_| {
+            verify_project_status(
+                &args.github_cli,
+                &args.owner,
+                args.project_number,
+                &refreshed.project_item.id,
+                "In Progress",
+            )
+        })
+    };
     if let Err(error) = project_update {
         if work_item_state != "blocked" {
             transition_factory_state(
@@ -1599,6 +1604,152 @@ fn load_project_items(
     .and_then(|value| serde_json::from_value(value).context("decode GitHub Project items"))
 }
 
+// Avoid full-Project rescans for a selected issue or an already-claimed item.
+fn load_requested_project_items(args: &FactoryArgs) -> Result<ProjectItemsEnvelope> {
+    let Some(number) = args.issue else {
+        return load_project_items(&args.github_cli, &args.owner, args.project_number);
+    };
+    let (owner, repository) = repository_parts(&args.repository)?;
+    let query = r#"query($owner:String!,$repo:String!,$number:Int!){
+      repository(owner:$owner,name:$repo){issue(number:$number){
+        projectItems(first:100){pageInfo{hasNextPage} nodes{
+          id project{number owner{... on User{login} ... on Organization{login}}}
+        }}
+      }}
+    }"#;
+    let result = gh_json(
+        &args.github_cli,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("repo={repository}"),
+            "-F",
+            &format!("number={number}"),
+        ],
+    )?;
+    let connection = result
+        .pointer("/data/repository/issue/projectItems")
+        .context("selected GitHub issue or Project memberships are unavailable")?;
+    if connection
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        bail!("selected issue Project memberships exceeded the bounded exact lookup");
+    }
+    let nodes = connection["nodes"]
+        .as_array()
+        .context("missing issue Project memberships")?;
+    let matches = nodes
+        .iter()
+        .filter(|node| project_identity_matches(node, &args.owner, args.project_number))
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!("selected issue has ambiguous membership in the requested Project");
+    }
+    let items = matches
+        .into_iter()
+        .map(|node| {
+            let id = node["id"]
+                .as_str()
+                .context("Project membership omitted its identity")?;
+            load_project_item_exact(&args.github_cli, &args.owner, args.project_number, id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ProjectItemsEnvelope {
+        total_count: items.len(),
+        items,
+    })
+}
+
+fn project_identity_matches(node: &Value, owner: &str, number: u32) -> bool {
+    node.pointer("/project/number").and_then(Value::as_u64) == Some(u64::from(number))
+        && node
+            .pointer("/project/owner/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.eq_ignore_ascii_case(owner))
+}
+
+fn load_project_item_exact(
+    github_cli: &Path,
+    owner: &str,
+    number: u32,
+    item_id: &str,
+) -> Result<ProjectItem> {
+    let query = r#"query($id:ID!){node(id:$id){
+      __typename ... on ProjectV2Item{
+        id isArchived project{number owner{... on User{login} ... on Organization{login}}}
+        fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+        content{__typename ... on Issue{id number title body url repository{nameWithOwner}}}
+      }
+    }}"#;
+    let result = gh_json(
+        github_cli,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("id={item_id}"),
+        ],
+    )?;
+    parse_exact_project_item(&result["data"]["node"], owner, number, item_id)
+}
+
+fn parse_exact_project_item(
+    node: &Value,
+    owner: &str,
+    number: u32,
+    item_id: &str,
+) -> Result<ProjectItem> {
+    if node["__typename"] != "ProjectV2Item"
+        || node["isArchived"] != false
+        || node["id"] != item_id
+        || !project_identity_matches(node, owner, number)
+        || node["content"]["__typename"] != "Issue"
+    {
+        bail!("selected GitHub Project item disappeared or changed Project/source identity");
+    }
+    let content = &node["content"];
+    Ok(ProjectItem {
+        id: item_id.to_owned(),
+        status: node
+            .pointer("/fieldValueByName/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        content: ProjectContent {
+            kind: "Issue".to_owned(),
+            number: content["number"]
+                .as_i64()
+                .context("Project issue number missing")?,
+            title: content["title"]
+                .as_str()
+                .context("Project issue title missing")?
+                .to_owned(),
+            body: content["body"]
+                .as_str()
+                .context("Project issue body missing")?
+                .to_owned(),
+            url: content["url"]
+                .as_str()
+                .context("Project issue URL missing")?
+                .to_owned(),
+            repository: content
+                .pointer("/repository/nameWithOwner")
+                .and_then(Value::as_str)
+                .context("Project issue repository missing")?
+                .to_ascii_lowercase(),
+        },
+    })
+}
+
 fn load_issue(github_cli: &Path, repository: &str, number: i64) -> Result<IssueView> {
     gh_json(
         github_cli,
@@ -1758,19 +1909,12 @@ async fn refresh_selected(
     args: &FactoryArgs,
     selected: &EvaluatedItem,
 ) -> Result<(EvaluatedItem, Option<ExistingFactoryItem>)> {
-    let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
-    if project.items.len() < project.total_count {
-        bail!(
-            "GitHub Project returned {} of {} items while refreshing the selected issue",
-            project.items.len(),
-            project.total_count
-        );
-    }
-    let item = project
-        .items
-        .into_iter()
-        .find(|item| item.id == selected.project_item.id)
-        .context("selected GitHub Project item disappeared before claim")?;
+    let item = load_project_item_exact(
+        &args.github_cli,
+        &args.owner,
+        args.project_number,
+        &selected.project_item.id,
+    )?;
     let existing =
         lookup_factory_work_items(client, server, args, std::slice::from_ref(&item.id)).await?;
     let mut cache = HashMap::new();
@@ -1794,19 +1938,13 @@ fn revalidate_selected_for_effect(
     expected_project_status: &str,
     stage: &str,
 ) -> Result<()> {
-    let project = load_project_items(&args.github_cli, &args.owner, args.project_number)?;
-    if project.items.len() < project.total_count {
-        bail!(
-            "GitHub Project returned {} of {} items while revalidating before {stage}",
-            project.items.len(),
-            project.total_count
-        );
-    }
-    let item = project
-        .items
-        .into_iter()
-        .find(|item| item.id == selected.project_item.id)
-        .with_context(|| format!("selected GitHub Project item disappeared before {stage}"))?;
+    let item = load_project_item_exact(
+        &args.github_cli,
+        &args.owner,
+        args.project_number,
+        &selected.project_item.id,
+    )
+    .with_context(|| format!("read exact Project item before {stage}"))?;
     let mut reasons = Vec::new();
     if item.content.kind != "Issue" {
         reasons.push(format!(
@@ -2046,13 +2184,8 @@ fn verify_project_status(
     item_id: &str,
     expected: &str,
 ) -> Result<()> {
-    let items = load_project_items(github_cli, owner, project_number)?;
-    let status = items
-        .items
-        .iter()
-        .find(|item| item.id == item_id)
-        .map(|item| item.status.as_str())
-        .context("updated GitHub Project item disappeared")?;
+    let item = load_project_item_exact(github_cli, owner, project_number, item_id)?;
+    let status = item.status.as_str();
     if status != expected {
         bail!("GitHub Project item status is {status}, not {expected}");
     }
@@ -2690,10 +2823,50 @@ mod tests {
     use super::{
         ExistingFactoryItem, FactoryArgs, acceptance_tests, blocked_dependency_numbers,
         factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        parse_github_repository_identity, publication_base_branch,
+        parse_exact_project_item, parse_github_repository_identity, publication_base_branch,
         resolve_recovery_publication_base_ref, sanitize_failure_detail,
         selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
     };
+
+    #[test]
+    fn exact_project_reads_preserve_source_content_and_project_identity() {
+        let node = json!({
+            "__typename": "ProjectV2Item", "id": "opaque-item", "isArchived": false,
+            "project": {"number": 3, "owner": {"login": "Owner"}},
+            "fieldValueByName": {"name": "In Progress"},
+            "content": {"__typename": "Issue", "number": 7, "title": "Work",
+                "body": "Exact source", "url": "https://github.com/owner/repo/issues/7",
+                "repository": {"nameWithOwner": "Owner/Repo"}}
+        });
+        let item = parse_exact_project_item(&node, "owner", 3, "opaque-item").unwrap();
+        assert_eq!(item.status, "In Progress");
+        assert_eq!(item.content.repository, "owner/repo");
+        assert_eq!(item.content.body, "Exact source");
+        assert_eq!(item.content.number, 7);
+        assert!(parse_exact_project_item(&node, "other", 3, "opaque-item").is_err());
+        assert!(parse_exact_project_item(&node, "owner", 4, "opaque-item").is_err());
+        assert!(parse_exact_project_item(&node, "owner", 3, "different-item").is_err());
+        let mut archived = node.clone();
+        archived["isArchived"] = json!(true);
+        assert!(parse_exact_project_item(&archived, "owner", 3, "opaque-item").is_err());
+        archived.as_object_mut().unwrap().remove("isArchived");
+        assert!(parse_exact_project_item(&archived, "owner", 3, "opaque-item").is_err());
+        assert!(
+            parse_exact_project_item(&serde_json::Value::Null, "owner", 3, "opaque-item").is_err()
+        );
+    }
+
+    #[test]
+    fn exact_project_reads_reject_deleted_or_non_issue_content() {
+        let mut node = json!({
+            "__typename": "ProjectV2Item", "id": "item", "isArchived": false,
+            "project": {"number": 3, "owner": {"login": "owner"}},
+            "fieldValueByName": null, "content": null
+        });
+        assert!(parse_exact_project_item(&node, "owner", 3, "item").is_err());
+        node["content"] = json!({"__typename": "DraftIssue", "number": 7});
+        assert!(parse_exact_project_item(&node, "owner", 3, "item").is_err());
+    }
 
     #[test]
     fn dependency_parser_uses_only_explicit_blockers() {

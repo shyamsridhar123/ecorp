@@ -46,9 +46,37 @@ function assertPublisherCredential() {
   }
 }
 
+function observeProjectItemRead() {
+  state.project_item_read_calls = (state.project_item_read_calls ?? 0) + 1
+  // Legacy fixture name: this hook schedules a source change at an item-read
+  // boundary, whether the controller uses a full list or an exact node.
+  const mutation = state.item_list_mutation
+  if (mutation && mutation.call === state.project_item_read_calls) {
+    const issue = state.issues[String(mutation.issue_number)]
+    if (!issue) fail(`scheduled mutation references unknown issue ${mutation.issue_number}`)
+    Object.assign(issue, mutation.patch ?? {})
+    if (mutation.remove_label) issue.labels = issue.labels.filter((label) => label.name !== mutation.remove_label)
+    state.item_list_mutations_applied = (state.item_list_mutations_applied ?? 0) + 1
+    state.item_list_mutation = null
+  }
+}
+
 if (args[0] === 'api' && args[1] === 'graphql') {
   assertPublisherCredential()
   const itemId = formValue('id')
+  if (!itemId && formValue('query')?.includes('projectItems(first:100)')) {
+    const repository = `${formValue('owner')}/${formValue('repo')}`
+    const number = Number(formValue('number'))
+    const issue = state.issues[String(number)]
+    const items = state.items.filter((item) => item.content.number === number &&
+      item.content.repository.toLowerCase() === repository.toLowerCase())
+    console.log(JSON.stringify({ data: { repository: { issue: issue ? {
+      projectItems: { pageInfo: { hasNextPage: false }, nodes: items.map((item) => ({
+        id: item.id, project: { number: state.project.number, owner: { login: state.project.owner } },
+      })) },
+    } : null } } }))
+    process.exit(0)
+  }
   if (!itemId) {
     fail('exact Project item lookup omitted its node id')
   }
@@ -73,6 +101,7 @@ if (args[0] === 'api' && args[1] === 'graphql') {
     )
     process.exit(0)
   }
+  observeProjectItemRead()
   const item = state.items.find((candidate) => candidate.id === itemId)
   const status = item
     ? state.project.status_options.find(
@@ -88,6 +117,12 @@ if (args[0] === 'api' && args[1] === 'graphql') {
           ? {
               __typename: 'ProjectV2Item',
               id: item.id,
+              isArchived: item.isArchived ?? false,
+              content: {
+                __typename: item.content.type,
+                ...item.content,
+                repository: { nameWithOwner: item.content.repository },
+              },
               project: {
                 id: state.project.id,
                 number: state.project.number,
@@ -115,25 +150,14 @@ if (args[0] === 'api' && args[1] === 'graphql') {
 } else if (args[0] === 'project' && args[1] === 'item-list') {
   assertProject()
   state.item_list_calls = (state.item_list_calls ?? 0) + 1
-  const mutation = state.item_list_mutation
-  if (mutation && mutation.call === state.item_list_calls) {
-    const issue = state.issues[String(mutation.issue_number)]
-    if (!issue) {
-      fail(`scheduled item-list mutation references unknown issue ${mutation.issue_number}`)
-    }
-    Object.assign(issue, mutation.patch ?? {})
-    if (mutation.remove_label) {
-      issue.labels = issue.labels.filter((label) => label.name !== mutation.remove_label)
-    }
-    state.item_list_mutations_applied = (state.item_list_mutations_applied ?? 0) + 1
-    state.item_list_mutation = null
-  }
+  observeProjectItemRead()
   await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`)
   const requestedLimit = Number(option('--limit') ?? state.items.length)
+  const activeItems = state.items.filter((item) => !item.isArchived)
   console.log(
     JSON.stringify({
-      items: state.items.slice(0, requestedLimit),
-      totalCount: state.items.length,
+      items: activeItems.slice(0, requestedLimit),
+      totalCount: activeItems.length,
     }),
   )
 } else if (args[0] === 'project' && args[1] === 'view') {

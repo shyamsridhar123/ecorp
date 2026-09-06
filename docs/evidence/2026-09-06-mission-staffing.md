@@ -94,9 +94,59 @@ hashes; its complete context digest is:
 5f61a37b8bc5e156d59a3f2e78ea844711b78dc934b860b5d01acdaad2953f3a
 ```
 
-At this checkpoint, no routine action approval had been requested. Final game
-verification, review and PR publication are not claimed by this checkpoint;
-their outcome must be recorded separately before closing the game work.
+No routine action approval was requested in any of the four real sessions.
+
+### Final game and publication
+
+The integration completed in the same mission without a replacement run.
+All nine persisted checks passed, including **18/18 substantive Node tests**,
+actual desktop/390px browser controls, reduced-motion mode, no remote requests
+or console errors, and real screenshots. Independent AI review found no blocking
+implementation issues; the development test principal exercised the final gate
+with the same explicit non-human/non-production-authentication caveat.
+
+Supplemental browser QA then reached Won/800 through 36 real Arrow-key moves and
+Lost/0 after Restart through 10 real `D` presses, without state injection.
+Restart from both outcomes returned to Ready. The source was not modified by
+that supplemental QA.
+
+| Final evidence | Value |
+|---|---|
+| Game commit | `d8e334d22e33808fccb8d0ae31d0b34b9964cb61` |
+| Source artifact | `d0b73a96-ab30-47a8-af20-b1a3fa7fa671` |
+| Artifact SHA-256 | `ed76927ea89e7fde8aef63ee13cdff9f410689272b470d02f10d22024b86f625` |
+| Verification digest | `258d5110acfbd8238cfdf09670fd3a2af786c613bc55a5a45cf109f8807227a3` |
+| Factory item | `b38b951a-66be-4506-96bb-672d42a082d4` |
+| Publication | `b898aaea-b975-44b9-8d22-1322c4f29ef9` |
+| Remote PR | `shyamsridhar123/ecorp-arcade-lab#2` |
+
+The trusted publisher created one branch/PR in one durable publication attempt;
+factory state is `published` and its Project item is `In Review`. Merge,
+auto-merge and deployment were not performed. The configured source checkout
+remained clean at its original `d6343f5` commit.
+
+### GraphQL quota failure and exact-item recovery
+
+Repeated full-Project reads exhausted the usable GraphQL budget during the
+active run. The controller correctly preserved the same mission/artifacts and
+recorded the remote revalidation failure as blocked. Intake was paused rather
+than repeatedly hammering GitHub. The actual GraphQL rate-limit response showed
+48 points remaining, insufficient for the old wide query; the REST rate-limit
+summary misleadingly reported 5,000.
+
+The CLI now resolves `--issue` through that issue's bounded Project memberships,
+then uses exact Project item reads at claim/effect/status revalidation. It still
+checks Project owner/number, opaque item identity, non-archived status, issue
+identity/content/revision, labels and dependencies. An unchanged In Progress
+status no longer causes a redundant Project write. Full-queue intake retains
+its completeness guard; adaptive polling/backoff for broad intake remains a
+separate follow-up.
+
+The lower-cost reads recovered the **same** item and mission to awaiting review
+and then verified, with `materialized_now=false`, unchanged four run IDs and no
+new workers. Publication then succeeded through the normal trusted publisher.
+No alternate account, quota bypass, manual database edit or replacement mission
+was used. Two exact-item parser tests extend the Rust workspace total to 194.
 
 Local real-provider evidence:
 
