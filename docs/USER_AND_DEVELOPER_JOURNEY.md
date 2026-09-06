@@ -1,10 +1,14 @@
 # ECorp user and developer journey
 
-Updated: September 3, 2026
+Updated: September 6, 2026
 
 ECorp turns a repository-level outcome into isolated agent work, human decisions, and verified
 artifacts. The office is a live projection of that workflow; it is not a separate game layer or the
 system of record.
+
+Start with the [interactive front office](https://ecorp-front-office.shyam-sridhar16.chatgpt.site)
+for the product story and illustrative tour. That separate website does not run agents or connect
+to a repository. This guide covers the actual ECorp application.
 
 The browser is one arcade game shell with five focused cabinets: **Control floor**, **Factory**,
 **Missions**, **Comms**, and **Audit**. Only one primary view is rendered at a time. A compact score
@@ -13,14 +17,15 @@ stacking every subsystem into one page. Hash links and desktop deep links select
 cabinet before focusing the requested room, mission, task, or run.
 
 A fixed bottom control dock switches cabinets while the selected workspace owns the screen. The
-Control floor is a coherent sprite-art world rather than a framed dashboard. Every authoritative
-agent identity remains selectable in the playfield, including truthful off-shift identities. Agent
+Control floor is a coherent sprite-art world rather than a framed dashboard. Non-retired
+agent identities remain selectable, including truthful off-shift identities. Retired mission
+workers stay in historical missions and runs rather than occupying the current floor. Agent
 details and controls open as a dismissible command HUD instead of consuming a permanent column.
 Factory uses one issue queue and one full workbench dossier. Missions uses one cartridge list and
 one active quest dossier. Mobile keeps the same game-world model with a bottom dock, a command
 sheet, and no document-level horizontal overflow.
 
-## The four-step user journey
+## The five-step user journey
 
 ### 1. Connect a runner
 
@@ -49,15 +54,25 @@ let an agent edit the configured source checkout directly.
 
 ### 2. Choose the crew
 
-The mission composer lists only adapters reported as available by a connected runner.
+In **Run setup**, select and confirm the exact source repository, symbolic ref, and immutable
+commit advertised by a connected runner. The mission composer then lists only compatible adapters,
+models, and reasoning levels for that source.
 
 - **GitHub Copilot** discovers the models enabled for the signed-in Copilot account.
-- **OpenAI Codex**, **Claude Code**, and **OpenCode** use their locally configured runtimes.
+- **OpenAI Codex** uses its locally configured app-server runtime.
+- **Claude Code** and **OpenCode** use normalized external-CLI runtimes on Windows. Their Unix
+  adapters are currently disabled because equivalent descendant-process containment is not proven.
 - **Test harness** is deterministic, quota-free, and contains no AI. Use it to test ECorp behavior,
   not to judge agent quality.
 
 For providers with model catalogs, choose a model and supported reasoning effort. Leaving the model
 blank uses that provider's default.
+
+ECorp can provision mission-owned workers when the accepted graph is saved; a proposal alone does
+not create a crew. **Studio team · 3 Copilot agents** requires a compatible GitHub Copilot runner.
+It creates visual, gameplay, and quality workers, with a later integration task assigned to the
+gameplay worker. The development browser starts without a fixed demo cast; explicit legacy fixtures
+remain available for testing.
 
 ### 3. Plan and run a mission
 
@@ -67,12 +82,12 @@ evidence that should prove it.
 The arcade-style composer keeps one decision screen visible at a time:
 
 1. **Mission:** short outcome plus the complete durable specification.
-2. **Loadout:** runtime, model, budget, deliverable, and orchestration pattern.
-3. **Win conditions:** tabbed outcome, guardrail, context, and verifier controls.
+2. **Run setup:** confirmed repository/ref/commit, runtime, model, budget, deliverable, and execution strategy.
+3. **Verification:** tabbed outcome, guardrail, context, and verifier controls.
 
-Win conditions accept explicit objectives, expected output, acceptance criteria, allowed tools,
+Verification accepts explicit objectives, expected output, acceptance criteria, allowed tools,
 prohibited actions, repository or issue references, approved context sources, and
-worktree-relative write scope. Enable **Custom victory gates** to add typed artifact, file, command,
+worktree-relative write scope. Enable **Custom verification** to add typed artifact, file, command,
 test, JSON-schema, or screenshot checks and an optional human-approval or independent-review gate.
 Enabling it pauses after planning by default. Expand each planned task to inspect the exact
 persisted completion plan before dispatch. After a mission is created, the composer collapses to a
@@ -90,9 +105,10 @@ Choose the portable result before dispatch:
 The optional commit toggle never publishes or merges. Pull-request publication and merge are
 separate authorized effects.
 
-By default, **Plan and run mission** creates the task graph and immediately dispatches ready tasks.
-Enable **Pause after planning** when a human should inspect the generated graph before selecting
-**Dispatch mission**.
+By default, **Launch mission** creates the task graph and requests dispatch. Enable **Hold at
+briefing** to use **Create mission plan** instead. Its persisted **Awaiting dispatch** state survives
+closing the browser and restarting the server; only an explicit authorized **Dispatch mission**
+can release the first run. Normal dependency release and retries apply only after launch.
 
 Before a ready mission's first run, an authorized operator can save a versioned `redispatch`
 contract revision and then explicitly dispatch it. After a failed, cancelled, or lost provider
@@ -103,11 +119,18 @@ and version.
 
 Strategy meanings:
 
-- **One agent delivers the outcome:** focused builds, fixes, and reviews.
-- **Two specialists, then synthesis:** independent approaches followed by a bounded synthesis task.
+- **Solo run:** focused builds, fixes, and reviews.
+- **Two specialists and synthesis:** independent approaches followed by a bounded synthesis task.
+- **Studio team · 3 Copilot agents:** three parallel handoff tasks, then integration by one of those
+  workers after all three parents pass verification and any required review. Integration consumes
+  signed, verified handoff artifacts, never another worker's live worktree.
 - **Verification matrix:** deterministic verifier coverage.
 - **Human approval / independent review:** completion pauses for an authorized decision.
-- **Verification failure demo:** intentionally exercises the failure path.
+- **Failure path:** intentionally exercises a verification failure.
+
+The deterministic strategies appear under **Developer fixtures**. A fixture or planned graph is
+not evidence of real provider execution. For the studio path and its exact evidence scope, read
+the [mission-staffing report](evidence/2026-09-06-mission-staffing.md).
 
 ### 4. Operate and review
 
@@ -128,8 +151,11 @@ the Escape key without ending or changing the agent process.
 
 When a run becomes completed, failed, or cancelled, its adapter disconnects or stops the provider,
 the runner removes the run from its active-process map, and the employee identity returns off shift.
-ECorp preserves the identity and resumable session metadata so future work can be scheduled without
-leaving an operating-system process alive.
+ECorp preserves the identity and resumable session metadata without leaving an operating-system
+process alive. Unpinned mission workers retire after terminal missions only when there is no active
+run, control lease, queued message, approval, durable command, or teardown uncertainty. An
+authorized resume can reactivate the preserved worker. Dedicated Pin/Unpin, Clear crew, and manual
+Retire controls remain tracked in [#48](https://github.com/shyamsridhar123/ecorp/issues/48).
 
 Risky commands create durable approval records. After verification passes, the mission card exposes
 provider evidence, verification evidence, the signed source deliverable, and integration state as
@@ -140,8 +166,12 @@ access. The room and immutable activity feed preserve the collaboration and repl
 
 An owner, admin, or manager can run `crony factory-publish <corp> <actor> <work-item>`. The trusted
 CLI derives the exact ready commit/branch deliverable, target, source issue, title/body, authorization
-record, and idempotent effect key from the durable snapshot. It uses the operator's existing GitHub
-credential helper without exposing that credential to the agent or server.
+record, and idempotent effect key from the exact Corp- and room-authorized publication context,
+not a bounded browser snapshot. An owner/admin must first enroll a short-lived publisher workload
+credential. Pass its identifier and credential-file path to the CLI; GitHub authentication remains
+in the trusted publisher, not the producing agent or server. Follow the complete
+[publisher setup and cleanup procedure](DARK_FACTORY_CONTRIBUTOR_GUIDE.md) rather than treating the
+positional command alone as sufficient authority.
 
 Retries do not create another branch or pull request. The UI shows the target, base, branch, commit,
 authorization, attempt history, failure detail, pull-request link, and Project transition. Project
@@ -159,13 +189,18 @@ does not merge or deploy.
 3. `crony-runner`, enrolled through an expiring token and then a rotating credential.
 4. The Vite web client on `127.0.0.1:5187`.
 
+When `ECORP_FACTORY_WATCH=1`, startup also starts the configured trusted GitHub Project watcher.
+Its heartbeat and pause/resume state are independent from individual missions. Without that
+configuration, the UI reports that Factory is not configured.
+
 The browser talks only to the server. The server persists domain state and sends fenced assignments
 over the outbound runner WebSocket. The runner starts the provider adapter in an isolated worktree
 and streams normalized lifecycle events back.
 
 ### Where to change each part
 
-- Web journey and office projection: `apps/web/src/App.tsx` and `apps/web/src/App.css`
+- Web journey and mission controls: `apps/web/src/App.tsx` and `apps/web/src/App.css`
+- Office projection and worker inspection: `apps/web/src/OfficeFloor.tsx` and `apps/web/src/OfficeInspector.tsx`
 - HTTP/WebSocket control plane: `crates/crony-server`
 - Task planning and bounds: `crates/crony-server/src/planning.rs`
 - Provider execution and worktree lifecycle: `crates/crony-runner`
@@ -176,6 +211,7 @@ and streams normalized lifecycle events back.
 ### Verification loop
 
 ```powershell
+node tools/check_migrations.mjs
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
