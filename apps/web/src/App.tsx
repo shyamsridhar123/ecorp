@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, FormEvent } from 'react'
+import type { FormEvent } from 'react'
 import './App.css'
 import './Arcade.css'
 import './Cabinet.css'
 import './World.css'
 import './Accessible.css'
-import { AgentSprite } from './AgentSprite'
+import { OfficeFloor, OfficePortrait } from './OfficeFloor'
+import { OfficeInspector } from './OfficeInspector'
 
 type Actor = {
   id: string
@@ -665,15 +666,6 @@ function usesDeterministicHarness(strategy: string): boolean {
   )
 }
 
-const OFFICE_POSITIONS = [
-  { x: 17, y: 42 },
-  { x: 41, y: 42 },
-  { x: 65, y: 42 },
-  { x: 28, y: 72 },
-  { x: 53, y: 72 },
-  { x: 78, y: 72 },
-] as const
-
 function adapterLabel(adapter: string): string {
   if (adapter === 'github-copilot') return 'GitHub Copilot'
   if (adapter === 'codex') return 'OpenAI Codex'
@@ -696,15 +688,6 @@ function agentStatusLabel(agent: Agent): string {
   if (agent.status === 'idle' && !agent.current_run_id) return 'idle'
   if (agent.status === 'offline') return 'runner unavailable'
   return agent.status
-}
-
-function agentVisualStateLabel(agent: Agent): string {
-  if (agent.status === 'idle') return 'Idle'
-  if (agent.status === 'starting') return 'Starting'
-  if (agent.status === 'working') return 'Working'
-  if (agent.status === 'reviewing') return 'Review ready'
-  if (agent.status === 'blocked') return 'Needs approval'
-  return 'Offline'
 }
 
 function statusLabel(value: string): string {
@@ -2289,134 +2272,8 @@ function AgentAvatar({ agent }: { agent: Agent }) {
       aria-hidden="true"
     >
       <span className="sprite-shadow" />
-      <AgentSprite agentId={agent.id} />
+      <OfficePortrait agentId={agent.id} />
       <span className="sprite-signal" />
-    </div>
-  )
-}
-
-function OfficeFloor({
-  agents,
-  selectedAgentId,
-  onSelect,
-}: {
-  agents: Agent[]
-  selectedAgentId: string
-  onSelect: (agent: Agent) => void
-}) {
-  const liveAgents = agents.filter(
-    (agent) =>
-      agent.current_run_id ||
-      ['starting', 'working', 'blocked', 'reviewing'].includes(agent.status),
-  )
-  return (
-    <div className="office-stage" aria-label="Live agent office">
-      <div className="world-sky" aria-hidden="true">
-        <span className="world-moon" />
-        <span className="world-star world-star-one" />
-        <span className="world-star world-star-two" />
-        <span className="world-star world-star-three" />
-        <span className="world-city world-city-back" />
-        <span className="world-city world-city-front" />
-      </div>
-      <div className="office-wall">
-        <span className="office-clock" />
-        <span className="office-window office-window-left" />
-        <span className="office-window office-window-center" />
-        <span className="office-window office-window-right" />
-        <span className="office-sign">
-          {liveAgents.length ? 'ECORP // LIVE FLOOR' : 'ECORP // FLOOR CLEAR'}
-        </span>
-        <span className="world-server-rack world-server-rack-left" />
-        <span className="world-server-rack world-server-rack-right" />
-      </div>
-      <div className="office-zone zone-review">
-        <span className="sr-only">Review table</span>
-        <i />
-      </div>
-      <div className="office-zone zone-approval">
-        <span className="sr-only">Approval desk</span>
-        <i />
-      </div>
-      <div className="office-zone zone-lounge">
-        <span className="sr-only">Operator bay</span>
-        <i />
-      </div>
-      <div className="world-floor-markings" aria-hidden="true">
-        <span className="world-lane world-lane-one" />
-        <span className="world-lane world-lane-two" />
-        <span className="world-lane world-lane-three" />
-      </div>
-      {agents.map((agent) => {
-        const index = agents.findIndex((candidate) => candidate.id === agent.id)
-        const destination = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
-        const style = {
-          '--agent-x': `${destination.x}%`,
-          '--agent-y': `${destination.y}%`,
-        } as CSSProperties
-        return (
-          <button
-            key={agent.id}
-            type="button"
-            className={`office-agent office-agent-${agent.status} ${
-              selectedAgentId === agent.id ? 'office-agent-selected' : ''
-            }`}
-            style={style}
-            onClick={() => onSelect(agent)}
-            aria-label={`Inspect ${agent.name}, ${agent.status}`}
-            aria-pressed={selectedAgentId === agent.id}
-            data-testid={`agent-${agent.name}`}
-          >
-            {agent.status !== 'idle' && agent.status !== 'offline' ? (
-              <span className="sprite-activity">
-                {agent.status === 'blocked'
-                  ? 'Approval needed'
-                  : agent.status === 'reviewing'
-                    ? 'Review ready'
-                    : agent.station ?? agent.status}
-              </span>
-            ) : null}
-            <AgentAvatar agent={agent} />
-            <span className="sprite-name">
-              <StatusMark status={agent.status} />
-              <span className="sprite-name-copy">
-                <strong>{agent.name}</strong>
-                <small>{agentVisualStateLabel(agent)}</small>
-              </span>
-            </span>
-          </button>
-        )
-      })}
-      {liveAgents.length === 0 ? (
-        <div className="office-empty" role="status">
-          <span>Floor clear</span>
-          <strong>Select Missions to deploy</strong>
-        </div>
-      ) : null}
-      {agents.map((agent, index) => {
-        const position = OFFICE_POSITIONS[index % OFFICE_POSITIONS.length]
-        const style = {
-          '--desk-x': `${position.x}%`,
-          '--desk-y': `${position.y}%`,
-        } as CSSProperties
-        return (
-          <div className="office-desk-mini" style={style} key={`desk-${agent.id}`} aria-hidden="true">
-            <span className="mini-monitor" />
-            <span className="mini-desk" />
-            <span className="mini-chair" />
-          </div>
-        )
-      })}
-      <div className="world-console world-console-left" aria-hidden="true">
-        <span />
-        <i />
-      </div>
-      <div className="world-console world-console-right" aria-hidden="true">
-        <span />
-        <i />
-      </div>
-      <div className="office-door" aria-hidden="true"><span>RUNNER</span></div>
-      <div className="office-carpet" aria-hidden="true" />
     </div>
   )
 }
@@ -4119,7 +3976,9 @@ function App() {
 
   useEffect(() => {
     const syncFromHash = () => {
-      setActiveWorkspaceView(workspaceViewFromHash(window.location.hash))
+      const view = workspaceViewFromHash(window.location.hash)
+      setActiveWorkspaceView(view)
+      if (view !== 'floor') setFloorInspectorOpen(false)
     }
     window.addEventListener('hashchange', syncFromHash)
     window.addEventListener('popstate', syncFromHash)
@@ -5234,8 +5093,8 @@ function App() {
           <div className={`runner-indicator ${connectedRunners.length ? 'runner-online' : ''}`}>
             {runnerLabel}
           </div>
-          <label>
-            Operating as
+          <label title={productionAuthenticated ? 'Your authenticated identity; switching accounts is not allowed here.' : 'Local demo identities only. Alice, Bob and Eve are seeded test users, not GitHub sign-in.'}>
+            {productionAuthenticated ? 'Signed in as' : 'Demo operator'}
             <select disabled={productionAuthenticated} value={selectedActor.id} onChange={(event) => {
               const actor = humans.find((candidate) => candidate.id === event.target.value)
               if (actor) selectActor(actor)
@@ -5494,66 +5353,28 @@ function App() {
         >
           <div className="panel-heading world-titleplate">
             <div>
-              <span className="section-code">Live agents</span>
+              <span className="section-code">ECorp · Control floor</span>
               <h2>{room?.name ?? 'Automation division'}</h2>
-              <p>Authoritative crew state. Select a sprite to inspect or take control.</p>
             </div>
-            <div className="floor-legend">
-              <span><StatusMark status="idle" /> idle</span>
-              <span><StatusMark status="working" /> working</span>
-              <span><StatusMark status="reviewing" /> review ready</span>
-              <span><StatusMark status="blocked" /> needs approval</span>
-            </div>
+            <p>A place for your agents. A clear view of their work.</p>
           </div>
           <div className="floor-plan">
-            <OfficeFloor
+            {activeWorkspaceView === 'floor' ? <OfficeFloor
               agents={data.snapshot.agents}
               selectedAgentId={selectedAgent.id}
-              onSelect={(agent) => {
-                setSelectedAgentId(agent.id)
+              pendingApprovalRunIds={new Set(pendingApprovals.map((approval) => approval.run_id))}
+              pendingReviewRunIds={new Set(pendingVerificationRequests.map((request) => request.run_id))}
+              connection={connection}
+              runnerCount={connectedRunners.length}
+              onSelect={(agentId) => {
+                setSelectedAgentId(agentId)
                 setFloorInspectorOpen(true)
               }}
-            />
-            <div className="world-crew-select" aria-label="Available crew">
-              <span>CREW</span>
-              {data.snapshot.agents.map((agent, index) => (
-                <button
-                  key={agent.id}
-                  type="button"
-                  className={selectedAgent.id === agent.id ? 'world-crew-selected' : ''}
-                  aria-label={`Inspect ${agent.name}, ${agent.status}`}
-                  onClick={() => {
-                    setSelectedAgentId(agent.id)
-                    setFloorInspectorOpen(true)
-                  }}
-                >
-                  <span>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="crew-agent-copy">
-                    <strong>{agent.name}</strong>
-                    <small>{agentVisualStateLabel(agent)}</small>
-                  </span>
-                  <StatusMark status={agent.status} />
-                </button>
-              ))}
-            </div>
-            {floorInspectorOpen ? (
-              <div className="world-inspector-layer">
-                <button
-                  type="button"
-                  className="world-inspector-scrim"
-                  aria-label="Close agent inspector"
-                  tabIndex={-1}
-                  onClick={() => setFloorInspectorOpen(false)}
-                />
-                <aside className="world-inspector" aria-label={`${selectedAgent.name} details and controls`}>
-                  <button
-                    type="button"
-                    className="world-inspector-close"
-                    onClick={() => setFloorInspectorOpen(false)}
-                    autoFocus
-                  >
-                    Close
-                  </button>
+              onMissions={() => activateWorkspaceView('missions')}
+              onFactory={() => activateWorkspaceView('factory')}
+            /> : null}
+            {floorInspectorOpen && activeWorkspaceView === 'floor' ? (
+              <OfficeInspector agentName={selectedAgent.name} onClose={() => setFloorInspectorOpen(false)}>
                   <AgentDesk
                     agent={selectedAgent}
                     capability={selectedAgentCapability}
@@ -5569,8 +5390,7 @@ function App() {
                     onEmergencyStop={emergencyStop}
                     onMessage={sendMessage}
                   />
-                </aside>
-              </div>
+              </OfficeInspector>
             ) : null}
           </div>
         </div>
