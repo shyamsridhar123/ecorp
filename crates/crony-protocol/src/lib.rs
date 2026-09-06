@@ -1,8 +1,8 @@
 use crony_domain::{
-    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryWorkItem, FactoryWorkItemState,
-    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction,
-    PullRequestPublication, SourceDeliverable, TaskContract, TaskSecretReference,
-    VerificationPolicy,
+    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryController, FactoryWorkItem,
+    FactoryWorkItemState, MissionBudgetRevision, MissionContractRevision,
+    MissionContractRevisionAction, PullRequestPublication, SourceDeliverable, TaskContract,
+    TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -146,6 +146,10 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ControlMessage {
+        #[serde(default)]
+        command_id: Option<Uuid>,
+        #[serde(default)]
+        message_id: Option<Uuid>,
         corp_id: Uuid,
         run_id: Uuid,
         agent_id: Uuid,
@@ -262,11 +266,21 @@ pub struct CreateRoomMessageRequest {
     #[serde(default)]
     pub mentions: Vec<Uuid>,
     pub link: Option<EntityLink>,
+    #[serde(default)]
+    pub idempotency_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRoomMessageResponse {
     pub message_id: Uuid,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionSource {
+    pub repository: String,
+    pub base_ref: String,
+    pub base_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +293,8 @@ pub struct CreateMissionRequest {
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default)]
+    pub source: Option<MissionSource>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
@@ -434,6 +450,68 @@ pub struct FactoryWorkItemResponse {
     pub work_item: FactoryWorkItem,
     pub claim_token: Option<Uuid>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureFactoryControllerRequest {
+    pub actor_id: Uuid,
+    pub controller_id: Uuid,
+    pub source_project_owner: String,
+    pub source_project_number: i64,
+    pub source_repository_owner: String,
+    pub source_repository_name: String,
+    pub connection_epoch: Uuid,
+    #[serde(default = "default_factory_controller_lease_seconds")]
+    pub lease_seconds: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryControllerHeartbeatRequest {
+    pub actor_id: Uuid,
+    pub connection_epoch: Uuid,
+    #[serde(default = "default_factory_controller_lease_seconds")]
+    pub lease_seconds: i64,
+    pub active_work_item_id: Option<Uuid>,
+    pub completed_reconcile_generation: Option<i64>,
+    pub reconcile_result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryControllerControlAction {
+    Pause,
+    Resume,
+    Reconcile,
+}
+
+impl FactoryControllerControlAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlFactoryControllerRequest {
+    pub actor_id: Uuid,
+    pub expected_version: i64,
+    pub action: FactoryControllerControlAction,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryControllerResponse {
+    pub controller: FactoryController,
+    pub replayed: bool,
+}
+
+const fn default_factory_controller_lease_seconds() -> i64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,12 +855,15 @@ pub struct QueueMessageRequest {
     pub actor_id: Uuid,
     pub lease_token: Option<Uuid>,
     pub text: String,
+    #[serde(default)]
+    pub idempotency_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueMessageResponse {
     pub message_id: Uuid,
     pub delivery: String,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,4 +928,35 @@ pub struct SetBudgetPolicyRequest {
     pub corp_cost_microusd_per_24h: i64,
     pub no_progress_event_limit: i32,
     pub repeated_tool_limit: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerToRunner;
+
+    #[test]
+    fn durable_control_message_accepts_the_legacy_wire_shape() {
+        let legacy = serde_json::json!({
+            "type": "control_message",
+            "corp_id": "00000000-0000-4000-8000-000000000001",
+            "run_id": "00000000-0000-4000-8000-000000000002",
+            "agent_id": "00000000-0000-4000-8000-000000000003",
+            "actor_id": "00000000-0000-4000-8000-000000000004",
+            "lease_token": "00000000-0000-4000-8000-000000000005",
+            "text": "Continue within the assigned worktree."
+        });
+        let message: ServerToRunner =
+            serde_json::from_value(legacy).expect("legacy control message");
+        match message {
+            ServerToRunner::ControlMessage {
+                command_id,
+                message_id,
+                ..
+            } => {
+                assert_eq!(command_id, None);
+                assert_eq!(message_id, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }

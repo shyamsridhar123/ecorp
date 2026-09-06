@@ -33,20 +33,22 @@ use crony_domain::{
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
+    ConfigureFactoryControllerRequest, ControlFactoryControllerRequest,
     CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
     CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
     CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
     CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
     DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
-    EmergencyStopResponse, FactoryMissionContract, FactoryPublicationContextResponse,
-    FactoryWorkItemResponse, InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest,
-    LaunchMissionResponse, LeaseMutationResponse, LookupFactoryWorkItemsRequest,
-    LookupFactoryWorkItemsResponse, MaterializeFactoryMissionRequest,
-    MaterializeFactoryMissionResponse, MissionBudgetRevisionResponse,
-    MissionContractRevisionResponse, PreflightFactoryMissionRequest,
-    PreflightFactoryMissionResponse, ProposeMissionBudgetRevisionRequest,
-    PullRequestPublicationCheckpoint, PullRequestPublicationResponse, QueueMessageRequest,
-    QueueMessageResponse, RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
+    EmergencyStopResponse, FactoryControllerHeartbeatRequest, FactoryControllerResponse,
+    FactoryMissionContract, FactoryPublicationContextResponse, FactoryWorkItemResponse,
+    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
+    LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
+    MissionBudgetRevisionResponse, MissionContractRevisionResponse, MissionSource,
+    PreflightFactoryMissionRequest, PreflightFactoryMissionResponse,
+    ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
+    PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
+    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
     ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
     RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
@@ -56,10 +58,11 @@ use crony_protocol::{
     VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, CreateMissionContractRevisionInput,
-    DecideMissionBudgetRevisionInput, FactorySourceInput, LaunchRecord,
-    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
-    PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
+    ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput, ControlFactoryControllerInput,
+    CreateMissionContractRevisionInput, DecideMissionBudgetRevisionInput, FactorySourceInput,
+    HeartbeatFactoryControllerInput, LaunchRecord, MaterializeFactoryMissionInput,
+    MissionFinishScopeInput, NewRoomMessageInput, PendingRunnerCommand, PgStore,
+    PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
     RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
     RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
@@ -439,6 +442,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers",
+            post(configure_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/heartbeat",
+            post(heartbeat_factory_controller),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/controllers/{controller_id}/control",
+            post(control_factory_controller),
         )
         .route(
             "/api/corps/{corp_id}/factory/preflight",
@@ -1239,24 +1254,113 @@ fn valid_scope_component(value: &str) -> bool {
 }
 
 async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> anyhow::Result<()> {
-    let Some(sender) = state
-        .runners
-        .get(runner_id)
-        .map(|connection| connection.tx.clone())
-    else {
+    let Some((sender, durable_control)) = state.runners.get(runner_id).map(|connection| {
+        (
+            connection.tx.clone(),
+            connection
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "durable-control-v1" && capability.available),
+        )
+    }) else {
         return Ok(());
     };
-    for command in state.store.pending_runner_commands(runner_id).await? {
-        let outgoing = decode_runner_command(&command)?;
-        if sender.send(outgoing).is_err() {
+    loop {
+        let commands = state.store.pending_runner_commands(runner_id).await?;
+        let batch_len = commands.len();
+        if batch_len == 0 {
+            break;
+        }
+        let mut dispatched = false;
+        for command in commands {
+            let control_lease_token = if command.command_kind == "control_message" {
+                match state.store.control_command_lease_token(&command).await? {
+                    Some(token) => Some(token),
+                    None => {
+                        if let Some(event) = state
+                            .store
+                            .fail_runner_command(
+                                command.id,
+                                runner_id,
+                                "control lease changed or expired before durable steering dispatch",
+                            )
+                            .await?
+                        {
+                            publish(state, event);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let outgoing = decode_runner_command(&command, control_lease_token, durable_control)?;
+            if sender.send(outgoing).is_err() {
+                return Ok(());
+            }
+            if command.command_kind == "control_message"
+                && !durable_control
+                && let Some(event) = state
+                    .store
+                    .acknowledge_runner_command(command.id, runner_id)
+                    .await?
+            {
+                publish(state, event);
+            }
+            dispatched = true;
+        }
+        if dispatched || batch_len < 100 {
             break;
         }
     }
     Ok(())
 }
 
-fn decode_runner_command(command: &PendingRunnerCommand) -> anyhow::Result<ServerToRunner> {
+fn decode_runner_command(
+    command: &PendingRunnerCommand,
+    control_lease_token: Option<Uuid>,
+    durable_control: bool,
+) -> anyhow::Result<ServerToRunner> {
     match command.command_kind.as_str() {
+        "control_message" => Ok(ServerToRunner::ControlMessage {
+            command_id: durable_control.then_some(command.id),
+            message_id: if durable_control {
+                Some(
+                    command
+                        .payload
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                        .context("control message command omitted message_id")
+                        .and_then(|value| {
+                            Uuid::parse_str(value).context("message id is invalid")
+                        })?,
+                )
+            } else {
+                None
+            },
+            corp_id: command.corp_id,
+            run_id: command.run_id,
+            agent_id: command
+                .payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted agent_id")
+                .and_then(|value| Uuid::parse_str(value).context("agent id is invalid"))?,
+            actor_id: command
+                .payload
+                .get("actor_id")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted actor_id")
+                .and_then(|value| Uuid::parse_str(value).context("actor id is invalid"))?,
+            lease_token: control_lease_token
+                .context("control message command omitted current lease token")?,
+            text: command
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .context("control message command omitted text")?
+                .to_owned(),
+        }),
         "approval_decision" => Ok(ServerToRunner::ApprovalDecision {
             command_id: command.id,
             run_id: command.run_id,
@@ -1443,6 +1547,7 @@ struct MissionPlanInput<'a> {
     preferred_model: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
     strategy: Option<&'a str>,
+    source: Option<&'a MissionSource>,
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
@@ -1473,6 +1578,10 @@ async fn plan_mission(
                 input.reasoning_effort,
             )
         };
+    let source = input
+        .source
+        .map(|source| resolve_mission_source(state, corp_id, source))
+        .transpose()?;
     validate_requested_model(
         state,
         corp_id,
@@ -1505,6 +1614,9 @@ async fn plan_mission(
     if let Some(contract) = input.contract {
         apply_mission_contract(&mut plan, contract)?;
     }
+    if let Some(source) = &source {
+        apply_mission_source(&mut plan, source);
+    }
     apply_mission_description(&mut plan, input.description)?;
     if let Some(policy) = input.verification_policy {
         apply_verification_policy(&mut plan, policy);
@@ -1513,7 +1625,101 @@ async fn plan_mission(
         enforce_factory_manual_gate(&mut plan);
     }
     validate_plan(&plan, &agents).map_err(ApiError::bad_request)?;
+    if source.is_some() {
+        validate_plan_runner_compatibility(state, corp_id, &plan)?;
+    }
     Ok(plan)
+}
+
+fn resolve_mission_source(
+    state: &AppState,
+    corp_id: Uuid,
+    requested: &MissionSource,
+) -> Result<MissionSource, ApiError> {
+    if requested.repository.trim().is_empty()
+        || requested.base_ref.trim().is_empty()
+        || requested.base_commit.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "mission source requires repository, base ref, and immutable base commit",
+        ));
+    }
+    state
+        .runners
+        .iter()
+        .filter(|entry| entry.corp_id == corp_id)
+        .flat_map(|entry| entry.capabilities.clone())
+        .find(|capability| {
+            capability.name == "workspace-isolation"
+                && capability.available
+                && capability
+                    .source_repository
+                    .as_deref()
+                    .is_some_and(|repository| {
+                        repository.eq_ignore_ascii_case(requested.repository.trim())
+                    })
+                && capability.source_base_ref.as_deref() == Some(requested.base_ref.trim())
+                && capability
+                    .source_base_commit
+                    .as_deref()
+                    .is_some_and(|commit| commit.eq_ignore_ascii_case(requested.base_commit.trim()))
+        })
+        .and_then(|capability| {
+            Some(MissionSource {
+                repository: capability.source_repository?,
+                base_ref: capability.source_base_ref?,
+                base_commit: capability.source_base_commit?,
+            })
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "selected repository {} @ {} ({}) is not available from a connected runner",
+                requested.repository.trim(),
+                requested.base_ref.trim(),
+                requested.base_commit.trim()
+            ))
+        })
+}
+
+fn apply_mission_source(plan: &mut TaskGraphPlan, source: &MissionSource) {
+    for task in &mut plan.tasks {
+        task.contract.source_repository = Some(source.repository.clone());
+        task.contract.source_base_ref = Some(source.base_ref.clone());
+        task.contract.source_base_commit = Some(source.base_commit.clone());
+    }
+}
+
+fn validate_plan_runner_compatibility(
+    state: &AppState,
+    corp_id: Uuid,
+    plan: &TaskGraphPlan,
+) -> Result<(), ApiError> {
+    for task in &plan.tasks {
+        let requirements = RunnerRequirements {
+            adapter: &task.required_adapter,
+            model: task.contract.model.as_deref(),
+            reasoning_effort: task.contract.reasoning_effort.as_deref(),
+            source_repository: task.contract.source_repository.as_deref(),
+            source_base_ref: task.contract.source_base_ref.as_deref(),
+            source_base_commit: task.contract.source_base_commit.as_deref(),
+        };
+        if select_runner(state, corp_id, &requirements).is_none() {
+            return Err(ApiError::bad_request(format!(
+                "task {} {}",
+                task.key,
+                runner_requirement_mismatch(
+                    &runner_capabilities(state, corp_id),
+                    &task.required_adapter,
+                    task.contract.model.as_deref(),
+                    task.contract.reasoning_effort.as_deref(),
+                    task.contract.source_repository.as_deref(),
+                    task.contract.source_base_ref.as_deref(),
+                    task.contract.source_base_commit.as_deref(),
+                )
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn apply_mission_contract(
@@ -1660,6 +1866,7 @@ async fn create_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: request.source.as_ref(),
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -1766,6 +1973,118 @@ async fn lookup_factory_work_items(
         .map_err(map_store_error)?;
     let total_count = items.len();
     Ok(Json(LookupFactoryWorkItemsResponse { items, total_count }))
+}
+
+async fn configure_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<ConfigureFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Manage,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .configure_factory_controller(ConfigureFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id: request.controller_id,
+            source_project_owner: request.source_project_owner,
+            source_project_number: request.source_project_number,
+            source_repository_owner: request.source_repository_owner,
+            source_repository_name: request.source_repository_name,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
+}
+
+async fn heartbeat_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<FactoryControllerHeartbeatRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .heartbeat_factory_controller(HeartbeatFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            connection_epoch: request.connection_epoch,
+            lease_seconds: request.lease_seconds,
+            active_work_item_id: request.active_work_item_id,
+            completed_reconcile_generation: request.completed_reconcile_generation,
+            reconcile_result: request.reconcile_result,
+            error: request.error,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: false,
+    }))
+}
+
+async fn control_factory_controller(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, controller_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ControlFactoryControllerRequest>,
+) -> Result<Json<FactoryControllerResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::ControlFactory,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .control_factory_controller(ControlFactoryControllerInput {
+            corp_id,
+            actor_id,
+            controller_id,
+            expected_version: request.expected_version,
+            action: request.action.as_str().to_owned(),
+            idempotency_key: request.idempotency_key,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryControllerResponse {
+        controller: outcome.controller,
+        replayed: outcome.replayed,
+    }))
 }
 
 async fn renew_factory_work_item(
@@ -1966,6 +2285,7 @@ async fn preflight_factory_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: None,
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -2088,6 +2408,7 @@ async fn materialize_factory_mission(
             preferred_model: request.preferred_model.as_deref(),
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
+            source: None,
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -2559,12 +2880,16 @@ async fn create_room_message(
             reply_to_id: request.reply_to_id,
             mentions: request.mentions,
             link: request.link,
+            idempotency_key: request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         })
         .await
         .map_err(map_store_error)?;
-    publish(&state, outcome.event);
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
     Ok(Json(CreateRoomMessageResponse {
         message_id: outcome.message.id,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -3457,51 +3782,26 @@ async fn queue_message(
             actor_id,
             request.lease_token,
             &request.text,
+            request.idempotency_key.unwrap_or_else(Uuid::new_v4),
         )
         .await
         .map_err(ApiError::conflict)?;
     let message_id = outcome.message.id;
-    let mut delivery = outcome.delivery.clone();
-    publish(&state, outcome.event);
-
-    if delivery == "immediate" {
-        let sent = if let (Some(run_id), Some(runner_id), Some(lease_token)) =
-            (outcome.run_id, outcome.runner_id, request.lease_token)
-        {
-            state.runners.get(&runner_id).is_some_and(|runner| {
-                runner
-                    .tx
-                    .send(ServerToRunner::ControlMessage {
-                        corp_id,
-                        run_id,
-                        agent_id,
-                        actor_id,
-                        lease_token,
-                        text: request.text.clone(),
-                    })
-                    .is_ok()
-            })
-        } else {
-            false
-        };
-        if !sent {
-            let event = state
-                .store
-                .requeue_control_message(
-                    corp_id,
-                    message_id,
-                    "runner disconnected before live control delivery",
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            publish(&state, event);
-            delivery = "queued".to_owned();
-        }
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.command_queued
+        && let Some(runner_id) = outcome.runner_id.as_deref()
+    {
+        dispatch_pending_runner_commands(&state, runner_id)
+            .await
+            .map_err(ApiError::internal)?;
     }
 
     Ok(Json(QueueMessageResponse {
         message_id,
-        delivery,
+        delivery: outcome.delivery,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -4071,6 +4371,17 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                 }
                 if !applied {
                     warn!(%runner_id, %command_id, %detail, "runner could not apply durable command");
+                    match state
+                        .store
+                        .fail_runner_command(command_id, &runner_id, &detail)
+                        .await
+                    {
+                        Ok(Some(event)) => publish(&state, event),
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, %runner_id, %command_id, "runner command failure persistence failed")
+                        }
+                    }
                     continue;
                 }
                 match state
@@ -4691,14 +5002,15 @@ mod tests {
         ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan, VerificationPolicy,
         VerifierCheck,
     };
-    use crony_protocol::{FactoryMissionContract, RunnerCapability, RunnerModel};
+    use crony_protocol::{FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel};
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        apply_mission_contract, apply_mission_description, artifact_content_disposition,
-        capability_satisfies_requirement, enforce_factory_manual_gate,
-        factory_materialization_failure_detail, runner_requirement_mismatch,
+        apply_mission_contract, apply_mission_description, apply_mission_source,
+        artifact_content_disposition, capability_satisfies_requirement,
+        enforce_factory_manual_gate, factory_materialization_failure_detail,
+        runner_requirement_mismatch,
     };
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
@@ -4925,6 +5237,97 @@ mod tests {
             "line one\nline two\n\nTASK-SPECIFIC OBJECTIVE:\nProduce the role-specific output."
         );
         assert!(apply_mission_description(&mut plan, "bad\u{0007}value").is_err());
+    }
+
+    #[test]
+    fn mission_source_is_pinned_to_every_planned_task() {
+        let mut plan: TaskGraphPlan = serde_json::from_value(json!({
+            "strategy": "parallel-specialists",
+            "max_nodes": 2,
+            "max_depth": 0,
+            "budget_tokens": 2_000,
+            "budget_cost_microusd": 2_000_000,
+            "tasks": [
+                {
+                    "key": "one",
+                    "title": "One",
+                    "contract": {
+                        "objective": "First task",
+                        "expected_output": "Output",
+                        "source_repository": null,
+                        "source_base_ref": null,
+                        "source_base_commit": null,
+                        "acceptance_tests": ["passes"],
+                        "allowed_tools": ["filesystem"],
+                        "prohibited_actions": ["escape"],
+                        "references": [],
+                        "write_scope": ["**"],
+                        "budget_tokens": 1_000,
+                        "budget_cost_microusd": 1_000_000,
+                        "deadline_at": null,
+                        "escalation": "ask",
+                        "secret_refs": [],
+                        "model": null,
+                        "reasoning_effort": null,
+                        "deliverable": null
+                    },
+                    "assigned_agent_id": Uuid::new_v4(),
+                    "required_adapter": "codex",
+                    "depends_on": [],
+                    "depth": 0,
+                    "max_attempts": 1,
+                    "verification_policy": {
+                        "checks": [{"type": "artifact", "min_bytes": 1}],
+                        "manual_gate": null
+                    }
+                },
+                {
+                    "key": "two",
+                    "title": "Two",
+                    "contract": {
+                        "objective": "Second task",
+                        "expected_output": "Output",
+                        "source_repository": null,
+                        "source_base_ref": null,
+                        "source_base_commit": null,
+                        "acceptance_tests": ["passes"],
+                        "allowed_tools": ["filesystem"],
+                        "prohibited_actions": ["escape"],
+                        "references": [],
+                        "write_scope": ["**"],
+                        "budget_tokens": 1_000,
+                        "budget_cost_microusd": 1_000_000,
+                        "deadline_at": null,
+                        "escalation": "ask",
+                        "secret_refs": [],
+                        "model": null,
+                        "reasoning_effort": null,
+                        "deliverable": null
+                    },
+                    "assigned_agent_id": Uuid::new_v4(),
+                    "required_adapter": "claude-code",
+                    "depends_on": [],
+                    "depth": 0,
+                    "max_attempts": 1,
+                    "verification_policy": {
+                        "checks": [{"type": "artifact", "min_bytes": 1}],
+                        "manual_gate": null
+                    }
+                }
+            ]
+        }))
+        .expect("plan");
+        let source = MissionSource {
+            repository: "local/dogfood-1234".to_owned(),
+            base_ref: "HEAD".to_owned(),
+            base_commit: "1".repeat(40),
+        };
+        apply_mission_source(&mut plan, &source);
+        assert!(plan.tasks.iter().all(|task| {
+            task.contract.source_repository.as_deref() == Some(source.repository.as_str())
+                && task.contract.source_base_ref.as_deref() == Some(source.base_ref.as_str())
+                && task.contract.source_base_commit.as_deref() == Some(source.base_commit.as_str())
+        }));
     }
 
     #[test]

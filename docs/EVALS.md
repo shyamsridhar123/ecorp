@@ -127,6 +127,14 @@ denial, and preserved provider-session/worktree reuse. Desktop and 390-pixel Chr
 exercise the structured contract editor, exact completion-plan preview, revision form/history, and
 responsive layout.
 
+`tools/e2e_mission_repository_routing.mjs` connects two runners advertising different source
+repositories and commits, creates an ordinary mission with one selected tuple, and proves only the
+matching runner receives the run. The task and run retain the exact repository, ref, and commit;
+the unselected runner creates no worktree; a stale commit is rejected before mission persistence;
+and the ECorp checkout remains unchanged. Browser validation selects and confirms a separate local
+dogfood repository, filters its available runtimes, launches through the UI, and verifies the
+resulting worktree remains outside the ECorp repository.
+
 `tools/e2e_identity.mjs` proves production OIDC enforcement, actor-spoof and cross-Corp rejection,
 authorization before WebSocket replay, one-time runner enrollment, credential rotation, replay
 rejection, active-run revocation, superseded-socket rejection, and rejection of a current socket
@@ -233,6 +241,35 @@ telemetry rather than trusting configured sandbox settings. Any shell execution 
 network-capable commands, publication or infrastructure commands, sandbox bypass, credential
 access, and external paths must fail closed or suspend through a durable ECorp decision.
 
+The live probe now enrolls its own runner on a fresh isolated server and injects a synthetic
+`GITHUB_TOKEN` into the actual runner launch. A process-boundary observer asserts that the runner
+inherited it and that each SDK-launched Copilot process did not, before starting the real Copilot
+binary. Missing seeds and unremoved canaries are test failures, not successful absence checks.
+Each negative mission must reach an approval containing its intended boundary action; a model
+refusal or an unrelated approval cannot count as exercised containment.
+
+The same probe asks real Copilot to author Piper Kingdom under `scenarios/piper-kingdom/**`.
+The runner executes the persisted syntax check, generated unit tests, and independently authored
+gameplay assertions, then exports a source archive. The probe requires zero routine approvals,
+the exact retained write scope, and an unchanged source checkout. It does not supply game code.
+`tools/copilot_probe_process.test.mjs` independently verifies the observer's positive and negative
+preconditions without an account. Native filesystem unit tests exercise dangling/ancestor links,
+hard links, root protection, Windows aliases, scope-limited mutations, and Unix executable modes.
+
+Run on a separate development server with no existing connected runner:
+
+```powershell
+$env:CRONY_SERVER_HTTP = 'http://127.0.0.1:<isolated-server-port>'
+$env:ECORP_TEST_SOURCE_REPOSITORY = 'C:\path\to\clean-disposable-repository'
+$env:CRONY_PROBE_COPILOT_BINARY = 'C:\path\to\real\copilot.exe'
+$env:CRONY_PROBE_OUTPUT = 'C:\path\outside\ecorp\unique-probe-output'
+node tools/probe_copilot_live.mjs
+```
+
+The probe resets only the specified development server, supervises its own enrolled runner, and
+keeps logs, worktrees, and the game outside the ECorp checkout. It does not publish, merge, deploy,
+or use hosted GitHub Actions.
+
 `tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message
 methods, and SSE streaming. See `docs/evidence/2026-08-30-protocol-gateway-validation.md`.
@@ -273,6 +310,35 @@ run to prove there is exactly one of each. Mission discovery uses the determinis
 title and persisted source marker from the fresh snapshot rather than following the work item's
 mission link, so an unlinked duplicate mission would also fail the regression. CLI unit coverage
 verifies Markdown section boundaries for dependency and acceptance parsing.
+
+`tools/e2e_factory_controller_service.mjs` verifies durable controller registration and exact
+idempotent replay, owner-only configuration, manager-capable control, member denial, pause/resume,
+monotonic reconciliation generations, bounded failure text, blocked and watching projections,
+lease-expiry offline state, stale connection-epoch rejection, and reconnect recovery.
+The live watcher probe starts `crony factory-watch` against a deterministic GitHub boundary,
+observes `watching`, applies durable pause and resume, verifies resume requests a reconciliation
+generation, terminates the watcher, and observes `offline` after the heartbeat lease expires.
+
+`tools/e2e_factory_cockpit_reconnect.mjs` drives one factory work item through two independently
+attributed browser-protocol clients. It posts contextual comments, takes and rotates the control
+lease, delivers steering through durable runner commands, restarts the server, resumes each
+browser from its prior sequence cursor, and records Bob's decision after reconnect. Exact replay
+of comment, steer, claim, materialization, and decision operation keys creates no duplicate
+message, provider effect, work item, mission, or run. The same drill proves two durable steer
+acknowledgments, stale-token rejection, cancellation of a pending steer after its lease version
+rotates, controller recovery to `watching`, and final `verified` state. A separate rendered
+two-browser pass exposed and verified the **Reclaim control** recovery for a browser that lost its
+private fencing token. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
+
+`tools/e2e_factory_cockpit_publication.mjs` continues that operating lane through a verified
+commit/branch deliverable and the trusted publisher. It crashes after the deterministic GitHub
+boundary has created the pull request but before ECorp records the remote checkpoint, restarts the
+server, and concurrently retries publication. The focused drill proves one work item, mission,
+run, branch, pull request, and publication; Project status changes to `In Review` only after pull
+request creation; Alice and Bob resume from independent event cursors; and auto-merge, merge, and
+deployment remain disabled. See
+`docs/evidence/2026-09-04-factory-cockpit-restart.md`.
 
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write

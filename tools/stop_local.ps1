@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $pidFile)) {
 }
 
 $roots = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
-$rootIds = @($roots.server, $roots.runner, $roots.web) |
+$rootIds = @($roots.server, $roots.runner, $roots.factoryController, $roots.web) |
     Where-Object { $_ -is [int] -or $_ -is [long] } |
     ForEach-Object { [int]$_ }
 

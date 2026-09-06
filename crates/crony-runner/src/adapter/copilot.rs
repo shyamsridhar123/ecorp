@@ -11,13 +11,15 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use github_copilot_sdk::{
     CliProgram, Client, ClientMode, ClientOptions, DeliveryMode, InfiniteSessionConfig, LogLevel,
-    MessageOptions, ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig, ToolSet,
-    Transport,
+    MessageOptions, ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig, Tool,
+    ToolResult, ToolSet, Transport,
     handler::{PermissionHandler, PermissionResult},
     rpc::UserSettingsSetRequest,
+    session_fs::SessionFsProvider,
+    tool::ToolHandler,
     types::{
         DisableBypassPermissionsMode, ManagedSettings, ManagedSettingsPermissions,
-        PermissionRequestData, RequestId, SessionFsConfig, SessionFsConventions,
+        PermissionRequestData, RequestId, SessionFsConfig, SessionFsConventions, ToolInvocation,
     },
 };
 use serde_json::{Value, json};
@@ -67,6 +69,59 @@ struct CronyPermissionHandler {
     state_directory: PathBuf,
     sink: Arc<dyn AdapterEventSink>,
     pending: Arc<DashMap<Uuid, oneshot::Sender<PermissionDecision>>>,
+}
+
+struct NativeDirectoryTool {
+    filesystem: Arc<ContainedSessionFs>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryArguments {
+    path: String,
+}
+
+#[async_trait]
+impl ToolHandler for NativeDirectoryTool {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<ToolResult, github_copilot_sdk::Error> {
+        let args: DirectoryArguments = invocation.params()?;
+        if invocation.tool_name != "ecorp_mkdir"
+            || !crony_domain::repository_relative_path_is_valid(&args.path)
+        {
+            return Err(github_copilot_sdk::Error::with_message(
+                github_copilot_sdk::ErrorKind::InvalidConfig,
+                "ecorp_mkdir requires one worktree-relative directory path",
+            ));
+        }
+        self.filesystem
+            .mkdir(&args.path, true, None)
+            .await
+            .map_err(|_| {
+                github_copilot_sdk::Error::with_message(
+                    github_copilot_sdk::ErrorKind::InvalidConfig,
+                    "directory creation denied by the assigned filesystem or task write scope",
+                )
+            })?;
+        Ok(ToolResult::Text(format!("Directory ready: {}", args.path)))
+    }
+}
+
+fn native_directory_tool(filesystem: Arc<ContainedSessionFs>) -> Tool {
+    Tool::new("ecorp_mkdir")
+        .with_description("Create a directory and its parents inside the task write scope. Use before native create when a parent directory is missing. No shell, network, deletion, or permissions changes.")
+        .with_parameters(json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 500}},
+            "required": ["path"],
+            "additionalProperties": false
+        }))
+        // This fixed primitive enforces authority through capability handles and
+        // the persisted task scope. It does not grant shell or arbitrary tools.
+        .with_skip_permission(true)
+        .with_handler(Arc::new(NativeDirectoryTool { filesystem }))
 }
 
 #[async_trait]
@@ -238,7 +293,8 @@ impl CopilotSdkAdapter {
         let session_fs = Arc::new(ContainedSessionFs::new(
             request.workspace.clone(),
             state_directory.clone(),
-        ));
+            request.write_scope.clone(),
+        )?);
         let permission_handler = Arc::new(CronyPermissionHandler {
             workspace: request.workspace.clone(),
             state_directory,
@@ -251,6 +307,7 @@ impl CopilotSdkAdapter {
             client
                 .resume_session(
                     config
+                        .with_tools([native_directory_tool(session_fs.clone())])
                         .with_permission_handler(permission_handler)
                         .with_session_fs_provider(session_fs),
                 )
@@ -262,6 +319,7 @@ impl CopilotSdkAdapter {
             client
                 .create_session(
                     config
+                        .with_tools([native_directory_tool(session_fs.clone())])
                         .with_permission_handler(permission_handler)
                         .with_session_fs_provider(session_fs),
                 )
@@ -583,6 +641,8 @@ fn apply_session_config(config: &mut SessionConfig, request: &AdapterRunRequest)
         ToolSet::new()
             .add_builtin("*")
             .expect("valid Copilot builtin wildcard")
+            .add_custom("ecorp_mkdir")
+            .expect("valid scoped directory tool")
             .into(),
     );
     config.excluded_tools = Some(vec![
@@ -593,7 +653,7 @@ fn apply_session_config(config: &mut SessionConfig, request: &AdapterRunRequest)
         SystemMessageConfig::new()
             .with_mode("append")
             .with_content(format!(
-                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Work only inside that worktree. Use Copilot's built-in read, create, and edit tools for file operations; reserve shell commands for build and test programs. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
+                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Work only inside that worktree. Use ecorp_mkdir to create missing directories within the task write scope, then Copilot's built-in read, create, and edit tools for file operations; do not invoke shell for routine build or tests. After you finish, the runner executes the mission's persisted verifier commands and records the results. Report checks you have not executed as delegated to the runner, never as passed. Model-session shell always requires an explicit durable decision. Network access and sandbox bypass require a durable human approval. Produce concrete repository changes and verification evidence.",
                 request.workspace.display()
             )),
     );
@@ -737,6 +797,8 @@ fn apply_resume_config(config: &mut ResumeSessionConfig, request: &AdapterRunReq
         ToolSet::new()
             .add_builtin("*")
             .expect("valid Copilot builtin wildcard")
+            .add_custom("ecorp_mkdir")
+            .expect("valid scoped directory tool")
             .into(),
     );
     config.excluded_tools = Some(vec![
@@ -747,7 +809,7 @@ fn apply_resume_config(config: &mut ResumeSessionConfig, request: &AdapterRunReq
         SystemMessageConfig::new()
             .with_mode("append")
             .with_content(format!(
-                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Continue only inside that worktree. Use Copilot's built-in read, create, and edit tools for file operations; reserve shell commands for build and test programs. Network access and sandbox bypass require a durable human approval.",
+                "You are supervised by ECorp. Your assigned worktree is {}. Use relative paths rooted there or that exact absolute path; do not use /workspace and never invent a home-directory path. Continue only inside that worktree. Use ecorp_mkdir to create missing directories within the task write scope, then Copilot's built-in read, create, and edit tools for file operations; do not invoke shell for routine build or tests. After you finish, the runner executes the mission's persisted verifier commands and records the results. Report checks you have not executed as delegated to the runner, never as passed. Model-session shell always requires an explicit durable decision. Network access and sandbox bypass require a durable human approval.",
                 request.workspace.display()
             )),
     );
@@ -978,303 +1040,10 @@ fn permission_is_automatically_safe(
             .get("fileName")
             .and_then(Value::as_str)
             .is_some_and(|candidate| path_is_inside_workspace(workspace, candidate)),
-        Some("shell") => {
-            let commands_read_only = request
-                .get("commands")
-                .and_then(Value::as_array)
-                .is_some_and(|commands| {
-                    !commands.is_empty()
-                        && commands.iter().all(|command| {
-                            command.get("readOnly").and_then(Value::as_bool) == Some(true)
-                        })
-                });
-            let command_is_known_pathless_read_only =
-                shell_command_is_known_pathless_read_only(request);
-            let command_is_scoped_read_only =
-                shell_command_is_scoped_read_only(request, workspace, state_directory);
-            let possible_paths = request
-                .get("possiblePaths")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let paths_are_read_scoped = !possible_paths.is_empty()
-                && possible_paths.iter().all(|candidate| {
-                    candidate.as_str().is_some_and(|candidate| {
-                        path_is_inside_workspace(workspace, candidate)
-                            || path_is_inside(state_directory, candidate)
-                    })
-                });
-            request
-                .get("possibleUrls")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty)
-                && !request
-                    .get("hasWriteFileRedirection")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                && (command_is_known_pathless_read_only
-                    || command_is_scoped_read_only
-                    || (commands_read_only && paths_are_read_scoped))
-        }
+        // Managed SDK permissions and this backstop agree: no shell spelling
+        // is authorization. Without verified OS isolation it needs a decision.
         _ => false,
     }
-}
-
-fn shell_command_is_known_pathless_read_only(request: &Value) -> bool {
-    let Some(command) = request.get("fullCommandText").and_then(Value::as_str) else {
-        return false;
-    };
-    let command = command.trim().to_ascii_lowercase();
-    if command.is_empty()
-        || command.contains('\n')
-        || command.contains('`')
-        || command.contains('&')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains("||")
-        || command.contains("$(")
-        || command.contains("${")
-        || command.contains("$env:")
-        || command.contains("::")
-    {
-        return false;
-    }
-    if pathless_read_only_segment(&command) {
-        return true;
-    }
-    request
-        .get("commandSegments")
-        .and_then(Value::as_array)
-        .is_some_and(|segments| {
-            !segments.is_empty()
-                && segments.iter().all(|segment| {
-                    segment
-                        .get("fullCommandText")
-                        .and_then(Value::as_str)
-                        .is_some_and(|segment| {
-                            pathless_read_only_segment(&segment.trim().to_ascii_lowercase())
-                        })
-                })
-        })
-}
-
-fn pathless_read_only_segment(command: &str) -> bool {
-    let exact = [
-        "pwd",
-        "get-location",
-        "(get-location).path",
-        "$pwd.path",
-        "ls",
-        "ls -a",
-        "ls -la",
-        "dir",
-        "get-childitem",
-        "get-childitem -force",
-    ];
-    if exact.contains(&command) {
-        return true;
-    }
-    if pathless_directory_listing(command) {
-        return true;
-    }
-    if [
-        "git status",
-        "git diff",
-        "git rev-parse",
-        "git log",
-        "git show",
-    ]
-    .iter()
-    .any(|prefix| command == *prefix || command.starts_with(&format!("{prefix} ")))
-    {
-        return !["--ext-diff", "--no-index", "--output", "--textconv", "-c "]
-            .iter()
-            .any(|forbidden| command.contains(forbidden));
-    }
-    command
-        .strip_prefix("select-object ")
-        .is_some_and(simple_property_list)
-}
-
-fn pathless_directory_listing(command: &str) -> bool {
-    let mut parts = command.split_ascii_whitespace();
-    let Some(program) = parts.next() else {
-        return false;
-    };
-    match program {
-        "get-childitem" => parts.all(|argument| {
-            matches!(
-                argument,
-                "-force" | "-name" | "-file" | "-directory" | "-hidden"
-            )
-        }),
-        "ls" => parts.all(|argument| matches!(argument, "-a" | "-l" | "-al" | "-la" | "-1")),
-        "dir" => parts.next().is_none(),
-        _ => false,
-    }
-}
-
-fn shell_command_is_scoped_read_only(
-    request: &Value,
-    workspace: &Path,
-    state_directory: &Path,
-) -> bool {
-    let Some(command) = request.get("fullCommandText").and_then(Value::as_str) else {
-        return false;
-    };
-    let lower = command.to_ascii_lowercase();
-    if command.is_empty()
-        || command.contains('\n')
-        || command.contains('`')
-        || command.contains('&')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains("$(")
-        || command.contains("${")
-        || lower.contains("$env:")
-        || lower.contains("[environment]")
-        || lower.contains("::")
-    {
-        return false;
-    }
-
-    let Some(segments) = request.get("commandSegments").and_then(Value::as_array) else {
-        return false;
-    };
-    if segments.is_empty()
-        || !segments.iter().all(|segment| {
-            let identifier = segment
-                .get("identifier")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let full = segment
-                .get("fullCommandText")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            matches!(
-                identifier.as_str(),
-                "get-location"
-                    | "get-childitem"
-                    | "join-path"
-                    | "test-path"
-                    | "get-content"
-                    | "write-output"
-                    | "select-object"
-            ) && (identifier != "select-object"
-                || full
-                    .strip_prefix("select-object ")
-                    .is_some_and(simple_property_list))
-        })
-    {
-        return false;
-    }
-
-    let assigned_variable = assigned_join_path_variable(command);
-    let references = variable_references(command);
-    if command.contains('=') && assigned_variable.is_none() {
-        return false;
-    }
-    match assigned_variable {
-        Some(variable)
-            if references
-                .iter()
-                .any(|candidate| !candidate.eq_ignore_ascii_case(&variable)) =>
-        {
-            return false;
-        }
-        None if !references.is_empty() => return false,
-        _ => {}
-    }
-
-    let path_literals = quoted_path_literals(command);
-    !path_literals.is_empty()
-        && path_literals.iter().all(|candidate| {
-            path_is_inside_workspace(workspace, candidate)
-                || path_is_inside(state_directory, candidate)
-        })
-}
-
-fn assigned_join_path_variable(command: &str) -> Option<String> {
-    let (assignment, expression) = command.split_once('=')?;
-    if expression.contains('=')
-        || !expression
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("join-path ")
-    {
-        return None;
-    }
-    let variable = assignment.trim().strip_prefix('$')?;
-    (!variable.is_empty()
-        && variable
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_'))
-    .then(|| variable.to_owned())
-}
-
-fn variable_references(command: &str) -> Vec<String> {
-    let mut references = Vec::new();
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'$' {
-            index += 1;
-            continue;
-        }
-        let start = index + 1;
-        let mut end = start;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
-        }
-        if end > start {
-            references.push(command[start..end].to_owned());
-        }
-        index = end.max(index + 1);
-    }
-    references
-}
-
-fn quoted_path_literals(command: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut quote = None;
-    let mut start = 0;
-    for (index, character) in command.char_indices() {
-        match quote {
-            None if matches!(character, '\'' | '"') => {
-                quote = Some(character);
-                start = index + character.len_utf8();
-            }
-            Some(expected) if character == expected => {
-                let literal = &command[start..index];
-                if looks_like_path(literal) {
-                    literals.push(literal.to_owned());
-                }
-                quote = None;
-            }
-            _ => {}
-        }
-    }
-    literals
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.contains('/')
-        || value.contains('\\')
-        || value.starts_with('.')
-        || value
-            .rsplit_once('.')
-            .is_some_and(|(_, extension)| !extension.is_empty() && extension.len() <= 12)
-}
-
-fn simple_property_list(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, ' ' | '\t' | ',' | '-' | '_' | '.' | '*')
-        })
 }
 
 fn permission_summary(request: &Value) -> String {
@@ -1549,7 +1318,7 @@ mod tests {
             &workspace,
             &state_directory,
         ));
-        assert!(permission_is_automatically_safe(
+        assert!(!permission_is_automatically_safe(
             &json!({
                 "kind":"shell",
                 "fullCommandText":"Get-Location",
@@ -1560,7 +1329,7 @@ mod tests {
             &workspace,
             &state_directory,
         ));
-        assert!(permission_is_automatically_safe(
+        assert!(!permission_is_automatically_safe(
             &json!({
                 "kind":"shell",
                 "fullCommandText":"pwd; Get-ChildItem -Force -Name | Select-Object -First 200",
@@ -1576,7 +1345,7 @@ mod tests {
             &workspace,
             &state_directory,
         ));
-        assert!(permission_is_automatically_safe(
+        assert!(!permission_is_automatically_safe(
             &json!({
                 "kind":"shell",
                 "fullCommandText":"Get-Location; Get-ChildItem -Force | Select-Object Name,Length,LastWriteTime",
@@ -1618,7 +1387,7 @@ mod tests {
             &workspace,
             &state_directory,
         ));
-        assert!(permission_is_automatically_safe(
+        assert!(!permission_is_automatically_safe(
             &json!({
                 "kind":"shell",
                 "commands":[{"identifier":"git","readOnly":true}],
@@ -1717,7 +1486,7 @@ mod tests {
             "$p = Join-Path -Path '{}' -ChildPath 'copilot-live-proof.txt'; if (Test-Path $p) {{ Get-Content -Raw $p }} else {{ Write-Output '__MISSING__' }}",
             workspace.display()
         );
-        assert!(permission_is_automatically_safe(
+        assert!(!permission_is_automatically_safe(
             &json!({
                 "kind":"shell",
                 "fullCommandText":inspect_command,
@@ -1786,6 +1555,7 @@ mod tests {
             model: Some("copilot-test-reasoning".to_owned()),
             reasoning_effort: Some("high".to_owned()),
             workspace: workspace.clone(),
+            write_scope: vec!["**".to_owned()],
             environment: HashMap::new(),
         };
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -1814,5 +1584,50 @@ mod tests {
         drop(events);
         assert!(workspace.join("copilot-evidence.json").is_file());
         let _ = std::fs::remove_dir_all(workspace);
+    }
+    #[tokio::test]
+    async fn typed_directory_tool_is_idempotent_and_cannot_expand_authority() {
+        let root = std::env::temp_dir().join(format!("crony-native-mkdir-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let state = root.join("state");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
+        tokio::fs::create_dir_all(&state).await.expect("state");
+        let fs = Arc::new(
+            ContainedSessionFs::new(
+                workspace.clone(),
+                state,
+                vec!["scenarios/game/**".to_owned()],
+            )
+            .expect("capability roots"),
+        );
+        let tool = native_directory_tool(fs.clone());
+        let handler = tool.handler().expect("directory handler");
+        for _ in 0..2 {
+            let mut invocation = ToolInvocation::default();
+            invocation.tool_name = "ecorp_mkdir".to_owned();
+            invocation.arguments = json!({"path":"scenarios/game/assets"});
+            assert!(handler.call(invocation).await.is_ok());
+        }
+        for arguments in [
+            json!({"path":"../outside"}),
+            json!({"path":"/session-state"}),
+            json!({"path":"scenarios/other"}),
+            json!({"path":".git/hooks"}),
+            json!({"path":"scenarios/game/assets","command":"Remove-Item"}),
+        ] {
+            let mut invocation = ToolInvocation::default();
+            invocation.tool_name = "ecorp_mkdir".to_owned();
+            invocation.arguments = arguments;
+            assert!(handler.call(invocation).await.is_err());
+        }
+        assert!(workspace.join("scenarios/game/assets").is_dir());
+        assert!(!root.join("outside").exists());
+        assert!(!workspace.join("scenarios/other").exists());
+        assert!(!workspace.join(".git").exists());
+        drop(tool);
+        drop(fs);
+        tokio::fs::remove_dir_all(root).await.expect("cleanup");
     }
 }

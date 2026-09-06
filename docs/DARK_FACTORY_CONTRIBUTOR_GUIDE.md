@@ -137,6 +137,22 @@ $env:CRONY_RUNNER_WORKSPACE = 'C:\path\to\isolated-runner-workspace'
 runs. The runner must create linked worktrees below `CRONY_RUNNER_WORKSPACE`; it must never fall
 back to editing the configured checkout.
 
+The Missions **Run setup** screen lists the structured repository, ref, and immutable commit
+advertised by every connected runner. Select and confirm the intended target before choosing a
+runtime. Runtime and model choices are filtered to runners serving that exact source. Local
+repositories without a GitHub remote use a stable `local/<name>-<digest>` identity.
+
+CLI callers can pin the same tuple explicitly:
+
+```powershell
+crony mission $corpId $actorId `
+  --adapter github-copilot `
+  --source-repository local/example-0123456789ab `
+  --source-base-ref HEAD `
+  --source-base-commit 0123456789abcdef0123456789abcdef01234567 `
+  'Build and verify the requested application.'
+```
+
 For factory work, the configured Git remote, symbolic source ref, and resolved immutable commit must
 match the persisted factory policy and the runner's advertised capability.
 

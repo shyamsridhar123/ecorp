@@ -229,6 +229,8 @@ Room membership is a server-side visibility boundary:
 - replies store both their immediate parent and stable thread root
 - mentions are actor IDs validated against room membership
 - links to missions, tasks, runs, and artifacts are validated against the same room
+- comment writes carry a client operation UUID; exact retry returns the original durable message,
+  while reuse with another request fails closed
 
 The demo includes Eve as a Corp guest without Automation Division membership so isolation can be exercised
 end to end.
@@ -253,9 +255,18 @@ ownership. The request is audited and delivered to the runner. Adapters first re
 turn interruption and are force-terminated after a bounded timeout. The mission, task, and run end
 as cancelled.
 
-Messages from the current controller can be delivered to adapters that support steering. Other
-messages are durably queued, reserved into the next task prompt, and marked delivered only after
-the run starts.
+Messages from the current controller become durable runner commands for adapters that support
+steering. The server checks the private lease token before persistence, stores no copy of that
+token in the command, and assigns a monotonic lease version, client operation UUID, and runner
+command ID. Dispatch revalidates the actor, lease version, expiry, active run, and runner. Pending
+commands are redispatched after server or runner reconnect, the runner deduplicates command IDs,
+and a runner acknowledgment marks delivery. A changed lease or negative acknowledgment
+terminalizes the command rather than leaving it to block later commands. A browser that reconnects
+without its private token can reclaim the lease as the same actor, which rotates the token and
+lease version and fences its prior copy.
+
+Other messages are durably queued, reserved into the next task prompt, and marked delivered only
+after the run starts.
 
 ## Target module boundaries
 
@@ -332,6 +343,13 @@ Every planned task persists a self-contained contract: objective, expected outpu
 tests, allowed tools, prohibited actions, references, write scope, token budget, deadline, and
 escalation path. Validation rejects unknown agents, adapter mismatches, missing contract fields,
 cycles, excessive depth, node fan-out, retry counts, and budgets.
+
+Interactive mission creation presents the structured workspace identities advertised by connected
+runners. The operator must select and confirm one exact repository, symbolic ref, and immutable
+commit before launch. The server matches that tuple to a connected runner, copies it into every
+planned task, and validates each task's adapter, model, and reasoning requirements against runners
+advertising the same source. Local repositories without a GitHub remote receive a stable
+`local/<name>-<digest>` identity; the host path is never used as shared routing authority.
 
 The scheduler:
 
@@ -441,10 +459,14 @@ reported explicitly rather than hidden.
 The GitHub Copilot adapter uses the official Rust SDK. A runner discovers the signed-in account's
 model catalog at registration and advertises policy state, model limits, vision support, reasoning
 levels, and billing multiplier metadata. The selected model and reasoning effort are persisted in
-the task contract and run, survive resume, and participate in runner matching. Copilot may write
-inside the assigned worktree and read its per-worktree isolated SDK state automatically. Network,
-sandbox bypass, external paths, and shell commands that cannot be proven scoped suspend through
-ECorp's durable approval flow.
+the task contract and run, survive resume, and participate in runner matching. Native filesystem
+tools use a capability-scoped `SessionFsProvider`; writes are limited by the persisted task write
+scope, and provider state is isolated per worktree. Linked-path and device-path escapes fail
+before effects. Network, sandbox bypass, external paths, and every model-session shell request
+remain under ECorp's durable approval flow. The adapter does not reimplement a shell-command
+classifier or treat requested sandbox configuration as proof of OS enforcement. Persisted
+runner-owned verifier commands execute after the provider has terminated, without duplicating
+routine tests as model-session approval requests.
 
 Deterministic app-server fixtures and authenticated real-provider probes cover start, structured
 streaming, steering, interruption, emergency stop, resume, usage, artifacts, and failure behavior.
@@ -523,6 +545,27 @@ ECorp Build GitHub Project #3 and its linked issues remain the planning and stat
 ECorp transitions. Pull-request publication, merge, and deployment are separate effects with
 separate authorization and idempotency boundaries. See ADR 0020.
 
+Factory controller configuration and health are persisted separately from individual work-item
+leases. A controller records its Project and repository scope, desired running or paused state,
+connection epoch, heartbeat lease, monotonic reconciliation generation, active work item, last
+result, and bounded failure detail. The browser derives `offline`, `watching`, `working`,
+`blocked`, and `needs decision` from this authoritative record and exposes versioned pause, resume,
+and reconciliation controls. Pausing intake never interrupts an existing mission.
+
+`crony factory-watch` keeps heartbeat and control polling independent from the one-at-a-time intake
+cycle. It reconnects using a new epoch, observes durable pause and reconciliation generations, and
+continues heartbeats while the current controller cycle waits on GitHub, a mission, or verification.
+The documented local stack starts this watcher only when `ECORP_FACTORY_WATCH=1`; otherwise the UI
+truthfully reports that Factory is not configured.
+
+The Factory workbench is also the selected work item's operational cockpit. It resolves the
+item's mission, tasks, runs, pending action approvals, verification decisions, artifacts, and
+room messages into one context. Comments are persisted as room messages with a structured mission
+link; approval and verification actions continue to use their existing durable, role-gated
+decision endpoints rather than being inferred from conversation. When the selected item has an
+active run, the cockpit resolves its agent and control lease: an operator must explicitly take
+control before sending live direction, while collaborators without the lease can still comment.
+
 Before changing GitHub Project state, the controller renews its lease to an external-effect window,
 then re-fetches the Project item, issue revision, issue state, required label, and dependency state.
 It renews again immediately before the mutation, and every GitHub CLI subprocess has a bounded
@@ -534,11 +577,11 @@ the human-readable source ref to a full immutable Git object ID. Factory policy,
 and run launch records retain the repository, symbolic ref, and resolved commit together.
 Runners resolve that same tuple once at startup and advertise it as structured workspace
 capability data. Scheduling compares the immutable commit rather than trusting a matching `HEAD`
-label, and the runner repeats the check before creating or reusing a worktree. Pinned assignments
-start from their exact authorized commit. Ordinary unpinned assignments preserve the prior behavior
-of resolving the configured symbolic ref under the Git lock for each new worktree. Resume carries
-the source run's persisted workspace base commit and must reuse a preserved branch descending from
-that exact identity.
+label, and the runner repeats the check before creating or reusing a worktree. Factory and
+operator-selected assignments start from their exact authorized commit. Legacy API clients may
+still omit a source tuple, but the browser does not create unpinned missions. Resume carries the
+source run's persisted workspace base commit and must reuse a preserved branch descending from that
+exact identity.
 
 Migration 0022 derives legacy factory commits only when persisted workspace evidence identifies one
 unambiguous commit. Legacy claims or materialized no-run missions without derivable evidence are

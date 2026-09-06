@@ -85,6 +85,7 @@ pub struct AdapterRunRequest {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub workspace: PathBuf,
+    pub write_scope: Vec<String>,
     pub environment: HashMap<String, String>,
 }
 
@@ -99,6 +100,7 @@ impl std::fmt::Debug for AdapterRunRequest {
             .field("mission_title", &self.mission_title)
             .field("model", &self.model)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("write_scope", &self.write_scope)
             .field("workspace", &self.workspace)
             .field(
                 "environment_keys",
@@ -376,6 +378,7 @@ mod tests {
             workspace: std::env::temp_dir()
                 .join("crony-adapter-tests")
                 .join(run_id.to_string()),
+            write_scope: vec!["**".to_owned()],
             environment: HashMap::new(),
         }
     }

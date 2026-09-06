@@ -350,6 +350,8 @@ struct ResolvedProgram {
 #[derive(Debug)]
 struct ResolutionEnvironment {
     path: Option<OsString>,
+    // Keep one injectable environment shape; PATHEXT has no Unix semantics.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pathext: Option<OsString>,
 }
 
@@ -937,7 +939,7 @@ mod tests {
         assert_eq!(resolved.mode, ResolutionMode::Path);
         assert_eq!(
             resolved.executable,
-            tokio::fs::canonicalize(current_exe)
+            tokio::fs::canonicalize(&current_exe)
                 .await
                 .expect("canonical test executable")
         );

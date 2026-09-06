@@ -88,9 +88,14 @@ GitHub remote matches the claimed repository, then persists the full 40- or 64-h
 Factory tasks and run launch records carry repository, ref, and commit as one all-or-nothing source
 identity. The scheduler accepts only a runner advertising the same structured tuple, and the runner
 independently rejects both start and resume commands before worktree access if any element differs.
-Symbolic refs alone are never sufficient authority for factory write-capable routing. Unpinned
-ordinary tasks continue to resolve the configured ref for each new worktree, while resume is fenced
-to the source run's persisted workspace base commit.
+Symbolic refs alone are never sufficient authority for factory write-capable routing. The browser
+also requires an operator to select and confirm one connected runner's structured repository, ref,
+and immutable commit before creating an ordinary mission. The server canonicalizes the selected
+tuple from live runner capabilities, applies it to every planned task, and rejects adapter, model,
+reasoning, repository, ref, or commit mismatch before mission persistence. Local repositories use
+a stable opaque `local/<name>-<digest>` identity rather than an absolute host path. Legacy API
+clients may omit source selection, but resume is always fenced to the source run's persisted
+workspace base commit.
 
 Pre-commit factory records are migrated only from unambiguous persisted workspace evidence.
 Underivable legacy claims are not guessed or silently widened: migration marks them as requiring an
@@ -101,6 +106,30 @@ incompatible task contracts, and any mission that has already produced a run. Ne
 requires a valid immutable commit and cannot self-declare the migration-only upgrade marker.
 Recovery of a migration-marked record requires the controller's requested symbolic ref to exactly
 match the persisted policy ref before resolving or storing a commit.
+
+Factory-wide pause, resume, and reconciliation controls require an owner, admin, or manager and an
+expected controller version plus idempotency key. Members may inspect controller health but cannot
+change Corp-wide intake. Controller heartbeats are fenced by a rotating connection epoch, bounded
+lease, service actor, and Corp. A stale process cannot extend the active lease or complete another
+process's reconciliation generation. Controller status never exposes GitHub credentials or
+work-item claim tokens.
+
+Inline cockpit decisions do not weaken the underlying authorization boundary. Action approvals and
+verification reviews retain their existing role, expiry, requester-exclusion, and idempotency
+rules. Contextual comments remain ordinary durable room messages linked to the mission; comment
+text cannot approve an effect, create a task, or steer a provider session implicitly. Comment
+operation UUIDs are scoped to the Corp and exact normalized request; replay returns the existing
+message, while changed content under the same key is rejected.
+
+Cockpit steering uses the existing single-holder agent lease and lease token. The token is checked
+before persistence but is never stored in the durable runner command. A separate client operation
+UUID prevents retry from creating another control message, and the runner command ID fences
+duplicate delivery across server reconnect. A monotonic lease version is persisted with the
+command and rechecked before dispatch, so renewal, release, transfer, or expiry cancels a pending
+stale steer. Negative runner acknowledgments also terminalize the command rather than leaving it
+pending indefinitely. A browser that lost its private token must reclaim the same actor's lease,
+which rotates the token and lease version before another steer. This does not add a second input
+path or convert a comment into provider control.
 External CLI failure details are collapsed to bounded single-line text before persistence so
 multi-line stderr cannot bypass the durable blocked transition.
 
@@ -108,6 +137,19 @@ GitHub Copilot receives a native SDK managed-settings layer on every create and 
 is told to disable bypass-permissions mode. Native read and write tools may proceed without a
 second ECorp prompt only because built-in filesystem operations are routed through an ECorp
 `SessionFsProvider` that rejects paths outside the worktree and isolated Copilot state directory.
+The provider retains capability-directory handles for both trusted roots and performs every
+filesystem operation relative to those handles. It rejects dangling and existing symbolic links,
+multiply-linked regular files, Git control paths, and Windows device/alternate-stream aliases.
+It checks an opened file before truncating or appending, so a hard link cannot modify a file in
+the source checkout. Native mutations also enforce the run's persisted task write scope; a
+directory-create may create only a granted path or an ancestor needed to reach it. This authority
+is rebuilt from the current task on resume. Ordinary Unix executable permission bits are honored;
+privilege bits and invalid modes are rejected before creating a file.
+The SDK-registered `ecorp_mkdir` tool accepts only a relative path and invokes that same scoped
+provider. It is idempotent, cannot delete or chmod, and never starts a command interpreter.
+Its finite directory-creation authority comes from the persisted run contract; the SDK tool
+declaration suppresses a redundant permission prompt for this one guarded primitive, not for
+shell or other tools.
 Every shell command remains an explicit ask. Command-family allowlists are not a filesystem
 boundary: interpreters, build tools, and PowerShell commands can write arbitrary host paths when
 the native sandbox is unavailable. Copilot's sandbox configuration therefore remains
@@ -118,9 +160,11 @@ Credential stores, the user profile, network access, and temporary-directory acc
 denied through the native sandbox configuration when the installed runtime applies it.
 
 The ECorp handler remains a fail-closed backstop for unresolved requests. It automatically approves
-only writes inside the assigned worktree, read-only operations it can prove are worktree-scoped,
+only native writes inside the assigned worktree, native reads it can prove are worktree-scoped,
 and reads from the SDK state directory isolated to that worktree. It canonicalizes existing
-ancestors to reject symlink escapes. External paths, network URLs, sandbox bypass,
+ancestors without treating a dangling link or inaccessible path as absent. The native filesystem
+provider independently enforces the narrower task write scope. No shell spelling or provider
+`readOnly` flag is interpreted as an ECorp automatic grant. External paths, network URLs, sandbox bypass,
 managed-policy approvals, shell effects, and ambiguous requests suspend durably. Shell approval
 cards include the bounded command text rather than only a generic action label. Arbitrary shell can
 become approval-free only behind a separately verified operating-system isolation boundary such as
