@@ -263,12 +263,27 @@ $env:CRONY_SERVER_HTTP = 'http://127.0.0.1:<isolated-server-port>'
 $env:ECORP_TEST_SOURCE_REPOSITORY = 'C:\path\to\clean-disposable-repository'
 $env:CRONY_PROBE_COPILOT_BINARY = 'C:\path\to\real\copilot.exe'
 $env:CRONY_PROBE_OUTPUT = 'C:\path\outside\ecorp\unique-probe-output'
+$env:CRONY_PROBE_MODEL = '<enabled model id from the connected account>'
 node tools/probe_copilot_live.mjs
 ```
 
-The probe resets only the specified development server, supervises its own enrolled runner, and
-keeps logs, worktrees, and the game outside the ECorp checkout. It does not publish, merge, deploy,
-or use hosted GitHub Actions.
+Set `CRONY_PROBE_BOUNDARY_ONLY=1` to run the negative conformance lane separately. Its report is
+explicitly labeled `boundaries_only` and cannot substitute for an application-build result. This is
+useful when an application model refuses a test prompt before reaching the permission handler; that
+refusal remains inconclusive for handler coverage rather than being counted as a passed probe.
+Set `CRONY_PROBE_PRESERVE_DEMO=1` to retain earlier test history instead of resetting the specified
+development server.
+
+For a preserved verification-failed run, `CRONY_PROBE_RECOVER_RUN_ID` plus its original
+`CRONY_COPILOT_EVENT_ROOT` exercises the existing resume API. It retains the source, task, model,
+provider session, worktree, and verifier policy; supplies bounded verifier feedback; and permits at
+most two automatic repair requests per invocation within the original remaining budget. A
+hard-stopped lineage is not resumable. Its evidence must be retained, not represented as recovered.
+
+The probe supervises only its own enrolled runner and keeps logs, worktrees, and the game outside
+the ECorp checkout. It does not publish, merge, deploy, or use hosted GitHub Actions.
+See `docs/evidence/2026-09-06-copilot-native-filesystem.md` for the accepted application, browser
+checks, retained failed lineage, and the explicitly incomplete live negative coverage.
 
 `tools/e2e_gateways.mjs` launches the MCP, ACP, and A2A binaries against a live server and verifies
 version negotiation, scoped tools, session-to-mission mapping, agent discovery, task/message

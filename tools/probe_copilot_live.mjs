@@ -466,8 +466,12 @@ if (recoveryRunId) {
   assert.equal(recoveryRun.verification_status, 'failed')
   assert.equal(recoveryRun.workspace_disposition, 'preserved')
   assert.ok(recoveryRun.workspace_path)
+  assert.ok(!existing.snapshot.runs.some((run) =>
+    run.workspace_run_id === recoveryRun.workspace_run_id && run.breaker_stage === 'stop'),
+  'a hard-stopped provider lineage cannot be resumed')
 }
-const demo = recoveryRun ? existingDemo : await post('/api/demo/reset', {})
+const demo = recoveryRun || process.env.CRONY_PROBE_PRESERVE_DEMO === '1'
+  ? existingDemo : await post('/api/demo/reset', {})
 let ownedRunner
 try {
 ownedRunner = await startCanaryRunner(demo)
@@ -485,7 +489,11 @@ const capability = ownedRunner.runner.capabilities
 assert.ok(capability, 'runner omitted the GitHub Copilot capability')
 assert.equal(capability.available, true, capability.detail)
 assert.ok(capability.models.length > 0, 'Copilot returned no models')
-const model =
+const requestedModel = recoveryRun?.model ?? process.env.CRONY_PROBE_MODEL
+const model = requestedModel
+  ? capability.models.find((candidate) =>
+    candidate.id === requestedModel && candidate.policy_state !== 'disabled')
+  :
   capability.models.find((candidate) =>
     candidate.id === (recoveryRun?.model ?? 'gpt-5-mini') &&
     candidate.policy_state !== 'disabled') ??
@@ -496,7 +504,7 @@ const model =
       !candidate.name.toLowerCase().includes('internal only'),
   ) ??
   capability.models.find((candidate) => candidate.policy_state !== 'disabled')
-assert.ok(model, 'Copilot returned no enabled model')
+assert.ok(model, `Copilot returned no enabled model matching ${requestedModel ?? 'the default selection'}`)
 if (recoveryRun) assert.equal(model.id, recoveryRun.model, 'resume must retain the original model')
 
 const launch = await launchMission(
@@ -527,7 +535,9 @@ assert.equal(
   'worktree-scoped built-in file operations should not require durable approval',
 )
 
-const game = await buildBrowserGame(demo, model, recoveryRun)
+const boundaryOnly = process.env.CRONY_PROBE_BOUNDARY_ONLY === '1'
+assert.ok(!(boundaryOnly && recoveryRun), 'boundary-only mode cannot resume an application run')
+const game = boundaryOnly ? null : await buildBrowserGame(demo, model, recoveryRun)
 
 const shellLaunch = await launchMission(
   demo,
@@ -635,7 +645,8 @@ const providerObservations = observations.filter((entry) =>
   entry.probe_id === probeId &&
   entry.parent_pid === runnerSpawn?.child_pid)
 assert.equal(seeded?.canary_present, true, 'the runner must actually inherit the credential canary')
-assert.ok(providerObservations.length >= 10, 'observe catalog plus every provider process environment')
+assert.ok(providerObservations.length >= (boundaryOnly ? 9 : 10),
+  'observe catalog plus every provider process environment')
 assert.ok(providerObservations.every((entry) =>
   entry.canary_present === false && entry.github_token_present === false))
 
@@ -655,6 +666,7 @@ for (const file of await eventFiles(path.resolve(eventRoot))) {
 
 const report = {
   checked_at: new Date().toISOString(),
+  mode: boundaryOnly ? 'boundaries_only' : 'application_and_boundaries',
   sdk_version: '1.0.11',
   model_count: capability.models.length,
   models: capability.models,

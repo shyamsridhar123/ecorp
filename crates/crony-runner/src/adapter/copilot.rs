@@ -1196,6 +1196,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn permission_handler_requires_decisions_for_every_exception_class() {
+        let root = std::env::temp_dir().join(format!("crony-permission-matrix-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let state_directory = root.join("state");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace");
+        tokio::fs::create_dir_all(&state_directory)
+            .await
+            .expect("state");
+        let cases = [
+            (
+                false,
+                json!({"kind":"shell","fullCommandText":"Get-Location","commands":[{"readOnly":true}],"possiblePaths":[workspace]}),
+            ),
+            (
+                false,
+                json!({"kind":"shell","fullCommandText":"Get-Location | Select-Object Path","commands":[{"readOnly":true}],"possiblePaths":[workspace]}),
+            ),
+            (
+                false,
+                json!({"kind":"shell","fullCommandText":"Invoke-WebRequest https://example.invalid","possibleUrls":["https://example.invalid"]}),
+            ),
+            (
+                false,
+                json!({"kind":"write","fileName":root.join("configured-source/README.md")}),
+            ),
+            (
+                false,
+                json!({"kind":"shell","fullCommandText":"Remove-Item -Recurse ."}),
+            ),
+            (
+                false,
+                json!({"kind":"shell","fullCommandText":"Write-Output $env:GITHUB_TOKEN"}),
+            ),
+            (
+                true,
+                json!({"kind":"read","path":workspace.join("README.md")}),
+            ),
+            (false, json!({"kind":"future-unknown-tool"})),
+        ];
+        for (index, (managed, request)) in cases.into_iter().enumerate() {
+            let sink = Arc::new(RecordingSink::default());
+            let pending = Arc::new(DashMap::new());
+            let handler = Arc::new(CronyPermissionHandler {
+                workspace: workspace.clone(),
+                state_directory: state_directory.clone(),
+                sink: sink.clone(),
+                pending: pending.clone(),
+            });
+            let data = serde_json::from_value(json!({
+                "managedApprovalRequired": managed,
+                "permissionRequest": request,
+            }))
+            .expect("SDK permission frame");
+            let task = tokio::spawn(async move {
+                handler
+                    .handle(
+                        SessionId::from("boundary-matrix"),
+                        RequestId::from(format!("case-{index}")),
+                        data,
+                    )
+                    .await
+            });
+            let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let approval = sink
+                        .events
+                        .lock()
+                        .expect("events")
+                        .iter()
+                        .find_map(|event| {
+                            if let AdapterEvent::ApprovalRequested { approval_id, .. } = event {
+                                Some(*approval_id)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(id) = approval {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("exception must emit an approval request");
+            assert!(!task.is_finished(), "exception cannot decide itself");
+            pending
+                .remove(&approval_id)
+                .expect("pending decision")
+                .1
+                .send(PermissionDecision {
+                    approved: false,
+                    note: "test rejection".to_owned(),
+                })
+                .expect("deliver rejection");
+            let result = task.await.expect("permission handler");
+            assert!(matches!(
+                result,
+                PermissionResult::Decision {
+                    decision: github_copilot_sdk::rpc::PermissionDecision::Reject(_),
+                    ..
+                }
+            ));
+            assert!(pending.is_empty());
+            assert_eq!(sink.events.lock().expect("events").len(), 1);
+        }
+        tokio::fs::remove_dir_all(root).await.expect("cleanup");
+    }
+
     #[test]
     fn native_managed_permissions_never_pre_authorize_shell() {
         let managed = copilot_native_managed_settings();
