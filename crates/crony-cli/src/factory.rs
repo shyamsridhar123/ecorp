@@ -4,6 +4,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +21,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
+
+mod project;
+mod quota;
 
 const DEFAULT_GITHUB_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS: u64 = 30_000;
@@ -94,6 +101,13 @@ pub struct FactoryArgs {
 
     #[arg(long, env = "ECORP_GITHUB_CLI", default_value = "gh")]
     pub github_cli: PathBuf,
+
+    #[arg(skip)]
+    github_budget: quota::BudgetState,
+
+    /// Discovery hint only; source content/eligibility are always re-read.
+    #[arg(skip)]
+    active_issue: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Args)]
@@ -247,6 +261,33 @@ impl EvaluatedItem {
 pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result<Value> {
     normalize_args(&mut args)?;
     validate_args(&args)?;
+    args.github_budget.check(Utc::now())?;
+    if args
+        .github_budget
+        .snapshot()
+        .graphql
+        .as_ref()
+        .is_none_or(|quota| {
+            quota.reset_at <= Utc::now()
+                || quota.observed_at + chrono::Duration::seconds(60) <= Utc::now()
+        })
+    {
+        graphql_json(
+            &args,
+            "query { rateLimit { limit remaining cost resetAt } }",
+            json!({}),
+        )?;
+        if args
+            .github_budget
+            .snapshot()
+            .graphql
+            .as_ref()
+            .is_none_or(|quota| quota.reset_at <= Utc::now())
+        {
+            bail!("GitHub did not provide a current GraphQL quota observation");
+        }
+        args.github_budget.check(Utc::now())?;
+    }
     let adapter_allowlist = factory_adapter_allowlist(&args)?;
     let requested_verification_policy = load_verification_policy(&args)?;
     let project_items = load_requested_project_items(&args)?;
@@ -274,6 +315,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             .then_with(|| left.issue.number.cmp(&right.issue.number))
     });
     let selected_index = evaluated.iter().position(EvaluatedItem::eligible);
+    if let Some(index) = selected_index {
+        args.active_issue
+            .store(evaluated[index].issue.number, Ordering::Relaxed);
+    }
     let selected_source_base_commit = selected_index
         .map(|index| {
             if evaluated[index].recovery {
@@ -379,6 +424,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "preflight": preflight,
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
+            "github_polling": args.github_budget.snapshot(),
             "mutations": [],
         }));
     }
@@ -646,16 +692,9 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             &args.owner,
             args.project_number,
             &refreshed.project_item.id,
+            &args.github_budget,
         )
-        .and_then(|_| {
-            verify_project_status(
-                &args.github_cli,
-                &args.owner,
-                args.project_number,
-                &refreshed.project_item.id,
-                "In Progress",
-            )
-        })
+        .and_then(|_| verify_project_status(&args, &refreshed.project_item.id, "In Progress"))
     };
     if let Err(error) = project_update {
         if work_item_state != "blocked" {
@@ -836,7 +875,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         work_item_version = transitioned.1;
         work_item_state = transitioned.0;
     }
-    if mission_completed && matches!(work_item_state.as_str(), "running" | "awaiting_approval") {
+    if mission_completed
+        && matches!(
+            work_item_state.as_str(),
+            "mission_created" | "running" | "awaiting_approval" | "blocked"
+        )
+    {
         let transitioned = transition_factory_state(
             client,
             server,
@@ -854,6 +898,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     }
     Ok(json!({
         "mode": "executed",
+        "github_polling": args.github_budget.snapshot(),
         "source_of_truth": "github_project",
         "project_owner": args.owner,
         "project_number": args.project_number,
@@ -916,6 +961,16 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
     )
     .await?;
     let mut controller = configured["controller"].clone();
+    args.factory.github_budget.restore(
+        serde_json::from_value(
+            controller
+                .get("polling")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        )
+        .context("decode persisted factory polling state")?,
+        Utc::now(),
+    );
     let mut cycle: Option<tokio::task::JoinHandle<Result<Value>>> = None;
     let mut cycle_generation: Option<i64> = None;
     let mut next_periodic = Instant::now();
@@ -932,9 +987,16 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
                 .await
                 .context("factory cycle task failed")?;
             match result {
-                Ok(_) => {
+                Ok(value) => {
                     last_error = None;
                     last_result = Some("succeeded");
+                    args.factory.github_budget.success(Utc::now());
+                    if matches!(
+                        value["factory_state"].as_str(),
+                        Some("verified" | "published" | "failed" | "cancelled")
+                    ) {
+                        args.factory.active_issue.store(0, Ordering::Relaxed);
+                    }
                 }
                 Err(error)
                     if error
@@ -943,8 +1005,22 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
                 {
                     last_error = None;
                     last_result = Some("succeeded");
+                    args.factory.github_budget.success(Utc::now());
+                    args.factory.active_issue.store(0, Ordering::Relaxed);
                 }
                 Err(error) => {
+                    // Request wrappers record throttling immediately, even if
+                    // later persistence/compensation fails. Do not count the
+                    // same request twice when its error reaches the watcher.
+                    if args
+                        .factory
+                        .github_budget
+                        .snapshot()
+                        .next_retry_at
+                        .is_none_or(|retry| retry <= Utc::now())
+                    {
+                        args.factory.github_budget.failure(&error, Utc::now());
+                    }
                     last_error = Some(bounded_status_error(&error.to_string()));
                     last_result = Some("failed");
                 }
@@ -992,7 +1068,7 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
                         && item["source_repository_name"] == repository_name
                         && !matches!(
                             item["state"].as_str(),
-                            Some("published" | "failed" | "cancelled")
+                            Some("verified" | "published" | "failed" | "cancelled")
                         )
                 })
             })
@@ -1001,6 +1077,8 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
         let completed_generation = controller["completed_reconcile_generation"]
             .as_i64()
             .unwrap_or(0);
+        let finished_generation = (cycle.is_none() && last_result.is_some())
+            .then_some(cycle_generation.unwrap_or(completed_generation));
         let heartbeat_result = server_json(
             client,
             Method::POST,
@@ -1013,18 +1091,16 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
                 "connection_epoch": connection_epoch,
                 "lease_seconds": (args.heartbeat_seconds * 3).clamp(10, 300),
                 "active_work_item_id": active_work_item_id,
-                "completed_reconcile_generation": cycle_generation
-                    .filter(|_| cycle.is_none()),
-                "reconcile_result": cycle_generation
-                    .filter(|_| cycle.is_none())
-                    .and(last_result),
-                "error": last_error
+                "completed_reconcile_generation": finished_generation,
+                "reconcile_result": finished_generation.and(last_result),
+                "error": last_error,
+                "polling": args.factory.github_budget.snapshot(),
             })),
         )
         .await;
         if let Ok(response) = heartbeat_result {
             controller = response["controller"].clone();
-            if cycle.is_none() && cycle_generation.is_some() {
+            if finished_generation.is_some() {
                 cycle_generation = None;
                 last_result = None;
             }
@@ -1038,11 +1114,21 @@ pub async fn watch(client: &Client, server: &str, mut args: FactoryWatchArgs) ->
 
         let paused = controller["desired_state"].as_str() == Some("paused");
         let forced = pending_generation > completed_generation;
-        if cycle.is_none() && !paused && (forced || Instant::now() >= next_periodic) {
+        if cycle.is_none()
+            && !paused
+            && args.factory.github_budget.check(Utc::now()).is_ok()
+            && (forced || Instant::now() >= next_periodic)
+        {
             cycle_generation = forced.then_some(pending_generation);
             let cycle_client = client.clone();
             let cycle_server = server.to_owned();
-            let cycle_args = args.factory.clone();
+            let mut cycle_args = args.factory.clone();
+            let selected = cycle_args.active_issue.load(Ordering::Relaxed);
+            if cycle_args.issue.is_none() && selected > 0 {
+                // Cache identity only while a selected lineage is active. Each
+                // cycle still reads live source/Project state before effects.
+                cycle_args.issue = Some(selected);
+            }
             cycle = Some(tokio::spawn(async move {
                 run(&cycle_client, &cycle_server, cycle_args).await
             }));
@@ -1582,32 +1668,12 @@ fn repository_parts(repository: &str) -> Result<(&str, &str)> {
     Ok((owner, name))
 }
 
-fn load_project_items(
-    github_cli: &Path,
-    owner: &str,
-    project_number: u32,
-) -> Result<ProjectItemsEnvelope> {
-    gh_json(
-        github_cli,
-        &[
-            "project",
-            "item-list",
-            &project_number.to_string(),
-            "--owner",
-            owner,
-            "--limit",
-            "1000",
-            "--format",
-            "json",
-        ],
-    )
-    .and_then(|value| serde_json::from_value(value).context("decode GitHub Project items"))
-}
-
 // Avoid full-Project rescans for a selected issue or an already-claimed item.
 fn load_requested_project_items(args: &FactoryArgs) -> Result<ProjectItemsEnvelope> {
     let Some(number) = args.issue else {
-        return load_project_items(&args.github_cli, &args.owner, args.project_number);
+        return project::discover(&args.owner, args.project_number, |query, variables| {
+            graphql_json(args, query, variables)
+        });
     };
     let (owner, repository) = repository_parts(&args.repository)?;
     let query = r#"query($owner:String!,$repo:String!,$number:Int!){
@@ -1615,22 +1681,12 @@ fn load_requested_project_items(args: &FactoryArgs) -> Result<ProjectItemsEnvelo
         projectItems(first:100){pageInfo{hasNextPage} nodes{
           id project{number owner{... on User{login} ... on Organization{login}}}
         }}
-      }}
+      }} rateLimit{limit remaining cost resetAt}
     }"#;
-    let result = gh_json(
-        &args.github_cli,
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-f",
-            &format!("owner={owner}"),
-            "-f",
-            &format!("repo={repository}"),
-            "-F",
-            &format!("number={number}"),
-        ],
+    let result = graphql_json(
+        args,
+        query,
+        json!({"owner":owner,"repo":repository,"number":number}),
     )?;
     let connection = result
         .pointer("/data/repository/issue/projectItems")
@@ -1658,7 +1714,7 @@ fn load_requested_project_items(args: &FactoryArgs) -> Result<ProjectItemsEnvelo
             let id = node["id"]
                 .as_str()
                 .context("Project membership omitted its identity")?;
-            load_project_item_exact(&args.github_cli, &args.owner, args.project_number, id)
+            load_project_item_exact(args, id)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ProjectItemsEnvelope {
@@ -1675,31 +1731,21 @@ fn project_identity_matches(node: &Value, owner: &str, number: u32) -> bool {
             .is_some_and(|login| login.eq_ignore_ascii_case(owner))
 }
 
-fn load_project_item_exact(
-    github_cli: &Path,
-    owner: &str,
-    number: u32,
-    item_id: &str,
-) -> Result<ProjectItem> {
+fn load_project_item_exact(args: &FactoryArgs, item_id: &str) -> Result<ProjectItem> {
     let query = r#"query($id:ID!){node(id:$id){
       __typename ... on ProjectV2Item{
         id isArchived project{number owner{... on User{login} ... on Organization{login}}}
         fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
         content{__typename ... on Issue{id number title body url repository{nameWithOwner}}}
       }
-    }}"#;
-    let result = gh_json(
-        github_cli,
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-f",
-            &format!("id={item_id}"),
-        ],
-    )?;
-    parse_exact_project_item(&result["data"]["node"], owner, number, item_id)
+    } rateLimit{limit remaining cost resetAt} }"#;
+    let result = graphql_json(args, query, json!({"id":item_id}))?;
+    parse_exact_project_item(
+        &result["data"]["node"],
+        &args.owner,
+        args.project_number,
+        item_id,
+    )
 }
 
 fn parse_exact_project_item(
@@ -1750,8 +1796,13 @@ fn parse_exact_project_item(
     })
 }
 
-fn load_issue(github_cli: &Path, repository: &str, number: i64) -> Result<IssueView> {
-    gh_json(
+fn load_issue(
+    github_cli: &Path,
+    repository: &str,
+    number: i64,
+    budget: &quota::BudgetState,
+) -> Result<IssueView> {
+    gh_json_guarded(
         github_cli,
         &[
             "issue",
@@ -1762,6 +1813,7 @@ fn load_issue(github_cli: &Path, repository: &str, number: i64) -> Result<IssueV
             "--json",
             "id,state,createdAt,updatedAt,title,body,url,number,labels",
         ],
+        budget,
     )
     .and_then(|value| serde_json::from_value(value).context("decode GitHub issue"))
 }
@@ -1783,6 +1835,7 @@ fn evaluate_items(
             &args.repository,
             item.content.number,
             issue_cache,
+            &args.github_budget,
         )?;
         let dependencies = blocked_dependency_numbers(&issue.body);
         let mut reasons = Vec::new();
@@ -1842,8 +1895,13 @@ fn evaluate_items(
             }
         }
         for dependency in &dependencies {
-            let dependency_issue =
-                cached_issue(&args.github_cli, &args.repository, *dependency, issue_cache)?;
+            let dependency_issue = cached_issue(
+                &args.github_cli,
+                &args.repository,
+                *dependency,
+                issue_cache,
+                &args.github_budget,
+            )?;
             if dependency_issue.state == "OPEN" {
                 reasons.push(format!("blocked by open issue #{dependency}"));
             }
@@ -1909,12 +1967,7 @@ async fn refresh_selected(
     args: &FactoryArgs,
     selected: &EvaluatedItem,
 ) -> Result<(EvaluatedItem, Option<ExistingFactoryItem>)> {
-    let item = load_project_item_exact(
-        &args.github_cli,
-        &args.owner,
-        args.project_number,
-        &selected.project_item.id,
-    )?;
+    let item = load_project_item_exact(args, &selected.project_item.id)?;
     let existing =
         lookup_factory_work_items(client, server, args, std::slice::from_ref(&item.id)).await?;
     let mut cache = HashMap::new();
@@ -1938,13 +1991,8 @@ fn revalidate_selected_for_effect(
     expected_project_status: &str,
     stage: &str,
 ) -> Result<()> {
-    let item = load_project_item_exact(
-        &args.github_cli,
-        &args.owner,
-        args.project_number,
-        &selected.project_item.id,
-    )
-    .with_context(|| format!("read exact Project item before {stage}"))?;
+    let item = load_project_item_exact(args, &selected.project_item.id)
+        .with_context(|| format!("read exact Project item before {stage}"))?;
     let mut reasons = Vec::new();
     if item.content.kind != "Issue" {
         reasons.push(format!(
@@ -1975,7 +2023,12 @@ fn revalidate_selected_for_effect(
         ));
     }
 
-    let issue = load_issue(&args.github_cli, &args.repository, selected.issue.number)?;
+    let issue = load_issue(
+        &args.github_cli,
+        &args.repository,
+        selected.issue.number,
+        &args.github_budget,
+    )?;
     if issue.id != selected.issue.id {
         reasons.push("GitHub issue identity changed".to_owned());
     }
@@ -2017,6 +2070,7 @@ fn revalidate_selected_for_effect(
             &args.repository,
             dependency,
             &mut issue_cache,
+            &args.github_budget,
         )?;
         if dependency_issue.state == "OPEN" {
             reasons.push(format!("blocked by open issue #{dependency}"));
@@ -2036,11 +2090,12 @@ fn cached_issue(
     repository: &str,
     number: i64,
     cache: &mut HashMap<i64, IssueView>,
+    budget: &quota::BudgetState,
 ) -> Result<IssueView> {
     if let Some(issue) = cache.get(&number) {
         return Ok(issue.clone());
     }
-    let issue = load_issue(github_cli, repository, number)?;
+    let issue = load_issue(github_cli, repository, number, budget)?;
     cache.insert(number, issue.clone());
     Ok(issue)
 }
@@ -2054,44 +2109,55 @@ async fn lookup_factory_work_items(
     if source_project_item_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let response = server_json(
-        client,
-        Method::POST,
-        format!(
-            "{server}/api/corps/{}/factory/work-items/lookup",
-            args.corp_id
-        ),
-        Some(json!({
-            "actor_id": args.actor_id,
-            "source_project_owner": args.owner,
-            "source_project_number": args.project_number,
-            "source_project_item_ids": source_project_item_ids,
-        })),
-    )
-    .await?;
-    let items = response
-        .get("items")
-        .and_then(Value::as_array)
-        .context("factory work-item lookup omitted items")?;
-    let total_count = response
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .context("factory work-item lookup omitted total_count")?;
-    if total_count != items.len() as u64 {
-        bail!(
-            "factory work-item lookup returned {} of {} items",
-            items.len(),
-            total_count
-        );
-    }
-    for item in items {
-        if value_string(item, "/source_project_owner")? != args.owner
-            || value_i64(item, "/source_project_number")? != i64::from(args.project_number)
-        {
-            bail!("factory work-item lookup returned an item from another GitHub Project");
+    let mut combined = HashMap::new();
+    for chunk in source_project_item_ids.chunks(1000) {
+        let response = server_json(
+            client,
+            Method::POST,
+            format!(
+                "{server}/api/corps/{}/factory/work-items/lookup",
+                args.corp_id
+            ),
+            Some(json!({
+                "actor_id": args.actor_id,
+                "source_project_owner": args.owner,
+                "source_project_number": args.project_number,
+                "source_project_item_ids": chunk,
+            })),
+        )
+        .await?;
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .context("factory work-item lookup omitted items")?;
+        let total_count = response
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .context("factory work-item lookup omitted total_count")?;
+        if total_count != items.len() as u64 {
+            bail!(
+                "factory work-item lookup returned {} of {} items",
+                items.len(),
+                total_count
+            );
+        }
+        for item in items {
+            if value_string(item, "/source_project_owner")? != args.owner
+                || value_i64(item, "/source_project_number")? != i64::from(args.project_number)
+            {
+                bail!("factory work-item lookup returned an item from another GitHub Project");
+            }
+            if !chunk.contains(&value_string(item, "/source_project_item_id")?) {
+                bail!("factory lookup returned an unrequested Project item");
+            }
+        }
+        for (id, item) in existing_factory_items(items)? {
+            if combined.insert(id, item).is_some() {
+                bail!("factory lookup returned a duplicate Project item");
+            }
         }
     }
-    existing_factory_items(items)
+    Ok(combined)
 }
 
 fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFactoryItem>> {
@@ -2123,8 +2189,9 @@ fn set_project_in_progress(
     owner: &str,
     project_number: u32,
     item_id: &str,
+    budget: &quota::BudgetState,
 ) -> Result<()> {
-    let project: ProjectView = serde_json::from_value(gh_json(
+    let project: ProjectView = serde_json::from_value(gh_json_guarded(
         github_cli,
         &[
             "project",
@@ -2135,9 +2202,10 @@ fn set_project_in_progress(
             "--format",
             "json",
         ],
+        budget,
     )?)
     .context("decode GitHub Project")?;
-    let fields: ProjectFields = serde_json::from_value(gh_json(
+    let fields: ProjectFields = serde_json::from_value(gh_json_guarded(
         github_cli,
         &[
             "project",
@@ -2148,6 +2216,7 @@ fn set_project_in_progress(
             "--format",
             "json",
         ],
+        budget,
     )?)
     .context("decode GitHub Project fields")?;
     let status = fields
@@ -2160,7 +2229,7 @@ fn set_project_in_progress(
         .iter()
         .find(|option| option.name == "In Progress")
         .context("GitHub Project Status has no In Progress option")?;
-    gh_run(
+    gh_run_guarded(
         github_cli,
         &[
             "project",
@@ -2174,17 +2243,12 @@ fn set_project_in_progress(
             "--single-select-option-id",
             &in_progress.id,
         ],
+        budget,
     )
 }
 
-fn verify_project_status(
-    github_cli: &Path,
-    owner: &str,
-    project_number: u32,
-    item_id: &str,
-    expected: &str,
-) -> Result<()> {
-    let item = load_project_item_exact(github_cli, owner, project_number, item_id)?;
+fn verify_project_status(args: &FactoryArgs, item_id: &str, expected: &str) -> Result<()> {
+    let item = load_project_item_exact(args, item_id)?;
     let status = item.status.as_str();
     if status != expected {
         bail!("GitHub Project item status is {status}, not {expected}");
@@ -2579,13 +2643,85 @@ pub(crate) fn sanitize_failure_detail(value: &str) -> String {
 
 pub(crate) fn gh_json(github_cli: &Path, args: &[&str]) -> Result<Value> {
     let output = gh_output(github_cli, args)?;
-    serde_json::from_slice(&output).with_context(|| {
+    serde_json::from_slice(quota::json_body(&output)?).with_context(|| {
         format!(
             "decode JSON from {} {}",
             github_cli.display(),
             args.join(" ")
         )
     })
+}
+
+fn graphql_json(args: &FactoryArgs, query: &str, variables: Value) -> Result<Value> {
+    args.github_budget.check(Utc::now())?;
+    let variables = variables
+        .as_object()
+        .context("GraphQL variables must be an object")?;
+    let mut command = vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "--include".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+    ];
+    for (key, value) in variables {
+        match value {
+            Value::String(value) => command.extend(["-f".to_owned(), format!("{key}={value}")]),
+            Value::Number(_) | Value::Bool(_) | Value::Null => {
+                command.extend(["-F".to_owned(), format!("{key}={value}")])
+            }
+            _ => bail!("unsupported GraphQL variable shape"),
+        }
+    }
+    let refs = command.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = match gh_output(&args.github_cli, &refs) {
+        Ok(output) => output,
+        Err(error) => {
+            args.github_budget.failure(&error, Utc::now());
+            return Err(error);
+        }
+    };
+    let value: Value = serde_json::from_slice(quota::json_body(&output)?)
+        .context("decode bounded GitHub GraphQL response")?;
+    if graphql_envelope_has_errors(&value) {
+        if let Some(wait) = quota::classify_failure(&output, &[], Utc::now()) {
+            let error = anyhow!(wait);
+            args.github_budget.failure(&error, Utc::now());
+            return Err(error);
+        }
+        bail!("GitHub GraphQL returned partial errors; refusing incomplete source data");
+    }
+    if value.pointer("/data/rateLimit").is_none() {
+        bail!("GitHub GraphQL response omitted rateLimit; refusing unbudgeted discovery");
+    }
+    args.github_budget.observe_json(&value, Utc::now())?;
+    Ok(value)
+}
+
+fn graphql_envelope_has_errors(value: &Value) -> bool {
+    match value.get("errors") {
+        None => false,
+        Some(Value::Array(errors)) => !errors.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn gh_json_guarded(github_cli: &Path, args: &[&str], budget: &quota::BudgetState) -> Result<Value> {
+    budget.check(Utc::now())?;
+    let result = gh_json(github_cli, args);
+    if let Err(error) = &result {
+        budget.failure(error, Utc::now());
+    }
+    result
+}
+
+fn gh_run_guarded(github_cli: &Path, args: &[&str], budget: &quota::BudgetState) -> Result<()> {
+    budget.check(Utc::now())?;
+    let result = gh_run(github_cli, args);
+    if let Err(error) = &result {
+        budget.failure(error, Utc::now());
+    }
+    result
 }
 
 pub(crate) fn gh_run(github_cli: &Path, args: &[&str]) -> Result<()> {
@@ -2643,6 +2779,9 @@ pub(crate) fn gh_output(github_cli: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let stdout = join_process_output(stdout_reader, "GitHub CLI standard output")?;
     let stderr = join_process_output(stderr_reader, "GitHub CLI standard error")?;
     if !status.success() {
+        if let Some(wait) = quota::classify_failure(&stdout, &stderr, Utc::now()) {
+            return Err(wait.into());
+        }
         let detail = sanitize_failure_detail(&String::from_utf8_lossy(&stderr));
         bail!(
             "{} {} failed: {}",
@@ -2822,11 +2961,29 @@ mod tests {
 
     use super::{
         ExistingFactoryItem, FactoryArgs, acceptance_tests, blocked_dependency_numbers,
-        factory_item_recoverable_by, issue_numbers, normalize_github_component,
-        parse_exact_project_item, parse_github_repository_identity, publication_base_branch,
-        resolve_recovery_publication_base_ref, sanitize_failure_detail,
+        factory_item_recoverable_by, graphql_envelope_has_errors, issue_numbers,
+        normalize_github_component, parse_exact_project_item, parse_github_repository_identity,
+        publication_base_branch, resolve_recovery_publication_base_ref, sanitize_failure_detail,
         selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
     };
+
+    #[test]
+    fn graphql_error_envelope_must_be_absent_or_an_empty_array() {
+        assert!(!graphql_envelope_has_errors(&json!({"data": {}})));
+        assert!(!graphql_envelope_has_errors(
+            &json!({"data": {}, "errors": []})
+        ));
+        for errors in [
+            json!({}),
+            json!("bad"),
+            json!(null),
+            json!([{"message":"bad"}]),
+        ] {
+            assert!(graphql_envelope_has_errors(
+                &json!({"data": {"node":{}}, "errors": errors})
+            ));
+        }
+    }
 
     #[test]
     fn exact_project_reads_preserve_source_content_and_project_identity() {
@@ -2980,6 +3137,8 @@ Blocked by #999 outside the section.
             issue: None,
             dry_run: true,
             github_cli: "gh".into(),
+            github_budget: Default::default(),
+            active_issue: Default::default(),
         };
         assert_eq!(selected_publication_base_ref(&args), "release");
         args.publication_base_ref = Some("main".to_owned());
@@ -3024,6 +3183,8 @@ Blocked by #999 outside the section.
             issue: None,
             dry_run: true,
             github_cli: "gh".into(),
+            github_budget: Default::default(),
+            active_issue: Default::default(),
         };
         assert_eq!(
             resolve_recovery_publication_base_ref(&args, &item).unwrap(),

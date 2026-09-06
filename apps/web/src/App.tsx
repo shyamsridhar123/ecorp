@@ -7,6 +7,9 @@ import './World.css'
 import './Accessible.css'
 import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
+import { FactoryPollingNotice } from './FactoryPollingNotice'
+import { factoryControllerState } from './factoryPolling'
+import type { FactoryPolling } from './factoryPolling'
 import { currentOfficeAgents, selectOfficeAgent } from './office/officeModel'
 import type { OfficeAgent } from './office/officeModel'
 import {
@@ -421,7 +424,8 @@ type FactoryController = {
   source_repository_owner: string
   source_repository_name: string
   desired_state: 'running' | 'paused'
-  status: 'offline' | 'watching' | 'working' | 'blocked' | 'needs_decision'
+  status: 'offline' | 'watching' | 'working' | 'blocked' | 'needs_decision' | 'backing_off'
+  polling?: FactoryPolling | null
   version: number
   lease_expires_at: string
   last_heartbeat_at: string
@@ -1573,9 +1577,7 @@ function FactoryPanel({
     .filter((attempt) => attempt.publication_id === selectedPublication?.id)
     .sort((left, right) => right.attempt - left.attempt)
   const controller = controllers[0]
-  const controllerState = controller?.desired_state === 'paused'
-    ? 'paused'
-    : controller?.status ?? 'not_configured'
+  const controllerState = factoryControllerState(controller)
 
   return (
     <section
@@ -1664,6 +1666,7 @@ function FactoryPanel({
             Project intake.
           </p>
         )}
+        {controller ? <FactoryPollingNotice controller={controller} /> : null}
         {controller?.last_error ? (
           <p className="factory-controller-error" role="alert">
             {controller.last_error}

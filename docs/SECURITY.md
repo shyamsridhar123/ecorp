@@ -114,6 +114,21 @@ lease, service actor, and Corp. A stale process cannot extend the active lease o
 process's reconciliation generation. Controller status never exposes GitHub credentials or
 work-item claim tokens.
 
+External throttling does not grant authority. The trusted controller persists
+typed polling/backoff metadata under its current connection epoch; stale workers
+and other Corp/Project/repository work items cannot substitute state. Reconnect
+and operator control retain outstanding retry deadlines instead of bypassing
+upstream limits. Raw queries, headers, credentials and upstream bodies are not
+stored as quota telemetry. GraphQL errors or incomplete/drifting pagination are
+rejected before claims/effects; a discovery cache contains an identity hint,
+never source authorization.
+
+Catch-up from a blocked factory item to verified repeats the existing server-side
+requirement for its original completed mission and passed task verification.
+A throttling response is not completion evidence. Local verification can finish
+independently, while remote effects still require current revalidation. No action
+permits merge/deployment implicitly.
+
 Inline cockpit decisions do not weaken the underlying authorization boundary. Action approvals and
 verification reviews retain their existing role, expiry, requester-exclusion, and idempotency
 rules. Contextual comments remain ordinary durable room messages linked to the mission; comment

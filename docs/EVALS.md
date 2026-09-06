@@ -148,7 +148,37 @@ installed Playwright module, exercises keyboard-activated controls at desktop/39
 blocks remote HTTP requests, and produces real screenshots and a structured report.
 Pin its source digest in the persisted command policy when using it for a factory run.
 
-### Workspace command gates
+### Factory polling and throttling
+
+`tools/e2e_factory_polling.mjs` exercises complete discovery beyond 1,000 items,
+zero-quota admission, durable retry timing, an actual controller restart and a
+forced reconciliation that must not bypass the wait. It uses an owned
+development server/runner and `tools/fake_github_cli.mjs`, not a real provider
+or live GitHub mutations. Every process and POST intent is recorded; existing
+checkpoints are preserved rather than reset.
+
+The fake GitHub boundary supports explicit GraphQL quota, cursor pages,
+primary/secondary/503 failures, Retry-After/reset headers and timestamped query
+counters. Its configuration is documented at the top of the fixture script.
+`tools/fake_github_quota.test.mjs` validates this boundary independently.
+
+`tools/e2e_factory_polling_browser.mjs` reads the real Factory notice at desktop
+and 390px. It allows only the normal idempotent development bootstrap handshake;
+other mutation requests and response/page injection are forbidden. Zero is
+required in the low-quota case, not in a secondary limit with healthy primary
+quota. `tools/e2e_factory_polling_recovery.mjs` can verify the exact preserved
+mission/item/run after an interrupted harness. `tools/e2e_factory_polling_notice.mjs`
+checks a controlled 503 notice without creating work.
+`tools/e2e_factory_source_drift.mjs` changes the controlled issue revision/body
+after claim and requires a blocked item, held mission and zero added runs.
+
+Use explicit `CRONY_POLLING_TEST=1`, owned `CRONY_SERVER_HTTP`/`CRONY_POLLING_WEB`,
+an evidence output directory, independent source repository and the candidate CLI
+binary. Never point these scripts at the canonical manual-test stack. Test-worker
+delays must remain labeled deterministic fixture timing, not model concurrency
+or real-provider performance.
+
+### Workspace validation commands
 
 ```powershell
 node tools/check_migrations.mjs

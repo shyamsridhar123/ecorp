@@ -76,7 +76,8 @@
 }
 
 .factory-controller-working,
-.factory-controller-needs_decision {
+.factory-controller-needs_decision,
+.factory-controller-backing_off {
   border-left-color: #b66a00;
 }
 
@@ -98,6 +99,42 @@
   border-radius: 8px;
   background: #fff1ef;
   font-size: 13px;
+}
+
+.factory-polling-notice {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.factory-polling-notice p {
+  margin: 0 0 8px;
+}
+
+.factory-polling-notice p:last-child {
+  margin-bottom: 0;
+}
+
+.factory-polling-notice strong,
+.factory-polling-notice dd {
+  font-size: 14px;
+}
+
+.factory-polling-notice dl {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.factory-polling-notice dt {
+  font-size: 12px;
 }
 
 .factory-cockpit-grid {
@@ -199,6 +236,10 @@
 }
 
 @media (max-width: 720px) {
+  .factory-polling-notice dl {
+    grid-template-columns: 1fr;
+  }
+
   .factory-controller-strip {
     grid-template-columns: 1fr;
     margin: 0 12px 14px;

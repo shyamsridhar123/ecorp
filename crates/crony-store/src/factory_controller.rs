@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
-use chrono::{Duration, Utc};
-use crony_domain::{FactoryController, NewEvent};
+use chrono::{DateTime, Duration, Utc};
+use crony_domain::{FactoryController, FactoryPollingState, NewEvent};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -83,7 +83,7 @@ impl PgStore {
                       desired_state, version, lease_expires_at, last_heartbeat_at,
                       reconcile_generation, completed_reconcile_generation,
                       active_work_item_id, reconcile_started_at, last_reconciled_at,
-                      last_reconcile_result, last_error, created_at, updated_at,
+                      last_reconcile_result, last_error, polling_state, created_at, updated_at,
                       false AS needs_decision
             "#,
         )
@@ -100,7 +100,7 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await?
         .context("factory controller id belongs to another Corp")?;
-        let controller = map_factory_controller(row);
+        let controller = map_factory_controller(row)?;
         record_operation_tx(
             &mut tx,
             input.corp_id,
@@ -190,19 +190,32 @@ impl PgStore {
         }
         if let Some(work_item_id) = input.active_work_item_id {
             let belongs = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM factory_work_items WHERE id = $1 AND corp_id = $2)",
+                r#"SELECT EXISTS (SELECT 1 FROM factory_work_items
+                   WHERE id = $1 AND corp_id = $2
+                     AND source_project_owner = $3 AND source_project_number = $4
+                     AND source_repository_owner = $5 AND source_repository_name = $6)"#,
             )
             .bind(work_item_id)
             .bind(input.corp_id)
+            .bind(current.get::<String, _>("source_project_owner"))
+            .bind(current.get::<i64, _>("source_project_number"))
+            .bind(current.get::<String, _>("source_repository_owner"))
+            .bind(current.get::<String, _>("source_repository_name"))
             .fetch_one(&mut *tx)
             .await?;
             if !belongs {
                 return Err(anyhow!(
-                    "factory controller active work item does not belong to the Corp"
+                    "factory controller active work item does not belong to its Corp/Project/repository"
                 ));
             }
         }
         let now = Utc::now();
+        let prior_polling: FactoryPollingState =
+            serde_json::from_value(current.get("polling_state"))
+                .context("invalid persisted controller polling state")?;
+        let polling = input.polling.as_ref().unwrap_or(&prior_polling);
+        validate_polling_update(&prior_polling, polling, now)?;
+        let polling_json = serde_json::to_value(polling)?;
         let lease_expires_at = now + Duration::seconds(input.lease_seconds);
         let row = sqlx::query(
             r#"
@@ -212,16 +225,19 @@ impl PgStore {
                 active_work_item_id = $3,
                 completed_reconcile_generation = $4,
                 reconcile_started_at = CASE
-                    WHEN $4 < reconcile_generation AND reconcile_started_at IS NULL THEN $2
+                    WHEN $4 < reconcile_generation AND reconcile_started_at IS NULL
+                         AND desired_state = 'running'
+                         AND $11 THEN $2
                     WHEN $4 = reconcile_generation THEN NULL
                     ELSE reconcile_started_at
                 END,
                 last_reconciled_at = CASE
-                    WHEN $4 > completed_reconcile_generation THEN $2
+                    WHEN $4 > completed_reconcile_generation OR $5 IS NOT NULL THEN $2
                     ELSE last_reconciled_at
                 END,
                 last_reconcile_result = COALESCE($5, last_reconcile_result),
                 last_error = $6,
+                polling_state = $10,
                 updated_at = $2
             WHERE id = $7 AND corp_id = $8 AND connection_epoch = $9
             RETURNING id, corp_id, service_actor_id, configured_by,
@@ -230,7 +246,7 @@ impl PgStore {
                       desired_state, version, lease_expires_at, last_heartbeat_at,
                       reconcile_generation, completed_reconcile_generation,
                       active_work_item_id, reconcile_started_at, last_reconciled_at,
-                      last_reconcile_result, last_error, created_at, updated_at,
+                      last_reconcile_result, last_error, polling_state, created_at, updated_at,
                       false AS needs_decision
             "#,
         )
@@ -243,16 +259,19 @@ impl PgStore {
         .bind(input.controller_id)
         .bind(input.corp_id)
         .bind(input.connection_epoch)
+        .bind(&polling_json)
+        .bind(polling.next_retry_at.is_none_or(|retry| retry <= now))
         .fetch_optional(&mut *tx)
         .await?
         .context("factory controller heartbeat lost its connection epoch")?;
-        let controller = map_factory_controller(row);
+        let controller = map_factory_controller(row)?;
         let changed = current.get::<Option<Uuid>, _>("active_work_item_id")
             != controller.active_work_item_id
             || completed_generation != controller.completed_reconcile_generation
             || current.get::<Option<String>, _>("last_reconcile_result")
                 != controller.last_reconcile_result
-            || current.get::<Option<String>, _>("last_error") != controller.last_error;
+            || current.get::<Option<String>, _>("last_error") != controller.last_error
+            || current.get::<Value, _>("polling_state") != polling_json;
         let event = if changed {
             append_event_tx(
                 &mut tx,
@@ -269,7 +288,8 @@ impl PgStore {
                             "active_work_item_id": controller.active_work_item_id,
                             "completed_reconcile_generation": controller.completed_reconcile_generation,
                             "last_reconcile_result": controller.last_reconcile_result,
-                            "last_error": controller.last_error
+                            "last_error": controller.last_error,
+                            "polling": controller.polling
                         }),
                     )
                 },
@@ -349,7 +369,7 @@ impl PgStore {
                       desired_state, version, lease_expires_at, last_heartbeat_at,
                       reconcile_generation, completed_reconcile_generation,
                       active_work_item_id, reconcile_started_at, last_reconciled_at,
-                      last_reconcile_result, last_error, created_at, updated_at,
+                      last_reconcile_result, last_error, polling_state, created_at, updated_at,
                       false AS needs_decision
             "#,
         )
@@ -361,7 +381,7 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await?
         .context("factory controller version changed during control")?;
-        let controller = map_factory_controller(row);
+        let controller = map_factory_controller(row)?;
         record_operation_tx(
             &mut tx,
             input.corp_id,
@@ -404,16 +424,23 @@ impl PgStore {
     }
 }
 
-pub(super) fn map_factory_controller(row: sqlx::postgres::PgRow) -> FactoryController {
+pub(super) fn map_factory_controller(row: sqlx::postgres::PgRow) -> Result<FactoryController> {
     let desired_state: String = row.get("desired_state");
     let lease_expires_at = row.get("lease_expires_at");
     let active_work_item_id: Option<Uuid> = row.get("active_work_item_id");
     let last_reconcile_result: Option<String> = row.get("last_reconcile_result");
     let needs_decision: bool = row.try_get("needs_decision").unwrap_or(false);
+    let polling: FactoryPollingState = serde_json::from_value(row.get("polling_state"))
+        .context("invalid persisted controller polling state")?;
     let status = if lease_expires_at <= Utc::now() {
         "offline"
     } else if needs_decision {
         "needs_decision"
+    } else if polling
+        .next_retry_at
+        .is_some_and(|retry_at| retry_at > Utc::now())
+    {
+        "backing_off"
     } else if last_reconcile_result.as_deref() == Some("failed")
         || row.get::<Option<String>, _>("last_error").is_some()
     {
@@ -423,7 +450,7 @@ pub(super) fn map_factory_controller(row: sqlx::postgres::PgRow) -> FactoryContr
     } else {
         "watching"
     };
-    FactoryController {
+    Ok(FactoryController {
         id: row.get("id"),
         corp_id: row.get("corp_id"),
         service_actor_id: row.get("service_actor_id"),
@@ -444,9 +471,10 @@ pub(super) fn map_factory_controller(row: sqlx::postgres::PgRow) -> FactoryContr
         last_reconciled_at: row.get("last_reconciled_at"),
         last_reconcile_result,
         last_error: row.get("last_error"),
+        polling,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
-    }
+    })
 }
 
 async fn controller_for_update_tx(
@@ -463,7 +491,7 @@ async fn controller_for_update_tx(
                last_heartbeat_at, reconcile_generation,
                completed_reconcile_generation, active_work_item_id,
                reconcile_started_at, last_reconciled_at,
-               last_reconcile_result, last_error, created_at, updated_at,
+               last_reconcile_result, last_error, polling_state, created_at, updated_at,
                false AS needs_decision
         FROM factory_controllers
         WHERE id = $1 AND corp_id = $2
@@ -507,7 +535,57 @@ async fn replay_operation_tx(
     let row = controller_for_update_tx(tx, corp_id, controller_id)
         .await?
         .context("factory controller operation lost its controller")?;
-    Ok(Some(map_factory_controller(row)))
+    Ok(Some(map_factory_controller(row)?))
+}
+
+fn validate_polling_update(
+    prior: &FactoryPollingState,
+    next: &FactoryPollingState,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if next.next_retry_at.is_some() != next.retry_reason.is_some() || next.consecutive_failures > 32
+    {
+        return Err(anyhow!("invalid bounded factory polling state"));
+    }
+    // Reconnect, resume and a forced reconciliation cannot erase an unexpired
+    // upstream wait. Legacy heartbeats omit the field and retain prior state.
+    if let Some(required) = prior.next_retry_at.filter(|required| *required > now)
+        && next
+            .next_retry_at
+            .is_none_or(|proposed| proposed < required)
+    {
+        return Err(anyhow!(
+            "factory polling update cannot shorten an outstanding retry wait"
+        ));
+    }
+    if let Some(quota) = &next.graphql {
+        let latest_reset = quota
+            .observed_at
+            .checked_add_signed(Duration::days(7))
+            .context("GraphQL observation timestamp is out of range")?;
+        let earliest_reset = quota
+            .observed_at
+            .checked_sub_signed(Duration::minutes(5))
+            .context("GraphQL observation timestamp is out of range")?;
+        if quota.limit == 0
+            || quota.limit > 1_000_000_000
+            || quota.remaining > quota.limit
+            || quota.cost > 1_000_000_000
+            || quota.observed_at > now + Duration::minutes(5)
+            || quota.reset_at > latest_reset
+            || quota.reset_at < earliest_reset
+        {
+            return Err(anyhow!("invalid GraphQL quota observation"));
+        }
+        if prior
+            .graphql
+            .as_ref()
+            .is_some_and(|old| old.observed_at > quota.observed_at)
+        {
+            return Err(anyhow!("GraphQL quota observations cannot move backwards"));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -575,4 +653,77 @@ fn sanitize_error(value: &str) -> Result<String> {
         return Err(anyhow!("factory controller error exceeds 2000 bytes"));
     }
     Ok(sanitized)
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+    use crony_domain::{FactoryRetryReason, GithubGraphqlQuota};
+
+    #[test]
+    fn unexpired_wait_survives_clear_shorten_and_legacy_updates() {
+        let now = Utc::now();
+        let prior = FactoryPollingState {
+            next_retry_at: Some(now + Duration::minutes(10)),
+            retry_reason: Some(FactoryRetryReason::PrimaryRateLimit),
+            consecutive_failures: 1,
+            graphql: None,
+        };
+        assert!(validate_polling_update(&prior, &prior, now).is_ok());
+        assert!(validate_polling_update(&prior, &FactoryPollingState::default(), now).is_err());
+        let mut shorter = prior.clone();
+        shorter.next_retry_at = Some(now + Duration::seconds(1));
+        assert!(validate_polling_update(&prior, &shorter, now).is_err());
+        assert!(
+            validate_polling_update(
+                &prior,
+                &FactoryPollingState::default(),
+                now + Duration::minutes(11)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn polling_observations_are_bounded_and_monotonic() {
+        let now = Utc::now();
+        let valid = FactoryPollingState {
+            graphql: Some(GithubGraphqlQuota {
+                limit: 5000,
+                remaining: 48,
+                cost: 1,
+                reset_at: now + Duration::minutes(40),
+                observed_at: now,
+            }),
+            ..FactoryPollingState::default()
+        };
+        assert!(validate_polling_update(&FactoryPollingState::default(), &valid, now).is_ok());
+        let mut bad = valid.clone();
+        bad.graphql.as_mut().unwrap().remaining = 5001;
+        assert!(validate_polling_update(&valid, &bad, now).is_err());
+        bad = valid.clone();
+        bad.graphql.as_mut().unwrap().observed_at = now - Duration::seconds(1);
+        assert!(validate_polling_update(&valid, &bad, now).is_err());
+        bad = valid.clone();
+        bad.graphql.as_mut().unwrap().observed_at = now + Duration::hours(1);
+        assert!(validate_polling_update(&valid, &bad, now).is_err());
+        bad = valid.clone();
+        bad.graphql.as_mut().unwrap().observed_at = DateTime::<Utc>::MIN_UTC;
+        bad.graphql.as_mut().unwrap().reset_at = DateTime::<Utc>::MIN_UTC;
+        assert!(validate_polling_update(&FactoryPollingState::default(), &bad, now).is_err());
+    }
+
+    #[test]
+    fn retry_metadata_cannot_be_ambiguous_or_unbounded() {
+        let now = Utc::now();
+        let mut state = FactoryPollingState {
+            next_retry_at: Some(now + Duration::seconds(60)),
+            ..FactoryPollingState::default()
+        };
+        assert!(validate_polling_update(&FactoryPollingState::default(), &state, now).is_err());
+        state.retry_reason = Some(FactoryRetryReason::SecondaryRateLimit);
+        assert!(validate_polling_update(&FactoryPollingState::default(), &state, now).is_ok());
+        state.consecutive_failures = 33;
+        assert!(validate_polling_update(&FactoryPollingState::default(), &state, now).is_err());
+    }
 }

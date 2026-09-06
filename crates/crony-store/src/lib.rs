@@ -128,6 +128,7 @@ pub struct HeartbeatFactoryControllerInput {
     pub completed_reconcile_generation: Option<i64>,
     pub reconcile_result: Option<String>,
     pub error: Option<String>,
+    pub polling: Option<crony_domain::FactoryPollingState>,
 }
 
 #[derive(Debug, Clone)]
@@ -1841,7 +1842,7 @@ impl PgStore {
                    controller.completed_reconcile_generation,
                    controller.active_work_item_id, controller.reconcile_started_at,
                    controller.last_reconciled_at, controller.last_reconcile_result,
-                   controller.last_error, controller.created_at, controller.updated_at,
+                   controller.last_error, controller.polling_state, controller.created_at, controller.updated_at,
                    EXISTS (
                        SELECT 1
                        FROM factory_work_items item
@@ -1882,7 +1883,7 @@ impl PgStore {
         .await?
         .into_iter()
         .map(factory_controller::map_factory_controller)
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
         let mut events = sqlx::query(
             r#"
@@ -9754,6 +9755,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
                 | FactoryWorkItemState::Blocked
                 | FactoryWorkItemState::AwaitingApproval
                 | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Verified
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
         ),
@@ -9771,6 +9773,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
             FactoryWorkItemState::Running
                 | FactoryWorkItemState::AwaitingApproval
                 | FactoryWorkItemState::VerificationFailed
+                | FactoryWorkItemState::Verified
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
         ),
@@ -11808,6 +11811,16 @@ mod tests {
 
     #[test]
     fn factory_state_transitions_do_not_skip_governance_stages() {
+        // These catch up reporting after an external outage. The mutation
+        // still calls ensure_factory_mission_verified_tx before accepting it.
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::Blocked,
+            FactoryWorkItemState::Verified,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::MissionCreated,
+            FactoryWorkItemState::Verified,
+        ));
         assert!(factory_transition_allowed(
             FactoryWorkItemState::MissionCreated,
             FactoryWorkItemState::Running,

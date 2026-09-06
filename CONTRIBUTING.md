@@ -155,6 +155,14 @@ As of September 3, 2026, GitHub-hosted Actions credits are exhausted for the mon
 unstarted hosted job as a completion gate or remain blocked solely for that reason. Record
 reproducible local validation evidence and state clearly that hosted Actions did not run.
 
+GitHub API throttling is a different limit. The factory observes GraphQL quota
+from GraphQL responses and persists the next permitted retry. Leave a throttled
+controller running: its heartbeat and local runner work continue, and intake
+resumes after the displayed wait. Restart, Resume and Reconcile do not bypass
+that deadline. Do not rotate accounts, reset the database, recreate the mission
+or move its Project status to work around throttling. See the contributor guide's
+quota/recovery section for the supported behavior.
+
 ## Pull requests
 
 - Link the source issue.

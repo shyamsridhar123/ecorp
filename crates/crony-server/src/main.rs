@@ -2165,6 +2165,7 @@ async fn heartbeat_factory_controller(
             completed_reconcile_generation: request.completed_reconcile_generation,
             reconcile_result: request.reconcile_result,
             error: request.error,
+            polling: request.polling,
         })
         .await
         .map_err(map_store_error)?;

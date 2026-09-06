@@ -340,6 +340,33 @@ pub struct FactoryWorkItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubGraphqlQuota {
+    pub limit: u64,
+    pub remaining: u64,
+    pub cost: u64,
+    pub reset_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryRetryReason {
+    GraphqlQuota,
+    PrimaryRateLimit,
+    SecondaryRateLimit,
+    GithubUnavailable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FactoryPollingState {
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub retry_reason: Option<FactoryRetryReason>,
+    pub consecutive_failures: u32,
+    pub graphql: Option<GithubGraphqlQuota>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactoryController {
     pub id: Uuid,
     pub corp_id: Uuid,
@@ -361,6 +388,8 @@ pub struct FactoryController {
     pub last_reconciled_at: Option<DateTime<Utc>>,
     pub last_reconcile_result: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub polling: FactoryPollingState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

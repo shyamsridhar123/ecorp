@@ -642,6 +642,37 @@ continues heartbeats while the current controller cycle waits on GitHub, a missi
 The documented local stack starts this watcher only when `ECORP_FACTORY_WATCH=1`; otherwise the UI
 truthfully reports that Factory is not configured.
 
+### Quota-aware discovery and retry
+
+Broad intake resolves the configured Project once per discovery pass, then reads
+only non-archived item identity, Status and issue fields needed for eligibility.
+It follows opaque cursors through complete pages, checks count/identity consistency,
+and rejects partial or drifting results before a claim. Discovery is bounded to
+10,000 items, 100 pages and 16 MiB; factory-state lookups are chunked within the
+server's 1,000-ID request limit. Exact item/source reads remain mandatory before
+effects; a discovery hint is never execution authority.
+
+The trusted CLI observes GraphQL `rateLimit` cost, remaining points and reset time
+from actual GraphQL responses, not the REST `/rate_limit` summary. A small reserve
+and fresh observations bound subsequent requests. Rate/secondary-limit and
+temporary-unavailability responses schedule retry from the relevant reset or
+Retry-After information with bounded local escalation. A secondary limit with
+healthy primary quota does not wait on an unrelated hourly reset.
+
+Controller polling metadata is persisted and connection-epoch fenced. It includes
+the next permitted retry, reason, consecutive failures and last GraphQL observation.
+Restart, Resume and queued reconciliation cannot shorten an outstanding upstream
+wait. Heartbeats, local execution, verification and review continue while external
+intake waits. The cockpit shows the reason, exact local retry/reset times and
+reported quota; absent telemetry is not zero.
+
+Only a selected issue identity is cached while its lineage is active. Every
+reconciliation re-reads current eligibility and authority. After an external outage,
+the original item may catch up from blocked/mission-created to verified only when
+the server's existing completed-mission and passed-verification gate succeeds.
+No replacement mission, reset budget, optimistic Project update or implicit merge
+is part of recovery.
+
 The Factory workbench is also the selected work item's operational cockpit. It resolves the
 item's mission, tasks, runs, pending action approvals, verification decisions, artifacts, and
 room messages into one context. Comments are persisted as room messages with a structured mission
