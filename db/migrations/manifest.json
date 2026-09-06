@@ -175,6 +175,11 @@
       "version": 35,
       "file": "0035_mission_scoped_staffing.sql",
       "sha384": "96491e446a1d5182ad7feb3f952fd8282f54d3f37de88d9e2da8ff1937540469366406b3addf78d2c0a2e3943f4ef2a9"
+    },
+    {
+      "version": 36,
+      "file": "0036_factory_polling_backoff.sql",
+      "sha384": "3880863a9e63c8817430b6345f070d21c7d204b3440431c725d0206ebbf16a046cad150b620f3f16ebb6ef54f1d7b404"
     }
   ]
 }

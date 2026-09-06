@@ -540,6 +540,34 @@ Do not report:
 
 ## Recovery
 
+### GitHub quota and temporary outages
+
+The Factory cockpit shows the actual GraphQL remaining/limit, last query cost,
+reset time, retry reason and next permitted retry. Missing observations are
+unavailable, not zero. Do not use the REST `/rate_limit` summary as a substitute
+for the GraphQL budget; it can differ from the response governing Project reads.
+
+Intake waits automatically after low quota, a primary/secondary limit or a
+temporary upstream failure. Retry follows the relevant upstream reset or
+Retry-After requirement plus bounded local escalation. A secondary response with
+healthy primary quota does not inherit an unrelated hourly reset. Controller
+restart, Resume and Reconcile retain the wait rather than forcing an early retry.
+
+Keep the server and runner alive. Local work, persisted verification and review
+can finish while Project reads wait. Once GitHub is available, the controller
+revalidates the same issue/item and reconciles its existing mission; it does not
+start a replacement to make the dashboard look active.
+
+Broad discovery uses a complete minimal paginated Project query. It rejects
+missing/duplicate/drifting pages instead of using a partial queue, with explicit
+10,000-item/100-page/16-MiB bounds. Only a selected issue identity may be cached;
+current source content, labels, dependencies, archive state and effect authority
+are revalidated independently. An unchanged In Progress state is not rewritten.
+
+Never use a new credential/account to evade an upstream limit, manually edit
+claim/state rows, drop preserved worktrees or label a waiting controller's work
+complete. Merge and deployment remain separately authorized effects.
+
 Always inspect persisted state before acting. Do not infer state from a controller terminal, browser
 tab, or provider transcript.
 

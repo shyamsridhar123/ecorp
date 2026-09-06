@@ -476,6 +476,10 @@ pub struct FactoryControllerHeartbeatRequest {
     pub completed_reconcile_generation: Option<i64>,
     pub reconcile_result: Option<String>,
     pub error: Option<String>,
+    /// Omission preserves durable state for legacy clients. A supplied value
+    /// is validated and fenced by the controller connection epoch.
+    #[serde(default)]
+    pub polling: Option<crony_domain::FactoryPollingState>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
