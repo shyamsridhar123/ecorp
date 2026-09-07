@@ -85,9 +85,11 @@
     "result": "failed acceptance: native first retry stalled"
   },
   "post_fix_runtime": {
-    "status": "pending",
+    "status": "passed after separately recorded171 lifecycle correction",
     "issue_number": 3,
-    "repository": "shyamsridhar123/ecorp-enterprise-lab"
+    "repository": "shyamsridhar123/ecorp-enterprise-lab",
+    "status_at_original_checkpoint": "pending",
+    "evidence": "2026-09-07-native-ack-runtime.json"
   },
   "hosted_actions_used": false,
   "merge_requested": false

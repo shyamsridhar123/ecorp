@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-07T21:48:07.1377547Z",
+  "branch": "codex/ui-enterprise-journey-audit",
+  "source_base_commit": "10068b60f130ce89259f87944d099015c15f3946",
+  "source_files": [
+    {
+      "path": "crates/crony-store/src/staffing.rs",
+      "sha256": "0999795885751d52e925309a4408de4f21fd02d807942743595abf68a2cf076d"
+    },
+    {
+      "path": "crates/crony-server/src/main.rs",
+      "sha256": "54277ee42ea72fc6565dc1f28d4e5f7e246c4865908ccfb082aa61a3b77f80ae"
+    }
+  ],
+  "migrations": {
+    "count": 38,
+    "passed": true
+  },
+  "format": {
+    "passed": true
+  },
+  "clippy": {
+    "passed": true,
+    "scope": "workspace/all-targets/-D warnings"
+  },
+  "rust": {
+    "passed": 351,
+    "failed": 0,
+    "seconds": 305.5,
+    "opt_in_ignored": 62
+  },
+  "frontend": {
+    "passed": 99,
+    "failed": 0
+  },
+  "web_build": {
+    "passed": true
+  },
+  "web_lint": {
+    "passed": true
+  },
+  "new_sqlx": {
+    "seconds": 120.73,
+    "exec_session": 54012,
+    "old_169_families_rerun": false,
+    "passed": 18,
+    "failed": 0,
+    "filter": "issue171_"
+  },
+  "server_focused": {
+    "passed": 9,
+    "failed": 0,
+    "seconds": 0.01
+  },
+  "transport_fixture": {
+    "code_unchanged_from_10068b6": true,
+    "not_rebound_over_live_qa_ports": true,
+    "previously_passed": 13
+  },
+  "runtime": {
+    "passed": true,
+    "integration_node_tests": 12,
+    "persisted_integration_checks": 5,
+    "factory_version": 11,
+    "source_checkout_unchanged": true,
+    "mission_id": "d561cc2b-8d5e-44c9-b9da-ae6060af78b3",
+    "independent_review_actor": "development Bob",
+    "original_failed_history_unchanged": true,
+    "same_worker_reactivated": true,
+    "signed_source_downloads": 6,
+    "factory_state": "verified",
+    "manual_domain_mutations": 0,
+    "native_integration_run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0"
+  },
+  "review": {
+    "global_deadlock_claim": false,
+    "deferred_issue": 172,
+    "single_runner_blockers": 0,
+    "read_only_reviewer": "Popper"
+  },
+  "github_actions_used": false,
+  "merged": false,
+  "auto_merge": false
+}
