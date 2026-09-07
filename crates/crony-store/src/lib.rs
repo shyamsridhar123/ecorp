@@ -11432,11 +11432,11 @@ fn validate_factory_plan_against_policy_parts(
     {
         let expected: VerificationPolicy = serde_json::from_value(policy_value.clone())
             .context("decode factory policy verification policy")?;
-        let delivery_depth = plan.tasks.iter().map(|task| task.depth).max().unwrap_or(0);
+        let outcomes = plan.terminal_task_keys();
         if let Some(task) = plan
             .tasks
             .iter()
-            .find(|task| task.depth == delivery_depth && task.verification_policy != expected)
+            .find(|task| outcomes.contains(&task.key) && task.verification_policy != expected)
         {
             return Err(anyhow!(
                 "factory task {} does not preserve the persisted delivery verification policy",
@@ -11454,11 +11454,12 @@ fn validate_factory_plan_against_policy_parts(
             "factory policy requires a non-empty verification policy for every task"
         ));
     }
+    let reviewed_outcomes = plan.provider_backed_outcome_keys();
     if let Some(task) = plan.tasks.iter().find(|task| {
-        task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
+        reviewed_outcomes.contains(&task.key) && task.verification_policy.manual_gate.is_none()
     }) {
         return Err(anyhow!(
-            "factory task {} requires a manual verification gate for provider-backed execution",
+            "factory task {} requires a manual verification gate for a provider-backed outcome",
             task.key
         ));
     }
@@ -16407,6 +16408,116 @@ mod tests {
                 .to_string()
                 .contains("requires a manual verification gate")
         );
+    }
+
+    fn factory_outcome_review_plan() -> (FactoryWorkItem, TaskGraphPlan) {
+        let (mut work_item, mut plan) = factory_policy_plan(None, None);
+        work_item.policy["strategy_allowlist"] = json!(["studio-swarm"]);
+        plan.strategy = "studio-swarm".to_owned();
+        plan.max_nodes = 4;
+        plan.max_depth = 1;
+        let mut outcome = plan.tasks[0].clone();
+        outcome.depth = 1;
+        outcome.contract.budget_tokens = 250;
+        outcome.contract.budget_cost_microusd = 250_000;
+        outcome.depends_on = vec![
+            "systems".to_owned(),
+            "experience".to_owned(),
+            "quality".to_owned(),
+        ];
+        plan.tasks = outcome
+            .depends_on
+            .iter()
+            .map(|key| {
+                let mut handoff = outcome.clone();
+                handoff.key = key.clone();
+                handoff.assigned_agent_id = Uuid::new_v4();
+                handoff.depth = 0;
+                handoff.depends_on.clear();
+                handoff.verification_policy.manual_gate = None;
+                handoff
+            })
+            .collect();
+        plan.tasks.push(outcome);
+        (work_item, plan)
+    }
+
+    #[test]
+    fn factory_outcome_review_allows_verified_internal_handoffs_without_human_gates() {
+        let (work_item, plan) = factory_outcome_review_plan();
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("three automated handoffs and one reviewed outcome are valid");
+
+        let mut legacy_gates = plan.clone();
+        for task in &mut legacy_gates.tasks {
+            task.verification_policy.manual_gate =
+                plan.tasks[3].verification_policy.manual_gate.clone();
+        }
+        validate_factory_plan_against_policy(&work_item, &legacy_gates)
+            .expect("explicit or previously persisted internal gates remain valid");
+
+        let mut missing_outcome_gate = legacy_gates;
+        missing_outcome_gate.tasks[3]
+            .verification_policy
+            .manual_gate = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &missing_outcome_gate)
+                .unwrap_err()
+                .to_string()
+                .contains("manual verification gate for a provider-backed outcome")
+        );
+
+        let mut unchecked_handoff = plan;
+        unchecked_handoff.tasks[0]
+            .verification_policy
+            .checks
+            .clear();
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &unchecked_handoff)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty verification policy for every task")
+        );
+    }
+
+    #[test]
+    fn factory_outcome_review_cannot_be_bypassed_by_a_deterministic_terminal_task() {
+        let (mut work_item, mut plan) = factory_outcome_review_plan();
+        work_item.policy["adapter_allowlist"] = json!(["codex", "fake-process"]);
+        plan.tasks[3].required_adapter = "fake-process".to_owned();
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("a reviewed deterministic outcome with provider ancestors is valid");
+        plan.tasks[3].verification_policy.manual_gate = None;
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &plan)
+                .unwrap_err()
+                .to_string()
+                .contains("manual verification gate for a provider-backed outcome")
+        );
+        for task in &mut plan.tasks {
+            task.required_adapter = "fake-process".to_owned();
+        }
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("entirely deterministic fixture retains automatic verification");
+    }
+
+    #[test]
+    fn factory_outcome_review_preserves_policy_for_leaves_at_different_depths() {
+        let (mut work_item, mut plan) = factory_outcome_review_plan();
+        plan.tasks[3].depends_on.retain(|key| key != "quality");
+        let mut expected = plan.tasks[3].verification_policy.clone();
+        expected.checks = vec![VerifierCheck::Artifact { min_bytes: 10 }];
+        work_item.policy["verification_policy"] = json!(expected);
+        plan.tasks[3].verification_policy = expected.clone();
+        assert!(
+            validate_factory_plan_against_policy(&work_item, &plan)
+                .unwrap_err()
+                .to_string()
+                .contains("quality does not preserve the persisted delivery verification policy")
+        );
+        plan.tasks[2].verification_policy = expected;
+        validate_factory_plan_against_policy(&work_item, &plan)
+            .expect("both independent outcomes preserve the exact persisted policy");
     }
 
     #[test]

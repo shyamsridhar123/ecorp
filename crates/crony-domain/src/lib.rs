@@ -600,6 +600,50 @@ pub struct TaskGraphPlan {
     pub tasks: Vec<PlannedTask>,
 }
 
+impl TaskGraphPlan {
+    /// Final outputs are leaves, not necessarily all at the maximum graph depth.
+    pub fn terminal_task_keys(&self) -> std::collections::HashSet<String> {
+        let internal: std::collections::HashSet<_> = self
+            .tasks
+            .iter()
+            .flat_map(|task| task.depends_on.iter())
+            .collect();
+        self.tasks
+            .iter()
+            .filter(|task| !internal.contains(&task.key))
+            .map(|task| task.key.clone())
+            .collect()
+    }
+
+    /// Shared by planning and persistence; this classifies outputs, not authority.
+    /// A deterministic leaf cannot hide a provider-backed dependency from review.
+    pub fn provider_backed_outcome_keys(&self) -> std::collections::HashSet<String> {
+        let outcomes = self.terminal_task_keys();
+        self.tasks
+            .iter()
+            .filter(|task| outcomes.contains(&task.key))
+            .filter(|outcome| {
+                let mut remaining = vec![outcome.key.as_str()];
+                let mut visited = std::collections::HashSet::new();
+                while let Some(key) = remaining.pop() {
+                    if !visited.insert(key) {
+                        continue;
+                    }
+                    let Some(task) = self.tasks.iter().find(|task| task.key == key) else {
+                        continue;
+                    };
+                    if task.required_adapter != "fake-process" {
+                        return true;
+                    }
+                    remaining.extend(task.depends_on.iter().map(String::as_str));
+                }
+                false
+            })
+            .map(|task| task.key.clone())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VerifierCheck {

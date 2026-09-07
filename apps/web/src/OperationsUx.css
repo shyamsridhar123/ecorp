@@ -284,3 +284,124 @@
   margin-block: 0.5rem;
   padding-inline-start: 1.25rem;
 }
+
+.mission-work-context,
+.manual-work-links,
+.room-context-bar {
+  padding: 14px 18px;
+  border-block-end: 1px solid #d5d9d6;
+  background: #f5f7f4;
+  color: #26352f;
+}
+
+.mission-work-context p,
+.manual-work-links p,
+.factory-start-help p,
+.room-comment-purpose {
+  margin: 0 0 10px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.work-context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.work-context-actions .button {
+  min-block-size: 44px;
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.factory-start-help {
+  min-inline-size: 0;
+}
+
+.factory-start-help summary {
+  min-block-size: 44px;
+  align-content: center;
+  cursor: pointer;
+}
+
+.factory-start-help li {
+  margin-block: 8px;
+  line-height: 1.5;
+}
+
+.room-context-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.room-context-bar select {
+  flex: 1 1 220px;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  min-block-size: 44px;
+}
+
+.room-message .entity-link {
+  max-inline-size: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.review-eligibility-notice {
+  flex-basis: 100%;
+  padding: 14px 16px;
+  border-inline-start: 4px solid #8c641f;
+  border-radius: 4px;
+  background: #fff7e4;
+  color: #503913;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.review-eligibility-notice p {
+  margin: 6px 0 10px;
+}
+
+.office-roster-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  min-block-size: 44px;
+  font-size: 0.875rem;
+  color: #38473f;
+}
+
+.mission-evidence-context {
+  display: grid;
+  gap: 8px;
+  min-inline-size: 0;
+  padding: 14px 18px;
+  border-block: 1px solid #d5d9d6;
+  background: #f5f7f4;
+  color: #26352f;
+}
+
+.mission-evidence-context label {
+  font-weight: 700;
+}
+
+.mission-evidence-context select {
+  inline-size: 100%;
+  min-inline-size: 0;
+  min-block-size: 44px;
+}
+
+.mission-evidence-context p {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.mission-evidence-context .work-context-actions {
+  align-items: center;
+}
