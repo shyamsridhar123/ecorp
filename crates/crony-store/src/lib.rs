@@ -8583,14 +8583,9 @@ impl PgStore {
                         related_events.push(factory_event);
                     }
                 }
-                sqlx::query(
-                    "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL
-                     WHERE id = $1 AND corp_id = $2 AND current_run_id = $3",
+                factory_run_failure::release_failed_run_agent_tx(
+                    &mut tx, corp_id, agent_id, run_id,
                 )
-                .bind(agent_id)
-                .bind(corp_id)
-                .bind(run_id)
-                .execute(&mut *tx)
                 .await?;
             }
             "run.cancelled" => {
