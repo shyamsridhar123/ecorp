@@ -6,7 +6,11 @@ mod secrets;
 mod staffing;
 
 use std::{
-    collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use anyhow::Context;
@@ -408,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(StdDuration::from_secs(3));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut scheduling_cursor = None;
+        let mut scheduling_cursor = CorpScheduleCursor::default();
         loop {
             interval.tick().await;
             match retirement_state
@@ -1391,9 +1395,17 @@ impl ReadyCorpSchedule {
     }
 }
 
+#[derive(Default)]
+struct CorpScheduleCursor {
+    after_corp: Option<Uuid>,
+    // Retire rotation only after a current singleton visit or Corp disappearance.
+    // A global tick number would alias when a Corp is visited every Nth tick.
+    after_runner: HashMap<Uuid, String>,
+}
+
 async fn reconcile_ready_corps<F, Fut>(
     runners: &DashMap<String, RunnerConnection>,
-    after_corp: &mut Option<Uuid>,
+    cursor: &mut CorpScheduleCursor,
     mut reconcile: F,
 ) -> Vec<(Uuid, anyhow::Error)>
 where
@@ -1410,20 +1422,48 @@ where
         })
         .collect::<Vec<_>>();
     scopes.sort_unstable_by(|a, b| (a.corp_id, &a.runner_id).cmp(&(b.corp_id, &b.runner_id)));
-    scopes.dedup_by_key(|scope| scope.corp_id);
-    if let Some(after) = *after_corp {
-        let split = scopes.partition_point(|scope| scope.corp_id <= after);
-        scopes.rotate_left(split);
+    let mut ready_corps = HashSet::new();
+    let mut multi_runner_corps = HashSet::new();
+    let mut representatives = Vec::new();
+    for peers in scopes.chunk_by(|a, b| a.corp_id == b.corp_id) {
+        let corp_id = peers[0].corp_id;
+        ready_corps.insert(corp_id);
+        if peers.len() > 1 {
+            multi_runner_corps.insert(corp_id);
+        }
+        let next = cursor.after_runner.get(&corp_id).map_or(0, |last| {
+            peers.partition_point(|scope| scope.runner_id <= *last) % peers.len()
+        });
+        representatives.push(peers[next].clone());
     }
-    // Round-robin across ticks rather than starving Corps beyond the first batch.
-    scopes.truncate(100);
-    if let Some(last) = scopes.last() {
-        *after_corp = Some(last.corp_id);
+    // Prune disappeared Corps immediately, but retain unvisited singletons:
+    // their other peers can rejoin before the next actual visit.
+    cursor
+        .after_runner
+        .retain(|corp_id, _| ready_corps.contains(corp_id));
+    if let Some(after) = cursor.after_corp {
+        let split = representatives.partition_point(|scope| scope.corp_id <= after);
+        representatives.rotate_left(split);
+    }
+    // At most one command drain/scheduling attempt per Corp, and 100 Corps per
+    // tick. A failing representative never expands this bound to all its peers.
+    representatives.truncate(100);
+    if let Some(last) = representatives.last() {
+        cursor.after_corp = Some(last.corp_id);
     }
     let mut failures = Vec::new();
-    for scope in scopes {
+    for scope in representatives {
+        // Advance even on failure or a stale snapshot; the next native tick
+        // must give the next peer a chance without bypassing command fences.
+        cursor
+            .after_runner
+            .insert(scope.corp_id, scope.runner_id.clone());
         if !scope.is_current(runners) {
             continue;
+        }
+        // A stale singleton candidate must not reset the next peer's turn.
+        if !multi_runner_corps.contains(&scope.corp_id) {
+            cursor.after_runner.remove(&scope.corp_id);
         }
         let corp_id = scope.corp_id;
         if let Err(error) = reconcile(scope).await {
@@ -6298,9 +6338,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        MissionPlanInput, ReadyCorpSchedule, RunnerConnection, RunnerRequirements,
-        apply_mission_contract, apply_mission_description, apply_mission_source,
-        artifact_content_disposition, capability_satisfies_requirement,
+        CorpScheduleCursor, MissionPlanInput, ReadyCorpSchedule, RunnerConnection,
+        RunnerRequirements, apply_mission_contract, apply_mission_description,
+        apply_mission_source, artifact_content_disposition, capability_satisfies_requirement,
         enable_runner_after_reconciliation, enable_runner_dispatch, enforce_factory_manual_gate,
         factory_materialization_failure_detail, mission_preview_response, reconcile_ready_corps,
         reconnect_preserved_run_ids, runner_epoch_is_ready, runner_requirement_mismatch,
@@ -6724,7 +6764,7 @@ mod tests {
             let schedules = &std::cell::Cell::new(0);
             let dispatched = &std::cell::Cell::new(0);
             let runner_ref = &runners;
-            let mut cursor = None;
+            let mut cursor = CorpScheduleCursor::default();
             for tick in 1..=2 {
                 // No lifecycle events and no reconnect between these two ticks.
                 let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
@@ -6773,7 +6813,7 @@ mod tests {
                 runners.insert(format!("runner-{id}"), connection);
             }
             let visited = std::cell::RefCell::new(Vec::new());
-            let mut cursor = None;
+            let mut cursor = CorpScheduleCursor::default();
             let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
                 visited.borrow_mut().push(scope.corp_id);
                 // The next candidate was ready in the snapshot but no longer
@@ -6804,7 +6844,7 @@ mod tests {
         let (mut duplicate, _received) = reconnect_test_connection(Uuid::new_v4());
         duplicate.dispatch_ready = true;
         runners.insert("z-duplicate-corp-one".to_owned(), duplicate);
-        let mut cursor = None;
+        let mut cursor = CorpScheduleCursor::default();
         let mut all = HashSet::new();
         for _ in 0..2 {
             let batch = std::cell::RefCell::new(Vec::new());
@@ -6837,20 +6877,305 @@ mod tests {
             runners.insert(format!("runner-{id}"), connection);
         }
         let visited = std::cell::RefCell::new(Vec::new());
-        let failures = reconcile_ready_corps(&runners, &mut None, |scope| {
-            visited.borrow_mut().push(scope.corp_id);
-            std::future::ready(if scope.corp_id == Uuid::from_u128(1) {
-                Err(anyhow::anyhow!("transient scheduling failure"))
-            } else {
-                Ok(true)
+        let failures =
+            reconcile_ready_corps(&runners, &mut CorpScheduleCursor::default(), |scope| {
+                visited.borrow_mut().push(scope.corp_id);
+                std::future::ready(if scope.corp_id == Uuid::from_u128(1) {
+                    Err(anyhow::anyhow!("transient scheduling failure"))
+                } else {
+                    Ok(true)
+                })
             })
-        })
-        .await;
+            .await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, Uuid::from_u128(1));
         assert_eq!(
             *visited.borrow(),
             vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue172_repeated_failure_cannot_starve_same_corp_healthy_runner() {
+        let runners = DashMap::new();
+        for (name, epoch) in [("a-failing", 1), ("b-healthy", 2)] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::from_u128(epoch));
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let attempts = &std::cell::RefCell::new(Vec::new());
+        let dispatched = &std::cell::Cell::new(0);
+        let runner_ref = &runners;
+        let mut cursor = CorpScheduleCursor::default();
+        for _ in 0..4 {
+            // No reconnect, lifecycle event, or permission change between ticks.
+            let _ = reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
+                attempts.borrow_mut().push(scope.runner_id.clone());
+                schedule_after_runner_commands(
+                    runner_ref,
+                    &scope,
+                    async {
+                        if scope.runner_id == "a-failing" {
+                            return Err(anyhow::anyhow!("owned runner command failure"));
+                        }
+                        Ok(())
+                    },
+                    async {
+                        assert_eq!(scope.runner_id, "b-healthy");
+                        dispatched.set(dispatched.get() + 1);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+            .await;
+        }
+        assert!(
+            dispatched.get() > 0,
+            "healthy runner was starved; attempted {:?}",
+            attempts.borrow()
+        );
+        assert!(attempts.borrow().iter().any(|name| name == "a-failing"));
+        assert!(attempts.borrow().iter().any(|name| name == "b-healthy"));
+    }
+
+    #[tokio::test]
+    async fn issue172_all_failing_peers_remain_bounded_and_each_get_a_turn() {
+        let runners = DashMap::new();
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            let (mut connection, _received) =
+                reconnect_test_connection(Uuid::from_u128(index as u128 + 1));
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        for _ in 0..6 {
+            let before = attempted.borrow().len();
+            let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                attempted.borrow_mut().push(scope.runner_id);
+                std::future::ready(Err(anyhow::anyhow!("still unavailable")))
+            })
+            .await;
+            assert_eq!(attempted.borrow().len() - before, 1);
+            assert_eq!(failures.len(), 1);
+        }
+        assert_eq!(*attempted.borrow(), ["a", "b", "c", "a", "b", "c"]);
+        assert_eq!(cursor.after_runner.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn issue172_corp_batching_does_not_alias_runner_rotation() {
+        let runners = DashMap::new();
+        for corp in 1..=200 {
+            for suffix in ["a-failing", "b-healthy"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp:03}-{suffix}"), connection);
+            }
+        }
+        let visits = std::cell::RefCell::new(std::collections::HashMap::<Uuid, Vec<String>>::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for tick in 0..4 {
+            let batch = std::cell::RefCell::new(HashSet::new());
+            let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                assert!(batch.borrow_mut().insert(scope.corp_id));
+                visits
+                    .borrow_mut()
+                    .entry(scope.corp_id)
+                    .or_default()
+                    .push(scope.runner_id.clone());
+                std::future::ready(if scope.runner_id.ends_with("a-failing") {
+                    Err(anyhow::anyhow!("representative remains unavailable"))
+                } else {
+                    Ok(true)
+                })
+            })
+            .await;
+            assert_eq!(batch.borrow().len(), 100);
+            assert_eq!(failures.len(), if tick < 2 { 100 } else { 0 });
+        }
+        assert_eq!(visits.borrow().len(), 200);
+        for peers in visits.borrow().values() {
+            assert_eq!(peers.len(), 2);
+            assert!(peers[0].ends_with("a-failing"));
+            assert!(peers[1].ends_with("b-healthy"));
+        }
+        assert_eq!(cursor.after_runner.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn issue172_unvisited_singleton_churn_preserves_runner_rotation() {
+        let runners = DashMap::new();
+        for corp in 1..=200 {
+            for suffix in ["a-failing", "b-healthy"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp:03}-{suffix}"), connection);
+            }
+        }
+        let corp_id = Uuid::from_u128(1);
+        let visits = std::cell::RefCell::new(Vec::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for tick in 0..4 {
+            // The failing peer is unready only on ticks that do not visit this
+            // Corp. Its healthy peer remains ready throughout the churn.
+            runners.get_mut("001-a-failing").unwrap().dispatch_ready = tick % 2 == 0;
+            let batch = std::cell::RefCell::new(HashSet::new());
+            let _ = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                assert!(scope.is_current(&runners));
+                assert!(batch.borrow_mut().insert(scope.corp_id));
+                if scope.corp_id == corp_id {
+                    visits.borrow_mut().push(scope.runner_id.clone());
+                }
+                std::future::ready(if scope.runner_id.ends_with("a-failing") {
+                    Err(anyhow::anyhow!("representative remains unavailable"))
+                } else {
+                    Ok(true)
+                })
+            })
+            .await;
+            assert_eq!(batch.borrow().len(), 100);
+            assert_eq!(batch.borrow().contains(&corp_id), tick % 2 == 0);
+        }
+        assert_eq!(*visits.borrow(), ["001-a-failing", "001-b-healthy"]);
+        assert_eq!(
+            cursor.after_runner.get(&corp_id).map(String::as_str),
+            Some("001-b-healthy")
+        );
+
+        // A singleton visit may now discard its cursor. A fully disappeared
+        // Corp must be pruned immediately even outside this tick's batch.
+        runners.remove("200-a-failing");
+        runners.remove("200-b-healthy");
+        let batch = std::cell::RefCell::new(HashSet::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            assert!(scope.is_current(&runners));
+            assert!(batch.borrow_mut().insert(scope.corp_id));
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(batch.borrow().len(), 100);
+        assert!(batch.borrow().contains(&corp_id));
+        assert!(!cursor.after_runner.contains_key(&corp_id));
+        assert!(!cursor.after_runner.contains_key(&Uuid::from_u128(200)));
+    }
+
+    #[tokio::test]
+    async fn issue172_epoch_replacement_during_commands_cannot_schedule_or_pin_the_corp() {
+        let runners = DashMap::new();
+        for name in ["a", "b"] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let runner_ref = &runners;
+        let scheduled = &std::cell::RefCell::new(Vec::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for _ in 0..2 {
+            assert!(
+                reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
+                    schedule_after_runner_commands(
+                        runner_ref,
+                        &scope,
+                        async {
+                            if scope.runner_id == "a" {
+                                runner_ref.get_mut("a").unwrap().connection_epoch = Uuid::new_v4();
+                            }
+                            Ok(())
+                        },
+                        async {
+                            scheduled.borrow_mut().push(scope.runner_id.clone());
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+                .await
+                .is_empty()
+            );
+        }
+        assert_eq!(*scheduled.borrow(), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn issue172_removed_representative_does_not_reset_other_corps_or_accumulate_state() {
+        let runners = DashMap::new();
+        for corp in 1..=2 {
+            for suffix in ["a", "b", "c"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp}-{suffix}"), connection);
+            }
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let first = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            first.borrow_mut().push(scope.runner_id);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*first.borrow(), ["1-a", "2-a"]);
+        runners.remove("1-a");
+        runners.remove("2-a");
+        runners.remove("2-c");
+        let second = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            second.borrow_mut().push(scope.runner_id);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*second.borrow(), ["1-b", "2-b"]);
+        assert_eq!(cursor.after_runner.len(), 1);
+        assert!(cursor.after_runner.contains_key(&Uuid::from_u128(1)));
+        runners.clear();
+        let mut called = false;
+        reconcile_ready_corps(&runners, &mut cursor, |_| {
+            called = true;
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert!(!called);
+        assert!(cursor.after_runner.is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue172_snapshot_fencing_skips_a_peer_moved_to_another_corp() {
+        let runners = DashMap::new();
+        for (name, corp) in [("1-a", 1), ("1-b", 1), ("2-a", 2), ("2-b", 2)] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+            connection.corp_id = Uuid::from_u128(corp);
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let first = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            first.borrow_mut().push(scope.runner_id);
+            runners.get_mut("2-a").unwrap().corp_id = Uuid::from_u128(3);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*first.borrow(), ["1-a"]);
+        let second = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            assert!(scope.is_current(&runners));
+            second.borrow_mut().push((scope.corp_id, scope.runner_id));
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert!(
+            second
+                .borrow()
+                .contains(&(Uuid::from_u128(2), "2-b".to_owned()))
+        );
+        assert!(
+            !second
+                .borrow()
+                .contains(&(Uuid::from_u128(2), "2-a".to_owned()))
         );
     }
 
