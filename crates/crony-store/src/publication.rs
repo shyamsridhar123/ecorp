@@ -2563,30 +2563,32 @@ async fn ensure_active_publication_control_tx(
     Ok(())
 }
 
+// This transaction touches last_used_at below. Take its write lock immediately:
+// concurrent FOR SHARE readers cannot both upgrade without a deadlock.
+const PUBLICATION_PUBLISHER_CREDENTIAL_LOCK_SQL: &str = r#"
+    SELECT id
+    FROM publication_publisher_credentials
+    WHERE corp_id = $1
+      AND publisher_id = $2
+      AND credential_hash = $3
+      AND revoked_at IS NULL
+      AND expires_at > now()
+    FOR UPDATE
+"#;
+
 async fn revalidate_publication_publisher_credential_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     publisher_id: &str,
     credential_hash: &str,
 ) -> Result<()> {
-    let credential_id = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        SELECT id
-        FROM publication_publisher_credentials
-        WHERE corp_id = $1
-          AND publisher_id = $2
-          AND credential_hash = $3
-          AND revoked_at IS NULL
-          AND expires_at > now()
-        FOR SHARE
-        "#,
-    )
-    .bind(corp_id)
-    .bind(publisher_id)
-    .bind(credential_hash)
-    .fetch_optional(&mut **tx)
-    .await?
-    .context("forbidden: publication publisher credential is no longer authorized")?;
+    let credential_id = sqlx::query_scalar::<_, Uuid>(PUBLICATION_PUBLISHER_CREDENTIAL_LOCK_SQL)
+        .bind(corp_id)
+        .bind(publisher_id)
+        .bind(credential_hash)
+        .fetch_optional(&mut **tx)
+        .await?
+        .context("forbidden: publication publisher credential is no longer authorized")?;
     sqlx::query("UPDATE publication_publisher_credentials SET last_used_at = now() WHERE id = $1")
         .bind(credential_id)
         .execute(&mut **tx)
@@ -2849,6 +2851,25 @@ async fn publication_event_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_credential_touch_locks_for_update_without_widening_authentication() {
+        let query = PUBLICATION_PUBLISHER_CREDENTIAL_LOCK_SQL;
+        assert!(query.trim_end().ends_with("FOR UPDATE"));
+        assert!(!query.contains("FOR SHARE"));
+        for predicate in [
+            "corp_id = $1",
+            "publisher_id = $2",
+            "credential_hash = $3",
+            "revoked_at IS NULL",
+            "expires_at > now()",
+        ] {
+            assert!(
+                query.contains(predicate),
+                "credential predicate {predicate}"
+            );
+        }
+    }
 
     #[test]
     fn publication_failure_is_single_line_and_bounded() {
