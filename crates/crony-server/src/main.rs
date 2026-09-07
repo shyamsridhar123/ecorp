@@ -3935,7 +3935,7 @@ async fn schedule_ready_tasks(
         let dependency_context = match resolve_dependency_context(state, &record).await {
             Ok(context) => context,
             Err(error) => {
-                if let Ok(event) = state
+                if let Ok(events) = state
                     .store
                     .fail_run_before_dispatch(
                         corp_id,
@@ -3944,7 +3944,9 @@ async fn schedule_ready_tasks(
                     )
                     .await
                 {
-                    publish(state, event);
+                    for event in events {
+                        publish(state, event);
+                    }
                 }
                 outcome.failures.push(format!(
                     "task {} dependency context failed: {error}",
@@ -3959,7 +3961,7 @@ async fn schedule_ready_tasks(
         let secrets = match resolve_run_secrets(state, &record, &runner_id).await {
             Ok(secrets) => secrets,
             Err(error) => {
-                if let Ok(event) = state
+                if let Ok(events) = state
                     .store
                     .fail_run_before_dispatch(
                         corp_id,
@@ -3968,7 +3970,9 @@ async fn schedule_ready_tasks(
                     )
                     .await
                 {
-                    publish(state, event);
+                    for event in events {
+                        publish(state, event);
+                    }
                 }
                 outcome.failures.push(format!(
                     "task {} secret assignment failed: {error}",
@@ -4003,12 +4007,14 @@ async fn schedule_ready_tasks(
             },
         ) {
             let reason = "runner disconnected or changed epoch before accepting the run";
-            if let Ok(event) = state
+            if let Ok(events) = state
                 .store
                 .fail_run_before_dispatch(corp_id, record.run_id, reason)
                 .await
             {
-                publish(state, event);
+                for event in events {
+                    publish(state, event);
+                }
             }
             outcome
                 .failures
@@ -4514,7 +4520,9 @@ async fn resume_run(
             )
             .await
             .map_err(ApiError::internal)?;
-        publish(&state, failure);
+        for event in failure {
+            publish(&state, event);
+        }
         return Err(ApiError::conflict(
             "source run's runner is disconnected or reconciling",
         ));
@@ -4530,7 +4538,9 @@ async fn resume_run(
             )
             .await
             .map_err(ApiError::internal)?;
-        publish(&state, failure);
+        for event in failure {
+            publish(&state, event);
+        }
         return Err(ApiError::forbidden(
             "source run's runner is enrolled to a different Corp",
         ));
@@ -4551,7 +4561,9 @@ async fn resume_run(
             )
             .await
             .map_err(ApiError::internal)?;
-        publish(&state, failure);
+        for event in failure {
+            publish(&state, event);
+        }
         return Err(ApiError::conflict(
             "source run's runner no longer advertises the required repository checkout",
         ));
@@ -4597,7 +4609,9 @@ async fn resume_run(
                 )
                 .await
                 .map_err(ApiError::internal)?;
-            publish(&state, failure);
+            for event in failure {
+                publish(&state, event);
+            }
             return Err(ApiError::conflict(
                 "verified dependency handoff denied resumed assignment",
             ));
@@ -4617,7 +4631,9 @@ async fn resume_run(
                 )
                 .await
                 .map_err(ApiError::internal)?;
-            publish(&state, failure);
+            for event in failure {
+                publish(&state, event);
+            }
             return Err(ApiError::conflict(
                 "secret broker denied resumed assignment",
             ));
@@ -4663,7 +4679,9 @@ async fn resume_run(
             )
             .await
             .map_err(ApiError::internal)?;
-        publish(&state, failure);
+        for event in failure {
+            publish(&state, event);
+        }
         return Err(ApiError::conflict(
             "runner disconnected or changed epoch before accepting resume",
         ));

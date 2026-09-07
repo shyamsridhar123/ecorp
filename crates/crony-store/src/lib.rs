@@ -6346,14 +6346,45 @@ impl PgStore {
         corp_id: Uuid,
         run_id: Uuid,
         reason: &str,
-    ) -> Result<DomainEvent> {
+    ) -> Result<Vec<DomainEvent>> {
         let mut tx = self.pool.begin().await?;
+        let scope = sqlx::query(
+            "SELECT task.mission_id, item.id AS factory_id
+             FROM runs run
+             JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
+             JOIN missions mission ON mission.id = task.mission_id AND mission.corp_id = task.corp_id
+             LEFT JOIN factory_work_items item ON item.mission_id = mission.id AND item.corp_id = mission.corp_id
+             WHERE run.id = $1 AND run.corp_id = $2",
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("run not found for dispatch failure")?;
+        let expected_mission_id: Uuid = scope.get("mission_id");
+        let expected_factory_id: Option<Uuid> = scope.get("factory_id");
+        if let Some(factory_id) = expected_factory_id {
+            // Recovery and publication already take these gates before their
+            // row locks. Join that ordering before locking run/task/mission.
+            lock_factory_keys_tx(
+                &mut tx,
+                &[
+                    format!("factory:item:{corp_id}:{factory_id}"),
+                    format!("publication:factory:{corp_id}:{factory_id}"),
+                ],
+            )
+            .await?;
+        }
         let row = sqlx::query(
             r#"
-            SELECT run.task_id, run.agent_id, task.mission_id, mission.room_id
+            SELECT run.task_id, run.agent_id, run.status AS run_status,
+                   run.summary, run.workspace_detail,
+                   task.mission_id, task.status AS task_status,
+                   mission.room_id, mission.status AS mission_status
             FROM runs run
-            JOIN tasks task ON task.id = run.task_id
+            JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
             JOIN missions mission ON mission.id = task.mission_id
+                                 AND mission.corp_id = task.corp_id
             WHERE run.id = $1 AND run.corp_id = $2
             FOR UPDATE OF run, task, mission
             "#,
@@ -6367,55 +6398,198 @@ impl PgStore {
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
-        sqlx::query(
-            "UPDATE runs SET status = 'failed', summary = $1,
-             workspace_detail = 'dispatch_not_started', updated_at = now() WHERE id = $2",
+        if mission_id != expected_mission_id {
+            return Err(anyhow!("dispatch failure mission scope changed"));
+        }
+        let run_status: String = row.get("run_status");
+        let task_status: String = row.get("task_status");
+        let mission_status: String = row.get("mission_status");
+        let replay = run_status == "failed"
+            && row.get::<Option<String>, _>("workspace_detail").as_deref()
+                == Some("dispatch_not_started")
+            && task_status == "failed"
+            && mission_status == "failed";
+        // Read again after taking the task/mission locks so a newer accepted
+        // attempt cannot be failed by an old dispatch callback.
+        let latest_run: Uuid = sqlx::query_scalar(
+            "SELECT id FROM runs WHERE task_id = $1 AND corp_id = $2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
-        .bind(reason)
-        .bind(run_id)
-        .execute(&mut *tx)
+        .bind(task_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE queued_messages SET status = 'queued', run_id = NULL WHERE run_id = $1 AND status = 'reserved'",
+        let started: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE corp_id = $1
+             AND aggregate_type = 'run' AND aggregate_id = $2
+             AND type IN ('run.started', 'run.session'))",
         )
+        .bind(corp_id)
         .bind(run_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1")
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1")
-            .bind(mission_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1 AND current_run_id = $2",
+        if latest_run != run_id
+            || started
+            || task_status == "completed"
+            || matches!(mission_status.as_str(), "completed" | "cancelled")
+            || (!replay && !matches!(run_status.as_str(), "provisioning" | "starting"))
+        {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let factory = sqlx::query(
+            "SELECT id, state, version FROM factory_work_items
+             WHERE corp_id = $1 AND mission_id = $2 FOR UPDATE",
         )
-        .bind(agent_id)
-        .bind(run_id)
-        .execute(&mut *tx)
+        .bind(corp_id)
+        .bind(mission_id)
+        .fetch_optional(&mut *tx)
         .await?;
-        let event = append_event_tx(
-            &mut tx,
-            NewEvent {
-                room_id: Some(room_id),
-                correlation_id: Some(mission_id),
-                ..NewEvent::new(
-                    corp_id,
-                    None,
-                    "run.failed",
-                    "run",
-                    run_id,
-                    format!("run:{run_id}:dispatch-failed"),
-                    json!({"error": reason}),
-                )
+        if factory.as_ref().map(|item| item.get::<Uuid, _>("id")) != expected_factory_id {
+            return Err(anyhow!("dispatch failure factory scope changed"));
+        }
+        let factory = factory.filter(|item| {
+            matches!(
+                item.get::<String, _>("state").as_str(),
+                "claimed"
+                    | "mission_created"
+                    | "running"
+                    | "blocked"
+                    | "awaiting_approval"
+                    | "verification_failed"
+            )
+        });
+        // A fresh generic resume can belong to a previously verified/final
+        // factory. Clean up its failed allocation without downgrading that item.
+        // Replay uses the persisted diagnostic, not new caller text. This also
+        // repairs a legacy failed dispatch's stale factory projection.
+        let original = row.get::<Option<String>, _>("summary");
+        let reason = normalize_bounded_failure_reason(
+            if replay {
+                original.as_deref().unwrap_or(reason)
+            } else {
+                reason
             },
-        )
-        .await?
-        .context("dispatch failure event unexpectedly existed")?;
+            "run dispatch failed before provider start",
+        );
+        let mut events = Vec::new();
+        if !replay {
+            sqlx::query(
+                "UPDATE runs SET status = 'failed', summary = $1,
+                 workspace_detail = 'dispatch_not_started', updated_at = now()
+                 WHERE id = $2 AND corp_id = $3",
+            )
+            .bind(&reason)
+            .bind(run_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE queued_messages SET status = 'queued', run_id = NULL
+                 WHERE run_id = $1 AND corp_id = $2 AND status = 'reserved'",
+            )
+            .bind(run_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1 AND corp_id = $2",
+            )
+            .bind(task_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND corp_id = $2",
+            )
+            .bind(mission_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL
+                 WHERE id = $1 AND current_run_id = $2 AND corp_id = $3",
+            )
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(event) = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: Some(room_id),
+                    correlation_id: Some(mission_id),
+                    ..NewEvent::new(
+                        corp_id,
+                        None,
+                        "run.failed",
+                        "run",
+                        run_id,
+                        format!("run:{run_id}:dispatch-failed"),
+                        json!({"error": reason, "dispatch_not_started": true}),
+                    )
+                },
+            )
+            .await?
+            {
+                events.push(event);
+            }
+        }
+        if let Some(factory) = factory {
+            let factory_id: Uuid = factory.get("id");
+            let key = format!("factory:{factory_id}:dispatch-failed:{run_id}");
+            let recorded: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE corp_id = $1 AND idempotency_key = $2)",
+            )
+            .bind(corp_id)
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !recorded {
+                let version: i64 = sqlx::query_scalar(
+                    "UPDATE factory_work_items SET state = 'blocked', version = version + 1,
+                     failure_detail = $1, updated_at = now()
+                     WHERE id = $2 AND corp_id = $3 RETURNING version",
+                )
+                .bind(&reason)
+                .bind(factory_id)
+                .bind(corp_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if let Some(event) = append_event_tx(
+                    &mut tx,
+                    NewEvent {
+                        room_id: Some(room_id),
+                        aggregate_version: version,
+                        correlation_id: Some(mission_id),
+                        ..NewEvent::new(
+                            corp_id,
+                            None,
+                            "factory.blocked",
+                            "factory_work_item",
+                            factory_id,
+                            key,
+                            json!({
+                                "previous_state": factory.get::<String, _>("state"),
+                                "state": "blocked",
+                                "mission_id": mission_id,
+                                "run_id": run_id,
+                                "failure_detail": reason,
+                                "dispatch_not_started": true,
+                            }),
+                        )
+                    },
+                )
+                .await?
+                {
+                    events.push(event);
+                }
+            }
+        }
+        events.sort_by_key(|event| event.seq);
         tx.commit().await?;
-        Ok(event)
+        Ok(events)
     }
 
     pub async fn fail_factory_recovery_before_dispatch(
@@ -14092,6 +14266,10 @@ fn ensure_artifact_upload_matches(
 }
 
 fn normalize_artifact_rejection_reason(reason: &str) -> String {
+    normalize_bounded_failure_reason(reason, "artifact finalization failed permanently")
+}
+
+fn normalize_bounded_failure_reason(reason: &str, fallback: &str) -> String {
     let normalized = reason
         .chars()
         .map(|character| {
@@ -14104,7 +14282,7 @@ fn normalize_artifact_rejection_reason(reason: &str) -> String {
         .collect::<String>();
     let mut normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        normalized = "artifact finalization failed permanently".to_owned();
+        normalized = fallback.to_owned();
     }
     if normalized.len() > 2_000 {
         let mut end = 2_000;
@@ -14807,6 +14985,472 @@ mod tests {
         should_retry_runner_failure, validate_factory_lease_seconds,
         validate_factory_plan_against_policy,
     };
+
+    async fn predispatch_failure_fixture(pool: sqlx::PgPool) -> super::PgStore {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE missions (id UUID PRIMARY KEY, corp_id UUID, room_id UUID,
+                status TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE tasks (id UUID PRIMARY KEY, corp_id UUID, mission_id UUID,
+                status TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE runs (id UUID PRIMARY KEY, corp_id UUID, task_id UUID, agent_id UUID,
+                status TEXT, summary TEXT, workspace_detail TEXT,
+                workspace_path TEXT DEFAULT 'preserved-source', budget_tokens_limit BIGINT DEFAULT 100,
+                input_tokens BIGINT DEFAULT 0, output_tokens BIGINT DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE agents (id UUID PRIMARY KEY, corp_id UUID, status TEXT,
+                station TEXT, current_run_id UUID);
+            CREATE TABLE queued_messages (id UUID PRIMARY KEY, corp_id UUID,
+                run_id UUID, status TEXT);
+            CREATE TABLE factory_work_items (id UUID PRIMARY KEY, corp_id UUID,
+                mission_id UUID UNIQUE, state TEXT, version BIGINT DEFAULT 1,
+                failure_detail TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE events (seq BIGSERIAL PRIMARY KEY, id UUID UNIQUE,
+                schema_version INTEGER DEFAULT 1, corp_id UUID, room_id UUID, actor_id UUID,
+                type TEXT, aggregate_type TEXT, aggregate_id UUID, aggregate_version BIGINT,
+                correlation_id UUID, causation_id UUID, idempotency_key TEXT,
+                visibility TEXT, payload JSONB, created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE(corp_id, idempotency_key));
+            INSERT INTO missions VALUES
+                ('00000000-0000-0000-0000-000000000002',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000006', 'running', now());
+            INSERT INTO tasks (id,corp_id,mission_id,status) VALUES
+                ('00000000-0000-0000-0000-000000000003',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000002', 'running');
+            INSERT INTO runs (id,corp_id,task_id,agent_id,status) VALUES
+                ('00000000-0000-0000-0000-000000000004',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000003',
+                 '00000000-0000-0000-0000-000000000005', 'provisioning');
+            INSERT INTO agents VALUES
+                ('00000000-0000-0000-0000-000000000005',
+                 '00000000-0000-0000-0000-000000000001', 'working', 'dispatch',
+                 '00000000-0000-0000-0000-000000000004');
+            INSERT INTO queued_messages VALUES
+                ('00000000-0000-0000-0000-000000000008',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000004', 'reserved');
+            INSERT INTO factory_work_items (id,corp_id,mission_id,state) VALUES
+                ('00000000-0000-0000-0000-000000000007',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000002', 'awaiting_approval');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("isolated pre-dispatch fixture");
+        super::PgStore { pool }
+    }
+
+    async fn predispatch_fixture_state(store: &super::PgStore) -> serde_json::Value {
+        sqlx::query_scalar(
+            r#"
+            SELECT jsonb_build_object(
+              'runs',(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM runs r),
+              'tasks',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM tasks t),
+              'missions',(SELECT jsonb_agg(to_jsonb(m) ORDER BY id) FROM missions m),
+              'agents',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM agents a),
+              'queued',(SELECT jsonb_agg(to_jsonb(q) ORDER BY id) FROM queued_messages q),
+              'factory',(SELECT jsonb_agg(to_jsonb(f) ORDER BY id) FROM factory_work_items f),
+              'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY seq) FROM events e))
+            "#,
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_blocks_factory_atomically_and_replays_without_effects(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        store
+            .fail_run_before_dispatch(
+                Uuid::from_u128(1),
+                Uuid::from_u128(4),
+                "dependency context could not be verified",
+            )
+            .await
+            .unwrap();
+        let state = predispatch_fixture_state(&store).await;
+        assert_eq!(state["runs"][0]["status"], "failed");
+        assert_eq!(state["tasks"][0]["status"], "failed");
+        assert_eq!(state["missions"][0]["status"], "failed");
+        assert_eq!(state["factory"][0]["state"], "blocked");
+        assert_eq!(state["factory"][0]["version"], 2);
+        assert_eq!(
+            state["factory"][0]["failure_detail"],
+            "dependency context could not be verified"
+        );
+        assert_eq!(state["runs"][0]["workspace_path"], "preserved-source");
+        assert_eq!(state["runs"][0]["budget_tokens_limit"], 100);
+        assert_eq!(state["runs"][0]["input_tokens"], 0);
+        assert_eq!(state["agents"][0]["status"], "idle");
+        assert!(state["agents"][0]["current_run_id"].is_null());
+        assert_eq!(state["queued"][0]["status"], "queued");
+        assert!(state["queued"][0]["run_id"].is_null());
+        let events = state["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "run.failed");
+        assert_eq!(events[1]["type"], "factory.blocked");
+        assert_eq!(events[1]["correlation_id"], Uuid::from_u128(2).to_string());
+        assert_eq!(events[1]["room_id"], Uuid::from_u128(6).to_string());
+        store
+            .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "late new reason")
+            .await
+            .unwrap();
+        assert_eq!(predispatch_fixture_state(&store).await, state);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_rolls_back_every_projection_when_factory_update_fails(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        sqlx::query(
+            "ALTER TABLE factory_work_items ADD CONSTRAINT injected_failure CHECK (state <> 'blocked')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(
+                    Uuid::from_u128(1),
+                    Uuid::from_u128(4),
+                    "unavailable handoff"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_fences_terminal_started_newer_and_foreign_work(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(Uuid::from_u128(99), run, "foreign call")
+                .await
+                .is_err()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+        for status in [
+            "running",
+            "waiting_for_approval",
+            "verifying",
+            "completed",
+            "cancelled",
+            "lost",
+            "failed",
+        ] {
+            sqlx::query("UPDATE runs SET status = $1")
+                .bind(status)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            assert!(
+                store
+                    .fail_run_before_dispatch(corp, run, "late callback")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(predispatch_fixture_state(&store).await, before, "{status}");
+        }
+        sqlx::query("UPDATE runs SET status = 'provisioning'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        for kind in ["run.started", "run.session"] {
+            sqlx::query(
+                "INSERT INTO events (id,corp_id,type,aggregate_type,aggregate_id)
+                 VALUES ($1,$2,$3,'run',$4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(corp)
+            .bind(kind)
+            .bind(run)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            assert!(
+                store
+                    .fail_run_before_dispatch(corp, run, "already started")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(predispatch_fixture_state(&store).await, before);
+            sqlx::query("DELETE FROM events")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO runs (id,corp_id,task_id,agent_id,status,created_at)
+             SELECT '00000000-0000-0000-0000-000000000009',corp_id,task_id,agent_id,
+                    'running',created_at + interval '1 second' FROM runs;
+             UPDATE agents SET current_run_id = '00000000-0000-0000-0000-000000000009';",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(corp, run, "obsolete attempt")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_cleans_new_resumes_without_downgrading_factory_outcomes(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        for state in ["verified", "publishing", "published", "failed", "cancelled"] {
+            sqlx::raw_sql(
+                "UPDATE runs SET status = 'starting', summary = NULL, workspace_detail = NULL;
+                 UPDATE tasks SET status = 'running';
+                 UPDATE missions SET status = 'running';
+                 UPDATE agents SET status = 'working', station = 'dispatch',
+                    current_run_id = '00000000-0000-0000-0000-000000000004';
+                 UPDATE queued_messages SET status = 'reserved',
+                    run_id = '00000000-0000-0000-0000-000000000004';
+                 DELETE FROM events;",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE factory_work_items SET state = $1")
+                .bind(state)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            let events = store
+                .fail_run_before_dispatch(
+                    Uuid::from_u128(1),
+                    Uuid::from_u128(4),
+                    "runner disconnected before accepting resume",
+                )
+                .await
+                .unwrap();
+            let after = predispatch_fixture_state(&store).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(after["runs"][0]["status"], "failed");
+            assert_eq!(after["agents"][0]["status"], "idle");
+            assert!(after["agents"][0]["current_run_id"].is_null());
+            assert_eq!(after["queued"][0]["status"], "queued");
+            assert_eq!(after["factory"], before["factory"], "{state}");
+        }
+        sqlx::raw_sql(
+            "UPDATE runs SET status = 'completed';
+             UPDATE tasks SET status = 'completed';
+             UPDATE missions SET status = 'completed';
+             UPDATE factory_work_items SET state = 'published';",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "late failure")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    async fn predispatch_gate_precedes_row_locks(pool: sqlx::PgPool, prefix: &str) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        let factory = Uuid::from_u128(7);
+        let mut blocker = store.pool.begin().await.unwrap();
+        super::lock_factory_keys_tx(&mut blocker, &[format!("{prefix}:{corp}:{factory}")])
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM factory_work_items FOR UPDATE")
+            .fetch_all(&mut *blocker)
+            .await
+            .unwrap();
+        let mut failure = Box::pin(store.fail_run_before_dispatch(corp, run, "blocked handoff"));
+        let pool = store.pool.clone();
+        let mut probe = Box::pin(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let waiting: Option<String> = sqlx::query_scalar(
+                    "SELECT query FROM pg_stat_activity
+                     WHERE datname = current_database() AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock' ORDER BY query_start LIMIT 1",
+                )
+                .fetch_optional(&pool)
+                .await?;
+                if let Some(query) = waiting {
+                    if !query.contains("pg_advisory_xact_lock") {
+                        return Err(anyhow::anyhow!("dispatch took rows before its shared gate"));
+                    }
+                    // A recovery/publication owner must be able to take mission
+                    // rows while the dispatch failure waits at the existing gate.
+                    sqlx::query("SELECT id FROM missions FOR UPDATE NOWAIT")
+                        .fetch_all(&mut *blocker)
+                        .await?;
+                    blocker.commit().await?;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!("dispatch never reached its shared gate"));
+                }
+            }
+        });
+        let mut finished = None;
+        std::future::poll_fn(|context| {
+            if finished.is_none()
+                && let Poll::Ready(result) = failure.as_mut().poll(context)
+            {
+                finished = Some(result);
+            }
+            probe.as_mut().poll(context)
+        })
+        .await
+        .unwrap();
+        let events = match finished {
+            Some(result) => result,
+            None => failure.await,
+        }
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            predispatch_fixture_state(&store).await["factory"][0]["state"],
+            "blocked"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_takes_recovery_gate_before_row_locks(pool: sqlx::PgPool) {
+        predispatch_gate_precedes_row_locks(pool, "factory:item").await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_takes_publication_gate_before_row_locks(pool: sqlx::PgPool) {
+        predispatch_gate_precedes_row_locks(pool, "publication:factory").await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_repairs_legacy_state_without_rewriting_failure_history(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        sqlx::raw_sql(
+            "UPDATE runs SET status = 'failed', workspace_detail = 'dispatch_not_started',
+                summary = E'Legacy\\n diagnostic';
+             UPDATE tasks SET status = 'failed';
+             UPDATE missions SET status = 'failed';
+             UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL;
+             UPDATE queued_messages SET status = 'queued', run_id = NULL;",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO events (id,corp_id,type,aggregate_type,aggregate_id,idempotency_key)
+             VALUES ($1,$2,'run.failed','run',$3,$4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(corp)
+        .bind(run)
+        .bind(format!("run:{run}:dispatch-failed"))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        let emitted = store
+            .fail_run_before_dispatch(corp, run, "new caller text")
+            .await
+            .unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].event_type, "factory.blocked");
+        let after = predispatch_fixture_state(&store).await;
+        for key in ["runs", "tasks", "missions", "agents", "queued"] {
+            assert_eq!(after[key], before[key], "{key}");
+        }
+        assert_eq!(after["factory"][0]["state"], "blocked");
+        assert_eq!(after["factory"][0]["failure_detail"], "Legacy diagnostic");
+        assert_eq!(after["events"].as_array().unwrap().len(), 2);
+        assert_eq!(after["events"][0], before["events"][0]);
+        assert!(
+            store
+                .fail_run_before_dispatch(corp, run, "another reason")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, after);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_never_mutates_another_corps_factory(pool: sqlx::PgPool) {
+        let store = predispatch_failure_fixture(pool).await;
+        sqlx::query("UPDATE factory_work_items SET corp_id = $1")
+            .bind(Uuid::from_u128(99))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        let events = store
+            .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "own run only")
+            .await
+            .unwrap();
+        let after = predispatch_fixture_state(&store).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(after["factory"], before["factory"]);
+        assert_eq!(after["runs"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn predispatch_diagnostic_is_nonempty_single_line_and_utf8_bounded() {
+        let normalize = |input| super::normalize_bounded_failure_reason(input, "dispatch failed");
+        assert_eq!(normalize(" \r\n\t "), "dispatch failed");
+        assert_eq!(
+            normalize("missing\n\t handoff\u{7}bytes"),
+            "missing handoff bytes"
+        );
+        let text = normalize(&"δ".repeat(3_000));
+        assert!(text.len() <= 2_000);
+        assert!(!text.chars().any(char::is_control));
+    }
 
     // These opt-in SQL regressions use only SQLx's disposable test database and
     // exercise the real selection method, not a second implementation of its query.
