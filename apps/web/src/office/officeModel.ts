@@ -119,6 +119,19 @@ export function currentOfficeAgents<T extends OfficeAgent>(agents: readonly T[])
   return agents.filter((agent) => agent.retired_at == null)
 }
 
+/** Idle registrations are not proof that an executable runtime is connected. */
+export function operatingOfficeAgents<T extends OfficeAgent>(
+  agents: readonly T[],
+  availableAdapters: ReadonlySet<string>,
+  showRegistered = false,
+): T[] {
+  return currentOfficeAgents(agents).filter((agent) =>
+    showRegistered ||
+    Boolean(agent.current_run_id) ||
+    (agent.adapter !== 'fake-process' && availableAdapters.has(agent.adapter)),
+  )
+}
+
 export function selectOfficeAgent<T extends OfficeAgent>(
   agents: readonly T[],
   selectedId: string | null,

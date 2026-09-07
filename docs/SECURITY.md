@@ -62,8 +62,12 @@ prohibitions, write scope, token budget, or cost budget. Factory `verified` stat
 authoritative completed mission and passing task-verification records.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
-Provider-backed factory tasks require a manual verification gate; an artifact-only result cannot
-become accepted completion without an authorized evidence decision.
+Provider-backed factory outcomes require a manual verification gate; an artifact-only final
+result cannot become accepted completion without an authorized evidence decision. Internal
+handoffs retain their automated file, integrity, and content checks without an additional
+implicit human gate. Explicitly declared internal review gates are preserved. A deterministic
+terminal task still requires outcome review when it depends on provider-backed work. These
+rules apply when planning new work and never rewrite an existing run's persisted policy.
 Verifier rejection is persisted as `verification_failed`, not collapsed into an execution failure.
 Publication states cannot be asserted through the generic factory transition endpoint.
 

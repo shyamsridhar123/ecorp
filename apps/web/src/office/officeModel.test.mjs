@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import {
-  currentOfficeAgents, officeNextAction, officePageForAgent, paginateOfficeAgents,
+  currentOfficeAgents, operatingOfficeAgents, officeNextAction, officePageForAgent, paginateOfficeAgents,
   resolveOfficeState, resolveOfficeView, selectOfficeAgent, shouldAnimateArrival,
 } from './officeModel.ts'
 
@@ -11,6 +11,21 @@ const agent = (id = 'agent-01', overrides = {}) => ({
   status: 'idle', station: null, current_run_id: null, ...overrides,
 })
 const ids = (agents) => agents.map(({ id }) => id)
+
+test('default floor distinguishes connected workers from offline and test registrations', () => {
+  const entries = [
+    agent('copilot'),
+    agent('unavailable', { adapter: 'claude-code' }),
+    agent('fixture', { adapter: 'fake-process' }),
+    agent('active-fixture', { adapter: 'fake-process', current_run_id: 'run-a' }),
+    agent('retired', { retired_at: '2026-09-07T12:00:00Z' }),
+  ]
+  const available = new Set(['github-copilot', 'fake-process'])
+  assert.deepEqual(ids(operatingOfficeAgents(entries, available)), ['copilot', 'active-fixture'])
+  assert.deepEqual(ids(operatingOfficeAgents(entries, available, true)),
+    ['copilot', 'unavailable', 'fixture', 'active-fixture'])
+  assert.equal(entries[1].status, 'idle', 'Presentation must not rewrite authoritative status')
+})
 
 test('omitted and null retirement fields keep legacy and mission identities available', () => {
   const entries = [
@@ -165,7 +180,8 @@ test('#154: exact approvals keep priority, and only an unblocked empty floor off
 
 test('history inspectors retain the full snapshot while the floor uses current identities', async () => {
   const app = await readFile(new URL('../App.tsx', import.meta.url), 'utf8')
-  assert.match(app, /<OfficeFloor\s+agents=\{currentAgents\}/)
+  assert.match(app, /const floorAgents = operatingOfficeAgents\(\s*currentAgents,/)
+  assert.match(app, /<OfficeFloor\s+agents=\{floorAgents\}/)
   assert.match(app, /<MissionCard[\s\S]*?agents=\{data\.snapshot\.agents\}/)
   assert.match(app, /<FactoryPanel[\s\S]*?agents=\{data\.snapshot\.agents\}/)
   assert.match(app, /data\.snapshot\.missions\.find\(\(mission\) => mission\.id === selectedMissionId\)/)
