@@ -22,6 +22,7 @@ use uuid::Uuid;
 mod budget_revision;
 mod contract_revision;
 mod factory_controller;
+mod factory_run_failure;
 mod publication;
 mod staffing;
 
@@ -6066,15 +6067,19 @@ impl PgStore {
         .context("source run not found")?;
         let expected_workspace_run_id: Uuid = resume_context.get("workspace_run_id");
         let expected_requester: Uuid = resume_context.get("requested_by");
+        let factory_scope =
+            factory_run_failure::RunScope::read_tx(&mut tx, corp_id, source_run_id).await?;
         let mut resume_lock_keys = budget_scope_lock_keys(corp_id, expected_requester);
         resume_lock_keys.push(format!(
             "resume:workspace:{corp_id}:{expected_workspace_run_id}"
         ));
+        factory_scope.add_lock_keys(corp_id, &mut resume_lock_keys);
         lock_factory_keys_tx(&mut tx, &resume_lock_keys).await?;
 
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
+                   r.status AS source_run_status,
                    r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
                    r.breaker_stage AS source_breaker_stage,
                    r.verification_status AS source_verification_status,
@@ -6148,6 +6153,9 @@ impl PgStore {
             ));
         }
         let mission_id: Uuid = row.get("mission_id");
+        factory_scope
+            .validate_tx(&mut tx, corp_id, mission_id)
+            .await?;
         let requester: Uuid = row.get("requested_by");
         if requester != expected_requester {
             return Err(anyhow!(
@@ -6158,22 +6166,9 @@ impl PgStore {
         let model = contract.model.clone();
         let reasoning_effort = contract.reasoning_effort.clone();
 
-        let lineage = workspace_lineage_tx(&mut tx, corp_id, workspace_run_id).await?;
-        if lineage
-            .iter()
-            .any(|candidate| candidate.get::<String, _>("breaker_stage") == "stop")
-        {
-            return Err(anyhow!(
-                "provider workspace lineage reached a stop-stage breaker and cannot be resumed"
-            ));
-        }
-        let latest_lineage_run_id = latest_workspace_source_id(&lineage)?;
-        if latest_lineage_run_id != source_run_id {
-            return Err(anyhow!(
-                "source run is not the latest run in its provider workspace lineage"
-            ));
-        }
-
+        // An active descendant's streaming callback may own its run row while
+        // waiting for this task/mission. Reject already-ineligible active work
+        // without first waiting for that descendant's lineage row lock.
         let active: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS(
@@ -6190,6 +6185,22 @@ impl PgStore {
         .await?;
         if active {
             return Err(anyhow!("task or assigned agent already has an active run"));
+        }
+
+        let lineage = workspace_lineage_tx(&mut tx, corp_id, workspace_run_id).await?;
+        if lineage
+            .iter()
+            .any(|candidate| candidate.get::<String, _>("breaker_stage") == "stop")
+        {
+            return Err(anyhow!(
+                "provider workspace lineage reached a stop-stage breaker and cannot be resumed"
+            ));
+        }
+        let latest_lineage_run_id = latest_workspace_source_id(&lineage)?;
+        if latest_lineage_run_id != source_run_id {
+            return Err(anyhow!(
+                "source run is not the latest run in its provider workspace lineage"
+            ));
         }
 
         let (mission_tokens_used, mission_cost_used) =
@@ -6275,6 +6286,19 @@ impl PgStore {
         .execute(&mut *tx)
         .await?;
 
+        // Persist Factory's projection before the returned resume event. Its
+        // sequence wakes existing clients after both changes have committed.
+        factory_run_failure::resume_tx(
+            &mut tx,
+            &factory_scope,
+            corp_id,
+            room_id,
+            source_run_id,
+            &row.get::<String, _>("source_run_status"),
+            run_id,
+            requested_by,
+        )
+        .await?;
         let event = append_event_tx(
             &mut tx,
             NewEvent {
@@ -7563,6 +7587,11 @@ impl PgStore {
             mut payload,
         } = input;
         let mut tx = self.pool.begin().await?;
+        let factory_scope = if factory_run_failure::event_reconciles_factory(&event_type) {
+            Some(factory_run_failure::RunScope::lock_tx(&mut tx, corp_id, run_id).await?)
+        } else {
+            None
+        };
         if event_type == "run.usage" {
             let requester: Uuid = sqlx::query_scalar(
                 r#"
@@ -7595,10 +7624,11 @@ impl PgStore {
                    r.workspace_disposition AS existing_workspace_disposition,
                    r.execution_mode, r.status AS run_status,
                    t.mission_id, t.contract, t.verification_policy, m.room_id,
+                   t.status AS task_status, m.status AS mission_status,
                    t.attempt_count, t.max_attempts
             FROM runs r
-            JOIN tasks t ON t.id = r.task_id
-            JOIN missions m ON m.id = t.mission_id
+            JOIN tasks t ON t.id = r.task_id AND t.corp_id = r.corp_id
+            JOIN missions m ON m.id = t.mission_id AND m.corp_id = t.corp_id
             WHERE r.id = $1 AND r.corp_id = $2 AND r.agent_id = $3 AND r.runner_id = $4
               AND r.assignment_token = $5
               AND (
@@ -7624,6 +7654,30 @@ impl PgStore {
         let task_id: Uuid = row.get("task_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
+        if let Some(scope) = &factory_scope {
+            scope.validate_tx(&mut tx, corp_id, mission_id).await?;
+        }
+        if event_type == "run.failed" {
+            let latest_run: Uuid = sqlx::query_scalar(
+                "SELECT id FROM runs WHERE task_id = $1 AND corp_id = $2
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(task_id)
+            .bind(corp_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if latest_run != run_id
+                || row.get::<String, _>("task_status") == "completed"
+                || matches!(
+                    row.get::<String, _>("mission_status").as_str(),
+                    "completed" | "cancelled"
+                )
+            {
+                return Err(anyhow!(
+                    "runner failure targets superseded or accepted work"
+                ));
+            }
+        }
         let attempt_count: i32 = row.get("attempt_count");
         let max_attempts: i32 = row.get("max_attempts");
         let run_verification_status: String = row.get("run_verification_status");
@@ -8567,11 +8621,23 @@ impl PgStore {
                     .bind(mission_id)
                     .execute(&mut *tx)
                     .await?;
+                    if !retry
+                        && let Some(scope) = &factory_scope
+                        && let Some(factory_event) = factory_run_failure::reconcile_tx(
+                            &mut tx, scope, corp_id, room_id, task_id, run_id, summary,
+                        )
+                        .await?
+                    {
+                        related_events.push(factory_event);
+                    }
                 }
                 sqlx::query(
-                    "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
+                    "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL
+                     WHERE id = $1 AND corp_id = $2 AND current_run_id = $3",
                 )
                 .bind(agent_id)
+                .bind(corp_id)
+                .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -9586,6 +9652,8 @@ impl PgStore {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        let factory_scope =
+            factory_run_failure::RunScope::lock_tx(&mut tx, corp_id, run_id).await?;
         let row = sqlx::query(
             r#"
             SELECT request.task_id, request.gate_type, request.gate,
@@ -9612,6 +9680,9 @@ impl PgStore {
         let task_id: Uuid = row.get("task_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
+        factory_scope
+            .validate_tx(&mut tx, corp_id, mission_id)
+            .await?;
         assert_room_membership_tx(&mut tx, corp_id, room_id, actor_id).await?;
         let actor = sqlx::query("SELECT kind, role FROM actors WHERE id = $1 AND corp_id = $2")
             .bind(actor_id)
@@ -13221,6 +13292,10 @@ async fn reconcile_factory_verification_failure_tx(
     if current.state == FactoryWorkItemState::VerificationFailed {
         return Ok(None);
     }
+    if current.state == FactoryWorkItemState::Blocked && cause != "recovery_admission" {
+        // Only explicit governed recovery may replace an existing block.
+        return Ok(None);
+    }
     if !matches!(
         current.state,
         FactoryWorkItemState::MissionCreated
@@ -13341,6 +13416,12 @@ async fn reconcile_factory_verified_tx(
     };
     let current = map_factory_work_item(row)?;
     if current.state == FactoryWorkItemState::Verified {
+        return Ok(None);
+    }
+    if current.state == FactoryWorkItemState::Blocked {
+        // A native resume/verification result is not authority to clear a
+        // controller's source or policy block. Explicit controller catch-up
+        // retains its existing verified-mission authority check.
         return Ok(None);
     }
     if !matches!(
@@ -13475,6 +13556,16 @@ async fn reconcile_factory_awaiting_approval_tx(
     };
     let current = map_factory_work_item(row)?;
     if current.state == FactoryWorkItemState::AwaitingApproval {
+        return Ok(None);
+    }
+    let mission_running: bool = sqlx::query_scalar(
+        "SELECT status = 'running' FROM missions WHERE id = $1 AND corp_id = $2",
+    )
+    .bind(mission_id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !mission_running || current.state == FactoryWorkItemState::Blocked {
         return Ok(None);
     }
     if !matches!(
