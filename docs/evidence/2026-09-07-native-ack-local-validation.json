@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-07T19:55:24.8104602Z",
+  "branch": "codex/ui-enterprise-journey-audit",
+  "source_head_before_followup_commit": "1201c754254ab2654f17030924b56e3460c7c66e",
+  "source_files": [
+    {
+      "path": "crates/crony-store/src/lib.rs",
+      "sha256": "76f2c5cc3f37fe2f02dc741f83ac95d1ffd1089d53ec037dac06b58f78054429"
+    },
+    {
+      "path": "crates/crony-store/src/factory_run_failure.rs",
+      "sha256": "3a92c66276fa79a448f54047e7c92f8ee4567191fc1f9380fc27a0923d992a29"
+    },
+    {
+      "path": "tools/runner_ack_fault_relay.mjs",
+      "sha256": "8dc41b5ac772a898081ae3db6a03686f53608b6c2f7f3187b497771b0183abd5"
+    },
+    {
+      "path": "tools/runner_ack_fault_relay.test.mjs",
+      "sha256": "9c39e9c125ed2b5fb42e9798c8ec24efc170c78f062e3042c431c47015384926"
+    }
+  ],
+  "migrations": {
+    "passed": true,
+    "count": 38
+  },
+  "format": {
+    "passed": true
+  },
+  "clippy": {
+    "passed": true,
+    "scope": "workspace all targets; deny warnings"
+  },
+  "rust": {
+    "command": "cargo test --workspace -- --test-threads=1",
+    "failed": 0,
+    "passed": 342,
+    "opt_in_ignored": 44
+  },
+  "frontend": {
+    "failed": 0,
+    "scope": "all seven src/**/*.test.mjs files",
+    "passed": 99
+  },
+  "ack_relay": {
+    "failed": 0,
+    "scope": "synthetic gate and actual loopback WS transport tests, not provider acceptance",
+    "passed": 13
+  },
+  "web_build": {
+    "passed": true
+  },
+  "web_lint": {
+    "passed": true
+  },
+  "sqlx_detached_review": {
+    "red_seconds": 24.6,
+    "old_23_cases_rerun": false,
+    "red_exec_session": 73629,
+    "worker": "Ramanujan",
+    "red_failed": 1,
+    "filter": "issue169_detached_review_",
+    "source_hashes_verified": true,
+    "green_passed": 11,
+    "green_exec_session": 1475,
+    "red_passed": 10,
+    "green_failed": 0,
+    "green_seconds": 55.31
+  },
+  "review": {
+    "global_deadlock_claim": false,
+    "blockers": 0,
+    "mode": "read only",
+    "reviewer": "Popper"
+  },
+  "first_runtime": {
+    "source_head": "1201c754254ab2654f17030924b56e3460c7c66e",
+    "owned_services_retired": true,
+    "mission_id": "6af8daed-07b8-42ac-b59d-3062def7ed29",
+    "retained": true,
+    "signed_downloads_verified": 3,
+    "quality_ack_delay_ms": 8221,
+    "source_ack_wait_ms": 30047,
+    "result": "failed acceptance: native first retry stalled"
+  },
+  "post_fix_runtime": {
+    "status": "pending",
+    "issue_number": 3,
+    "repository": "shyamsridhar123/ecorp-enterprise-lab"
+  },
+  "hosted_actions_used": false,
+  "merge_requested": false
+}
