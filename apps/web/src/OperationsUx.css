@@ -219,6 +219,24 @@
   .app-shell .operations-review-decision { padding: 12px; }
   .operations-run-metadata > div { flex-basis: 100%; }
 }
+.factory-dossier-stage .factory-facts > div {
+  background: #f2f5f7;
+  border-color: #c8d0d7;
+}
+
+.factory-dossier-stage .factory-facts dt {
+  color: #48515a;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.factory-dossier-stage .factory-facts dd {
+  color: #1c2630;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .mission-submit-note.mission-plan-summary {
   max-inline-size: 54rem;
   text-align: left;
