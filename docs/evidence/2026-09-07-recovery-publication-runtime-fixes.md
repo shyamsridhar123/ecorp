@@ -76,8 +76,10 @@ All suite processes and that container were stopped afterward. The manual ECorp
 database and unrelated Open Notebook containers remain available.
 
 Independent read-only review found no concrete new regression in these fixes. It
-confirmed a pre-existing generic pre-dispatch failure/state-coherence gap, tracked
-separately as #167. PR #162 remains draft while that release work is addressed.
+confirmed the pre-existing generic pre-dispatch state gap in #167. The subsequent
+[state-coherence report](2026-09-07-predispatch-state-coherence.md) records its separate
+fix, PostgreSQL regressions, runtime replay/restart and rendered UI acceptance.
+Review and merge remain separate from these local checks.
 
 #148 budget-boundary checkpoints, #164 real-game completion and the broader dark-factory
 objective remain incomplete. No manual mission, hard stop, budget or provider session

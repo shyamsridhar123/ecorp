@@ -1,0 +1,29 @@
+{
+  "before": {
+    "sha256": "bf27b499e85b0c542af77c321ff6961a4ae08c15590da8eb66d8bb838ef8156d",
+    "state": "blocked",
+    "mission_status": "failed"
+  },
+  "blocked_requests": [],
+  "errors": [],
+  "viewports": [
+    {
+      "width": 1440,
+      "scroll": 1440,
+      "metadata_min_contrast": 7.37629545342715,
+      "metadata_min_font_px": 14
+    },
+    {
+      "width": 390,
+      "scroll": 390,
+      "metadata_min_contrast": 7.37629545342715,
+      "metadata_min_font_px": 14
+    }
+  ],
+  "after": {
+    "sha256": "bf27b499e85b0c542af77c321ff6961a4ae08c15590da8eb66d8bb838ef8156d",
+    "state": "blocked",
+    "mission_status": "failed"
+  },
+  "passed": true
+}

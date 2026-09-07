@@ -1,0 +1,59 @@
+{
+  "suite": "predispatch-failure-167",
+  "passed": true,
+  "fixture_key": "8d8942d1-3531-4052-a166-6211e1e64713",
+  "started_at": "2026-09-07T08:41:36.166Z",
+  "exact_ids": {
+    "corp_id": "00000000-0000-4000-8000-000000000001",
+    "actor_ids": [
+      "c701381f-d7ae-42b6-9eaf-69b53d207c9b",
+      "5419529c-593f-46c6-9b8c-5d5137f041e6",
+      "3a113f62-9887-4705-be9e-079ce5b77028"
+    ],
+    "agent_ids": [
+      "715b7bc3-5713-4895-9dff-d27155486fde",
+      "c04b2963-7f6a-4cb7-9c5f-c62852a21b19",
+      "87f843a7-aa27-4557-98c0-85b2a0bbf98f"
+    ],
+    "factory_work_item_id": "9ad7ced8-721a-4813-88d3-8706d2040230",
+    "mission_id": "c7d46d04-d5a5-4d6b-98d6-e93ed5c7fc31",
+    "task_ids": [
+      "2624f8c6-2910-4857-8a0a-dddcdf979a57",
+      "41ab75d7-943b-410a-8c22-de4d69719f1a",
+      "73887218-6a6a-4617-8c43-3534dd8657ca"
+    ],
+    "run_ids": [
+      "181ca0d8-abc0-426f-8544-d32ca51e1af0",
+      "4b00760e-c3af-4d69-a503-5a28bba71f98",
+      "6eb5beb4-2a29-4de7-b80b-6bfaf8f1b62a"
+    ],
+    "unavailable_artifact_id": "1cc9d918-1468-4f7d-8b19-34565e036fc3"
+  },
+  "checks": [
+    "atomic_predispatch_failure",
+    "zero_child_execution_or_recovery",
+    "native_parent_replay_no_effects",
+    "owned_restart_and_replay_no_effects",
+    "original_fixtures_source_worktrees_preserved"
+  ],
+  "limitations": [
+    "Deterministic fake-process and development principals only; no real-provider/browser/OIDC evidence.",
+    "Native approval replay is covered; direct duplicate/late/foreign store callbacks need store tests.",
+    "Existing stack and all fixture evidence are retained; no automatic rollback or cleanup."
+  ],
+  "phase": "complete",
+  "observed": {
+    "mission_status": "failed",
+    "child_task_status": "failed",
+    "child_run_status": "failed",
+    "factory_state": "blocked",
+    "run_count": 3
+  },
+  "failure": {
+    "run_failed_seq": 584,
+    "factory_blocked_seq": 585,
+    "reason": "dependency context could not be verified: dependency handoff is incomplete or unverified: expected 2, found 1"
+  },
+  "fixture_state_sha256": "52b5f9f7305c011884a525d42b81939ab6ac00438d0655f11e7265d329bf9d00",
+  "finished_at": "2026-09-07T08:43:39.399Z"
+}

@@ -187,3 +187,11 @@ This does not retroactively turn the earlier failed runs into passes. The indepe
 review's pre-existing generic pre-dispatch state gap is tracked as #167, and PR #162
 remains draft. Budget-boundary recovery and a newly completed real-provider game are
 still separate outstanding work.
+
+### Subsequent state-coherence acceptance
+
+The [#167 report](2026-09-07-predispatch-state-coherence.md) records the remaining
+pre-dispatch state fix. A rejected dependency now yields a blocked factory item,
+not an empty approval wait; native replay, restart, scope and concurrency checks
+and a read-only browser inspection passed. This is separate from budget-boundary
+recovery or a new real-provider game.

@@ -490,6 +490,16 @@ existing verification-linked run binding. Artifact signature, retention, digest 
 checks still occur before dispatch. The prompt and `run.dependency_context` event record
 both producer `run_id` and `verification_run_id`; recovery does not forge a new producer.
 
+If dependency or assignment admission fails before a provider starts, the same transaction
+fails the run/task/mission, releases that run's agent and reserved messages, and blocks its
+eligible factory item with bounded failure detail. Ordered `run.failed` and `factory.blocked`
+events are published only after commit. Existing recovery/publication gates are acquired
+before row locks. Duplicate failures create no new work or events; a legacy failed dispatch
+can repair its stale factory projection using the original diagnostic. Started, terminal
+or superseded runs are not rewritten. A failed new generic-resume allocation is still
+released when its factory already has a verified/final outcome, without downgrading that
+outcome. No verifier failure, approval or workspace is invented for a never-started run.
+
 ## Mission specifications and contract revisions
 
 Mission titles remain bounded labels. The durable `missions.description` field carries the complete

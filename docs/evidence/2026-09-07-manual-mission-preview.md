@@ -82,7 +82,8 @@ cancelled with three preserved worktrees and the same 492,741 recorded tokens. N
 real-provider build was launched. A separately authorized real-provider run is still
 required to prove that the improved handoff path reaches a completed playable game.
 
-Budget-boundary checkpoint recovery in #148 remains separate. PR #162 also retains the
-open upstream-recovery-settlement and concurrent-publication runtime failures documented
-in the [recovery checkpoint](2026-09-06-current-main-recovery-and-operations.md).
-No hosted Actions, merge, auto-merge or deployment is claimed here.
+Budget-boundary checkpoint recovery in #148 remains separate. The original recovery and
+publication failures received [subsequent verified fixes](2026-09-07-recovery-publication-runtime-fixes.md),
+followed by the [pre-dispatch state repair](2026-09-07-predispatch-state-coherence.md).
+Those checks do not constitute a new real-provider game build. No hosted Actions,
+merge, auto-merge or deployment is claimed here.

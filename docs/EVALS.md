@@ -682,7 +682,7 @@ recovered parent's artifact. Issues #165/#166 repair those defects, and both com
 suites now pass; see [the runtime-fix report](evidence/2026-09-07-recovery-publication-runtime-fixes.md).
 The earlier failures remain preserved as evidence. These are local fixture results, not a
 new real-GitHub recovery-to-publication effect claim. The separate pre-dispatch state-coherence
-gap in #167 remains open.
+gap in #167 is covered by the [pre-dispatch state report](evidence/2026-09-07-predispatch-state-coherence.md).
 
 Two opt-in SQLx regressions additionally exercise the actual `dependency_artifacts` store
 method with recovered-parent metadata, multiple verifier-only generations, stale runs,
@@ -701,6 +701,15 @@ running owned loopback QA container, creates only a uniquely named synthetic sch
 terminates only its own tagged sessions, removes that schema, and checks that the real
 publisher-credential fingerprint is unchanged. It starts no server, provider or container.
 Complete publication acceptance still requires the server/runner/CLI/Git E2E.
+
+`tools/e2e_predispatch_failure.mjs` adds one new deterministic graph to an explicitly
+owned, quiescent Windows QA stack without bootstrap/reset. It makes only a new
+approved parent's artifact unavailable, then proves the child fails before provider
+start and the factory is atomically blocked rather than awaiting approval. Native
+parent-decision replay and an owned server restart preserve exact state, journal and
+pre-existing fixtures. Direct store SQLx tests additionally exercise duplicate/late/
+foreign callbacks, rollback, legacy projection repair, protected outcomes and shared
+recovery/publication lock ordering. PowerShell 7 is required for the ownership probe.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,
