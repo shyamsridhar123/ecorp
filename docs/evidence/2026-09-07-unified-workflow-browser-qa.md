@@ -246,8 +246,11 @@ No history, artifact, verifier policy or worktree was deleted.
 
 ## Remaining acceptance
 
-- Execute `tools/e2e_evidence_selection.mjs` against an explicitly owned non-manual
-  fixture, using the actual browser for both decisions and replay/context checks.
+- The isolated two-review acceptance was subsequently completed in two retained
+  missions. The first exposed a page-reload selection gap, which was fixed before
+  a fresh full patched-UI pass. See the
+  [dedicated #163 browser report](2026-09-07-evidence-selection-browser.md) for
+  exact decisions, downloads, role checks and measured narrow-screen evidence.
 - User-operated manual play and final presenter dress rehearsal remain open.
   The accepted native outcome above does not turn a blocked host-play attempt
   into a passing manual browser check.
@@ -262,3 +265,11 @@ Local raw evidence is retained under the canonical checkout's
 `output/playwright/ecorp-ui-audit-20260907` and the trusted live runtime's
 `incident-arcade-demo-20260907` directory. These are evidence stores, not the backlog;
 GitHub Project #3 and its issues remain the operational queue.
+
+## Subsequent September 7 store verification
+
+The ordinary post-dispatch Factory failure/recovery patch for #169 was independently
+reviewed and passed **23 actual-store SQLx tests** under real migrations. This
+does not close the missing/delayed-ack server/runner/UI acceptance. The
+[store failure report](2026-09-07-factory-run-failure.md) records the exact scope,
+source hashes, earlier fixture failure and remaining runtime work.

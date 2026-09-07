@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-07T17:51:58.1220884Z",
+  "source_base_commit": "f2ecc8c1c3ec4b3966b36b41806fe397813ac4cf",
+  "branch": "codex/ui-enterprise-journey-audit",
+  "source_files": [
+    {
+      "path": "apps/web/src/App.tsx",
+      "sha256": "7676ab861682d8a5d292437d8874fdb50d1578fa6c42a6dcc6f18482e61d5d43"
+    },
+    {
+      "path": "apps/web/src/workflowContext.ts",
+      "sha256": "c29725518f08bbc2150a4772f90a94e6c641639d97875b2af61a4c1add73a7c3"
+    },
+    {
+      "path": "apps/web/src/workflowContext.test.mjs",
+      "sha256": "9299c347fa5ff698e5aa1a5d0de1ec697f1dd0f02dd65b6ae5a6af4c37eb7ff0"
+    },
+    {
+      "path": "apps/web/src/evidenceSelection.ts",
+      "sha256": "d44f7be6548d0b37bc9a8273ee73844003dbf57ea9705ef784694c494b0bb8e5"
+    },
+    {
+      "path": "apps/web/src/evidenceSelection.test.mjs",
+      "sha256": "dd7b9c00258b468042f2c2453a7cc03cd8f9fdc05ae0c7fa60a53445a8bc1b35"
+    },
+    {
+      "path": "crates/crony-store/src/lib.rs",
+      "sha256": "1ed53ca42108ad9a1aaa0968251bc4bcb4220cc5b0f632a87d63423b076a7930"
+    },
+    {
+      "path": "crates/crony-store/src/factory_run_failure.rs",
+      "sha256": "937678e417dc1c7b5124b98a08f65df6486f9bff4ffd1b6584aa46097a8a0a27"
+    }
+  ],
+  "migrations": {
+    "immutable_checksums": true,
+    "count": 38,
+    "passed": true
+  },
+  "format": {
+    "output": "silent zero-exit check in parent exec session 1188; no log file emitted",
+    "passed": true
+  },
+  "clippy": {
+    "scope": "workspace all-targets; warnings denied",
+    "passed": true
+  },
+  "rust": {
+    "opt_in_ignored": 33,
+    "command": "cargo test --workspace -- --test-threads=1",
+    "passed": 342,
+    "failed": 0
+  },
+  "sqlx": {
+    "passed": 23,
+    "ignored": 0,
+    "command": "cargo test -p crony-store issue169_ -- --ignored --test-threads=1",
+    "transcript_exec_session": 40066,
+    "seconds": 52.47,
+    "source_hashes_match_independent_review": true,
+    "maintenance_database": "crony_issue169_20260907",
+    "failed": 0,
+    "worker": "Ramanujan",
+    "filtered_out": 53
+  },
+  "frontend": {
+    "failed": 0,
+    "passed": 99
+  },
+  "helper_offline": {
+    "failed": 0,
+    "passed": 14
+  },
+  "web_build": {
+    "passed": true
+  },
+  "web_lint": {
+    "passed": true
+  },
+  "browser": {
+    "narrow_content_width_before_and_after_both_decisions": 375,
+    "provider": "native fake-process",
+    "earlier_reload_regression_preserved": true,
+    "auth": "development Bob, not GitHub login",
+    "passes": [
+      {
+        "result_file": "final-result.json",
+        "mission_id": "59b13205-087a-4d22-a4ce-32a195b151c1",
+        "newer_review_run": "cbed3afa-0382-4e69-9921-51978dddd925",
+        "older_review_run": "4b83510a-04e4-414c-9afe-8f4b9154a022",
+        "synthesis_run": "4bc8e5fe-fe67-458a-b492-1e30116209f7",
+        "synthesis_sha256": "b3e5ce08e8402907705a260ef11ce7cf8772f6f09a8518605e177fd8b8db4fcc",
+        "passed": true
+      },
+      {
+        "result_file": "final-390-result.json",
+        "mission_id": "5d135468-1b00-4ae1-99ed-defa4f7698d9",
+        "newer_review_run": "2db63278-6559-4f23-aee1-5f84e04d77e9",
+        "older_review_run": "734f18f6-134a-46c3-85fd-2cfc9c0ca692",
+        "synthesis_run": "b3e16bd8-f057-4e45-ac14-ef95bbcde65d",
+        "synthesis_sha256": "65e8636025d6160c4cc18871c59eee8a3662351a831242ae3e619ce12897d19f",
+        "passed": true
+      }
+    ],
+    "narrow_viewport_width": 390,
+    "transport": "CUA"
+  },
+  "cleanup": {
+    "test_owned": true,
+    "stopped_at": "2026-09-07T17:42:17.0574282Z",
+    "stopped_pids": [
+      60872,
+      43328,
+      27140
+    ],
+    "automatically_exited_console_hosts": [
+      63924,
+      55808,
+      61336
+    ],
+    "stopped_ports": [
+      15496,
+      18961
+    ],
+    "retained_completed_fixture_missions": 2,
+    "retained_preserved_fixture_runs": 6,
+    "manual_listeners": [
+      {
+        "LocalAddress": "127.0.0.1",
+        "LocalPort": 18962,
+        "OwningProcess": 43796
+      },
+      {
+        "LocalAddress": "127.0.0.1",
+        "LocalPort": 15491,
+        "OwningProcess": 34788
+      }
+    ],
+    "manual_incident_mission": "32d82858-0e38-43db-bf77-eb431ba0bda8",
+    "manual_mission_status": "completed",
+    "manual_factory_state": "verified",
+    "databases_objects_worktrees_retained": true,
+    "docker_lifecycle_operations": 0,
+    "guard_notes": [
+      "Exact UTC ticks retained after JSON DateTime parsing.",
+      "The only descendants were individually verified system console hosts, which exited automatically."
+    ]
+  },
+  "raw_log_root": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue163-acceptance-20260907",
+  "raw_logs": [
+    {
+      "file": "parent-migrations-final.log",
+      "sha256": "8f4ebd1e7cc6ac5ce6b626ff3e054e5fa4bc527bcd251b2bd062ab0ecbc4acb5"
+    },
+    {
+      "file": "parent-clippy-final.log",
+      "sha256": "07b7f3abcd657c6aaca5a804a185f6f3f45a8b8ac4278ce4d86ead1c1673a021"
+    },
+    {
+      "file": "parent-rust-final.log",
+      "sha256": "f8b2e08e8831437fd4a0b844b0b9d8ec80e3dc1c45f70e00ef64befb40e6ffef"
+    },
+    {
+      "file": "frontend-all-after-selection.log",
+      "sha256": "00ff622f88273987bff132fb4467034bd32b283031b1647e1e9f70b5b95f3eac"
+    },
+    {
+      "file": "helper-offline-final.log",
+      "sha256": "8095bd68c10e6f2be7a0448a2c535151452b6810d2755bc223b66b2b07723854"
+    },
+    {
+      "file": "parent-web-build-final.log",
+      "sha256": "55ec643a4f7adf310e8f197eed5b56410866ed25a68513db55116c7ac300e51c"
+    },
+    {
+      "file": "parent-web-lint-final.log",
+      "sha256": "827b649d485c99a80680a27128e7b9fcb299a1edc963402b6fe41d46295a856c"
+    }
+  ],
+  "limitations": [
+    "No new missing/delayed source-ack server/runner/browser fault acceptance for issue 169.",
+    "No fresh concurrent real-provider load acceptance for issue 168.",
+    "No global deadlock-freedom or production-authentication claim.",
+    "No manual-runtime backend rollout, merge, auto-merge, hosted Actions result or deployment."
+  ]
+}

@@ -24,6 +24,7 @@ import {
 import type { MissionPreviewLoad, MissionRequestScope } from './missionPreview'
 import { isProviderLiveRun, messagesForMission, missionIdForLink, pendingReviewForRun, relatedWorkOptions, reviewBlockedReason, selectMissionEvidenceRun, workLinkLabel, workflowTaskLabel } from './workflowContext'
 import { createSnapshotRefresher } from './snapshotRefresh'
+import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
 
 type Actor = {
   id: string
@@ -3367,7 +3368,14 @@ function MissionCard({
   onOpenFactory: () => void
 }) {
   const [copiedRecoveryCommand, setCopiedRecoveryCommand] = useState<string | null>(null)
-  const [selectedEvidenceRunId, setSelectedEvidenceRunId] = useState<string | null>(null)
+  const evidenceStorageKey = evidenceSelectionKey({ server: API_URL, corpId, actorId, missionId: mission.id })
+  const [selectedEvidenceRunId, setSelectedEvidenceRunId] = useState<string | null>(
+    () => readEvidenceSelection(() => window.sessionStorage, evidenceStorageKey),
+  )
+  const rememberEvidenceRun = (runId: string) => {
+    rememberEvidenceSelection(() => window.sessionStorage, evidenceStorageKey, runId)
+    setSelectedEvidenceRunId(runId)
+  }
   const [recoveryContextLoad, setRecoveryContextLoad] = useState<FactoryRecoveryContextLoad | null>(null)
   const [recoveryReload, setRecoveryReload] = useState(0)
   const recoveryItemId = factoryItem?.id
@@ -3389,6 +3397,18 @@ function MissionCard({
   )
   const taskById = new Map(tasks.map((task) => [task.id, task]))
   const evidenceRun = selectMissionEvidenceRun(runs, verificationRequests, selectedEvidenceRunId)
+  const displayedEvidenceRunId = evidenceRun?.id
+  useEffect(() => {
+    if (selectedEvidenceRunId !== null || !displayedEvidenceRunId) return
+    // Pin the initial viewed run too: another reviewer completing it, a newer
+    // worker, navigation or reload must not silently move this review context.
+    const remembered = rememberEvidenceSelection(
+      () => window.sessionStorage, evidenceStorageKey, displayedEvidenceRunId,
+    )
+    // One guarded synchronization when the first run arrives, never per streamed event.
+    // oxlint-disable-next-line react/set-state-in-effect
+    setSelectedEvidenceRunId(remembered ? displayedEvidenceRunId : '')
+  }, [displayedEvidenceRunId, evidenceStorageKey, selectedEvidenceRunId])
   const completedTasks = tasks.filter((task) => task.status === 'completed').length
   const activeRuns = runs.filter((run) => isProviderLiveRun(run, verificationRequests)).length
   const hasUnfinishedRuns = runs.some((run) => !terminalRun(run.status))
@@ -3416,7 +3436,7 @@ function MissionCard({
   const resumeStopBlocked = resumableRun?.breaker_stage === 'stop'
   const pendingReviewRuns = runs.filter((run) => pendingReviewForRun(run, verificationRequests))
   const pendingRequest = pendingReviewForRun(evidenceRun, verificationRequests)
-  const pendingRun = pendingRequest ? evidenceRun : undefined
+  const pendingRun = selectedEvidenceRunId !== null && pendingRequest ? evidenceRun : undefined
   const runIds = new Set(runs.map((run) => run.id))
   const pendingActionApprovals = actionApprovals.filter(
     (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
@@ -3513,15 +3533,15 @@ function MissionCard({
   }
   const decideEvidence = (approved: boolean) => {
     if (!pendingRun || !pendingRequest) return
-    // Keep the decided run visible after the snapshot refresh. Another review
-    // needs an explicit selector/next-review action, never a second blind click.
-    setSelectedEvidenceRunId(pendingRun.id)
+    // Keep the decided run visible across snapshot refresh, reload and navigation.
+    // Another review needs an explicit selector/next-review action.
+    rememberEvidenceRun(pendingRun.id)
     void onVerificationDecision(pendingRun, approved)
   }
   const resumeEvidence = async () => {
     if (!resumableRun) return
     const resumedRunId = await onResume(resumableRun)
-    if (resumedRunId) setSelectedEvidenceRunId(resumedRunId)
+    if (resumedRunId) rememberEvidenceRun(resumedRunId)
   }
   return (
     <article
@@ -3727,20 +3747,21 @@ function MissionCard({
         </details>
       ) : null}
       </details>
-      {evidenceRun ? (
+      {runs.length ? (
         <section
           className="mission-evidence-context"
           aria-label="Run evidence"
-          data-evidence-run-id={evidenceRun.id}
-          data-evidence-task-id={evidenceRun.task_id}
+          data-evidence-run-id={evidenceRun?.id}
+          data-evidence-task-id={evidenceRun?.task_id}
         >
           <label htmlFor={`mission-evidence-${mission.id}`}>Evidence for</label>
           <select
             id={`mission-evidence-${mission.id}`}
-            value={evidenceRun.id}
+            value={evidenceRun?.id ?? ''}
             disabled={busy}
-            onChange={(event) => setSelectedEvidenceRunId(event.target.value)}
+            onChange={(event) => rememberEvidenceRun(event.target.value)}
           >
+            {!evidenceRun ? <option value="" disabled>Choose a run to inspect</option> : null}
             {runs.map((run) => (
               <option key={run.id} value={run.id}>
                 {taskById.get(run.task_id)?.title ?? 'Task'} · {shortId(run.id)} · {statusLabel(run.status)}
@@ -3748,11 +3769,17 @@ function MissionCard({
               </option>
             ))}
           </select>
-          <p>
-            Produced by {agents.find((agent) => agent.id === evidenceRun.agent_id)?.name ?? shortId(evidenceRun.agent_id)}
-            {' · '}run {shortId(evidenceRun.id)}
-          </p>
-          <p>Downloads, checks and evidence decisions below apply only to this run.</p>
+          {evidenceRun ? (
+            <>
+              <p>
+                Produced by {agents.find((agent) => agent.id === evidenceRun.agent_id)?.name ?? shortId(evidenceRun.agent_id)}
+                {' · '}run {shortId(evidenceRun.id)}
+              </p>
+              <p>Downloads, checks and evidence decisions below apply only to this run.</p>
+            </>
+          ) : (
+            <p role="status">Choose a run to view its evidence. Reviews never transfer between runs.</p>
+          )}
           {pendingReviewRuns.length ? (
             <div className="work-context-actions">
               <strong>{pendingReviewRuns.length} evidence review{pendingReviewRuns.length === 1 ? '' : 's'} pending</strong>
@@ -3762,8 +3789,8 @@ function MissionCard({
                   type="button"
                   disabled={busy}
                   onClick={() => {
-                    const current = pendingReviewRuns.findIndex((run) => run.id === evidenceRun.id)
-                    setSelectedEvidenceRunId(pendingReviewRuns[(current + 1) % pendingReviewRuns.length].id)
+                    const current = pendingReviewRuns.findIndex((run) => run.id === evidenceRun?.id)
+                    rememberEvidenceRun(pendingReviewRuns[(current + 1) % pendingReviewRuns.length].id)
                   }}
                 >
                   Review next pending run
@@ -6864,7 +6891,7 @@ function App() {
             <div className="mission-list">
               {selectedMission ? (
                 <MissionCard
-                  key={selectedMission.id}
+                  key={`${bootstrap.corp_id}:${selectedActor.id}:${selectedMission.id}`}
                   corpId={bootstrap.corp_id}
                   mission={selectedMission}
                   tasks={selectedMissionTasks}
