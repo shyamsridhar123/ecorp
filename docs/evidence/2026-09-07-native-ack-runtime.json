@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-07T21:45:06.6629371Z",
+  "scope": "single-runner, real Copilot, two development-principal browser clients",
+  "source_candidate": "10068b60f130ce89259f87944d099015c15f3946",
+  "continued_with_issue171_source_hashes": {
+    "staffing": "0999795885751D52E925309A4408DE4F21FD02D807942743595ABF68A2CF076D",
+    "server": "54277EE42EA72FC6565DC1F28D4E5F7E246C4865908CCFB082AA61A3B77F80AE"
+  },
+  "end_to_end": {
+    "at": "2026-09-07T21:34:28.641Z",
+    "result": "PASS: native saved-session recovery, verified integration and independent review",
+    "mission_id": "d561cc2b-8d5e-44c9-b9da-ae6060af78b3",
+    "factory_id": "c860fb2b-9b67-46a5-ba46-3db0360c7fd2",
+    "resumed_run_id": "70660159-a8ea-4f62-99d8-c65c308f94e1",
+    "integration_run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0",
+    "provider_session_id": "83761e9f-32bb-4ce5-8353-ae6700e1e2c4",
+    "source_session": {
+      "run_id": "70660159-a8ea-4f62-99d8-c65c308f94e1",
+      "provider_session_id": "83761e9f-32bb-4ce5-8353-ae6700e1e2c4",
+      "workspace_hash": "9cdae4c79db634be010d0579",
+      "events_sha256": "c5e9c8431dac794f273cdb97578913b5a271700cc11233c254e39312f9ac1fb0",
+      "lifecycle": [
+        {
+          "type": "session.start",
+          "id": "c2235a52-48fa-4f8a-96b9-1f5ae5b73afe",
+          "timestamp": "2026-09-07T20:07:00.009Z",
+          "session_id": "83761e9f-32bb-4ce5-8353-ae6700e1e2c4"
+        },
+        {
+          "type": "session.shutdown",
+          "id": "70ffff29-ddaa-4019-8695-8c33b1558c55",
+          "timestamp": "2026-09-07T20:08:02.362Z",
+          "session_id": null
+        },
+        {
+          "type": "session.resume",
+          "id": "f80c8ad8-aca4-40d7-84f2-e226a531e136",
+          "timestamp": "2026-09-07T20:13:11.874Z",
+          "session_id": null
+        },
+        {
+          "type": "session.shutdown",
+          "id": "97b039a4-683c-4479-953f-2c5e3c6e21dd",
+          "timestamp": "2026-09-07T20:18:39.643Z",
+          "session_id": null
+        }
+      ],
+      "store_files": [
+        {
+          "name": "session-store.db",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "name": "session-store.db-shm",
+          "bytes": 32768,
+          "sha256": "58f2ce70b79006ae960567e57c08b23c612b61245bf0fa1788552d89d02394b2"
+        },
+        {
+          "name": "session-store.db-wal",
+          "bytes": 741632,
+          "sha256": "f20589e4431a09897ed063c0094047e8c939d7cc38efb98d8bfc1d8dea4041cc"
+        }
+      ],
+      "workspace_head": "e3dc3d669b1a99832e2e7af9be16f7f39842586d"
+    },
+    "source_downloads": [
+      {
+        "run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0",
+        "artifact_id": "49445ad5-50f1-4e3b-9a31-ff1638244f25",
+        "bytes": 28134,
+        "sha256": "df27c00e28af64e4ab2ddc561ea96c634e480dce4d49f853263b9fdf48c4446a",
+        "verification_sha256": "142a1c6c68bd1709b88381d408e7351798ddae53b392296271ff16293a792c22",
+        "provenance_signature": "487c14d66d55386a17991d5c839fc301b4504f2aa3daa161258cfa222fd9e534",
+        "download_status": 200
+      },
+      {
+        "run_id": "70660159-a8ea-4f62-99d8-c65c308f94e1",
+        "artifact_id": "3b655f4b-5e84-4564-8913-2926c817c0d4",
+        "bytes": 11877,
+        "sha256": "114ad22a4e0c1c485288a81dfd6be38c890f747ba515ab167868be91ee5e926f",
+        "verification_sha256": "77c39ed0abadadedc7574556f5e1293c066f8c512b178f7e301be463c357afa4",
+        "provenance_signature": "0dca8c311d65c031491d4465a210bd0d91a10080a933943c494cc026ff6425cc",
+        "download_status": 200
+      },
+      {
+        "run_id": "58333c7a-2360-499b-b580-9697410b7d77",
+        "artifact_id": "ff1e0026-e02a-40fd-9c0c-18dc766f10b4",
+        "bytes": 11877,
+        "sha256": "e8fcec88c4d55686fcb7042fc159ea2c72c71588a0d8bebc5c6882bdec3a1978",
+        "verification_sha256": "e53038fd4ee58c8a983361a17785ce15cecc5db1381d2d94e165184398f473aa",
+        "provenance_signature": "536509cbbf737c3ae5d33f90d2004b49ae613cbebda50b90c16d40dfd20294dc",
+        "download_status": 200
+      },
+      {
+        "run_id": "3d3db10a-b443-4f5b-b66b-a0685be60a6e",
+        "artifact_id": "db1a7529-1553-4812-a67a-8c8ac6e20e72",
+        "bytes": 11173,
+        "sha256": "e333aa023b653306065956813fd6e2d284b648a1c67a1f2bb5eb49f14cc67e1a",
+        "verification_sha256": "3ae6e63867d8aa6e83bda2f433aec2c0cc144a6dfdff6bb4563ea673e266e794",
+        "provenance_signature": "12c7f4d47e2a25fca812c76affe878bfb19ab2e621acca5453a5d6dd2387c000",
+        "download_status": 200
+      },
+      {
+        "run_id": "2f49d631-9e60-4177-a8ec-dfc3b88e5dff",
+        "artifact_id": "d489af01-a4b3-4d59-a879-4a7112ec15a1",
+        "bytes": 10549,
+        "sha256": "a01fae2e9aac7ebda9e13fd7662389b41c81a19a756736d33dd76fcc7b4feefa",
+        "verification_sha256": "6760849046ed967fa7079a2b91f7561fbe8370a0ed460395329dfd7e5a6352c6",
+        "provenance_signature": "355c8455b07962d09f0bb989230a8c0cf2a9891d75a94922c06e17e92a73646b",
+        "download_status": 200
+      },
+      {
+        "run_id": "38ff0719-0208-434e-bd5c-1baa1d16b1f9",
+        "artifact_id": "5fc6a50c-bb98-4fb4-941a-51d7550ff033",
+        "bytes": 11333,
+        "sha256": "6c47677a158ae605a094cb1585098e975aa59e2a9caab936e78a099a7da055b7",
+        "verification_sha256": "13f4e1f102fd37cdc224308678afb3af60fa715fb18ed3d4730021bb40b0cc2a",
+        "provenance_signature": "5ee357dd70c204e80844b4c3026ffb2f815cc15be05688d13c85cf7c5806fd33",
+        "download_status": 200
+      }
+    ],
+    "independent_review": {
+      "run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0",
+      "corp_id": "00000000-0000-4000-8000-000000000001",
+      "task_id": "94d99940-a24d-484d-8d24-d809224222f6",
+      "gate_type": "independent_review",
+      "gate": {
+        "type": "independent_review",
+        "roles": [
+          "owner",
+          "admin",
+          "member"
+        ],
+        "exclude_requester": true
+      },
+      "status": "approved",
+      "requested_at": "2026-09-07T21:28:40.034383Z",
+      "decided_by": "00000000-0000-4000-8000-000000000012",
+      "decision_note": "Bob accepted the recorded verification evidence.",
+      "decided_at": "2026-09-07T21:33:47.529818Z"
+    },
+    "original_history_unchanged": true,
+    "source_checkout_unchanged": true
+  },
+  "browser_reload": {
+    "started_at": "2026-09-07T20:06:18.823Z",
+    "client": "Bob",
+    "post_reload_operator": "Bob member",
+    "duration_ms": 692,
+    "completed_at": "2026-09-07T20:06:19.517Z",
+    "dom_and_screenshot_in_tool_transcript": true,
+    "performance_api_in_read_only_dom_scope": "unavailable; no live in-flight-count claim",
+    "transport": "CUA",
+    "alice_visible_working_agents": 3,
+    "post_reload_visible_live_runs": 3,
+    "native_sessions": [
+      {
+        "run_id": "3d3db10a-b443-4f5b-b66b-a0685be60a6e",
+        "provider_session_id": "b7ee29bf-5ad9-4272-a9fb-52b12bcd95bd",
+        "plan_key": "quality-verification",
+        "started_at": "2026-09-07T20:06:00.465Z",
+        "provider_shutdown_at": "2026-09-07T20:06:27.382Z",
+        "active_through_reload": true
+      },
+      {
+        "run_id": "38ff0719-0208-434e-bd5c-1baa1d16b1f9",
+        "provider_session_id": "876d14e1-f3b4-4569-97ec-5918781f4efd",
+        "plan_key": "visual-direction",
+        "started_at": "2026-09-07T20:06:01.226Z",
+        "provider_shutdown_at": "2026-09-07T20:06:22.583Z",
+        "active_through_reload": true
+      },
+      {
+        "run_id": "2f49d631-9e60-4177-a8ec-dfc3b88e5dff",
+        "provider_session_id": "b9f766af-4c95-4174-b21f-8feb47c0bda4",
+        "plan_key": "gameplay-systems",
+        "started_at": "2026-09-07T20:06:02.367Z",
+        "provider_shutdown_at": "2026-09-07T20:06:26.012Z",
+        "active_through_reload": true
+      }
+    ],
+    "all_three_native_sessions_survived_reload": true,
+    "shared_overlap_ms": 20216,
+    "live_inflight_snapshot_count": "not directly instrumented; covered separately by coalescer unit tests"
+  },
+  "native_integration_dispatch": {
+    "integration_task_id": "94d99940-a24d-484d-8d24-d809224222f6",
+    "mission_id": "d561cc2b-8d5e-44c9-b9da-ae6060af78b3",
+    "workspace_path": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue169-ack-acceptance-20260907-fixed\\runner\\worktrees\\94d99940a24d484d8d24d809224222f6\\b6f9e47e4b4942d594674772381456b0",
+    "run_status": "running",
+    "at": "2026-09-07T21:28:26.8197621Z",
+    "provider_session_id": "129fa7a8-bf81-4ba5-aaa9-7e54c28f2f18",
+    "manual_database_mutations": 0,
+    "agent_id": "107b8cbd-b6a6-487c-b1d6-c970bc90813a",
+    "current_run_count": 6,
+    "manual_dispatch_requests": 0,
+    "agent_retired_at": null,
+    "integration_run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0",
+    "original_run_count": 5
+  },
+  "native_integration_test_count": 12,
+  "persisted_integration_checks_passed": 5,
+  "original_failure_preserved": true,
+  "routine_action_approvals": 0,
+  "independent_review_count": 1,
+  "factory_state": "verified",
+  "factory_version": 11,
+  "hosted_actions_used": false,
+  "application_code_published": false,
+  "merge_or_auto_merge": false,
+  "remaining_scope": [
+    "issue172 multi-runner fairness source-review finding",
+    "no global deadlock claim",
+    "not production human GitHub authentication",
+    "live in-flight snapshot counts not directly measured"
+  ]
+}

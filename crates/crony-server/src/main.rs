@@ -407,6 +407,8 @@ async fn main() -> anyhow::Result<()> {
     let retirement_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(StdDuration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut scheduling_cursor = None;
         loop {
             interval.tick().await;
             match retirement_state
@@ -420,6 +422,42 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(error) => warn!(%error, "mission crew retirement reconciliation failed"),
+            }
+            match retirement_state
+                .store
+                .reactivate_running_mission_agents()
+                .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        publish(&retirement_state, event);
+                    }
+                }
+                Err(error) => warn!(%error, "mission crew reactivation reconciliation failed"),
+            }
+            // A committed reactivation is not a durable scheduling queue. Retry
+            // normal admission even when this tick emits no new lifecycle event.
+            let schedule_state = &retirement_state;
+            let failures = reconcile_ready_corps(
+                &schedule_state.runners,
+                &mut scheduling_cursor,
+                |scope| async move {
+                    schedule_after_runner_commands(
+                        &schedule_state.runners,
+                        &scope,
+                        dispatch_pending_runner_commands_for_epoch(
+                            schedule_state,
+                            &scope.runner_id,
+                            scope.connection_epoch,
+                        ),
+                        schedule_ready_corp(schedule_state, scope.corp_id),
+                    )
+                    .await
+                },
+            )
+            .await;
+            for (corp_id, error) in failures {
+                warn!(%error, %corp_id, "mission lifecycle scheduling deferred until a later tick");
             }
         }
     });
@@ -1334,6 +1372,84 @@ fn runner_epoch_is_ready(
     runners.get(runner_id).is_some_and(|connection| {
         connection.connection_epoch == connection_epoch && connection.dispatch_ready
     })
+}
+
+#[derive(Clone)]
+struct ReadyCorpSchedule {
+    corp_id: Uuid,
+    runner_id: String,
+    connection_epoch: Uuid,
+}
+
+impl ReadyCorpSchedule {
+    fn is_current(&self, runners: &DashMap<String, RunnerConnection>) -> bool {
+        runners.get(&self.runner_id).is_some_and(|connection| {
+            connection.corp_id == self.corp_id
+                && connection.connection_epoch == self.connection_epoch
+                && connection.dispatch_ready
+        })
+    }
+}
+
+async fn reconcile_ready_corps<F, Fut>(
+    runners: &DashMap<String, RunnerConnection>,
+    after_corp: &mut Option<Uuid>,
+    mut reconcile: F,
+) -> Vec<(Uuid, anyhow::Error)>
+where
+    F: FnMut(ReadyCorpSchedule) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut scopes = runners
+        .iter()
+        .filter(|connection| connection.dispatch_ready)
+        .map(|connection| ReadyCorpSchedule {
+            corp_id: connection.corp_id,
+            runner_id: connection.key().clone(),
+            connection_epoch: connection.connection_epoch,
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_unstable_by(|a, b| (a.corp_id, &a.runner_id).cmp(&(b.corp_id, &b.runner_id)));
+    scopes.dedup_by_key(|scope| scope.corp_id);
+    if let Some(after) = *after_corp {
+        let split = scopes.partition_point(|scope| scope.corp_id <= after);
+        scopes.rotate_left(split);
+    }
+    // Round-robin across ticks rather than starving Corps beyond the first batch.
+    scopes.truncate(100);
+    if let Some(last) = scopes.last() {
+        *after_corp = Some(last.corp_id);
+    }
+    let mut failures = Vec::new();
+    for scope in scopes {
+        if !scope.is_current(runners) {
+            continue;
+        }
+        let corp_id = scope.corp_id;
+        if let Err(error) = reconcile(scope).await {
+            failures.push((corp_id, error));
+        }
+    }
+    failures
+}
+
+async fn schedule_after_runner_commands(
+    runners: &DashMap<String, RunnerConnection>,
+    scope: &ReadyCorpSchedule,
+    commands: impl std::future::Future<Output = anyhow::Result<()>>,
+    schedule: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<bool> {
+    if !scope.is_current(runners) {
+        return Ok(false);
+    }
+    commands.await?;
+    // Command handling awaits storage and may outlive this connection. Only the
+    // successfully reconciled current epoch may wake normal task scheduling.
+    if !scope.is_current(runners) {
+        return Ok(false);
+    }
+    schedule.await?;
+    Ok(true)
 }
 
 fn send_command_to_current_runner(
@@ -5386,15 +5502,25 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             .await;
                             match finalized {
                                 Ok(true) => {
-                                    if let Err(error) = dispatch_pending_runner_commands_for_epoch(
-                                        &finalize_state,
-                                        &finalize_runner,
+                                    let scope = ReadyCorpSchedule {
+                                        corp_id,
+                                        runner_id: finalize_runner.clone(),
                                         connection_epoch,
+                                    };
+                                    if let Err(error) = schedule_after_runner_commands(
+                                        &finalize_state.runners,
+                                        &scope,
+                                        dispatch_pending_runner_commands_for_epoch(
+                                            &finalize_state,
+                                            &finalize_runner,
+                                            connection_epoch,
+                                        ),
+                                        schedule_ready_corp(&finalize_state, corp_id),
                                     )
                                     .await
                                     {
                                         warn!(%error, runner_id = %finalize_runner,
-                                            "failed to dispatch durable commands after reconciliation");
+                                            "runner post-reconciliation commands or scheduling failed");
                                     }
                                 }
                                 Ok(false) => {
@@ -6156,7 +6282,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use crony_domain::{
         ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan, VerificationPolicy,
@@ -6172,13 +6298,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        MissionPlanInput, RunnerConnection, RunnerRequirements, apply_mission_contract,
-        apply_mission_description, apply_mission_source, artifact_content_disposition,
-        capability_satisfies_requirement, enable_runner_after_reconciliation,
-        enable_runner_dispatch, enforce_factory_manual_gate,
-        factory_materialization_failure_detail, mission_preview_response,
-        reconnect_preserved_run_ids, runner_requirement_mismatch, select_ready_runner,
-        send_command_to_current_runner, validate_verification_artifact_reference,
+        MissionPlanInput, ReadyCorpSchedule, RunnerConnection, RunnerRequirements,
+        apply_mission_contract, apply_mission_description, apply_mission_source,
+        artifact_content_disposition, capability_satisfies_requirement,
+        enable_runner_after_reconciliation, enable_runner_dispatch, enforce_factory_manual_gate,
+        factory_materialization_failure_detail, mission_preview_response, reconcile_ready_corps,
+        reconnect_preserved_run_ids, runner_epoch_is_ready, runner_requirement_mismatch,
+        schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
+        validate_verification_artifact_reference,
     };
 
     fn mission_preview_test_request() -> CreateMissionRequest {
@@ -6383,6 +6510,348 @@ mod tests {
             run_id,
             reason: "test delivery marker".to_owned(),
         }
+    }
+
+    fn reconnect_test_scope(epoch: Uuid) -> ReadyCorpSchedule {
+        ReadyCorpSchedule {
+            corp_id: Uuid::from_u128(1),
+            runner_id: "runner".to_owned(),
+            connection_epoch: epoch,
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_reconnect_wakeup_waits_for_finalization_then_commands() {
+        let epoch = Uuid::new_v4();
+        let runners = Arc::new(DashMap::new());
+        let (connection, _received) = reconnect_test_connection(epoch);
+        runners.insert("runner".to_owned(), connection);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let (commands_started_tx, commands_started_rx) = oneshot::channel();
+        let (commands_done_tx, commands_done_rx) = oneshot::channel();
+        let (scheduled_tx, mut scheduled_rx) = oneshot::channel();
+        let worker_runners = runners.clone();
+        let worker = tokio::spawn(async move {
+            assert!(
+                enable_runner_after_reconciliation(&worker_runners, "runner", epoch, async {
+                    finish_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            );
+            schedule_after_runner_commands(
+                &worker_runners,
+                &reconnect_test_scope(epoch),
+                async {
+                    commands_started_tx.send(()).unwrap();
+                    commands_done_rx.await.unwrap();
+                    Ok(())
+                },
+                async {
+                    scheduled_tx.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+        });
+        assert!(!runner_epoch_is_ready(&runners, "runner", epoch));
+        assert!(matches!(
+            scheduled_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        finish_tx.send(()).unwrap();
+        commands_started_rx.await.unwrap();
+        assert!(runner_epoch_is_ready(&runners, "runner", epoch));
+        assert!(matches!(
+            scheduled_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        commands_done_tx.send(()).unwrap();
+        assert!(worker.await.unwrap());
+        scheduled_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue171_failed_or_superseded_finalization_cannot_wake_scheduling() {
+        for fail in [false, true] {
+            let epoch = Uuid::new_v4();
+            let runners = DashMap::new();
+            let (connection, _received) = reconnect_test_connection(epoch);
+            runners.insert("runner".to_owned(), connection);
+            let finalized = enable_runner_after_reconciliation(&runners, "runner", epoch, async {
+                if fail {
+                    return Err(anyhow::anyhow!("fixture finalization failed"));
+                }
+                let (replacement, _received) = reconnect_test_connection(Uuid::new_v4());
+                runners.insert("runner".to_owned(), replacement);
+                Ok(())
+            })
+            .await;
+            assert!(!matches!(finalized, Ok(true)));
+            let calls = std::cell::Cell::new(0);
+            assert!(
+                !schedule_after_runner_commands(
+                    &runners,
+                    &reconnect_test_scope(epoch),
+                    async {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                    async {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_failed_command_handling_cannot_wake_scheduling() {
+        let epoch = Uuid::new_v4();
+        let runners = DashMap::new();
+        let (connection, _received) = reconnect_test_connection(epoch);
+        runners.insert("runner".to_owned(), connection);
+        assert!(enable_runner_dispatch(&runners, "runner", epoch));
+        let scheduled = std::cell::Cell::new(false);
+        let result = schedule_after_runner_commands(
+            &runners,
+            &reconnect_test_scope(epoch),
+            async { Err(anyhow::anyhow!("fixture command handling failed")) },
+            async {
+                scheduled.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "fixture command handling failed"
+        );
+        assert!(!scheduled.get());
+    }
+
+    #[tokio::test]
+    async fn issue171_epoch_loss_during_commands_cannot_wake_scheduling() {
+        for change in ["disconnect", "replace", "unready", "move_corp"] {
+            let epoch = Uuid::new_v4();
+            let runners = DashMap::new();
+            let (connection, _received) = reconnect_test_connection(epoch);
+            runners.insert("runner".to_owned(), connection);
+            assert!(enable_runner_dispatch(&runners, "runner", epoch));
+            let scheduled = std::cell::Cell::new(false);
+            assert!(
+                !schedule_after_runner_commands(
+                    &runners,
+                    &reconnect_test_scope(epoch),
+                    async {
+                        match change {
+                            "disconnect" => {
+                                runners.remove("runner");
+                            }
+                            "replace" => {
+                                let newer_epoch = Uuid::new_v4();
+                                let (connection, _received) =
+                                    reconnect_test_connection(newer_epoch);
+                                runners.insert("runner".to_owned(), connection);
+                                assert!(enable_runner_dispatch(&runners, "runner", newer_epoch));
+                            }
+                            "move_corp" => {
+                                runners.get_mut("runner").unwrap().corp_id = Uuid::new_v4();
+                            }
+                            _ => runners.get_mut("runner").unwrap().dispatch_ready = false,
+                        }
+                        Ok(())
+                    },
+                    async {
+                        scheduled.set(true);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap()
+            );
+            assert!(!scheduled.get(), "{change} woke scheduling");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_unready_or_stale_epoch_never_polls_commands_or_scheduler() {
+        for ready in [false, true] {
+            let epoch = Uuid::new_v4();
+            let runners = DashMap::new();
+            let (connection, _received) = reconnect_test_connection(epoch);
+            runners.insert("runner".to_owned(), connection);
+            if ready {
+                assert!(enable_runner_dispatch(&runners, "runner", epoch));
+            }
+            let requested_epoch = if ready { Uuid::new_v4() } else { epoch };
+            let calls = std::cell::Cell::new(0);
+            assert!(
+                !schedule_after_runner_commands(
+                    &runners,
+                    &reconnect_test_scope(requested_epoch),
+                    async {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                    async {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_ticks_retry_failed_commands_or_scheduling_without_new_events() {
+        for failure_phase in ["commands", "scheduling"] {
+            let epoch = Uuid::new_v4();
+            let runners = DashMap::new();
+            let (connection, _received) = reconnect_test_connection(epoch);
+            runners.insert("runner".to_owned(), connection);
+            assert!(enable_runner_dispatch(&runners, "runner", epoch));
+            let commands = &std::cell::Cell::new(0);
+            let schedules = &std::cell::Cell::new(0);
+            let dispatched = &std::cell::Cell::new(0);
+            let runner_ref = &runners;
+            let mut cursor = None;
+            for tick in 1..=2 {
+                // No lifecycle events and no reconnect between these two ticks.
+                let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
+                    schedule_after_runner_commands(
+                        runner_ref,
+                        &scope,
+                        async {
+                            commands.set(commands.get() + 1);
+                            if failure_phase == "commands" && commands.get() == 1 {
+                                return Err(anyhow::anyhow!("transient command failure"));
+                            }
+                            Ok(())
+                        },
+                        async {
+                            schedules.set(schedules.get() + 1);
+                            if failure_phase == "scheduling" && schedules.get() == 1 {
+                                return Err(anyhow::anyhow!("transient scheduling failure"));
+                            }
+                            dispatched.set(dispatched.get() + 1);
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+                .await;
+                assert_eq!(failures.len(), usize::from(tick == 1));
+                assert_eq!(dispatched.get(), i32::from(tick == 2));
+                assert!(runner_epoch_is_ready(&runners, "runner", epoch));
+            }
+            assert_eq!(commands.get(), 2);
+            assert_eq!(
+                schedules.get(),
+                if failure_phase == "commands" { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_tick_skips_unready_and_rechecks_corp_epoch_snapshots() {
+        for change_corp in [false, true] {
+            let runners = DashMap::new();
+            for id in 1..=3 {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::from_u128(id));
+                connection.corp_id = Uuid::from_u128(id);
+                connection.dispatch_ready = id != 3;
+                runners.insert(format!("runner-{id}"), connection);
+            }
+            let visited = std::cell::RefCell::new(Vec::new());
+            let mut cursor = None;
+            let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                visited.borrow_mut().push(scope.corp_id);
+                // The next candidate was ready in the snapshot but no longer
+                // represents the same Corp/epoch when its turn arrives.
+                let mut next = runners.get_mut("runner-2").unwrap();
+                if change_corp {
+                    next.corp_id = Uuid::from_u128(4);
+                } else {
+                    next.connection_epoch = Uuid::new_v4();
+                }
+                std::future::ready(Ok(true))
+            })
+            .await;
+            assert!(failures.is_empty());
+            assert_eq!(*visited.borrow(), vec![Uuid::from_u128(1)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn issue171_tick_bounds_and_rotates_unique_current_ready_corps() {
+        let runners = DashMap::new();
+        for id in 1..=102 {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::from_u128(id));
+            connection.corp_id = Uuid::from_u128(id);
+            connection.dispatch_ready = id != 102;
+            runners.insert(format!("runner-{id}"), connection);
+        }
+        let (mut duplicate, _received) = reconnect_test_connection(Uuid::new_v4());
+        duplicate.dispatch_ready = true;
+        runners.insert("z-duplicate-corp-one".to_owned(), duplicate);
+        let mut cursor = None;
+        let mut all = HashSet::new();
+        for _ in 0..2 {
+            let batch = std::cell::RefCell::new(Vec::new());
+            assert!(
+                reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                    assert!(scope.is_current(&runners));
+                    batch.borrow_mut().push(scope.corp_id);
+                    std::future::ready(Ok(true))
+                })
+                .await
+                .is_empty()
+            );
+            let batch = batch.into_inner();
+            assert_eq!(batch.len(), 100);
+            assert_eq!(batch.iter().collect::<HashSet<_>>().len(), 100);
+            all.extend(batch);
+        }
+        assert_eq!(all.len(), 101);
+        assert!(all.contains(&Uuid::from_u128(101)));
+        assert!(!all.contains(&Uuid::from_u128(102)));
+    }
+
+    #[tokio::test]
+    async fn issue171_tick_continues_other_corps_after_a_scheduling_failure() {
+        let runners = DashMap::new();
+        for id in 1..=2 {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::from_u128(id));
+            connection.corp_id = Uuid::from_u128(id);
+            connection.dispatch_ready = true;
+            runners.insert(format!("runner-{id}"), connection);
+        }
+        let visited = std::cell::RefCell::new(Vec::new());
+        let failures = reconcile_ready_corps(&runners, &mut None, |scope| {
+            visited.borrow_mut().push(scope.corp_id);
+            std::future::ready(if scope.corp_id == Uuid::from_u128(1) {
+                Err(anyhow::anyhow!("transient scheduling failure"))
+            } else {
+                Ok(true)
+            })
+        })
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, Uuid::from_u128(1));
+        assert_eq!(
+            *visited.borrow(),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+        );
     }
 
     #[tokio::test]

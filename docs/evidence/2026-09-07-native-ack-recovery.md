@@ -4,7 +4,8 @@
 
 **Tracking:** #169, with separate concurrent/reload acceptance in #168
 
-**Status:** In progress; the first real run exposed an additional retry regression.
+**Status:** End-to-end single-runner acceptance passed after the two recorded
+native lifecycle corrections. Multi-runner fairness remains tracked in #172.
 
 **GitHub Actions:** Not used.
 
@@ -144,20 +145,161 @@ deadlock freedom. A separately scoped post-correction candidate uses
 enterprise-lab issue #3; the original issue #2 diagnostic is not reset or reused
 as a purported passing automatic-retry run.
 
-## Pending acceptance
+## Acceptance status
 
-- Fresh post-correction real run reaching both native automatic attempts.
-- Immediate mission-failed / scoped Factory-blocked reconciliation without a watcher.
-- Late original acknowledgment fencing.
-- Exact same-mission/task/agent/worktree/native Copilot-session resume and new usage.
-- Preserved failed history, original fingerprints, signed bytes, attempts and spend.
-- Dependency-gated integration and an authorized independent final review.
-- Separate completion of #168's fresh multi-provider load/reload regression.
+The second candidate passed native retry, failure reconciliation, late-ACK
+fencing, saved-session recovery, dependency-gated integration, independent final
+review and unchanged signed-byte checks. The fresh three-provider browser
+reload observation also passed. The first stalled diagnostic and the later
+#171 staffing obstruction remain recorded below rather than relabeled.
 
 Ordinary resume must not be described as verifier-only sealed-checkpoint recovery:
 it carries the persisted source/workspace/session policy, but does not supply the
 verifier-only expected-fingerprint/HEAD parameters. A resumed worktree fingerprint
 may change after real authorized edits; the original failed-run record must not.
+
+## Second candidate: native recovery and the #171 obstruction
+
+Fresh standalone executables were built from the clean, pushed
+`10068b60f130ce89259f87944d099015c15f3946` candidate. The runner/source tuple,
+Copilot SDK/runtime pair, immutable enterprise-lab source commit and native
+verifier policies were unchanged. A new owned database and source clone were
+used for enterprise-lab issue #3; the first diagnostic was not reset.
+
+| Identity | Value |
+| --- | --- |
+| Mission | `d561cc2b-8d5e-44c9-b9da-ae6060af78b3` |
+| Factory | `c860fb2b-9b67-46a5-ba46-3db0360c7fd2` |
+| First visual attempt | `38ff0719-0208-434e-bd5c-1baa1d16b1f9` |
+| Second, exhausted visual attempt | `58333c7a-2360-499b-b580-9697410b7d77` |
+| Native resumed run | `70660159-a8ea-4f62-99d8-c65c308f94e1` |
+| Preserved Copilot session | `83761e9f-32bb-4ce5-8353-ae6700e1e2c4` |
+| Pending integration task | `94d99940-a24d-484d-8d24-d809224222f6` |
+
+The first ordinary timeout now caused an actual second automatic assignment.
+The mission and Factory stayed running between attempts. After all six native
+ACK windows expired in each attempt, the mission failed and Factory immediately
+became blocked v8, with the exact bounded timeout detail. Twelve original ACK
+frames were withheld in total. No external Factory watcher, manual launch,
+counter change or synthetic lifecycle event was used.
+
+Both failed runs retained three passed check rows, their original workspace
+fingerprints, source identity and usage. Neither emitted accepted verification
+or completion. Four signed source objects were downloaded and byte-verified
+before recovery; integration had never started.
+
+The fixture released one original second-attempt ACK without retagging it.
+Mission/Factory/version and every recorded original run field remained unchanged.
+Fault injection was then disabled.
+
+Alice selected the exact exhausted run in the real mission UI and used the
+product's native **Resume agent session** action. No alternate recovery endpoint
+or custom prompt/approval mechanism was added. The new run preserved its task,
+agent, provider session, workspace-run ID, path, branch and source tuple.
+Factory changed to running v9 with no failure detail.
+
+The actual retained Copilot journal records `session.resume` at
+`2026-09-07T20:13:11.874Z`, followed by real tool/model activity and native
+shutdown. The resumed run completed with 77,586 new input tokens and 997 output
+tokens. Original run history/usage remained unchanged. Its new fingerprint
+`189b5db753ca5ab8fabb380fe5cafa0a0bbab4d78623da8db985b4476eddfda8`
+legitimately differs from the unchanged original
+`6f777fb7a7d2ea5f303724864add71a1e0d573f32bc13f5b8214a40da6ce02ec`.
+
+All three roots completed, but integration remained ready at attempt 0. Its
+original Gameplay worker `107b8cbd-b6a6-487c-b1d6-c970bc90813a` had been
+automatically retired when the mission failed. Native resume reactivated only
+the visual worker. This is #171, not a missing ACK or failed vendor-session
+recovery. No successful root was rerun and no runtime database row was manually
+changed to make the graph advance.
+
+### Fresh browser reload observation for #168
+
+Two CUA-operated ECorp clients were connected. The floor showed all three
+genuine Copilot workers Working. Native session-start/shutdown records establish
+20,216 ms of three-session overlap.
+
+Bob reloaded between `2026-09-07T20:06:18.823Z` and
+`2026-09-07T20:06:19.517Z`; the measured reload-to-ready interval was **692 ms**.
+His UI still showed the same mission, three live runs and Bob's development
+role. All three native sessions remained active throughout the reload; Alice's
+client stayed connected. Neither client had application console errors at
+inspection.
+
+Live in-flight snapshot request counts were not directly instrumented:
+Performance is unavailable in CUA's read-only DOM scope. The 99-test frontend
+run covers the coalescer's bounded burst/trailing behavior, cancellation and
+errors separately. The real observation proves functional concurrency and
+reload survival, not a fully isolated causal or throughput benchmark.
+
+The second fixture and its phase-specific proof receipts are retained at:
+
+```text
+C:\Users\shyamsridhar\.codex\dogfood\issue169-ack-acceptance-20260907-fixed
+```
+
+Its original service keys are retained only in a restricted Windows
+current-user encrypted envelope, permitting an explicit same-state server
+upgrade without invalidating original signed objects. A #171 fix must continue
+this same mission through the normal scheduler; that continuation subsequently
+passed as described next.
+
+### Same-state continuation and accepted outcome
+
+The reviewed #171 server was built from the exact recorded staffing/server
+source digests and substituted for only the owned QA server, PID 33328 → 14008.
+The same database, original encrypted signing/master keys, source checkout,
+mission, worktrees, runner identity and five existing run records were retained.
+No manual runtime database mutation, fresh mission, successful-root rerun or
+extra launch request was used.
+
+The QA-only ACK bridge treated the planned server downtime as a fatal transport
+failure. Its latched diagnostic state was preserved, and that bridge alone was
+restarted after the replacement server was healthy. Faults stayed disabled,
+the already-executed one-shot late-ACK command was removed from its control
+file, and the original trace remained append-only. This is not a claim of an
+uninterrupted test-bridge connection.
+
+The native reconciler reactivated exactly the original Gameplay worker, leaving
+the completed Quality worker retired. The existing runner then reconnected
+through native enrollment/reconciliation, and normal scheduling created only
+the pending integration run:
+
+```text
+Integration run: b6f9e47e-4b49-42d5-9467-4772381456b0
+Native session:  129fa7a8-bf81-4ba5-aaa9-7e54c28f2f18
+Gameplay worker: 107b8cbd-b6a6-487c-b1d6-c970bc90813a
+```
+
+Copilot produced the actual release-receipt module, tests and README under
+`qa/issue169/` in its isolated worktree. Its persisted runner evidence records
+**12 Node tests passed** and **all five verifier checks passed**. Independent
+read-only source review found no blocker for this bounded synthetic utility.
+It is not a production compliance certification or a complete enterprise app.
+
+Bob's real UI retained an older failed run selection. **Review next pending
+run** correctly switched to integration; **Accept evidence** applied only to
+that selected run. There was exactly one independent final review, zero routine
+action approvals, and no source-artifact-by-artifact approval workflow.
+
+The actual server snapshot and both UI projections then reported:
+
+- Mission completed, all **4/4 tasks completed**, **6 total runs**.
+- Factory **verified v11**, no remaining review decision.
+- Original two failed attempts still failed, with unchanged source, fingerprints,
+  usage, budgets and source bytes.
+- The resumed run still uses the exact failed run's native session/workspace
+  lineage, with its new usage retained.
+- **Six authenticated source downloads** matched their metadata and provenance
+  headers; all four original signed objects remained byte-identical.
+- The immutable source checkout remained clean at the same `e3dc3d6…` commit.
+- No pull-request publication, merge, auto-merge, deployment or game preview.
+
+`complete-proof.json`, phase-specific snapshots, native session records,
+actual test evidence, browser observations and service receipts are preserved
+under the fixed fixture root. The separate #172 source-review finding limits
+claims about fairness across multiple runners; this acceptance used one runner
+with multiple real Copilot sessions.
 
 ## Retained local evidence
 
