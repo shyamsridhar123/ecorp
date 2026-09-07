@@ -9,7 +9,8 @@ use crony_store::StoredArtifact;
 use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
 use object_store::{
-    ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectPath,
+    GetOptions, GetRange, GetResult, ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem,
+    path::Path as ObjectPath,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -381,6 +382,46 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    pub async fn read_verified_bounded(
+        &self,
+        artifact: &StoredArtifact,
+        max_bytes: usize,
+    ) -> Result<Bytes> {
+        if artifact.retention_until <= Utc::now() {
+            return Err(anyhow!("artifact retention period has expired"));
+        }
+        self.verify_signature(artifact)?;
+        let expected_bytes =
+            usize::try_from(artifact.bytes).context("artifact byte count is out of range")?;
+        if expected_bytes == 0 || expected_bytes > max_bytes {
+            return Err(anyhow!(
+                "artifact size {expected_bytes} is outside the bounded range 1..={max_bytes}"
+            ));
+        }
+        // Ask the native store for one extra byte so a longer object cannot be
+        // accepted as a valid prefix, even if its returned size is understated.
+        let range_end = u64::try_from(expected_bytes)?
+            .checked_add(1)
+            .context("artifact read range is out of bounds")?;
+        let result = self
+            .store
+            .get_opts(
+                &ObjectPath::from(artifact.object_key.clone()),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..range_end)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("read bounded artifact object")?;
+        let bytes = collect_bounded_artifact_bytes(result, expected_bytes).await?;
+        if artifact.retention_until <= Utc::now() {
+            return Err(anyhow!("artifact retention period has expired"));
+        }
+        verify_artifact_bytes(artifact, &bytes, "stored artifact")?;
+        Ok(bytes)
+    }
+
     fn sign(&self, artifact: &StoredArtifact) -> Result<String> {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.signing_key)
             .map_err(|_| anyhow!("initialize artifact provenance signer"))?;
@@ -397,6 +438,37 @@ impl ArtifactStore {
         mac.verify_slice(&signature)
             .map_err(|_| anyhow!("artifact provenance signature is invalid"))
     }
+}
+
+async fn collect_bounded_artifact_bytes(result: GetResult, expected_bytes: usize) -> Result<Bytes> {
+    let expected_size = u64::try_from(expected_bytes)?;
+    if result.meta.size != expected_size || result.range != (0..expected_size) {
+        return Err(anyhow!(PermanentArtifactError::Integrity(
+            "stored artifact".to_owned()
+        )));
+    }
+    let mut stream = result.into_stream();
+    let mut bytes = Vec::with_capacity(expected_bytes);
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .context("read bounded artifact bytes")?
+    {
+        // Do not trust response metadata or grow the buffer beyond the signed
+        // length. Keep polling at the exact limit to reject trailing bytes.
+        if chunk.len() > expected_bytes - bytes.len() {
+            return Err(anyhow!(PermanentArtifactError::Integrity(
+                "stored artifact".to_owned()
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != expected_bytes {
+        return Err(anyhow!(PermanentArtifactError::Integrity(
+            "stored artifact".to_owned()
+        )));
+    }
+    Ok(bytes.into())
 }
 
 fn verify_artifact_bytes(artifact: &StoredArtifact, bytes: &[u8], label: &str) -> Result<()> {
@@ -623,7 +695,11 @@ fn valid_artifact_file_name(file_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use futures_util::{StreamExt, stream};
+    use object_store::{GetResultPayload, ObjectMeta, memory::InMemory};
     use serde_json::json;
 
     fn identity() -> ArtifactIdentity<'static> {
@@ -635,6 +711,209 @@ mod tests {
             agent_id: Uuid::new_v4(),
             runner_id: "runner-test",
         }
+    }
+
+    fn memory_store() -> ArtifactStore {
+        ArtifactStore {
+            store: Arc::new(InMemory::new()),
+            signing_key: Arc::new(vec![0x4c; 32]),
+            max_bytes: 1_024,
+        }
+    }
+
+    async fn small_signed_artifact(store: &ArtifactStore) -> StoredArtifact {
+        let content = br#"{"verified":true}"#;
+        store
+            .ingest(
+                identity(),
+                &json!({
+                    "sha256": hex::encode(Sha256::digest(content)),
+                    "bytes": content.len(),
+                    "media_type": "application/json",
+                    "content_base64": BASE64.encode(content),
+                }),
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .expect("ingest small signed artifact")
+    }
+
+    fn streamed_result(
+        size: u64,
+        range: std::ops::Range<u64>,
+        chunk_sizes: &'static [usize],
+        polled: Arc<AtomicUsize>,
+    ) -> GetResult {
+        let chunks = stream::iter(chunk_sizes.iter().copied())
+            .map(move |size| {
+                polled.fetch_add(1, Ordering::SeqCst);
+                Ok(Bytes::from(vec![b'x'; size]))
+            })
+            .boxed();
+        GetResult {
+            payload: GetResultPayload::Stream(chunks),
+            meta: ObjectMeta {
+                location: ObjectPath::from("bounded-artifact-test"),
+                last_modified: Utc::now(),
+                size,
+                e_tag: None,
+                version: None,
+            },
+            range,
+            attributes: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_read_round_trips_small_artifact_without_limiting_downloads() {
+        let store = memory_store();
+        let artifact = small_signed_artifact(&store).await;
+        let content = Bytes::from_static(br#"{"verified":true}"#);
+        assert_eq!(
+            store
+                .read_verified_bounded(&artifact, content.len())
+                .await
+                .expect("read artifact at the exact transfer limit"),
+            content
+        );
+        assert!(
+            store
+                .read_verified_bounded(&artifact, content.len() - 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .read_verified(&artifact)
+                .await
+                .expect("ordinary download is not constrained by a transfer limit"),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_read_rejects_oversized_object_with_small_signed_metadata() {
+        let store = memory_store();
+        let artifact = small_signed_artifact(&store).await;
+        let limit = crony_protocol::MAX_VERIFICATION_ARTIFACT_BYTES;
+        store
+            .store
+            .put(
+                &ObjectPath::from(artifact.object_key.clone()),
+                Bytes::from(vec![b'x'; limit + 1]).into(),
+            )
+            .await
+            .expect("replace stored object without changing signed metadata");
+        store
+            .verify_signature(&artifact)
+            .expect("small metadata still has its valid signature");
+        let error = store
+            .read_verified_bounded(&artifact, limit)
+            .await
+            .expect_err("oversized backing object must not be buffered");
+        assert!(artifact_error_is_permanent(&error));
+    }
+
+    #[tokio::test]
+    async fn bounded_verified_read_preserves_signature_retention_digest_and_media_checks() {
+        let store = memory_store();
+        let artifact = small_signed_artifact(&store).await;
+        let mut tampered = artifact.clone();
+        tampered.bytes += 1;
+        assert!(
+            store
+                .read_verified_bounded(&tampered, 1_024)
+                .await
+                .expect_err("reject invalid provenance")
+                .to_string()
+                .contains("signature")
+        );
+
+        let mut expired = artifact.clone();
+        expired.retention_until = Utc::now() - chrono::Duration::seconds(1);
+        expired.provenance_signature = store.sign(&expired).expect("sign expired metadata");
+        assert!(
+            store
+                .read_verified_bounded(&expired, 1_024)
+                .await
+                .expect_err("reject expired artifact")
+                .to_string()
+                .contains("retention")
+        );
+
+        let mut wrong_media = artifact.clone();
+        wrong_media.media_type = "image/png".to_owned();
+        wrong_media.provenance_signature = store.sign(&wrong_media).expect("sign media metadata");
+        let error = store
+            .read_verified_bounded(&wrong_media, 1_024)
+            .await
+            .expect_err("verify media after bounded collection");
+        assert!(matches!(
+            error.downcast_ref::<PermanentArtifactError>(),
+            Some(PermanentArtifactError::Media(_, _))
+        ));
+
+        store
+            .store
+            .put(
+                &ObjectPath::from(artifact.object_key.clone()),
+                Bytes::from_static(br#"{"verified":null}"#).into(),
+            )
+            .await
+            .expect("replace content with equal-length bytes");
+        let error = store
+            .read_verified_bounded(&artifact, 1_024)
+            .await
+            .expect_err("verify digest after bounded collection");
+        assert!(artifact_error_is_permanent(&error));
+    }
+
+    #[tokio::test]
+    async fn bounded_artifact_stream_rejects_size_or_range_mismatch_before_polling() {
+        for (size, range) in [(u64::MAX, 0..4), (4, 0..u64::MAX), (4, 1..4)] {
+            let polled = Arc::new(AtomicUsize::new(0));
+            let result = streamed_result(size, range, &[4], polled.clone());
+            let error = collect_bounded_artifact_bytes(result, 4)
+                .await
+                .expect_err("reject unbounded metadata without consuming the body");
+            assert!(artifact_error_is_permanent(&error));
+            assert_eq!(polled.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_artifact_stream_rejects_understated_body_without_draining() {
+        for (chunks, expected_polls) in [
+            (&[5, 1_024][..], 1),
+            (&[2, 2, 1, 1_024][..], 3),
+            (&[4, 1_024, 1_024][..], 2),
+        ] {
+            let polled = Arc::new(AtomicUsize::new(0));
+            // Both response size and range lie; only counting the actual chunks
+            // catches the excess, including one byte after an exact-size prefix.
+            let result = streamed_result(4, 0..4, chunks, polled.clone());
+            let error = collect_bounded_artifact_bytes(result, 4)
+                .await
+                .expect_err("reject overflow before growing the collection buffer");
+            assert!(artifact_error_is_permanent(&error));
+            assert_eq!(polled.load(Ordering::SeqCst), expected_polls);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_artifact_stream_requires_exact_length_and_eof() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let result = streamed_result(4, 0..4, &[2, 0, 2], polled.clone());
+        assert_eq!(
+            collect_bounded_artifact_bytes(result, 4)
+                .await
+                .expect("accept complete bounded stream"),
+            Bytes::from_static(b"xxxx")
+        );
+        assert_eq!(polled.load(Ordering::SeqCst), 3);
+
+        let result = streamed_result(4, 0..4, &[3], polled);
+        assert!(collect_bounded_artifact_bytes(result, 4).await.is_err());
     }
 
     #[tokio::test]
@@ -673,6 +952,13 @@ mod tests {
         assert_eq!(artifact.media_type, "application/json");
         assert_eq!(
             store.read_verified(&artifact).await.expect("read artifact"),
+            Bytes::from_static(content)
+        );
+        assert_eq!(
+            store
+                .read_verified_bounded(&artifact, content.len())
+                .await
+                .expect("stream local artifact at its exact bound"),
             Bytes::from_static(content)
         );
 

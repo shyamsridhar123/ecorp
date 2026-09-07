@@ -440,7 +440,11 @@ async fn ensure_resumable_contract_revision_source_tx(
                 WHERE parent.corp_id = source.corp_id
                   AND parent.task_id = source.task_id
                   AND parent.agent_id = source.agent_id
+                  AND parent.runner_id = source.runner_id
                   AND parent.workspace_run_id = source.workspace_run_id
+                  AND parent.source_repository IS NOT DISTINCT FROM source.source_repository
+                  AND parent.source_base_ref IS NOT DISTINCT FROM source.source_base_ref
+                  AND parent.source_base_commit IS NOT DISTINCT FROM source.source_base_commit
                   AND NOT parent.id = ANY(lineage.visited)
                   AND lineage.depth < 64
             )
@@ -484,21 +488,11 @@ async fn ensure_resumable_contract_revision_source_tx(
             "stop-stage provider work cannot be revised for resume"
         ));
     }
+    source_workspace_checkpoint_tx(tx, corp_id, source_run_id)
+        .await?
+        .ensure_preserved()?;
     let workspace_run_id: Uuid = source.get("workspace_run_id");
-    let lineage = sqlx::query(
-        r#"
-        SELECT id, breaker_stage, status, workspace_path,
-               workspace_disposition, workspace_detail
-        FROM runs
-        WHERE corp_id = $1 AND workspace_run_id = $2
-        ORDER BY created_at DESC, id DESC
-        FOR UPDATE
-        "#,
-    )
-    .bind(corp_id)
-    .bind(workspace_run_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let lineage = workspace_lineage_tx(tx, corp_id, workspace_run_id).await?;
     if lineage.iter().any(|run| {
         run.get::<String, _>("breaker_stage") == "stop"
             || run
@@ -510,19 +504,7 @@ async fn ensure_resumable_contract_revision_source_tx(
             "provider workspace lineage reached stop or quarantine and cannot be revised for resume"
         ));
     }
-    let latest = lineage
-        .iter()
-        .find(|run| {
-            !lineage_run_is_pre_dispatch_failure(
-                run.get::<String, _>("status").as_str(),
-                run.get::<Option<String>, _>("workspace_path").as_deref(),
-                run.get::<Option<String>, _>("workspace_disposition")
-                    .as_deref(),
-                run.get::<Option<String>, _>("workspace_detail").as_deref(),
-            )
-        })
-        .map(|run| run.get::<Uuid, _>("id"))
-        .context("provider workspace lineage is empty")?;
+    let latest = latest_workspace_source_id(&lineage)?;
     if latest != source_run_id {
         return Err(anyhow!(
             "contract revision source run is not the latest resumable lineage checkpoint"

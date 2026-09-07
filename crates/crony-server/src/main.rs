@@ -1735,7 +1735,10 @@ async fn hydrate_verification_artifact(
             "verifier artifact reference does not match its authorized stored artifact"
         ));
     }
-    let bytes = state.artifacts.read_verified(&artifact).await?;
+    let bytes = state
+        .artifacts
+        .read_verified_bounded(&artifact, crony_protocol::MAX_VERIFICATION_ARTIFACT_BYTES)
+        .await?;
     // Object storage can be slow. Recheck the exact command, actor, room and
     // source-artifact binding before returning bytes to the runner connection.
     let current = state

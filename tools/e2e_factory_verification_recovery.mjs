@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
@@ -353,6 +353,307 @@ async function restartTestServer() {
   return true
 }
 
+async function openRecoveryEventClient(demo, afterSeq) {
+  const events = []
+  let failure = null
+  const socket = new WebSocket(
+    `${server.replace(/^http/u, 'ws')}/ws/corps/${demo.corp_id}?actor_id=${demo.bob_actor_id}&after_seq=${afterSeq}`,
+  )
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.close()
+      reject(new Error('Recovery event replay did not become ready'))
+    }, 15_000)
+    socket.onmessage = ({ data }) => {
+      const message = JSON.parse(data)
+      if (message.type === 'event') events.push(message.event)
+      if (message.type === 'ready') {
+        clearTimeout(timer)
+        resolve()
+      }
+    }
+    socket.onerror = () => {
+      failure = new Error('Recovery event socket failed')
+      clearTimeout(timer)
+      reject(failure)
+    }
+    socket.onclose = () => {
+      failure ??= new Error('Recovery event socket closed')
+      clearTimeout(timer)
+      reject(failure)
+    }
+  })
+  try {
+    await ready
+  } catch (error) {
+    socket.close()
+    throw error
+  }
+  return { socket, events, failure: () => failure }
+}
+
+function assertIncreasingEvents(events) {
+  for (let index = 1; index < events.length; index += 1) {
+    assert.ok(events[index - 1].seq < events[index].seq, 'Live/replay sequences must increase')
+  }
+  assert.equal(new Set(events.map((event) => event.id)).size, events.length)
+}
+
+async function decideWithOrderedEvents(demo, workItemId, runId, decision) {
+  const before = await snapshot(demo)
+  const cursor = Math.max(0, ...before.snapshot.events.map((event) => event.seq))
+  const live = await openRecoveryEventClient(demo, cursor)
+  let replay
+  const decisionType = decision.approved ? 'verification.approved' : 'verification.rejected'
+  const factoryType = decision.approved ? 'factory.verified' : 'factory.verification_failed'
+  const relevant = (event) =>
+    (event.type === decisionType && event.aggregate_id === runId) ||
+    (event.type === factoryType && event.aggregate_id === workItemId && event.payload.run_id === runId)
+  try {
+    const response = await post(
+      `/api/corps/${demo.corp_id}/runs/${runId}/verification-decision`,
+      decision,
+    )
+    const deadline = Date.now() + 15_000
+    while (live.events.filter(relevant).length < 2) {
+      if (live.failure()) throw live.failure()
+      assert.ok(Date.now() < deadline, `Missing live ${decisionType}/${factoryType} pair`)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    assertIncreasingEvents(live.events)
+    replay = await openRecoveryEventClient(demo, cursor)
+    assertIncreasingEvents(replay.events)
+    const livePair = live.events.filter(relevant).map(({ id, seq, type }) => ({ id, seq, type }))
+    const replayPair = replay.events.filter(relevant).map(({ id, seq, type }) => ({ id, seq, type }))
+    assert.deepEqual(replayPair, livePair)
+    assert.equal(livePair.length, 2)
+    return { response, live: livePair, replay: replayPair }
+  } finally {
+    replay?.socket.close()
+    live.socket.close()
+  }
+}
+
+async function assertMemberCannotResumeFactoryFailure(demo, sourceRun) {
+  assert.ok(sourceRun.provider_session_id, 'Exercise a real resumable fixture session, not a missing-session error')
+  const before = await snapshot(demo)
+  assert.equal(before.snapshot.actors.find((actor) => actor.id === demo.bob_actor_id)?.role, 'member')
+  const rejected = await request(`/api/corps/${demo.corp_id}/runs/${sourceRun.id}/resume`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requested_by: demo.bob_actor_id,
+      prompt: 'Attempt to bypass governed verification recovery through native resume.',
+    }),
+  })
+  assert.equal(rejected.response.status, 409)
+  assert.match(rejected.body.error, /factory verification-failed lineage requires governed verification recovery/u)
+  const after = await snapshot(demo)
+  assert.deepEqual(
+    after.snapshot.runs.map((run) => run.id).sort(),
+    before.snapshot.runs.map((run) => run.id).sort(),
+  )
+  const previousTask = before.snapshot.tasks.find((task) => task.id === sourceRun.task_id)
+  const currentTask = after.snapshot.tasks.find((task) => task.id === sourceRun.task_id)
+  assert.equal(currentTask.status, previousTask.status)
+  assert.equal(currentTask.attempt_count, previousTask.attempt_count)
+  return { status: rejected.response.status, new_runs: 0 }
+}
+
+const recoveryManualGate = {
+  type: 'independent_review',
+  roles: ['owner', 'admin', 'manager', 'member'],
+  exclude_requester: true,
+}
+
+async function heldRecoveryFixture(demo, number, strategy, verificationPolicy, maxAttempts = 2, adapter = 'fake-process') {
+  const issue = {
+    id: `I_FACTORY_STORE_RECOVERY_${number}`,
+    number,
+    title: `Bounded store recovery regression ${number}`,
+    body: 'Verify the same issue, task, workspace and policy through governed recovery.',
+    url: `https://github.com/shyamsridhar123/ecorp/issues/${number}`,
+    updatedAt: '2026-09-04T02:00:00Z',
+  }
+  const itemId = `PVTI_FACTORY_STORE_RECOVERY_${number}`
+  const policy = {
+    schema_version: 1,
+    source_of_truth: 'github_project',
+    project_owner: 'acme',
+    project_number: 7,
+    project_status: 'Todo',
+    required_label: 'factory:ready',
+    dependencies: [],
+    repository_allowlist: ['shyamsridhar123/ecorp'],
+    source_base_ref: 'HEAD',
+    source_base_commit: sourceBaseCommit,
+    source_commit_upgrade_required: false,
+    adapter_allowlist: [adapter],
+    strategy_allowlist: [strategy],
+    model: null,
+    reasoning_effort: null,
+    write_scope: ['**'],
+    allowed_tools: ['filesystem', 'shell'],
+    prohibited_actions: [
+      'modify files outside the assigned worktree',
+      'use undeclared long-lived credentials',
+      'merge or deploy without a separate current authorization',
+    ],
+    secret_ids: [],
+    verification_required: true,
+    budget_tokens: 100_000,
+    budget_cost_microusd: 1_000_000,
+    auto_merge: false,
+  }
+  const materialization = {
+    actor_id: demo.alice_actor_id,
+    title: issue.title,
+    description: issue.body,
+    preferred_adapter: adapter,
+    strategy,
+    budget_tokens: policy.budget_tokens,
+    budget_cost_microusd: policy.budget_cost_microusd,
+    deliverable: { form: 'commit_branch', commit_after_verification: true, paths: [] },
+    contract: {
+      objective: issue.body,
+      expected_output: 'A verified bounded fixture in the same source lineage.',
+      acceptance_tests: ['All persisted verifier checks pass.'],
+      allowed_tools: policy.allowed_tools,
+      prohibited_actions: policy.prohibited_actions,
+      references: [issue.url],
+      write_scope: policy.write_scope,
+    },
+    verification_policy: verificationPolicy,
+  }
+  const preflight = await post(`/api/corps/${demo.corp_id}/factory/preflight`, {
+    ...materialization,
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    policy,
+  })
+  assert.equal(preflight.valid, true)
+  const claim = await post(`/api/corps/${demo.corp_id}/factory/work-items/claim`, {
+    actor_id: demo.alice_actor_id,
+    source_project_owner: policy.project_owner,
+    source_project_number: policy.project_number,
+    source_project_item_id: itemId,
+    source_repository_owner: 'shyamsridhar123',
+    source_repository_name: 'ecorp',
+    source_issue_number: number,
+    source_issue_node_id: issue.id,
+    source_issue_url: issue.url,
+    source_title: issue.title,
+    source_revision: issue.updatedAt,
+    idempotency_key: `store-recovery-${number}-claim`,
+    lease_seconds: 300,
+    policy,
+  })
+  assert.equal(claim.replayed, false, 'Use fresh QA; never adopt an existing completed fixture')
+  const materialized = await post(
+    `/api/corps/${demo.corp_id}/factory/work-items/${claim.work_item.id}/materialize`,
+    {
+      ...materialization,
+      claim_token: claim.claim_token,
+      expected_version: claim.work_item.version,
+      idempotency_key: `store-recovery-${number}-materialize`,
+    },
+  )
+  const missionId = materialized.mission_id
+  const held = await snapshot(demo)
+  const tasks = held.snapshot.tasks.filter((task) => task.mission_id === missionId)
+  assert.ok(tasks.length > 0)
+  assert.ok(tasks.every((task) => task.required_adapter === adapter))
+  assert.equal(held.snapshot.runs.filter((run) => tasks.some((task) => task.id === run.task_id)).length, 0)
+  // Reuse the native held-graph contract revision API to give each task the same
+  // explicit policy before execution, rather than manufacturing terminal states.
+  for (const task of tasks) {
+    await post(`/api/corps/${demo.corp_id}/missions/${missionId}/contract-revisions`, {
+      actor_id: demo.alice_actor_id,
+      task_id: task.id,
+      expected_contract_version: task.contract_version,
+      next_action: 'redispatch',
+      source_run_id: null,
+      reason: 'Configure the fresh held recovery regression before its first run.',
+      idempotency_key: randomUUID(),
+      description: issue.body,
+      contract: task.contract,
+      verification_policy: verificationPolicy,
+    })
+  }
+  if (maxAttempts !== 2) {
+    assert.ok(maxAttempts > 2 && maxAttempts <= 4)
+    // Fixture configuration only: never reset an attempt or alter a live task.
+    await psql(`
+      UPDATE tasks SET max_attempts = ${maxAttempts}
+      WHERE mission_id = ${sqlLiteral(missionId)}::uuid AND attempt_count = 0
+        AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.task_id = tasks.id);
+    `)
+  }
+  return {
+    demo, issue, itemId, missionId, tasks,
+    workItemId: claim.work_item.id,
+    claimToken: claim.claim_token,
+  }
+}
+
+async function authorizeFixtureRecovery(fixture, reason, { mode = 'verifier_only', contractRevisionId = null } = {}) {
+  const { demo, workItemId } = fixture
+  const context = await requestOk(
+    `/api/corps/${demo.corp_id}/factory/work-items/${workItemId}/verification-recoveries?actor_id=${demo.alice_actor_id}`,
+  )
+  const renewed = await post(`/api/corps/${demo.corp_id}/factory/work-items/${workItemId}/renew`, {
+    actor_id: demo.alice_actor_id,
+    claim_token: fixture.claimToken,
+    expected_version: context.work_item.version,
+    idempotency_key: randomUUID(),
+    lease_seconds: 300,
+  })
+  const body = {
+    actor_id: demo.alice_actor_id,
+    claim_token: fixture.claimToken,
+    expected_factory_version: renewed.work_item.version,
+    idempotency_key: randomUUID(),
+    source_run_id: context.source_run_id,
+    mode,
+    reason,
+    observed_source_revision: fixture.issue.updatedAt,
+    reviewed_source_snapshot: {
+      source_revision: fixture.issue.updatedAt,
+      issue_number: fixture.issue.number,
+      issue_node_id: fixture.issue.id,
+      issue_url: fixture.issue.url,
+      title: fixture.issue.title,
+      body: fixture.issue.body,
+      repository: 'shyamsridhar123/ecorp',
+      project_owner: 'acme',
+      project_number: 7,
+      project_item_id: fixture.itemId,
+    },
+    contract_revision_id: contractRevisionId,
+    expected_workspace_fingerprint: context.workspace_fingerprint,
+    expected_head_commit: context.expected_head_commit,
+  }
+  const route = `/api/corps/${demo.corp_id}/factory/work-items/${workItemId}/verification-recoveries`
+  return { result: await post(route, body), body, route, context }
+}
+
+async function waitForReviewRun(demo, taskId, runId) {
+  return waitFor(demo, (state) => state.runs.find((run) =>
+    run.task_id === taskId && (!runId || run.id === runId) &&
+    run.status === 'waiting_for_approval' && run.workspace_disposition === 'preserved' &&
+    run.workspace_fingerprint,
+  ), 'exact review run with completed workspace cleanup')
+}
+
+function decideFixtureRun(demo, runId, approved, note) {
+  return post(`/api/corps/${demo.corp_id}/runs/${runId}/verification-decision`, {
+    actor_id: demo.bob_actor_id,
+    approved,
+    note,
+    decision_key: randomUUID(),
+  })
+}
+
 async function verifierOnlyRecovery() {
   const demo = await post('/api/demo/bootstrap', {})
   const issue = {
@@ -441,10 +742,13 @@ async function verifierOnlyRecovery() {
     note: 'Independent reviewer requests a provider-free recheck.',
     decision_key: rejectionKey,
   }
-  const rejected = await post(
-    `/api/corps/${demo.corp_id}/runs/${sourceRun.id}/verification-decision`,
+  const rejectionEvents = await decideWithOrderedEvents(
+    demo,
+    first.factory_work_item_id,
+    sourceRun.id,
     rejection,
   )
+  const rejected = rejectionEvents.response
   assert.equal(rejected.replayed, false)
   const decisionReplay = await post(
     `/api/corps/${demo.corp_id}/runs/${sourceRun.id}/verification-decision`,
@@ -630,8 +934,10 @@ async function verifierOnlyRecovery() {
       (deliverable) => deliverable.run_id === recoveryRun.id,
     )
   assert.equal(recoveryDeliverable?.head_commit, sourceDeliverable.head_commit)
-  await post(
-    `/api/corps/${demo.corp_id}/runs/${recoveryRun.id}/verification-decision`,
+  const approvalEvents = await decideWithOrderedEvents(
+    demo,
+    first.factory_work_item_id,
+    recoveryRun.id,
     {
       actor_id: demo.bob_actor_id,
       approved: true,
@@ -664,6 +970,8 @@ async function verifierOnlyRecovery() {
     source_run_id: sourceRun.id,
     recovery_run_id: recoveryRun.id,
     decision_replay: decisionReplay.replayed,
+    decision_event_order: { rejection: rejectionEvents.live, approval: approvalEvents.live },
+    decision_live_replay_exact: true,
     controller_replay: replay.launch.recovered,
     same_workspace_lineage:
       recoveryRun.workspace_run_id === sourceRun.workspace_run_id,
@@ -759,6 +1067,11 @@ async function sourceCorrectionRecovery() {
   )
   const sourceRun = failed.value.run
   assert.ok(sourceRun.provider_session_id)
+  const memberResumeRejection = await assertMemberCannotResumeFactoryFailure(demo, sourceRun)
+  await writeFile(
+    path.join(output, 'member-generic-resume-rejection.json'),
+    `${JSON.stringify({ source_run_id: sourceRun.id, ...memberResumeRejection }, null, 2)}\n`,
+  )
   const sourceAgent = failed.state.snapshot.agents.find(
     (agent) => agent.id === sourceRun.agent_id,
   )
@@ -938,10 +1251,11 @@ async function sourceCorrectionRecovery() {
     't',
     'durable recovery commands must not contain hydrated artifact bytes',
   )
-  return finishSourceCorrectionRecovery({
+  const result = await finishSourceCorrectionRecovery({
     demo, issue, statePath, policyPath, weakenedPolicyPath, github, first, failed,
     sourceRun, verifierOnlyRun, missionOwned,
   })
+  return { ...result, member_generic_resume_rejection: memberResumeRejection }
 }
 
 async function finishSourceCorrectionRecovery({
@@ -1716,8 +2030,434 @@ async function exhaustedRecoveryIsRejected() {
   }
 }
 
+async function upstreamThenLaterTaskRecovery() {
+  const demo = await post('/api/demo/bootstrap', {})
+  const before = await snapshot(demo)
+  assert.ok(!before.snapshot.factory_work_items.some((item) =>
+    item.source_project_item_id === 'PVTI_FACTORY_STORE_RECOVERY_9400',
+  ), 'Graph recovery requires a fresh fixture')
+  // The existing planner needs two workers. Seed only new deterministic identities;
+  // keep every existing adapter/agent unchanged and use the native graph planner.
+  for (let index = 0; index < 2; index += 1) {
+    const actorId = randomUUID()
+    const agentId = randomUUID()
+    await psql(`
+      INSERT INTO actors
+      SELECT (jsonb_populate_record(NULL::actors, to_jsonb(actor) ||
+        jsonb_build_object('id', ${sqlLiteral(actorId)},
+                           'name', ${sqlLiteral(`Store recovery fixture actor ${index}`)},
+                           'created_at', now()))).*
+      FROM actors actor JOIN agents agent ON agent.actor_id = actor.id
+      WHERE agent.id = ${sqlLiteral(demo.worker_agent_id)}::uuid;
+      INSERT INTO agents
+      SELECT (jsonb_populate_record(NULL::agents, to_jsonb(agent) ||
+        jsonb_build_object('id', ${sqlLiteral(agentId)},
+                           'actor_id', ${sqlLiteral(actorId)},
+                           'name', ${sqlLiteral(`000 Store recovery specialist ${index}`)},
+                           'adapter', 'fake-process', 'status', 'idle',
+                           'current_run_id', NULL, 'station', NULL,
+                           'mission_id', NULL, 'retired_at', NULL,
+                           'created_at', now()))).*
+      FROM agents agent WHERE id = ${sqlLiteral(demo.worker_agent_id)}::uuid;
+    `)
+  }
+  const fixture = await heldRecoveryFixture(demo, 9400, 'parallel-specialists', {
+    checks: [{ type: 'artifact', min_bytes: 1 }],
+    manual_gate: recoveryManualGate,
+  })
+  assert.equal(fixture.tasks.length, 3)
+  const upstream = fixture.tasks.find((task) => task.plan_key === 'specialist-a')
+  const peer = fixture.tasks.find((task) => task.plan_key === 'specialist-b')
+  const later = fixture.tasks.find((task) => task.plan_key === 'synthesis')
+  assert.ok(upstream && peer && later)
+  await post(`/api/corps/${demo.corp_id}/missions/${fixture.missionId}/launch`, {
+    requested_by: demo.alice_actor_id,
+  })
+  const firstUpstream = await waitForReviewRun(demo, upstream.id)
+  const firstPeer = await waitForReviewRun(demo, peer.id)
+  await decideFixtureRun(demo, firstPeer.value.id, true, 'Accept the independent peer task.')
+  await decideFixtureRun(demo, firstUpstream.value.id, false, 'Recheck the upstream task in place.')
+  const recoveredUpstream = await authorizeFixtureRecovery(fixture, 'Authorize the same upstream checkpoint.')
+  assert.equal(recoveredUpstream.context.task_id, upstream.id)
+  const upstreamReview = await waitForReviewRun(demo, upstream.id, recoveredUpstream.result.run_id)
+  await decideFixtureRun(demo, upstreamReview.value.id, true, 'Accept the recovered upstream task.')
+  const upstreamSettled = await waitFor(demo, (state) => {
+    const recovery = state.factory_verification_recoveries.find((entry) => entry.id === recoveredUpstream.result.recovery.id)
+    const task = state.tasks.find((entry) => entry.id === later.id)
+    const mission = state.missions.find((entry) => entry.id === fixture.missionId)
+    return recovery?.status === 'completed' && task?.status !== 'completed' &&
+      mission?.status === 'running' ? recovery : null
+  }, 'upstream recovery settled before its mission completes')
+  assert.equal(upstreamSettled.state.snapshot.factory_verification_recoveries.filter((entry) =>
+    entry.factory_work_item_id === fixture.workItemId && ['authorized', 'running'].includes(entry.status),
+  ).length, 0)
+  const firstLater = await waitForReviewRun(demo, later.id)
+  await decideFixtureRun(demo, firstLater.value.id, false, 'Recheck the later task without replacing the graph.')
+  const recoveredLater = await authorizeFixtureRecovery(fixture, 'Authorize the same later-task checkpoint.')
+  assert.equal(recoveredLater.context.task_id, later.id)
+  assert.notEqual(recoveredLater.result.recovery.id, recoveredUpstream.result.recovery.id)
+  const laterReview = await waitForReviewRun(demo, later.id, recoveredLater.result.run_id)
+  await decideFixtureRun(demo, laterReview.value.id, true, 'Accept the recovered final task.')
+  const finished = await waitFor(demo, (state) => {
+    const item = state.factory_work_items.find((entry) => entry.id === fixture.workItemId)
+    const recoveries = state.factory_verification_recoveries.filter((entry) =>
+      entry.factory_work_item_id === fixture.workItemId,
+    )
+    return item?.state === 'verified' && recoveries.length === 2 &&
+      recoveries.every((entry) => entry.status === 'completed') ? recoveries : null
+  }, 'both task recoveries completed in the original graph')
+  const runs = finished.state.snapshot.runs.filter((run) => fixture.tasks.some((task) => task.id === run.task_id))
+  assert.equal(runs.length, 5)
+  assert.equal(finished.state.snapshot.tasks.filter((task) => task.mission_id === fixture.missionId).length, 3)
+  return {
+    factory_work_item_id: fixture.workItemId,
+    mission_id: fixture.missionId,
+    upstream_recovery_id: recoveredUpstream.result.recovery.id,
+    later_recovery_id: recoveredLater.result.recovery.id,
+    upstream_settled_before_mission: true,
+    later_recovery_admitted: true,
+    original_graph_task_count: 3,
+    run_count: runs.length,
+  }
+}
+
+async function gateFreeRecoverySettles() {
+  const demo = await post('/api/demo/bootstrap', {})
+  const allowFile = path.join(output, 'gate-free-verifier-allowed.flag')
+  assert.ok(!existsSync(allowFile), 'Gate-free verifier input must be fresh')
+  const fixture = await heldRecoveryFixture(demo, 9450, 'single', {
+    checks: [
+      { type: 'artifact', min_bytes: 1 },
+      {
+        type: 'command',
+        program: 'node',
+        args: ['-e', `process.exit(require('node:fs').existsSync(${JSON.stringify(allowFile)})?0:1)`],
+        timeout_ms: 30_000,
+      },
+    ],
+    manual_gate: null,
+  })
+  await post(`/api/corps/${demo.corp_id}/missions/${fixture.missionId}/launch`, {
+    requested_by: demo.alice_actor_id,
+  })
+  const failed = await waitFor(demo, (state) => state.runs.find((run) =>
+    run.task_id === fixture.tasks[0].id && run.verification_status === 'failed' &&
+    run.workspace_disposition === 'preserved' && run.workspace_fingerprint,
+  ), 'gate-free source failure with retained checkpoint')
+  // Change only the external verifier fixture input, never the retained source.
+  await writeFile(allowFile, 'allowed\n', { flag: 'wx' })
+  const recovered = await authorizeFixtureRecovery(fixture, 'Retry the same source after the verifier fixture becomes available.')
+  const finished = await waitFor(demo, (state) => {
+    const recovery = state.factory_verification_recoveries.find((entry) => entry.id === recovered.result.recovery.id)
+    const run = state.runs.find((entry) => entry.id === recovered.result.run_id)
+    const item = state.factory_work_items.find((entry) => entry.id === fixture.workItemId)
+    return recovery?.status === 'completed' && run?.status === 'completed' &&
+      run.workspace_fingerprint && item?.state === 'verified' ? { recovery, run } : null
+  }, 'gate-free recovery and factory completion')
+  assert.equal(finished.value.run.workspace_run_id, failed.value.workspace_run_id)
+  assert.equal(finished.value.run.workspace_fingerprint, failed.value.workspace_fingerprint)
+  assert.equal(finished.value.run.provider_session_id, null)
+  assert.equal(finished.state.snapshot.verification_requests.filter((entry) =>
+    entry.run_id === recovered.result.run_id,
+  ).length, 0)
+  return {
+    factory_work_item_id: fixture.workItemId,
+    mission_id: fixture.missionId,
+    recovery_id: recovered.result.recovery.id,
+    run_id: recovered.result.run_id,
+    manual_decisions: 0,
+    same_source_fingerprint: true,
+    recovery_status: finished.value.recovery.status,
+  }
+}
+
+async function acknowledgedVerifierLossRecovery(reviseAfterLoss = false) {
+  const demo = await post('/api/demo/bootstrap', {})
+  const number = reviseAfterLoss ? 9501 : 9500
+  const adapter = reviseAfterLoss ? 'codex' : 'fake-process'
+  const holdFile = path.join(output, `lost-verifier-${number}-hold.flag`)
+  assert.ok(!existsSync(holdFile), 'Runner-loss verifier input must be fresh')
+  const policy = {
+    checks: [
+      { type: 'artifact', min_bytes: 1 },
+      { type: 'file', path: reviseAfterLoss ? 'base.txt' : 'result.md', min_bytes: reviseAfterLoss ? 5 : 50 },
+      {
+        type: 'command',
+        program: 'node',
+        args: ['-e', `if(require('node:fs').existsSync(${JSON.stringify(holdFile)}))setTimeout(()=>{},55000)`],
+        timeout_ms: 60_000,
+      },
+    ],
+    manual_gate: recoveryManualGate,
+  }
+  const fixture = await heldRecoveryFixture(demo, number, 'single', policy, 3, adapter)
+  await post(`/api/corps/${demo.corp_id}/missions/${fixture.missionId}/launch`, {
+    requested_by: demo.alice_actor_id,
+  })
+  const original = await waitForReviewRun(demo, fixture.tasks[0].id)
+  const sourceRun = original.value
+  if (reviseAfterLoss) {
+    // Same scripts/fake-codex-app-server.mjs protocol fixture as the existing
+    // source-correction lane; its native thread/resume writes resumed.txt.
+    assert.ok(sourceRun.provider_session_id)
+    assert.equal(await readFile(path.join(sourceRun.workspace_path, 'base.txt'), 'utf8'), 'base\n')
+  }
+  await decideFixtureRun(demo, sourceRun.id, false, 'Exercise loss of one acknowledged verifier-only attempt.')
+  await writeFile(holdFile, 'hold\n', { flag: 'wx' })
+  const first = await authorizeFixtureRecovery(fixture, 'Authorize the bounded verifier attempt that will lose its connection.')
+  assert.match(first.context.expected_head_commit, /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u)
+  const active = await waitFor(demo, (state) => state.runs.find((run) =>
+    run.id === first.result.run_id && run.status === 'verifying',
+  ), 'verifier-only run before transport loss')
+  const commandQuery = `
+    SELECT status FROM runner_commands
+    WHERE corp_id = ${sqlLiteral(demo.corp_id)}::uuid
+      AND run_id = ${sqlLiteral(first.result.run_id)}::uuid
+      AND command_kind = 'factory_verification_recovery';
+  `
+  const ackDeadline = Date.now() + 15_000
+  while ((await psql(commandQuery)) !== 'dispatched') {
+    assert.ok(Date.now() < ackDeadline, 'Recovery command was not acknowledged before the loss test')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  const beforeDisconnect = await snapshot(demo)
+  const activeStates = ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying']
+  assert.deepEqual(beforeDisconnect.snapshot.runs.filter((run) =>
+    run.runner_id === active.value.runner_id && activeStates.includes(run.status),
+  ).map((run) => run.id), [active.value.id], 'Never disconnect a runner carrying unrelated work')
+  assert.equal(await psql(`
+    SELECT id FROM runs
+    WHERE runner_id = ${sqlLiteral(active.value.runner_id)}
+      AND status IN ('provisioning', 'starting', 'running', 'waiting_for_input',
+                     'waiting_for_approval', 'verifying')
+    ORDER BY id;
+  `), active.value.id, 'Room-filtered snapshots must not hide unrelated active runner work')
+  const epochQuery = `
+    SELECT connection_epoch FROM runner_nodes
+    WHERE id = ${sqlLiteral(active.value.runner_id)}
+      AND corp_id = ${sqlLiteral(demo.corp_id)}::uuid;
+  `
+  const priorEpoch = await psql(epochQuery)
+  // Reuse the native disconnect primitive. Leave a bounded interval after the
+  // five-second QA grace expires to test admission before any cleanup arrives.
+  const disconnectedAt = new Date().toISOString()
+  await post(`/api/demo/runners/${encodeURIComponent(active.value.runner_id)}/disconnect`, {
+    reconnect_delay_ms: 30_000,
+  })
+  const lost = await waitFor(demo, (state) => {
+    const run = state.runs.find((entry) => entry.id === first.result.run_id)
+    const recovery = state.factory_verification_recoveries.find((entry) => entry.id === first.result.recovery.id)
+    const task = state.tasks.find((entry) => entry.id === run?.task_id)
+    const item = state.factory_work_items.find((entry) => entry.id === fixture.workItemId)
+    return run?.status === 'lost' && recovery?.status === 'failed' &&
+      task?.status === 'verification_failed' && item?.state === 'verification_failed'
+      ? { run, recovery, task, item } : null
+  }, 'acknowledged verifier-only loss terminalized after grace', 15_000)
+  assert.equal(lost.value.run.workspace_fingerprint, null, 'Loss must not mint a trusted fingerprint')
+  assert.notEqual(lost.value.run.workspace_disposition, 'preserved', 'Loss alone cannot prove workspace cleanup')
+  assert.equal(await psql(commandQuery), 'dispatched')
+  const revisionRoute = `/api/corps/${demo.corp_id}/missions/${fixture.missionId}/contract-revisions`
+  const revisionBody = (sourceId, overrides = {}) => ({
+    actor_id: demo.alice_actor_id,
+    task_id: sourceRun.task_id,
+    expected_contract_version: lost.value.task.contract_version,
+    next_action: 'resume',
+    source_run_id: sourceId,
+    reason: 'Review the same latest preserved checkpoint after verifier loss.',
+    idempotency_key: randomUUID(),
+    description: fixture.issue.body,
+    contract: lost.value.task.contract,
+    verification_policy: policy,
+    ...overrides,
+  })
+  const rejection = async (route, body, pattern) => {
+    const response = await request(route, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    assert.equal(response.response.status, 400)
+    assert.match(response.body.error, pattern)
+  }
+  const unconfirmedContext = await request(`${first.route}?actor_id=${demo.alice_actor_id}`)
+  assert.equal(unconfirmedContext.response.status, 400)
+  assert.match(unconfirmedContext.body.error, /preserved|confirmed/u)
+  for (const [sourceId, pattern] of [
+    [lost.value.run.id, /preserved|confirmed/u],
+    [sourceRun.id, /not the latest/u],
+  ]) {
+    await rejection(first.route, {
+      ...first.body,
+      expected_factory_version: lost.value.item.version,
+      idempotency_key: randomUUID(),
+      source_run_id: sourceId,
+    }, pattern)
+  }
+  if (reviseAfterLoss) {
+    await rejection(revisionRoute, revisionBody(lost.value.run.id), /preserved|confirmed/u)
+    await rejection(revisionRoute, revisionBody(sourceRun.id), /not the latest/u)
+  }
+  // The native reconnect sends StopRun for the stale claim. Wait for its bounded
+  // cleanup before requesting another run; do not pretend a DB terminal state
+  // alone proves the old verifier has stopped.
+  const cleanup = await waitFor(demo, (state) => state.runs.find((run) =>
+    run.id === first.result.run_id && run.status === 'lost' &&
+    run.workspace_disposition === 'preserved' && run.workspace_fingerprint,
+  ), 'native stale-claim stop and workspace cleanup', 45_000)
+  assert.equal(cleanup.value.workspace_fingerprint, sourceRun.workspace_fingerprint)
+  const reconnectedEpoch = await psql(epochQuery)
+  assert.notEqual(reconnectedEpoch, priorEpoch)
+  const beforeReplay = await snapshot(demo)
+  assert.equal(beforeReplay.snapshot.tasks.find((task) => task.id === sourceRun.task_id).contract_version,
+    lost.value.task.contract_version, 'Rejected revisions must leave the contract unchanged')
+  assert.equal(beforeReplay.snapshot.runs.filter((run) => run.task_id === sourceRun.task_id).length, 2)
+  const confirmedContext = await requestOk(`${first.route}?actor_id=${demo.alice_actor_id}`)
+  assert.equal(confirmedContext.source_run_id, lost.value.run.id)
+  assert.equal(confirmedContext.workspace_fingerprint, sourceRun.workspace_fingerprint)
+  assert.equal(confirmedContext.expected_head_commit, first.context.expected_head_commit)
+  const currentRequest = {
+    ...first.body,
+    expected_factory_version: confirmedContext.work_item.version,
+    source_run_id: lost.value.run.id,
+  }
+  await rejection(first.route, {
+    ...currentRequest, idempotency_key: randomUUID(), source_run_id: sourceRun.id,
+  }, /not the latest/u)
+  const wrongFingerprint = `${sourceRun.workspace_fingerprint[0] === '0' ? '1' : '0'}${sourceRun.workspace_fingerprint.slice(1)}`
+  await rejection(first.route, {
+    ...currentRequest, idempotency_key: randomUUID(), expected_workspace_fingerprint: wrongFingerprint,
+  }, /workspace fingerprint mismatch/u)
+  await rejection(first.route, {
+    ...currentRequest, idempotency_key: randomUUID(), expected_head_commit: null,
+  }, /head commit mismatch/u)
+  const replay = await post(first.route, first.body)
+  assert.equal(replay.replayed, true)
+  assert.equal(replay.run_id, first.result.run_id)
+  assert.equal(replay.recovery.status, 'failed')
+  const afterReplay = await snapshot(demo)
+  assert.deepEqual(
+    afterReplay.snapshot.runs.map((run) => run.id).sort(),
+    beforeReplay.snapshot.runs.map((run) => run.id).sort(),
+  )
+  assert.equal(await psql(commandQuery), 'dispatched')
+  await rm(holdFile)
+  let revision = null
+  let replacementPolicy = policy
+  if (reviseAfterLoss) {
+    await rejection(revisionRoute, revisionBody(sourceRun.id), /not the latest/u)
+    const staleContract = { ...lost.value.task.contract, source_base_commit: '0'.repeat(sourceBaseCommit.length) }
+    await rejection(revisionRoute, revisionBody(lost.value.run.id, { contract: staleContract }),
+      /source|authority|cannot change/u)
+    const correction = 'Create resumed.txt in the same preserved workspace using the existing provider session.'
+    const description = `${fixture.issue.body}\n\nReviewed correction: ${correction}`
+    replacementPolicy = {
+      ...policy,
+      checks: [
+        ...policy.checks.slice(0, 2),
+        {
+          type: 'command',
+          program: 'node',
+          args: ['-e', "const fs=require('node:fs');process.exit(fs.existsSync('resumed.txt')&&fs.readFileSync('resumed.txt','utf8')==='resumed\\n'?0:1)"],
+          timeout_ms: 60_000,
+        },
+      ],
+    }
+    const body = revisionBody(lost.value.run.id, {
+      description,
+      contract: { ...lost.value.task.contract, objective: correction },
+      verification_policy: replacementPolicy,
+    })
+    revision = await post(revisionRoute, body)
+    const revisionReplay = await post(revisionRoute, body)
+    assert.equal(revisionReplay.replayed, true)
+    assert.equal(revisionReplay.revision.id, revision.revision.id)
+    assert.equal(revision.revision.source_run_id, lost.value.run.id)
+    assert.equal(revision.revision.revised_by, demo.alice_actor_id)
+    fixture.issue.body = description
+    fixture.issue.updatedAt = '2026-09-04T02:30:00Z'
+  }
+  const second = await authorizeFixtureRecovery(
+    fixture,
+    reviseAfterLoss
+      ? 'Authorize the reviewed source correction and replacement policy against the latest preserved lost run.'
+      : 'Authorize an unchanged-policy recheck against the latest preserved lost run.',
+    {
+      mode: reviseAfterLoss ? 'source_correction' : 'verifier_only',
+      contractRevisionId: revision?.revision.id ?? null,
+    },
+  )
+  assert.equal(second.context.source_run_id, lost.value.run.id)
+  assert.equal(second.context.workspace_fingerprint, sourceRun.workspace_fingerprint)
+  assert.equal(second.context.expected_head_commit, first.context.expected_head_commit)
+  assert.notEqual(second.result.run_id, first.result.run_id)
+  const secondReview = await waitForReviewRun(demo, sourceRun.task_id, second.result.run_id)
+  assert.equal(secondReview.value.workspace_run_id, sourceRun.workspace_run_id)
+  assert.equal(secondReview.value.resumed_from_run_id, lost.value.run.id)
+  assert.equal(secondReview.value.workspace_path, sourceRun.workspace_path)
+  assert.equal(secondReview.value.workspace_branch, sourceRun.workspace_branch)
+  assert.equal(secondReview.value.source_base_commit, sourceRun.source_base_commit)
+  assert.deepEqual(second.result.recovery.replacement_verification_policy, replacementPolicy)
+  if (reviseAfterLoss) {
+    assert.equal(secondReview.value.execution_mode, 'provider')
+    assert.equal(secondReview.value.provider_session_id, sourceRun.provider_session_id)
+    assert.equal(second.result.recovery.contract_revision_id, revision.revision.id)
+    assert.equal(second.result.recovery.observed_source_revision, fixture.issue.updatedAt)
+    assert.equal(await readFile(path.join(sourceRun.workspace_path, 'resumed.txt'), 'utf8'), 'resumed\n')
+    assert.match(await readFile(path.join(sourceRun.workspace_path, 'resume-prompt.txt'), 'utf8'), /Reviewed correction/u)
+  } else {
+    assert.equal(secondReview.value.workspace_fingerprint, sourceRun.workspace_fingerprint)
+    assert.equal(secondReview.value.artifact_id, sourceRun.artifact_id)
+    assert.equal(secondReview.value.provider_session_id, null)
+    assert.equal(secondReview.state.snapshot.source_deliverables.find((entry) =>
+      entry.run_id === second.result.run_id,
+    )?.head_commit, first.context.expected_head_commit)
+    assert.equal(secondReview.state.snapshot.events.filter((event) =>
+      event.aggregate_id === second.result.run_id &&
+      ['run.session', 'run.session_terminated', 'run.output', 'run.artifact'].includes(event.type),
+    ).length, 0)
+  }
+  await decideFixtureRun(demo, secondReview.value.id, true, 'Accept the fresh explicitly authorized recheck.')
+  const completed = await waitFor(demo, (state) => {
+    const recovery = state.factory_verification_recoveries.find((entry) => entry.id === second.result.recovery.id)
+    const task = state.tasks.find((entry) => entry.id === sourceRun.task_id)
+    return recovery?.status === 'completed' && task?.status === 'completed' ? task : null
+  }, 'loss recovery retry completion')
+  assert.equal(completed.value.attempt_count, 3)
+  assert.equal(completed.state.snapshot.runs.filter((run) => run.task_id === sourceRun.task_id).length, 3)
+  assert.equal(completed.state.snapshot.factory_verification_recoveries.filter((entry) =>
+    entry.factory_work_item_id === fixture.workItemId && ['authorized', 'running'].includes(entry.status),
+  ).length, 0)
+  return {
+    factory_work_item_id: fixture.workItemId,
+    mission_id: fixture.missionId,
+    runner_id: sourceRun.runner_id,
+    prior_epoch: priorEpoch,
+    reconnected_epoch: reconnectedEpoch,
+    source_run_id: sourceRun.id,
+    lost_run_id: first.result.run_id,
+    retry_run_id: second.result.run_id,
+    disconnected_at: disconnectedAt,
+    acknowledged_before_loss: true,
+    loss_did_not_mint_trust: true,
+    mismatched_checkpoint_rejected: true,
+    consumed_command_replay_created_runs: 0,
+    unconfirmed_context_and_admissions_rejected: true,
+    stale_ancestor_rejected: true,
+    missing_head_rejected: true,
+    latest_preserved_run_reauthorized: true,
+    recovery_source_run_id: second.context.source_run_id,
+    contract_revision_id: revision?.revision.id ?? null,
+    revised_policy_source_correction: reviseAfterLoss,
+    native_provider_session_retained: reviseAfterLoss ? secondReview.value.provider_session_id === sourceRun.provider_session_id : null,
+    attempt_count: completed.value.attempt_count,
+  }
+}
+
 const reportPath = path.join(output, 'e2e-factory-verification-recovery.json')
 const resumeAfterBridge = process.argv.includes('--resume-after-bridge')
+if (!resumeAfterBridge && existsSync(reportPath)) {
+  throw new Error('Recovery evidence already exists; use a fresh owned QA output, never reset/replay a completed fixture.')
+}
 let report = { passed: false, started_at: new Date().toISOString() }
 if (resumeAfterBridge) {
   const previous = JSON.parse(await readFile(reportPath, 'utf8'))
@@ -1736,6 +2476,10 @@ for (const [name, exercise] of [
   ['source_correction', resumeAfterBridge ? resumeSourceCorrectionAfterBridge : sourceCorrectionRecovery],
   ['cancelled_recovery', cancelledRecoveryTerminalizes],
   ['exhausted_attempts', exhaustedRecoveryIsRejected],
+  ['upstream_then_later_recovery', upstreamThenLaterTaskRecovery],
+  ['gate_free_recovery', gateFreeRecoverySettles],
+  ['acknowledged_verifier_loss', acknowledgedVerifierLossRecovery],
+  ['lost_verifier_revision', () => acknowledgedVerifierLossRecovery(true)],
 ]) {
   try {
     report[name] = await exercise()

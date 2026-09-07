@@ -273,7 +273,9 @@ async function runPublisher(
         ECORP_FAKE_GITHUB_STATE: statePath,
         ECORP_PUBLICATION_TEST_REMOTE_URL: remotePath,
         ECORP_PUBLICATION_EFFECT_LEASE_SECONDS: '30',
-        ECORP_GITHUB_COMMAND_TIMEOUT_MS: '1000',
+        // Cold Node startup plus the >1,000-item fixture is not a 1-second SLA.
+        // Keep requests bounded well inside the unchanged 30-second effect lease.
+        ECORP_GITHUB_COMMAND_TIMEOUT_MS: '5000',
         ECORP_SOURCE_GIT_COMMAND_TIMEOUT_MS: '5000',
         ...(crashAfter
           ? { ECORP_PUBLICATION_TEST_CRASH_AFTER: crashAfter }
