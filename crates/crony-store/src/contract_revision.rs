@@ -125,6 +125,9 @@ impl PgStore {
         );
         validate_revised_contract(&replacement_contract, &input.verification_policy)?;
         let current_policy_value: Value = mission.get("verification_policy");
+        let current_verification_policy: VerificationPolicy =
+            serde_json::from_value(current_policy_value.clone())
+                .context("decode current mission verifier policy")?;
         let mission_status: String = mission.get("status");
         let task_status: String = mission.get("task_status");
         let required_adapter: String = mission.get("required_adapter");
@@ -175,6 +178,22 @@ impl PgStore {
                     &replacement_contract,
                     &required_adapter,
                 )?;
+                let factory_linked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM factory_work_items
+                        WHERE corp_id = $1 AND mission_id = $2
+                    )",
+                )
+                .bind(input.corp_id)
+                .bind(input.mission_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if factory_linked {
+                    ensure_factory_recovery_verification_policy_not_weakened(
+                        &current_verification_policy,
+                        &input.verification_policy,
+                    )?;
+                }
             }
         }
         if required_adapter == "fake-process"
@@ -399,11 +418,39 @@ async fn ensure_resumable_contract_revision_source_tx(
 ) -> Result<()> {
     let source = sqlx::query(
         r#"
-        SELECT task_id, workspace_run_id, provider_session_id, breaker_stage,
-               status, workspace_disposition
-        FROM runs
-        WHERE id = $1 AND corp_id = $2
-        FOR UPDATE
+        SELECT source.task_id, source.workspace_run_id,
+               COALESCE(source.provider_session_id, provider_lineage.provider_session_id)
+                   AS provider_session_id,
+               source.breaker_stage, source.status, source.workspace_disposition
+        FROM runs source
+        LEFT JOIN LATERAL (
+            WITH RECURSIVE lineage AS (
+                SELECT ancestor.id, ancestor.resumed_from_run_id,
+                       ancestor.provider_session_id, 0 AS depth,
+                       ARRAY[ancestor.id] AS visited
+                FROM runs ancestor
+                WHERE ancestor.id = source.id AND ancestor.corp_id = source.corp_id
+                  AND source.execution_mode = 'verification_only'
+                UNION ALL
+                SELECT parent.id, parent.resumed_from_run_id,
+                       parent.provider_session_id, lineage.depth + 1,
+                       lineage.visited || parent.id
+                FROM runs parent
+                JOIN lineage ON lineage.resumed_from_run_id = parent.id
+                WHERE parent.corp_id = source.corp_id
+                  AND parent.task_id = source.task_id
+                  AND parent.agent_id = source.agent_id
+                  AND parent.workspace_run_id = source.workspace_run_id
+                  AND NOT parent.id = ANY(lineage.visited)
+                  AND lineage.depth < 64
+            )
+            SELECT provider_session_id FROM lineage
+            WHERE provider_session_id IS NOT NULL
+            ORDER BY depth
+            LIMIT 1
+        ) provider_lineage ON TRUE
+        WHERE source.id = $1 AND source.corp_id = $2
+        FOR UPDATE OF source
         "#,
     )
     .bind(source_run_id)
@@ -452,12 +499,15 @@ async fn ensure_resumable_contract_revision_source_tx(
     .bind(workspace_run_id)
     .fetch_all(&mut **tx)
     .await?;
-    if lineage
-        .iter()
-        .any(|run| run.get::<String, _>("breaker_stage") == "stop")
-    {
+    if lineage.iter().any(|run| {
+        run.get::<String, _>("breaker_stage") == "stop"
+            || run
+                .get::<Option<String>, _>("workspace_disposition")
+                .as_deref()
+                == Some("quarantined")
+    }) {
         return Err(anyhow!(
-            "provider workspace lineage reached stop and cannot be revised for resume"
+            "provider workspace lineage reached stop or quarantine and cannot be revised for resume"
         ));
     }
     let latest = lineage

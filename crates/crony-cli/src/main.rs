@@ -482,6 +482,7 @@ async fn main() -> Result<()> {
                     actor_id,
                     approved: approve,
                     note,
+                    decision_key: None,
                 })?),
             )
             .await?
@@ -511,4 +512,154 @@ async fn request(
         anyhow::bail!("{status}: {text}");
     }
     serde_json::from_str(&text).with_context(|| format!("decode response from {url}: {text}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+    use uuid::Uuid;
+
+    use super::{Args, Command};
+    use crate::factory::VerificationRecoveryModeArg;
+
+    fn copied_recovery_command(mode: &str) -> Vec<String> {
+        [
+            "crony",
+            "--server",
+            "http://127.0.0.1:9876",
+            "factory",
+            "00000000-0000-4000-8000-000000000011",
+            "00000000-0000-4000-8000-000000000022",
+            "--owner",
+            "reviewed-owner",
+            "--project-number",
+            "42",
+            "--repository",
+            "reviewed-owner/reviewed-repo",
+            "--source-base-ref",
+            "refs/heads/release",
+            "--adapter",
+            "github-copilot",
+            "--budget-tokens",
+            "23456",
+            "--budget-cost-microusd",
+            "345678",
+            "--issue",
+            "113",
+            "--verification-recovery",
+            mode,
+            "--verification-recovery-reason",
+            "Keep #113's source; do not widen ** or $scope.",
+            "--model",
+            "reviewed-model",
+            "--reasoning-effort",
+            "high",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn copied_recovery_commands_preserve_every_literal_argument() {
+        for (mode, expected_mode) in [
+            (
+                "source-correction",
+                VerificationRecoveryModeArg::SourceCorrection,
+            ),
+            ("verifier-only", VerificationRecoveryModeArg::VerifierOnly),
+        ] {
+            let mut command = copied_recovery_command(mode);
+            command.extend(
+                [
+                    "--source-repository-path",
+                    r"C:\Preserved Source\repo",
+                    "--verification-policy-file",
+                    r"C:\Reviewed Policy\policy.json",
+                    "--write-scope",
+                    "crates/crony-cli/src/**",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            let parsed = Args::try_parse_from(command).unwrap();
+            assert_eq!(parsed.server, "http://127.0.0.1:9876");
+            let Command::Factory { args } = parsed.command else {
+                panic!("copied recovery command did not select factory");
+            };
+            assert_eq!(
+                args.corp_id,
+                Uuid::parse_str("00000000-0000-4000-8000-000000000011").unwrap()
+            );
+            assert_eq!(
+                args.actor_id,
+                Uuid::parse_str("00000000-0000-4000-8000-000000000022").unwrap()
+            );
+            assert_eq!(args.owner, "reviewed-owner");
+            assert_eq!(args.project_number, 42);
+            assert_eq!(args.repository, "reviewed-owner/reviewed-repo");
+            assert_eq!(args.source_base_ref, "refs/heads/release");
+            assert_eq!(args.adapter, "github-copilot");
+            assert_eq!(args.budget_tokens, 23456);
+            assert_eq!(args.budget_cost_microusd, 345678);
+            assert_eq!(args.issue, Some(113));
+            assert_eq!(args.verification_recovery, Some(expected_mode));
+            assert_eq!(
+                args.verification_recovery_reason.as_deref(),
+                Some("Keep #113's source; do not widen ** or $scope.")
+            );
+            assert_eq!(args.model.as_deref(), Some("reviewed-model"));
+            assert_eq!(args.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(
+                args.source_repository_path,
+                PathBuf::from(r"C:\Preserved Source\repo")
+            );
+            assert_eq!(
+                args.verification_policy_file,
+                Some(PathBuf::from(r"C:\Reviewed Policy\policy.json"))
+            );
+            assert_eq!(args.write_scope, ["crates/crony-cli/src/**"]);
+        }
+    }
+
+    #[test]
+    fn copied_recovery_commands_reject_missing_required_arguments() {
+        for flag in [
+            "--adapter",
+            "--budget-tokens",
+            "--budget-cost-microusd",
+            "--issue",
+            "--verification-recovery",
+            "--verification-recovery-reason",
+        ] {
+            let mut command = copied_recovery_command("source-correction");
+            let index = command
+                .iter()
+                .position(|argument| argument == flag)
+                .unwrap();
+            command.drain(index..index + 2);
+            assert!(
+                Args::try_parse_from(command).is_err(),
+                "accepted command without {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_factory_commands_do_not_require_recovery_options() {
+        for subcommand in ["factory", "factory-watch"] {
+            let mut command = copied_recovery_command("verifier-only");
+            command[3] = subcommand.to_owned();
+            for flag in ["--verification-recovery", "--verification-recovery-reason"] {
+                let index = command
+                    .iter()
+                    .position(|argument| argument == flag)
+                    .unwrap();
+                command.drain(index..index + 2);
+            }
+            assert!(Args::try_parse_from(command).is_ok());
+        }
+    }
 }

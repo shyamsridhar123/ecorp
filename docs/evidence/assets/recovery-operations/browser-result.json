@@ -1,0 +1,104 @@
+{
+  "started_at": "2026-09-07T00:16:13.608Z",
+  "finished_at": "2026-09-07T00:16:45.455Z",
+  "scope": "Read-only continuation of the existing Bob-rejected fixture; no new decision or fixture.",
+  "blocked_requests": [],
+  "passed": true,
+  "note": "Bob UI rejection was executed once in the preceding receipt; this is the same rejected fixture, not a fabricated page state.",
+  "fixture": {
+    "corp_id": "00000000-0000-4000-8000-000000000001",
+    "alice_actor_id": "00000000-0000-4000-8000-000000000011",
+    "bob_actor_id": "00000000-0000-4000-8000-000000000012",
+    "mission_id": "fe4d8973-3809-439e-9ae5-db38c502aa44",
+    "run_id": "cbe9aaa9-55d9-4e03-a9d9-7d198d7dab58",
+    "factory_work_item_id": "004e992a-4c29-4e3b-acbe-76a84cc41532"
+  },
+  "errors": [],
+  "viewports": [
+    {
+      "name": "desktop",
+      "width": 1440,
+      "height": 900,
+      "passed": true,
+      "default_collapsed": true,
+      "keyboard_expand_collapse": true,
+      "layout": {
+        "viewport": 1440,
+        "document": 1440,
+        "body": 1440,
+        "regions": [
+          {
+            "selector": "#missions",
+            "client": 1374,
+            "scroll": 1374
+          },
+          {
+            "selector": ".mission-list",
+            "client": 946,
+            "scroll": 946
+          },
+          {
+            "selector": ".operations-verification",
+            "client": 872,
+            "scroll": 872
+          },
+          {
+            "selector": ".operations-review-decision",
+            "client": 871,
+            "scroll": 871
+          },
+          {
+            "selector": ".operations-identity",
+            "client": 384,
+            "scroll": 384
+          }
+        ]
+      }
+    },
+    {
+      "name": "mobile-390",
+      "width": 390,
+      "height": 844,
+      "passed": true,
+      "default_collapsed": true,
+      "keyboard_expand_collapse": true,
+      "layout": {
+        "viewport": 390,
+        "document": 390,
+        "body": 390,
+        "regions": [
+          {
+            "selector": "#missions",
+            "client": 372,
+            "scroll": 372
+          },
+          {
+            "selector": ".mission-list",
+            "client": 346,
+            "scroll": 346
+          },
+          {
+            "selector": ".operations-verification",
+            "client": 282,
+            "scroll": 282
+          },
+          {
+            "selector": ".operations-review-decision",
+            "client": 281,
+            "scroll": 281
+          },
+          {
+            "selector": ".operations-identity",
+            "client": 170,
+            "scroll": 170
+          },
+          {
+            "selector": ".verification-policy-editor",
+            "client": 288,
+            "scroll": 288
+          }
+        ]
+      }
+    }
+  ]
+}

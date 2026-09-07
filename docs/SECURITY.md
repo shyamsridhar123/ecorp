@@ -278,6 +278,22 @@ signs provenance with a deployment key and never exposes backend bucket URLs. Do
 `ready` metadata, Corp authorization, and room membership, then revalidate signature, retention,
 digest, length, and media type before returning an attachment with content sniffing disabled.
 
+Verifier-only artifact transfer repeats authorization against the exact pending command, assigned
+runner, Corp, task, source run, current human author role, and mission-room membership. Only the
+ready `provider_evidence` artifact already linked to both runs can be transferred. Its signed
+object is validated before delivery, with a second authority/binding check after storage I/O.
+Transferred bytes are capped at 16 MiB, excluded from persisted commands, and omitted from typed
+debug output. The receiver enforces encoded and decoded bounds, length and SHA-256, and uses a
+fresh private staging name rather than the supplied path. Evidence staging is separate from the
+preserved source, sealed baseline, and per-command snapshots, so it cannot satisfy a missing
+source-file check. All snapshot cleanup must finish before accepted verification.
+
+Prepared-workspace failures preserve or quarantine the workspace instead of leaving a false
+`active` disposition. A rejected fingerprint is not replaced by the newly observed bytes.
+Consumed recovery commands are not replayed, and terminal-target commands are retired without
+execution. Capability negotiation describes this transfer protocol; it is not OS-isolation
+attestation and does not relax source-path, budget, or hard-stop authority.
+
 Portable source exports use a temporary Git index rooted in the assigned worktree. They include
 tracked changes and non-ignored untracked files, exclude provider evidence, and reject symbolic
 links, Git links, path escapes, runner-internal directories, ignored files, and secret-like names.

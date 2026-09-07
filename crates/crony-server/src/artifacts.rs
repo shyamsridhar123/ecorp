@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use crony_domain::repository_relative_path_is_valid;
 use crony_store::StoredArtifact;
 use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
@@ -233,6 +234,16 @@ impl ArtifactStore {
         }
         let metadata = if artifact_role == "source_deliverable" {
             source_deliverable_metadata(payload)?
+        } else if let Some(path) = payload
+            .get("workspace_relative_path")
+            .and_then(Value::as_str)
+        {
+            if !repository_relative_path_is_valid(path) {
+                return Err(anyhow!(
+                    "provider artifact workspace-relative path is invalid"
+                ));
+            }
+            json!({"workspace_relative_path": path})
         } else {
             json!({})
         };

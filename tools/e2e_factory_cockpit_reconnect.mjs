@@ -1,11 +1,5 @@
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import {
-  existsSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -124,73 +118,7 @@ async function waitForBrowserEvent(client, predicate, description, timeoutMs = 1
 }
 
 async function restartLocalServer() {
-  const pidPath = process.env.CRONY_TEST_SERVER_PID_FILE
-  if (!pidPath || !existsSync(pidPath)) {
-    throw new Error('CRONY_TEST_SERVER_PID_FILE must identify the test-owned server')
-  }
-  const jsonPidFile = pidPath.endsWith('.json')
-  const pidState = jsonPidFile
-    ? JSON.parse(readFileSync(pidPath, 'utf8'))
-    : { server: Number(readFileSync(pidPath, 'utf8').trim()) }
-  const serverPid = Number(pidState.server)
-  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) {
-    throw new Error(`test-owned server PID is invalid: ${serverPid}`)
-  }
-
-  process.kill(serverPid, 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const binary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const logDir = path.dirname(path.resolve(pidPath))
-  const stdout = openSync(path.join(logDir, 'cockpit-server-restart.stdout.log'), 'a')
-  const stderr = openSync(path.join(logDir, 'cockpit-server-restart.stderr.log'), 'a')
-  const child = spawn(
-    binary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout, stderr],
-    },
-  )
-  if (jsonPidFile) {
-    writeFileSync(
-      pidPath,
-      `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`,
-    )
-  } else {
-    writeFileSync(pidPath, `${child.pid}\n`)
-  }
-  child.unref()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return child.pid
-    } catch {
-      // The server is restarting or the runner is reconnecting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  throw new Error('server and runner did not recover after cockpit restart')
+  return restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'cockpit-restart' })
 }
 
 function assertUniqueSequences(events, minimumExclusive) {

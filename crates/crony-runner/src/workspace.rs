@@ -1,5 +1,7 @@
 use std::{
     ffi::OsString,
+    fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Output, Stdio},
     sync::Arc,
@@ -9,10 +11,12 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::Mutex};
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const VERIFICATION_SNAPSHOT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -405,6 +409,21 @@ impl WorkspaceManager {
         })
     }
 
+    pub async fn fingerprint(&self, workspace: &WorkspaceLease) -> Result<String> {
+        self.verify_managed_path(&workspace.path).await?;
+        fingerprint_path(&workspace.path).await
+    }
+
+    pub async fn head_commit(&self, workspace: &WorkspaceLease) -> Result<String> {
+        self.verify_managed_path(&workspace.path).await?;
+        self.git_text_os(
+            &workspace.path,
+            &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
+        )
+        .await
+        .map(|value| value.trim().to_ascii_lowercase())
+    }
+
     async fn verify_existing(
         &self,
         path: PathBuf,
@@ -588,6 +607,600 @@ impl WorkspaceManager {
     async fn git_exit_success(&self, cwd: &Path, args: &[OsString]) -> Result<bool> {
         Ok(run_git(cwd, args).await?.status.success())
     }
+}
+
+pub async fn fingerprint_path(root: &Path) -> Result<String> {
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || fingerprint_workspace(&root))
+        .await
+        .context("join workspace fingerprint task")?
+}
+
+pub async fn find_file_by_digest(
+    root: &Path,
+    file_name: &str,
+    expected_sha256: &str,
+    expected_bytes: usize,
+) -> Result<PathBuf> {
+    let root = root.to_owned();
+    let file_name = file_name.to_owned();
+    let expected_sha256 = expected_sha256.to_owned();
+    tokio::task::spawn_blocking(move || {
+        find_workspace_file_by_digest(&root, &file_name, &expected_sha256, expected_bytes)
+    })
+    .await
+    .context("join workspace artifact search task")?
+}
+
+#[derive(Debug)]
+pub struct VerificationSnapshot {
+    path: Option<PathBuf>,
+}
+
+impl VerificationSnapshot {
+    pub fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("verification snapshot path is unavailable after cleanup")
+    }
+
+    pub async fn cleanup(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        remove_verification_snapshot(path).await?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for VerificationSnapshot {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = remove_verification_snapshot(path.clone()).await {
+                        warn!(
+                            path = %path.display(),
+                            error = %format!("{error:#}"),
+                            "background verifier snapshot cleanup failed"
+                        );
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "verifier snapshot dropped outside a Tokio runtime"
+                );
+            }
+        }
+    }
+}
+
+async fn fresh_verification_snapshot_path(run_id: Uuid) -> Result<PathBuf> {
+    let temp_root = tokio::fs::canonicalize(std::env::temp_dir())
+        .await
+        .context("canonicalize system temporary directory")?;
+    let parent = temp_root.join("ecorp-verification-snapshots");
+    tokio::fs::create_dir_all(&parent)
+        .await
+        .context("create verifier snapshot parent")?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .await
+        .context("secure verifier snapshot parent permissions")?;
+    let parent = tokio::fs::canonicalize(&parent)
+        .await
+        .context("canonicalize verifier snapshot parent")?;
+    if !parent.starts_with(&temp_root) {
+        return Err(anyhow!(
+            "verifier snapshot parent escapes the system temporary directory"
+        ));
+    }
+    Ok(parent.join(format!("{}-{}", run_id.simple(), Uuid::new_v4().simple())))
+}
+
+/// A separate private owner for transferred evidence, never part of a source/check snapshot.
+pub async fn empty_verification_snapshot(run_id: Uuid) -> Result<VerificationSnapshot> {
+    let path = fresh_verification_snapshot_path(run_id).await?;
+    tokio::fs::create_dir(&path)
+        .await
+        .context("create empty private verifier snapshot")?;
+    #[cfg(unix)]
+    if let Err(error) =
+        tokio::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).await
+    {
+        let cleanup = remove_verification_snapshot(path).await;
+        return Err(anyhow!(error).context(match cleanup {
+            Ok(()) => "secure empty verifier snapshot permissions".to_owned(),
+            Err(cleanup_error) => format!(
+                "secure empty verifier snapshot permissions; cleanup also failed: {cleanup_error:#}"
+            ),
+        }));
+    }
+    Ok(VerificationSnapshot { path: Some(path) })
+}
+
+pub async fn verification_snapshot(root: &Path, run_id: Uuid) -> Result<VerificationSnapshot> {
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .context("canonicalize verifier-only source workspace")?;
+    let path = fresh_verification_snapshot_path(run_id).await?;
+    let snapshot_root = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        copy_workspace_snapshot(&root, &snapshot_root)?;
+        Ok::<_, anyhow::Error>(snapshot_root)
+    })
+    .await
+    .context("join verifier-only workspace snapshot task")?;
+    match result {
+        Ok(path) => Ok(VerificationSnapshot { path: Some(path) }),
+        Err(error) => match remove_verification_snapshot(path).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "verifier snapshot cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+    }
+}
+
+async fn remove_verification_snapshot(path: PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let display = path.display().to_string();
+    tokio::time::timeout(
+        VERIFICATION_SNAPSHOT_CLEANUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            // Only private snapshot copies are made removable; never relax source permissions.
+            let result = prepare_snapshot_cleanup(&path).and_then(|()| fs::remove_dir_all(&path));
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("remove verifier snapshot {display}"))
+                }
+            }
+        }),
+    )
+    .await
+    .context("verifier snapshot cleanup timed out")?
+    .context("join verifier snapshot cleanup task")?
+}
+
+fn prepare_snapshot_cleanup(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if snapshot_entry_is_link(&metadata) {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if metadata.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        // This clears only the Windows readonly attribute; Unix uses owner-mode bits above.
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            prepare_snapshot_cleanup(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_workspace_snapshot(root: &Path, destination: &Path) -> Result<()> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    if destination.exists() {
+        return Err(anyhow!(
+            "verifier-only workspace snapshot target already exists"
+        ));
+    }
+    fs::create_dir(destination).with_context(|| {
+        format!(
+            "create verifier-only workspace snapshot {}",
+            destination.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        destination,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .with_context(|| {
+        format!(
+            "secure verifier-only workspace snapshot {}",
+            destination.display()
+        )
+    })?;
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    copy_snapshot_directory(
+        root,
+        root,
+        destination,
+        &mut entries,
+        &mut bytes,
+        MAX_ENTRIES,
+        MAX_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_snapshot_directory(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    entries: &mut usize,
+    bytes: &mut u64,
+    max_entries: usize,
+    max_bytes: u64,
+) -> Result<()> {
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read verifier snapshot directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        if is_git_control_path(root, &source_path) {
+            continue;
+        }
+        *entries += 1;
+        if *entries > max_entries {
+            return Err(anyhow!(
+                "verifier-only workspace snapshot exceeds {max_entries} entries"
+            ));
+        }
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path).with_context(|| {
+            format!("inspect verifier snapshot entry {}", source_path.display())
+        })?;
+        let file_type = metadata.file_type();
+        if snapshot_entry_is_link(&metadata) {
+            copy_snapshot_symlink(root, &source_path, &destination_path)?;
+        } else if file_type.is_dir() {
+            fs::create_dir(&destination_path).with_context(|| {
+                format!(
+                    "create verifier snapshot directory {}",
+                    destination_path.display()
+                )
+            })?;
+            copy_snapshot_directory(
+                root,
+                &source_path,
+                &destination_path,
+                entries,
+                bytes,
+                max_entries,
+                max_bytes,
+            )?;
+            // The root stays private (0700), but entry modes must match the sealed source.
+            fs::set_permissions(&destination_path, metadata.permissions()).with_context(|| {
+                format!(
+                    "preserve verifier snapshot directory permissions {}",
+                    destination_path.display()
+                )
+            })?;
+        } else if file_type.is_file() {
+            let length = metadata.len();
+            *bytes = bytes
+                .checked_add(length)
+                .context("verifier-only workspace snapshot byte count overflowed")?;
+            if *bytes > max_bytes {
+                return Err(anyhow!(
+                    "verifier-only workspace snapshot exceeds {max_bytes} bytes"
+                ));
+            }
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy verifier snapshot file {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            fs::set_permissions(&destination_path, metadata.permissions()).with_context(|| {
+                format!(
+                    "preserve verifier snapshot file permissions {}",
+                    destination_path.display()
+                )
+            })?;
+        } else {
+            return Err(anyhow!(
+                "verifier-only workspace snapshot encountered unsupported entry {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn snapshot_entry_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+pub(crate) fn snapshot_entry_is_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn validated_snapshot_symlink_target(root: &Path, source: &Path) -> Result<PathBuf> {
+    let target = fs::read_link(source)
+        .with_context(|| format!("read verifier snapshot symlink {}", source.display()))?;
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(anyhow!(
+            "verifier snapshot symlink {} has an absolute target",
+            source.display()
+        ));
+    }
+    let resolved = source
+        .parent()
+        .context("verifier snapshot symlink has no parent")?
+        .join(&target);
+    let canonical = fs::canonicalize(&resolved).with_context(|| {
+        format!(
+            "canonicalize verifier snapshot symlink target {}",
+            source.display()
+        )
+    })?;
+    if !canonical.starts_with(root) || is_git_control_path(root, &canonical) {
+        return Err(anyhow!(
+            "verifier snapshot symlink {} escapes the preserved workspace",
+            source.display()
+        ));
+    }
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn copy_snapshot_symlink(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let target = validated_snapshot_symlink_target(root, source)?;
+    std::os::unix::fs::symlink(&target, destination).with_context(|| {
+        format!(
+            "copy verifier snapshot symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn copy_snapshot_symlink(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let target = validated_snapshot_symlink_target(root, source)?;
+    let target_is_directory = fs::metadata(source)
+        .with_context(|| format!("inspect verifier snapshot symlink {}", source.display()))?
+        .is_dir();
+    if target_is_directory {
+        std::os::windows::fs::symlink_dir(&target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(&target, destination)
+    }
+    .with_context(|| {
+        format!(
+            "copy verifier snapshot symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+fn find_workspace_file_by_digest(
+    root: &Path,
+    file_name: &str,
+    expected_sha256: &str,
+    expected_bytes: usize,
+) -> Result<PathBuf> {
+    if file_name.is_empty()
+        || file_name.len() > 240
+        || file_name.contains(['/', '\\'])
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(anyhow!("legacy workspace artifact identity is invalid"));
+    }
+    for (_, path) in fingerprint_entries(root)? {
+        if path.file_name().and_then(|name| name.to_str()) != Some(file_name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect legacy workspace artifact {}", path.display()))?;
+        if snapshot_entry_is_link(&metadata)
+            || !metadata.is_file()
+            || metadata.len() != expected_bytes as u64
+        {
+            continue;
+        }
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("open legacy workspace artifact {}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read legacy workspace artifact {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        if hex::encode(digest.finalize()) == expected_sha256 {
+            return Ok(path);
+        }
+    }
+    Err(anyhow!(
+        "legacy workspace artifact {file_name} did not match its persisted digest"
+    ))
+}
+
+fn fingerprint_workspace(root: &Path) -> Result<String> {
+    let root = fs::canonicalize(root).context("resolve workspace fingerprint root")?;
+    let mut digest = Sha256::new();
+    // Root permissions intentionally differ for private snapshots. Bind every copied entry.
+    for (relative, path) in fingerprint_entries(&root)? {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect workspace fingerprint path {}", path.display()))?;
+        if snapshot_entry_is_link(&metadata) {
+            let target = validated_snapshot_symlink_target(&root, &path)?;
+            digest.update(b"L\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(target.as_os_str().as_encoded_bytes());
+            digest.update(b"\0");
+        } else if metadata.is_dir() {
+            digest.update(b"D\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(fingerprint_mode(&metadata).to_le_bytes());
+        } else if metadata.is_file() {
+            digest.update(b"F\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(fingerprint_mode(&metadata).to_le_bytes());
+            digest.update(metadata.len().to_le_bytes());
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("open workspace fingerprint path {}", path.display()))?;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).with_context(|| {
+                    format!("read workspace fingerprint path {}", path.display())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            digest.update(b"\0");
+        } else {
+            return Err(anyhow!(
+                "workspace fingerprint encountered unsupported entry {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn fingerprint_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // File type is encoded separately. Include permissions, including executable/special bits,
+        // regardless of Git's core.filemode setting; inode, ownership and timestamps are not copied.
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no physical POSIX executable bit. Only bind its portable read-only flag,
+        // not archive/creation attributes which can legitimately change when a snapshot is copied.
+        u32::from(metadata.permissions().readonly())
+    }
+}
+
+fn fingerprint_entries(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    const MAX_ENTRIES: usize = 100_000;
+    let mut paths = Vec::new();
+    collect_fingerprint_entries(root, root, &mut paths, MAX_ENTRIES)?;
+    let mut entries = paths
+        .into_iter()
+        .map(|path| Ok((portable_relative(root, &path)?, path)))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn collect_fingerprint_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<PathBuf>,
+    max_entries: usize,
+) -> Result<()> {
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "read workspace fingerprint directory {}",
+            directory.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_git_control_path(root, &path) {
+            continue;
+        }
+        entries.push(path.clone());
+        if entries.len() > max_entries {
+            return Err(anyhow!(
+                "workspace fingerprint exceeds {max_entries} entries"
+            ));
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        // A Windows junction may look like a directory. Never enumerate through any reparse point.
+        if metadata.is_dir() && !snapshot_entry_is_link(&metadata) {
+            collect_fingerprint_entries(root, &path, entries, max_entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_git_control_path(root: &Path, path: &Path) -> bool {
+    let Some(Component::Normal(first)) = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+    else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        first
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+    }
+    #[cfg(not(windows))]
+    {
+        first == ".git"
+    }
+}
+
+fn portable_relative(root: &Path, path: &Path) -> Result<String> {
+    Ok(path
+        .strip_prefix(root)
+        .context("workspace fingerprint path escapes its root")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .context("workspace fingerprint path is not UTF-8"),
+            _ => Err(anyhow!("workspace fingerprint path is not relative")),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("/"))
 }
 
 fn parse_github_repository_identity(remote: &str) -> Option<String> {
@@ -827,6 +1440,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn physical_fixture() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .join("ecorp physical workspace tests")
+            .join(Uuid::new_v4().to_string());
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create physical source");
+        (root, source)
+    }
+
+    fn cleanup_physical_fixture(root: &Path) {
+        let canonical = fs::canonicalize(root).expect("resolve physical fixture");
+        let temporary = fs::canonicalize(std::env::temp_dir()).expect("resolve temporary root");
+        assert!(canonical != temporary && canonical.starts_with(&temporary));
+        prepare_snapshot_cleanup(&canonical).expect("make owned fixture removable");
+        fs::remove_dir_all(&canonical).expect("remove owned physical fixture");
+    }
+
     #[tokio::test]
     async fn provisions_distinct_worktrees_without_touching_source_checkout() {
         let (root, repository, managed) = fixture();
@@ -888,6 +1518,476 @@ mod tests {
         assert_eq!(second_cleanup.disposition, WorkspaceDisposition::Preserved);
         assert!(first.path.exists());
         assert!(second.path.exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_covers_tracked_untracked_and_ignored_bytes() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        let initial = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("initial fingerprint");
+        std::fs::write(workspace.path.join("untracked.txt"), "one\n")
+            .expect("write untracked file");
+        let with_untracked = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("untracked fingerprint");
+        assert_ne!(initial, with_untracked);
+        std::fs::write(workspace.path.join("valuable.log"), "ignored\n")
+            .expect("write ignored file");
+        let with_ignored = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("ignored fingerprint");
+        assert_ne!(with_untracked, with_ignored);
+        std::fs::write(workspace.path.join("README.md"), "# changed\n")
+            .expect("change tracked file");
+        let with_tracked = manager
+            .fingerprint(&workspace)
+            .await
+            .expect("tracked fingerprint");
+        assert_ne!(with_ignored, with_tracked);
+        assert_eq!(with_tracked.len(), 64);
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[test]
+    fn fingerprint_is_reproducible_and_excludes_only_root_git_control() {
+        let (root, source) = physical_fixture();
+        let other = root.join("other");
+        let files = [
+            ("z.txt", "last\n"),
+            ("nested/a.txt", "first\n"),
+            ("ignored.log", "ignored bytes\n"),
+            ("nested/.git/marker", "nested control is source\n"),
+        ];
+        for (path, bytes) in files {
+            let path = source.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        for (path, bytes) in files.into_iter().rev() {
+            let path = other.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        fs::write(source.join(".git"), "linked worktree control\n").unwrap();
+        fs::create_dir(other.join(".git")).unwrap();
+        fs::write(other.join(".git/HEAD"), "different Git control\n").unwrap();
+
+        let expected = fingerprint_workspace(&source).unwrap();
+        assert_eq!(fingerprint_workspace(&source).unwrap(), expected);
+        assert_eq!(fingerprint_workspace(&other).unwrap(), expected);
+        fs::write(other.join("z.txt"), "last\n").unwrap();
+        assert_eq!(fingerprint_workspace(&other).unwrap(), expected);
+        fs::write(other.join("nested/.git/marker"), "changed nested source\n").unwrap();
+        assert_ne!(fingerprint_workspace(&other).unwrap(), expected);
+        assert!(portable_relative(&source, &root.join("outside")).is_err());
+        assert!(portable_relative(&source, &source.join("../outside")).is_err());
+        #[cfg(windows)]
+        assert!(is_git_control_path(&source, &source.join(".GiT/HEAD")));
+        #[cfg(unix)]
+        assert!(!is_git_control_path(&source, &source.join(".GiT/HEAD")));
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_binds_unix_modes_even_when_git_ignores_mode_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, repository, _) = fixture();
+        command(
+            &repository,
+            &[
+                OsStr::new("config"),
+                OsStr::new("core.filemode"),
+                OsStr::new("false"),
+            ],
+        );
+        fs::write(repository.join("untracked.sh"), "untracked\n").unwrap();
+        fs::write(repository.join("ignored.log"), "ignored\n").unwrap();
+        let paths = ["README.md", "untracked.sh", "ignored.log"];
+        for path in paths {
+            fs::set_permissions(repository.join(path), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let expected = fingerprint_workspace(&repository).unwrap();
+        for path in paths {
+            let path = repository.join(path);
+            let bytes = fs::read(&path).unwrap();
+            for mode in [0o755, 0o744, 0o640, 0o645, 0o4755] {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                assert_eq!(fingerprint_mode(&fs::metadata(&path).unwrap()), mode);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_ne!(fingerprint_workspace(&repository).unwrap(), expected);
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(fingerprint_workspace(&repository).unwrap(), expected);
+        }
+        fs::set_permissions(
+            repository.join("README.md"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let diff = std::process::Command::new("git")
+            .args(["diff", "--name-only"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(diff.status.success());
+        assert!(
+            diff.stdout.is_empty(),
+            "Git alone hides this executable-mode drift"
+        );
+        assert_ne!(fingerprint_workspace(&repository).unwrap(), expected);
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshots_preserve_unix_modes_without_changing_source_during_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, source) = physical_fixture();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/script.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(
+            source.join("nested/script.sh"),
+            fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o550)).unwrap();
+        let expected = fingerprint_workspace(&source).unwrap();
+        let mut baseline = verification_snapshot(&source, Uuid::new_v4())
+            .await
+            .unwrap();
+        let mut check = verification_snapshot(baseline.path(), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(fingerprint_workspace(baseline.path()).unwrap(), expected);
+        assert_eq!(fingerprint_workspace(check.path()).unwrap(), expected);
+        assert_eq!(
+            fingerprint_mode(&fs::metadata(baseline.path()).unwrap()),
+            0o700
+        );
+        assert_eq!(
+            fingerprint_mode(&fs::metadata(check.path().join("nested")).unwrap()),
+            0o550
+        );
+        fs::set_permissions(
+            check.path().join("nested/script.sh"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_ne!(fingerprint_workspace(check.path()).unwrap(), expected);
+        assert_eq!(fingerprint_workspace(baseline.path()).unwrap(), expected);
+        check
+            .cleanup()
+            .await
+            .expect("remove copy with restrictive directory mode");
+        baseline.cleanup().await.expect("remove sealed baseline");
+        assert_eq!(fingerprint_workspace(&source).unwrap(), expected);
+        fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o750)).unwrap();
+        assert_ne!(fingerprint_workspace(&source).unwrap(), expected);
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fingerprint_binds_windows_readonly_modes_and_snapshots_preserve_them() {
+        let (root, source) = physical_fixture();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/tool.exe"), "same bytes\n").unwrap();
+        fs::write(source.join("plain.txt"), "same bytes\n").unwrap();
+        assert_eq!(
+            fingerprint_mode(&fs::metadata(source.join("nested/tool.exe")).unwrap()),
+            fingerprint_mode(&fs::metadata(source.join("plain.txt")).unwrap())
+        );
+        let writable = fingerprint_workspace(&source).unwrap();
+        for path in [source.join("nested/tool.exe"), source.join("nested")] {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let expected = fingerprint_workspace(&source).unwrap();
+        assert_ne!(expected, writable);
+        let mut snapshot = verification_snapshot(&source, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(fingerprint_workspace(snapshot.path()).unwrap(), expected);
+        assert_eq!(
+            fingerprint_mode(&fs::metadata(snapshot.path().join("nested/tool.exe")).unwrap()),
+            1
+        );
+        snapshot
+            .cleanup()
+            .await
+            .expect("remove read-only snapshot entries");
+        assert!(
+            fs::metadata(source.join("nested"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            fs::metadata(source.join("nested/tool.exe"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(fingerprint_workspace(&source).unwrap(), expected);
+        cleanup_physical_fixture(&root);
+    }
+
+    #[test]
+    fn fingerprint_entry_and_snapshot_byte_limits_fail_without_source_mutation() {
+        let (root, source) = physical_fixture();
+        fs::write(source.join("a.txt"), "1234").unwrap();
+        fs::write(source.join("b.txt"), "5678").unwrap();
+        let expected = fingerprint_workspace(&source).unwrap();
+        let error = collect_fingerprint_entries(&source, &source, &mut Vec::new(), 1)
+            .expect_err("entry bound");
+        assert!(error.to_string().contains("exceeds 1 entries"));
+        let destination = root.join("limited");
+        fs::create_dir(&destination).unwrap();
+        let mut entries = 0;
+        let mut bytes = 0;
+        let error = copy_snapshot_directory(
+            &source,
+            &source,
+            &destination,
+            &mut entries,
+            &mut bytes,
+            10,
+            3,
+        )
+        .expect_err("byte bound");
+        assert!(error.to_string().contains("exceeds 3 bytes"));
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(fingerprint_workspace(&source).unwrap(), expected);
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_rejects_lossy_non_utf8_path_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (root, source) = physical_fixture();
+        fs::write(source.join(OsString::from_vec(vec![b'a', 0xff])), "bytes\n").unwrap();
+        assert!(
+            fingerprint_workspace(&source)
+                .expect_err("non-UTF-8 paths must not collide through lossy encoding")
+                .to_string()
+                .contains("not UTF-8")
+        );
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fingerprint_and_snapshots_bind_contained_links_and_reject_git_control_links() {
+        use std::os::unix::fs::symlink;
+
+        let (root, source) = physical_fixture();
+        fs::write(source.join("one.txt"), "same\n").unwrap();
+        fs::write(source.join("two.txt"), "same\n").unwrap();
+        fs::write(source.join(".git"), "private Git control\n").unwrap();
+        symlink("one.txt", source.join("alias.txt")).unwrap();
+        symlink(".", source.join("loop")).unwrap();
+        let expected = fingerprint_workspace(&source).unwrap();
+        assert_eq!(fingerprint_entries(&source).unwrap().len(), 4);
+        let mut snapshot = verification_snapshot(&source, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(fingerprint_workspace(snapshot.path()).unwrap(), expected);
+        fs::write(snapshot.path().join("alias.txt"), "check side effect\n").unwrap();
+        snapshot.cleanup().await.unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("one.txt")).unwrap(),
+            "same\n"
+        );
+        assert_eq!(fingerprint_workspace(&source).unwrap(), expected);
+        fs::remove_file(source.join("alias.txt")).unwrap();
+        symlink("two.txt", source.join("alias.txt")).unwrap();
+        assert_ne!(fingerprint_workspace(&source).unwrap(), expected);
+        fs::remove_file(source.join("alias.txt")).unwrap();
+        symlink(".git", source.join("alias.txt")).unwrap();
+        assert!(fingerprint_workspace(&source).is_err());
+        assert!(
+            verification_snapshot(&source, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fingerprint_and_legacy_search_never_traverse_windows_junctions() {
+        let (root, source) = physical_fixture();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("evidence.txt"), "outside bytes\n").unwrap();
+        let junction = source.join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .expect("create owned junction fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(snapshot_entry_is_link(
+            &fs::symlink_metadata(&junction).unwrap()
+        ));
+        let entries = fingerprint_entries(&source).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "junction");
+        assert!(fingerprint_workspace(&source).is_err());
+        assert!(
+            verification_snapshot(&source, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        assert!(
+            find_file_by_digest(
+                &source,
+                "evidence.txt",
+                &hex::encode(Sha256::digest(b"outside bytes\n")),
+                b"outside bytes\n".len(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("evidence.txt")).unwrap(),
+            "outside bytes\n"
+        );
+        cleanup_physical_fixture(&root);
+    }
+
+    #[tokio::test]
+    async fn legacy_artifact_search_is_bounded_by_name_size_and_digest() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        std::fs::create_dir_all(workspace.path.join("nested")).expect("create nested directory");
+        let bytes = b"legacy artifact\n";
+        let artifact = workspace.path.join("nested").join("provider.json");
+        std::fs::write(&artifact, bytes).expect("write legacy artifact");
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        let found = find_file_by_digest(&workspace.path, "provider.json", &sha256, bytes.len())
+            .await
+            .expect("find legacy artifact");
+        assert_eq!(found, artifact);
+        assert!(
+            find_file_by_digest(
+                &workspace.path,
+                "provider.json",
+                &"0".repeat(64),
+                bytes.len(),
+            )
+            .await
+            .expect_err("wrong digest must fail")
+            .to_string()
+            .contains("did not match")
+        );
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn verifier_snapshot_is_physical_isolated_and_excludes_git_control() {
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        std::fs::write(workspace.path.join("untracked.txt"), "source\n")
+            .expect("write untracked source");
+        std::fs::write(workspace.path.join("valuable.log"), "ignored\n")
+            .expect("write ignored source");
+        let mut snapshot = verification_snapshot(&workspace.path, Uuid::new_v4())
+            .await
+            .expect("create verifier snapshot");
+        let snapshot_path = snapshot.path().to_owned();
+        assert!(!snapshot_path.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path.join("untracked.txt"))
+                .expect("read snapshot untracked source"),
+            "source\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path.join("valuable.log"))
+                .expect("read snapshot ignored source"),
+            "ignored\n"
+        );
+        std::fs::write(
+            snapshot_path.join("untracked.txt"),
+            "verifier side effect\n",
+        )
+        .expect("modify verifier snapshot");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("untracked.txt"))
+                .expect("read unchanged source"),
+            "source\n"
+        );
+        snapshot.cleanup().await.expect("clean verifier snapshot");
+        assert!(!snapshot_path.exists());
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_snapshot_rejects_a_symlink_that_escapes_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (root, repository, managed) = fixture();
+        let manager = WorkspaceManager::initialize(managed, repository.clone(), "HEAD".to_owned())
+            .await
+            .expect("initialize manager");
+        let workspace = manager
+            .prepare(Uuid::new_v4(), Uuid::new_v4(), None, None)
+            .await
+            .expect("prepare worktree");
+        let outside = workspace
+            .path
+            .parent()
+            .expect("worktree parent")
+            .join("outside.txt");
+        std::fs::write(&outside, "outside\n").expect("write outside file");
+        symlink("../outside.txt", workspace.path.join("escape.txt"))
+            .expect("create escaping symlink");
+        assert!(manager.fingerprint(&workspace).await.is_err());
+        let error = verification_snapshot(&workspace.path, Uuid::new_v4())
+            .await
+            .expect_err("escaping symlink must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("escapes the preserved workspace")
+        );
+        std::fs::remove_file(outside).expect("remove outside file");
         cleanup_fixture(&root, &repository);
     }
 

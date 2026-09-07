@@ -5,6 +5,7 @@ import './Arcade.css'
 import './Cabinet.css'
 import './World.css'
 import './Accessible.css'
+import './OperationsUx.css'
 import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
 import { FactoryPollingNotice } from './FactoryPollingNotice'
@@ -179,6 +180,8 @@ type Run = {
   workspace_base_commit: string | null
   workspace_disposition: string | null
   workspace_detail: string | null
+  workspace_fingerprint: string | null
+  execution_mode: 'provider' | 'verification_only'
   verification_status: string
   verification_summary: string | null
   verification_sha256: string | null
@@ -437,6 +440,23 @@ type FactoryController = {
   last_error: string | null
 }
 
+type FactoryVerificationRecovery = {
+  id: string
+  factory_work_item_id: string
+  mission_id: string
+  task_id: string
+  source_run_id: string
+  replacement_run_id: string | null
+  mode: 'source_correction' | 'verifier_only'
+  status: 'authorized' | 'running' | 'completed' | 'failed'
+  authorized_by: string
+  reason: string
+  observed_source_revision: string
+  contract_revision_id: string | null
+  created_at: string
+  updated_at: string
+}
+
 type DomainEvent = {
   seq: number
   id: string
@@ -494,6 +514,7 @@ type SnapshotResponse = {
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
     factory_controllers?: FactoryController[]
+    factory_verification_recoveries: FactoryVerificationRecovery[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -987,7 +1008,7 @@ function VerificationPolicyEditor({
     <div className="verification-policy-editor" data-testid={`${idPrefix}-verification-editor`}>
       <div className="contract-section-heading">
         <div>
-          <strong>Victory gate editor</strong>
+          <strong>Verification checks</strong>
           <span>Each check executes on the runner inside the assigned worktree.</span>
         </div>
         <button
@@ -3026,6 +3047,7 @@ function BudgetRevisionPanel({
 }
 
 function MissionCard({
+  corpId,
   mission,
   tasks,
   runs,
@@ -3037,6 +3059,8 @@ function MissionCard({
   actors,
   verificationRequests,
   actionApprovals,
+  factoryItem,
+  factoryRecoveries,
   actorId,
   actorRole,
   busy,
@@ -3050,6 +3074,7 @@ function MissionCard({
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
+  corpId: string
   mission: Mission
   tasks: Task[]
   runs: Run[]
@@ -3061,6 +3086,8 @@ function MissionCard({
   actors: Actor[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
+  factoryItem: FactoryWorkItem | undefined
+  factoryRecoveries: FactoryVerificationRecovery[]
   actorId: string
   actorRole: string
   busy: boolean
@@ -3086,6 +3113,7 @@ function MissionCard({
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
+  const [copiedRecoveryMode, setCopiedRecoveryMode] = useState<string | null>(null)
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
@@ -3131,6 +3159,37 @@ function MissionCard({
         .filter((item) => item.run_id === latestRun.id)
         .toSorted((left, right) => left.check_index - right.check_index)
     : []
+  const totalAutomatedChecks = Math.max(
+    latestEvidence.length,
+    latestRun ? taskById.get(latestRun.task_id)?.verification_policy.checks.length ?? 0 : 0,
+  )
+  const passedAutomatedChecks = latestEvidence.filter((item) => item.status === 'passed').length
+  const failedAutomatedChecks = latestEvidence.filter((item) => item.status === 'failed').length
+  const missingAutomatedChecks = totalAutomatedChecks - latestEvidence.length
+  const automatedVerificationStatus = failedAutomatedChecks > 0
+    ? 'failed'
+    : missingAutomatedChecks > 0 || latestEvidence.length === 0 ? 'pending' : 'passed'
+  const automatedVerificationSummary = latestEvidence.length === 0
+    ? 'No check results recorded'
+    : failedAutomatedChecks > 0
+      ? `${failedAutomatedChecks} check${failedAutomatedChecks === 1 ? '' : 's'} failed`
+      : 'All recorded checks passed'
+  const latestVerificationRequest = latestRun
+    ? verificationRequests.find(
+        (request) => request.run_id === latestRun.id && request.task_id === latestRun.task_id,
+      )
+    : undefined
+  const reviewRejected = latestVerificationRequest?.status === 'rejected'
+  const reviewDecisionLabel = latestVerificationRequest?.gate_type === 'independent_review'
+    ? 'Independent review'
+    : 'Human approval'
+  const reviewer = actors.find((actor) => actor.id === latestVerificationRequest?.decided_by)
+  const reviewDecisionNote = latestVerificationRequest?.decision_note?.trim() ||
+    'No reason was recorded for this decision.'
+  const compactReviewNote = reviewDecisionNote.replace(/\s+/g, ' ')
+  const reviewDecisionSummary = compactReviewNote.length > 240
+    ? `${compactReviewNote.slice(0, 237).trimEnd()}…`
+    : compactReviewNote
   const latestDeliverable = latestRun
     ? deliverables.find((deliverable) => deliverable.run_id === latestRun.id)
     : undefined
@@ -3138,6 +3197,66 @@ function MissionCard({
     latestRun && terminalRun(latestRun.status)
       ? latestRun.summary ?? latestRun.verification_summary
       : null
+  const failedTask = tasks.find((task) => task.status === 'verification_failed')
+  const failedRun = failedTask
+    ? runs.find(
+        (run) =>
+          run.task_id === failedTask.id &&
+          run.status === 'failed' &&
+          run.verification_status === 'failed',
+      )
+    : undefined
+  const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
+  const recoveryAgent = failedTask?.assigned_agent_id
+    ? agents.find((agent) => agent.id === failedTask.assigned_agent_id)
+    : undefined
+  const recoveryAdapter = failedTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
+  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
+    if (!factoryItem || !failedTask || !recoveryAdapter) return ''
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+    const command = [
+      'crony factory',
+      quote(corpId),
+      quote(actorId),
+      '--owner',
+      quote(factoryItem.source_project_owner),
+      '--project-number',
+      String(factoryItem.source_project_number),
+      '--repository',
+      quote(`${factoryItem.source_repository_owner}/${factoryItem.source_repository_name}`),
+      '--source-base-ref',
+      quote(failedTask.contract.source_base_ref ?? 'HEAD'),
+      '--adapter',
+      quote(recoveryAdapter),
+      '--budget-tokens',
+      String(mission.budget_tokens),
+      '--budget-cost-microusd',
+      String(mission.budget_cost_microusd),
+      '--issue',
+      String(factoryItem.source_issue_number),
+      '--verification-recovery',
+      mode,
+      '--verification-recovery-reason',
+      quote('Explain why this bounded recovery is authorized.'),
+    ]
+    if (failedTask.contract.model) {
+      command.push('--model', quote(failedTask.contract.model))
+    }
+    if (failedTask.contract.reasoning_effort) {
+      command.push('--reasoning-effort', quote(failedTask.contract.reasoning_effort))
+    }
+    return command.join(' ')
+  }
+  const copyRecoveryCommand = async (
+    mode: 'verifier-only' | 'source-correction',
+  ) => {
+    try {
+      await navigator.clipboard.writeText(recoveryCommand(mode))
+      setCopiedRecoveryMode(mode)
+    } catch {
+      setCopiedRecoveryMode(null)
+    }
+  }
   return (
     <article
       className="mission-card"
@@ -3360,16 +3479,26 @@ function MissionCard({
       {latestRun &&
       (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
         <details
-          className={`verification-box verification-${latestRun.verification_status}`}
+          key={`verification-${latestRun.id}`}
+          className={`verification-box operations-verification verification-${automatedVerificationStatus}`}
           data-testid="verification-evidence"
-          open={latestRun.verification_status === 'failed'}
         >
           <summary>
-            <strong>{statusLabel(latestRun.verification_status)}</strong>
-            <span>
-              {latestEvidence.filter((item) => item.status === 'passed').length}/
-              {latestEvidence.length} checks passed
+            <span className="operations-verification-copy">
+              <strong>Automated verification</strong>
+              <small>
+                {automatedVerificationSummary}
+                {missingAutomatedChecks > 0
+                  ? ` · ${missingAutomatedChecks} result${missingAutomatedChecks === 1 ? '' : 's'} not yet recorded`
+                  : ''}
+              </small>
             </span>
+            <span className="operations-verification-score">
+              {totalAutomatedChecks > 0
+                ? `${passedAutomatedChecks}/${totalAutomatedChecks} passed`
+                : 'No check records'}
+            </span>
+            <span className="operations-disclosure-mark" aria-hidden="true">+</span>
           </summary>
           {latestEvidence.length ? (
             <ol className="evidence-checks">
@@ -3384,34 +3513,168 @@ function MissionCard({
           ) : null}
         </details>
       ) : null}
-      {latestRun && terminalRun(latestRun.status) ? (
-        <div className={`terminal-summary terminal-${latestRun.status}`}>
-          <strong>{statusLabel(latestRun.status)}</strong>
-          <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+      {reviewRejected ? (
+        <section
+          className="operations-review-decision"
+          role="alert"
+          aria-labelledby={`review-decision-${mission.id}`}
+          data-testid="review-decision"
+        >
+          <span className="operations-review-label">{reviewDecisionLabel}</span>
+          <strong id={`review-decision-${mission.id}`}>Changes requested</strong>
           <small>
-            Worktree: {latestRun.workspace_disposition
-              ? statusLabel(latestRun.workspace_disposition)
-              : 'cleanup pending'}
-            {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            {reviewer
+              ? `Reviewed by ${reviewer.name}`
+              : latestVerificationRequest?.decided_by
+                ? `Reviewer ${shortId(latestVerificationRequest.decided_by)} (name unavailable)`
+                : 'Reviewer not recorded'}
           </small>
-        </div>
+          <p>{reviewDecisionSummary}</p>
+          {reviewDecisionSummary !== reviewDecisionNote ? (
+            <details className="operations-review-details" key={latestVerificationRequest?.run_id}>
+              <summary>Read full reviewer findings</summary>
+              <div
+                className="operations-review-full"
+                role="region"
+                aria-label="Full reviewer findings"
+                tabIndex={0}
+              >
+                <p>{reviewDecisionNote}</p>
+              </div>
+            </details>
+          ) : null}
+          <p className="operations-review-next">
+            <strong>Next step: </strong>
+            {factoryItem?.state === 'verification_failed' && failedTask && failedRun
+              ? 'Use the governed recovery controls below to request a bounded correction or evidence recheck. A new review decision is still required.'
+              : 'Ask an authorized operator to resolve the findings and submit new evidence through the governed verification flow.'}
+          </p>
+        </section>
       ) : null}
-      {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
-        <div className="usage-box">
-          {latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out
-        </div>
+      {factoryItem?.state === 'verification_failed' && failedTask && failedRun ? (
+        <section
+          className="factory-recovery-callout"
+          aria-labelledby={`factory-recovery-${factoryItem.id}`}
+          data-testid="factory-verification-recovery"
+        >
+          <div className="factory-recovery-heading">
+            <div>
+              <span>Governed recovery</span>
+              <strong id={`factory-recovery-${factoryItem.id}`}>
+                The failed work is preserved
+              </strong>
+            </div>
+            <span className="status-chip status-chip-failed">Verification failed</span>
+          </div>
+          <p>
+            Choose a provider-free recheck when the source is correct, or resume the same
+            provider session for a bounded source correction. The trusted controller validates
+            the Project issue, policy, budget, worktree, and lineage before creating one run.
+          </p>
+          <dl>
+            <div>
+              <dt>Attempts remaining</dt>
+              <dd>{Math.max(0, failedTask.max_attempts - failedTask.attempt_count)}</dd>
+            </div>
+            <div>
+              <dt>Workspace</dt>
+              <dd>{failedRun.workspace_disposition ?? 'unknown'}</dd>
+            </div>
+            <div>
+              <dt>Checkpoint</dt>
+              <dd>{failedRun.workspace_fingerprint ? `${shortId(failedRun.workspace_fingerprint)}…` : 'Unavailable'}</dd>
+            </div>
+            <div>
+              <dt>Prior recovery attempts</dt>
+              <dd>{factoryRecoveries.length}</dd>
+            </div>
+          </dl>
+          {canAuthorizeRecovery && recoveryAdapter ? (
+            <div className="factory-recovery-actions">
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('verifier-only')}
+              >
+                {copiedRecoveryMode === 'verifier-only'
+                  ? 'Verifier command copied'
+                  : 'Copy verifier-only command'}
+              </button>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('source-correction')}
+              >
+                {copiedRecoveryMode === 'source-correction'
+                  ? 'Correction command copied'
+                  : 'Copy source-correction command'}
+              </button>
+            </div>
+          ) : (
+            <p className="factory-recovery-role-note">
+              {canAuthorizeRecovery
+                ? 'Recovery command metadata is incomplete; inspect the persisted task contract.'
+                : 'An owner, admin, or manager must authorize the recovery.'}
+            </p>
+          )}
+          <details>
+            <summary>Show trusted controller command</summary>
+            <code>{recoveryCommand('verifier-only')}</code>
+          </details>
+        </section>
       ) : null}
-      {latestRun?.model ? (
-        <div className="usage-box">
-          {latestRun.model}
-          {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
-        </div>
+      {latestRun && terminalRun(latestRun.status) ? (
+        reviewRejected ? (
+          <details className="operations-run-outcome" key={`run-outcome-${latestRun.id}`}>
+            <summary>Run record · {statusLabel(latestRun.status)}</summary>
+            <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+            <small>
+              Worktree: {latestRun.workspace_disposition
+                ? statusLabel(latestRun.workspace_disposition)
+                : 'cleanup pending'}
+              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            </small>
+          </details>
+        ) : (
+          <div className={`terminal-summary terminal-${latestRun.status}`}>
+            <strong>{statusLabel(latestRun.status)}</strong>
+            <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+            <small>
+              Worktree: {latestRun.workspace_disposition
+                ? statusLabel(latestRun.workspace_disposition)
+                : 'cleanup pending'}
+              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            </small>
+          </div>
+        )
       ) : null}
-      {latestRun?.workspace_branch ? (
-        <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
-          <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
-          <strong>{latestRun.workspace_branch}</strong>
-        </div>
+      {latestRun && (
+        latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ||
+        latestRun.model || latestRun.workspace_branch
+      ) ? (
+        <dl className="operations-run-metadata" aria-label="Run details">
+          {latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ? (
+            <div>
+              <dt>Usage</dt>
+              <dd>{latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out</dd>
+            </div>
+          ) : null}
+          {latestRun.model ? (
+            <div>
+              <dt>Model</dt>
+              <dd>
+                {latestRun.model}
+                {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
+              </dd>
+            </div>
+          ) : null}
+          {latestRun.workspace_branch ? (
+            <div title={latestRun.workspace_detail ?? undefined}>
+              <dt>{statusLabel(latestRun.workspace_disposition ?? 'active')} worktree</dt>
+              <dd>{latestRun.workspace_branch}</dd>
+            </div>
+          ) : null}
+        </dl>
       ) : null}
       {latestDeliverable ? (
         <div className="workspace-box integration-box" data-testid="integration-state">
@@ -3618,25 +3881,29 @@ function RoomPanel({
     )
   }
 
-  const linkedOptions = [
-    ...missions.slice(0, 2).map((mission) => ({
-      value: `mission:${mission.id}`,
-      label: `Mission · ${mission.title}`,
-    })),
-    ...tasks.slice(0, 2).map((task) => ({
-      value: `task:${task.id}`,
-      label: `Task · ${task.title}`,
-    })),
-    ...runs.slice(0, 2).flatMap((run) => [
-      { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
-      ...(run.artifact_sha256 && run.artifact_id
-        ? [{
-            value: `artifact:${run.artifact_id}`,
-            label: `Artifact · ${shortId(run.artifact_sha256)}`,
-          }]
-        : []),
-    ]),
-  ]
+  const linkedOptions = Array.from(
+    new Map(
+      [
+        ...missions.slice(0, 2).map((mission) => ({
+          value: `mission:${mission.id}`,
+          label: `Mission · ${mission.title}`,
+        })),
+        ...tasks.slice(0, 2).map((task) => ({
+          value: `task:${task.id}`,
+          label: `Task · ${task.title}`,
+        })),
+        ...runs.slice(0, 2).flatMap((run) => [
+          { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
+          ...(run.artifact_sha256 && run.artifact_id
+            ? [{
+                value: `artifact:${run.artifact_id}`,
+                label: `Artifact · ${shortId(run.artifact_sha256)}`,
+              }]
+            : []),
+        ]),
+      ].map((option) => [option.value, option] as const),
+    ).values(),
+  )
   const visibleMessages = messages.slice(-40)
   const replyTarget = replyToId
     ? messages.find((message) => message.id === replyToId)
@@ -4988,19 +5255,32 @@ function App() {
           <div className={`runner-indicator ${connectedRunners.length ? 'runner-online' : ''}`}>
             {runnerLabel}
           </div>
-          <label title={productionAuthenticated ? 'Your authenticated identity; switching accounts is not allowed here.' : 'Local demo identities only. Alice, Bob and Eve are seeded test users, not GitHub sign-in.'}>
-            {productionAuthenticated ? 'Signed in as' : 'Demo operator'}
-            <select disabled={productionAuthenticated} value={selectedActor.id} onChange={(event) => {
-              const actor = humans.find((candidate) => candidate.id === event.target.value)
-              if (actor) selectActor(actor)
-            }}>
-              {humans.map((actor) => (
-                <option key={actor.id} value={actor.id}>
-                  {actor.name} · {actor.role}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="operations-identity">
+            <label htmlFor="operator-actor">
+              {productionAuthenticated ? 'Signed in as' : 'Demo operator'}
+              <select
+                id="operator-actor"
+                aria-describedby="operator-identity-help"
+                disabled={productionAuthenticated}
+                value={selectedActor.id}
+                onChange={(event) => {
+                  const actor = humans.find((candidate) => candidate.id === event.target.value)
+                  if (actor) selectActor(actor)
+                }}
+              >
+                {humans.map((actor) => (
+                  <option key={actor.id} value={actor.id}>
+                    {actor.name} · {actor.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <small id="operator-identity-help">
+              {productionAuthenticated
+                ? 'Locked to your authenticated OIDC account. Identity switching is disabled.'
+                : 'Alice, Bob and Eve are seeded local demo users. Switching changes demo permissions, not your GitHub sign-in.'}
+            </small>
+          </div>
         </div>
       </header>
 
@@ -5304,20 +5584,16 @@ function App() {
           hidden={activeWorkspaceView !== 'missions'}
           tabIndex={-1}
         >
-          <div className="panel-heading">
+          <div className="panel-heading operations-mission-toolbar">
             <div>
-              <span className="section-code">Missions</span>
-              <h2>Authorize work</h2>
-              <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
+              <h2>Mission queue</h2>
+              <p>
+                {missionComposerCollapsed
+                  ? 'Track work, inspect evidence, and decide what happens next.'
+                  : 'Give ECorp a goal, then choose its runtime and completion evidence.'}
+              </p>
             </div>
-          </div>
-          {missionComposerCollapsed ? (
-            <div className="arcade-new-mission-bar">
-              <div>
-                <span>Ready for work</span>
-                <strong>Create another mission</strong>
-                <small>The active mission log stays below.</small>
-              </div>
+            {missionComposerCollapsed && (
               <button
                 className="button button-primary"
                 type="button"
@@ -5328,8 +5604,9 @@ function App() {
               >
                 New mission
               </button>
-            </div>
-          ) : (
+            )}
+          </div>
+          {!missionComposerCollapsed && (
           <form className="mission-form arcade-mission-form" onSubmit={createMission}>
             <div className="arcade-composer-header">
               <div>
@@ -6004,6 +6281,7 @@ function App() {
               {selectedMission ? (
                 <MissionCard
                   key={selectedMission.id}
+                  corpId={bootstrap.corp_id}
                   mission={selectedMission}
                   tasks={selectedMissionTasks}
                   runs={selectedMissionRuns}
@@ -6019,6 +6297,12 @@ function App() {
                   actors={data.snapshot.actors}
                   verificationRequests={data.snapshot.verification_requests}
                   actionApprovals={data.snapshot.action_approvals}
+                  factoryItem={data.snapshot.factory_work_items.find(
+                    (item) => item.mission_id === selectedMission.id,
+                  )}
+                  factoryRecoveries={data.snapshot.factory_verification_recoveries.filter(
+                    (recovery) => recovery.mission_id === selectedMission.id,
+                  )}
                   actorId={selectedActor.id}
                   actorRole={selectedActor.role}
                   busy={busy}

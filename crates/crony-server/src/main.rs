@@ -27,24 +27,29 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::{
-    DomainEvent, ManualVerificationGate, TaskGraphPlan, TaskSecretReference, VerificationPolicy,
+    DeliverableSpec, DomainEvent, FactoryVerificationRecoveryMode, ManualVerificationGate,
+    TaskGraphPlan, TaskSecretReference, VerificationPolicy,
 };
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
+    CheckpointFactoryWorkspaceRequest, CheckpointFactoryWorkspaceResponse,
     ClaimFactoryWorkItemRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     ConfigureFactoryControllerRequest, ControlFactoryControllerRequest,
+    CreateFactoryVerificationRecoveryRequest, CreateFactoryVerificationRecoveryResponse,
     CreateMissionContractRevisionRequest, CreateMissionRequest, CreateMissionResponse,
     CreatePublicationPublisherCredentialRequest, CreatePublicationPublisherCredentialResponse,
     CreateRoomMessageRequest, CreateRoomMessageResponse, CreateRunnerEnrollmentRequest,
     CreateRunnerEnrollmentResponse, CreateSecretRequest, CreateSecretResponse,
     DecideMissionBudgetRevisionRequest, DemoBootstrapResponse, EmergencyStopRequest,
     EmergencyStopResponse, FactoryControllerHeartbeatRequest, FactoryControllerResponse,
-    FactoryMissionContract, FactoryPublicationContextResponse, FactoryWorkItemResponse,
-    InterruptRunRequest, InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse,
-    LeaseMutationResponse, LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
+    FactoryMissionContract, FactoryPublicationContextResponse,
+    FactoryVerificationRecoveryContextResponse, FactoryWorkItemResponse, InterruptRunRequest,
+    InterruptRunResponse, LaunchMissionRequest, LaunchMissionResponse, LeaseMutationResponse,
+    LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
     MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
     MissionBudgetRevisionResponse, MissionContractRevisionResponse, MissionSource,
     PreflightFactoryMissionRequest, PreflightFactoryMissionResponse,
@@ -57,18 +62,20 @@ use crony_protocol::{
     RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
     SetBudgetPolicyRequest, SnapshotResponse, StartPullRequestPublicationRequest,
     TransferLeaseRequest, TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
-    VerificationDecisionRequest, VerificationDecisionResponse,
+    VerificationArtifactReference, VerificationDecisionRequest, VerificationDecisionResponse,
 };
 use crony_store::{
-    ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput, ControlFactoryControllerInput,
+    CheckpointFactoryWorkspaceInput, ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput,
+    ControlFactoryControllerInput, CreateFactoryVerificationRecoveryInput,
     CreateMissionContractRevisionInput, DecideMissionBudgetRevisionInput, FactorySourceInput,
-    HeartbeatFactoryControllerInput, LaunchRecord, MaterializeFactoryMissionInput,
-    MissionFinishScopeInput, NewRoomMessageInput, PendingRunnerCommand, PgStore,
-    PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
+    FactoryVerificationRecoveryLaunch, HeartbeatFactoryControllerInput, LaunchRecord,
+    MaterializeFactoryMissionInput, MissionFinishScopeInput, NewRoomMessageInput,
+    PendingRunnerCommand, PgStore, PreflightFactoryMissionInput, ProposeMissionBudgetRevisionInput,
     PullRequestPublicationCheckpointInput, PullRequestPublicationOutcome, QueuedRunMessage,
     RecordPullRequestPublicationCheckpointInput, RejectFactoryMaterializationInput,
-    RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim, RunnerConnectInput,
-    RunnerEventInput, StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
+    RenewFactoryWorkItemInput, RenewPullRequestPublicationInput, RunClaim,
+    RunnerCommandDispatchState, RunnerConnectInput, RunnerEventInput, RunnerEventOutcome,
+    StartPullRequestPublicationInput, TransitionFactoryWorkItemInput,
     UpgradeFactorySourceCommitInput,
 };
 use dashmap::DashMap;
@@ -223,6 +230,7 @@ struct AppState {
 struct RunnerConnection {
     corp_id: Uuid,
     connection_epoch: Uuid,
+    dispatch_ready: bool,
     tx: mpsc::UnboundedSender<ServerToRunner>,
     capabilities: Vec<RunnerCapability>,
 }
@@ -493,8 +501,17 @@ async fn main() -> anyhow::Result<()> {
             post(upgrade_factory_source_commit),
         )
         .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/workspace-checkpoint",
+            post(checkpoint_factory_workspace),
+        )
+        .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/transition",
             post(transition_factory_work_item),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/verification-recoveries",
+            get(get_factory_verification_recovery_context)
+                .post(create_factory_verification_recovery),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
@@ -1280,15 +1297,123 @@ fn valid_scope_component(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
+fn enable_runner_dispatch(
+    runners: &DashMap<String, RunnerConnection>,
+    runner_id: &str,
+    connection_epoch: Uuid,
+) -> bool {
+    let Some(mut connection) = runners.get_mut(runner_id) else {
+        return false;
+    };
+    if connection.connection_epoch != connection_epoch {
+        return false;
+    }
+    connection.dispatch_ready = true;
+    true
+}
+
+async fn enable_runner_after_reconciliation(
+    runners: &DashMap<String, RunnerConnection>,
+    runner_id: &str,
+    connection_epoch: Uuid,
+    finalization: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<bool> {
+    finalization.await?;
+    Ok(enable_runner_dispatch(runners, runner_id, connection_epoch))
+}
+
+fn runner_epoch_is_ready(
+    runners: &DashMap<String, RunnerConnection>,
+    runner_id: &str,
+    connection_epoch: Uuid,
+) -> bool {
+    runners.get(runner_id).is_some_and(|connection| {
+        connection.connection_epoch == connection_epoch && connection.dispatch_ready
+    })
+}
+
+fn send_command_to_current_runner(
+    runners: &DashMap<String, RunnerConnection>,
+    runner_id: &str,
+    connection_epoch: Uuid,
+    command: ServerToRunner,
+) -> bool {
+    // Keep the map guard through the synchronous send: a replaced socket must not
+    // receive or acknowledge a command fetched by an older dispatch invocation.
+    runners.get(runner_id).is_some_and(|connection| {
+        connection.connection_epoch == connection_epoch
+            && connection.dispatch_ready
+            && connection.tx.send(command).is_ok()
+    })
+}
+
+fn reconnect_preserved_run_ids(accepted: &[Uuid], pending_recoveries: Vec<Uuid>) -> Vec<Uuid> {
+    // Pending assignments are not fabricated runner claims: they emit no
+    // run.reconciled event and still pass normal durable-command admission.
+    let mut preserved = accepted.to_vec();
+    preserved.extend(pending_recoveries);
+    preserved.sort_unstable();
+    preserved.dedup();
+    preserved
+}
+
+async fn pending_recovery_runs_at_reconnect(
+    store: &PgStore,
+    runner_id: &str,
+    corp_id: Uuid,
+    connection_epoch: Uuid,
+) -> anyhow::Result<Vec<Uuid>> {
+    // This is an assignment snapshot, not the dispatcher's bounded command page.
+    // A recovery authorized while offline already has a starting run, but cannot
+    // appear in Register.active_runs until its durable command is delivered.
+    // Capture all such IDs before dispatch is enabled and retain them even after
+    // CommandAck removes the command from the pending queue.
+    sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT command.run_id
+        FROM runner_commands command
+        JOIN runs run ON run.id = command.run_id
+          AND run.corp_id = command.corp_id AND run.runner_id = command.runner_id
+        JOIN runner_nodes runner ON runner.id = command.runner_id
+          AND runner.corp_id = command.corp_id
+        WHERE command.runner_id = $1 AND command.corp_id = $2
+          AND command.command_kind = 'factory_verification_recovery'
+          AND command.status = 'pending'
+          AND runner.connection_epoch = $3 AND runner.status = 'connected'
+        ORDER BY command.run_id
+        "#,
+    )
+    .bind(runner_id)
+    .bind(corp_id)
+    .bind(connection_epoch)
+    .fetch_all(store.pool())
+    .await
+    .context("capture pending recovery assignments before reconnect dispatch")
+}
+
 async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> anyhow::Result<()> {
-    let Some((sender, durable_control)) = state.runners.get(runner_id).map(|connection| {
-        (
-            connection.tx.clone(),
+    let Some(connection_epoch) = state.runners.get(runner_id).and_then(|connection| {
+        connection
+            .dispatch_ready
+            .then_some(connection.connection_epoch)
+    }) else {
+        return Ok(());
+    };
+    dispatch_pending_runner_commands_for_epoch(state, runner_id, connection_epoch).await
+}
+
+async fn dispatch_pending_runner_commands_for_epoch(
+    state: &AppState,
+    runner_id: &str,
+    connection_epoch: Uuid,
+) -> anyhow::Result<()> {
+    let Some(durable_control) = state.runners.get(runner_id).and_then(|connection| {
+        (connection.dispatch_ready && connection.connection_epoch == connection_epoch).then(|| {
             connection
                 .capabilities
                 .iter()
-                .any(|capability| capability.name == "durable-control-v1" && capability.available),
-        )
+                .any(|capability| capability.name == "durable-control-v1" && capability.available)
+        })
     }) else {
         return Ok(());
     };
@@ -1300,6 +1425,9 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
         }
         let mut dispatched = false;
         for command in commands {
+            if !runner_epoch_is_ready(&state.runners, runner_id, connection_epoch) {
+                return Ok(());
+            }
             let control_lease_token = if command.command_kind == "control_message" {
                 match state.store.control_command_lease_token(&command).await? {
                     Some(token) => Some(token),
@@ -1321,8 +1449,44 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
             } else {
                 None
             };
-            let outgoing = decode_runner_command(&command, control_lease_token, durable_control)?;
-            if sender.send(outgoing).is_err() {
+            let decoded = decode_recovery_runner_command(
+                state,
+                &command,
+                control_lease_token,
+                durable_control,
+            )
+            .await;
+            if !runner_epoch_is_ready(&state.runners, runner_id, connection_epoch) {
+                return Ok(());
+            }
+            let outgoing = match decoded {
+                Ok(Some(outgoing)) => outgoing,
+                Ok(None) => continue,
+                Err(error) if command.command_kind == "factory_verification_recovery" => {
+                    let detail = factory_recovery_dispatch_failure_detail(&error);
+                    for event in state
+                        .store
+                        .fail_factory_recovery_before_dispatch(
+                            command.corp_id,
+                            command.run_id,
+                            &detail,
+                        )
+                        .await?
+                    {
+                        publish(state, event);
+                    }
+                    warn!(%error, run_id = %command.run_id, command_id = %command.id,
+                        "factory recovery command failed before runner dispatch");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !send_command_to_current_runner(
+                &state.runners,
+                runner_id,
+                connection_epoch,
+                outgoing,
+            ) {
                 return Ok(());
             }
             if command.command_kind == "control_message"
@@ -1339,6 +1503,286 @@ async fn dispatch_pending_runner_commands(state: &AppState, runner_id: &str) -> 
         if dispatched || batch_len < 100 {
             break;
         }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct FactoryRecoveryRunnerCommandPayload {
+    mode: FactoryVerificationRecoveryMode,
+    corp_id: Uuid,
+    room_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    workspace_run_id: Uuid,
+    agent_id: Uuid,
+    assignment_token: Uuid,
+    adapter: String,
+    provider_session_id: Option<String>,
+    prompt: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
+    workspace_base_commit: String,
+    expected_workspace_fingerprint: String,
+    expected_head_commit: Option<String>,
+    verification_policy: VerificationPolicy,
+    #[serde(default)]
+    write_scope: Vec<String>,
+    deliverable: Option<DeliverableSpec>,
+    #[serde(default)]
+    secret_refs: Vec<TaskSecretReference>,
+    provider_artifact: Option<VerificationArtifactReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FactoryWorkspaceCheckpointRunnerCommandPayload {
+    corp_id: Uuid,
+    room_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    workspace_run_id: Uuid,
+    agent_id: Uuid,
+    assignment_token: Uuid,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
+    workspace_base_commit: String,
+    expected_head_commit: String,
+}
+
+async fn decode_recovery_runner_command(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+    control_lease_token: Option<Uuid>,
+    durable_control: bool,
+) -> anyhow::Result<Option<ServerToRunner>> {
+    match command.command_kind.as_str() {
+        "factory_verification_recovery" => {
+            if !recovery_command_can_dispatch(state, command).await? {
+                return Ok(None);
+            }
+            let mut payload: FactoryRecoveryRunnerCommandPayload =
+                serde_json::from_value(command.payload.clone())
+                    .context("decode factory verification recovery runner command")?;
+            if payload.run_id != command.run_id || payload.corp_id != command.corp_id {
+                return Err(anyhow::anyhow!(
+                    "factory recovery runner command identity mismatch"
+                ));
+            }
+            match payload.mode {
+                FactoryVerificationRecoveryMode::SourceCorrection => {
+                    let secrets = resolve_secret_refs(
+                        state,
+                        payload.corp_id,
+                        payload.task_id,
+                        payload.run_id,
+                        &command.runner_id,
+                        &payload.secret_refs,
+                    )
+                    .await?;
+                    if !recovery_command_can_dispatch(state, command).await? {
+                        return Ok(None);
+                    }
+                    Ok(Some(ServerToRunner::ResumeRun {
+                        command_id: Some(command.id),
+                        corp_id: payload.corp_id,
+                        room_id: payload.room_id,
+                        mission_id: payload.mission_id,
+                        task_id: payload.task_id,
+                        run_id: payload.run_id,
+                        workspace_run_id: payload.workspace_run_id,
+                        agent_id: payload.agent_id,
+                        assignment_token: payload.assignment_token,
+                        adapter: payload.adapter,
+                        provider_session_id: payload
+                            .provider_session_id
+                            .context("source-correction command omitted provider session")?,
+                        prompt: payload.prompt,
+                        model: payload.model,
+                        reasoning_effort: payload.reasoning_effort,
+                        source_repository: payload.source_repository,
+                        source_base_ref: payload.source_base_ref,
+                        source_base_commit: payload.source_base_commit,
+                        workspace_base_commit: Some(payload.workspace_base_commit),
+                        expected_workspace_fingerprint: Some(
+                            payload.expected_workspace_fingerprint,
+                        ),
+                        expected_head_commit: payload.expected_head_commit,
+                        verification_policy: payload.verification_policy,
+                        write_scope: payload.write_scope,
+                        deliverable: payload.deliverable,
+                        secrets,
+                    }))
+                }
+                FactoryVerificationRecoveryMode::VerifierOnly => {
+                    if !payload.secret_refs.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "verifier-only recovery cannot receive provider secrets"
+                        ));
+                    }
+                    if let Some(reference) = payload.provider_artifact.as_mut()
+                        && !hydrate_verification_artifact(
+                            state,
+                            command,
+                            payload.task_id,
+                            reference,
+                        )
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                    if !recovery_command_can_dispatch(state, command).await? {
+                        return Ok(None);
+                    }
+                    Ok(Some(ServerToRunner::VerifyRun {
+                        command_id: command.id,
+                        corp_id: payload.corp_id,
+                        room_id: payload.room_id,
+                        mission_id: payload.mission_id,
+                        task_id: payload.task_id,
+                        run_id: payload.run_id,
+                        workspace_run_id: payload.workspace_run_id,
+                        agent_id: payload.agent_id,
+                        assignment_token: payload.assignment_token,
+                        source_repository: payload.source_repository,
+                        source_base_ref: payload.source_base_ref,
+                        source_base_commit: payload.source_base_commit,
+                        workspace_base_commit: payload.workspace_base_commit,
+                        expected_workspace_fingerprint: payload.expected_workspace_fingerprint,
+                        expected_head_commit: payload.expected_head_commit,
+                        verification_policy: payload.verification_policy,
+                        write_scope: payload.write_scope,
+                        deliverable: payload.deliverable,
+                        provider_artifact: payload.provider_artifact,
+                    }))
+                }
+            }
+        }
+        _ => decode_runner_command(command, control_lease_token, durable_control).map(Some),
+    }
+}
+
+async fn recovery_command_can_dispatch(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<bool> {
+    match state.store.runner_command_dispatch_state(command).await? {
+        RunnerCommandDispatchState::Pending => Ok(true),
+        RunnerCommandDispatchState::Settled => Ok(false),
+        RunnerCommandDispatchState::Obsolete => {
+            if let Some(event) = state
+                .store
+                .fail_runner_command(
+                    command.id,
+                    &command.runner_id,
+                    "recovery command target is no longer active; no repeated execution",
+                )
+                .await?
+            {
+                publish(state, event);
+            }
+            Ok(false)
+        }
+    }
+}
+
+async fn hydrate_verification_artifact(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+    task_id: Uuid,
+    reference: &mut VerificationArtifactReference,
+) -> anyhow::Result<bool> {
+    validate_verification_artifact_reference(reference)?;
+    let capable = state.runners.get(&command.runner_id).is_some_and(|runner| {
+        runner.capabilities.iter().any(|capability| {
+            capability.name == "verification-artifact-transfer-v1" && capability.available
+        })
+    });
+    if !capable {
+        return Err(anyhow::anyhow!(
+            "runner does not support verified artifact transfer; update the runner before recovery"
+        ));
+    }
+    let artifact = state
+        .store
+        .verification_artifact_for_recovery(
+            command.id,
+            command.corp_id,
+            command.run_id,
+            &command.runner_id,
+        )
+        .await?;
+    let artifact = match artifact {
+        Some(artifact) => artifact,
+        None if !recovery_command_can_dispatch(state, command).await? => return Ok(false),
+        None => {
+            return Err(anyhow::anyhow!(
+                "verified source artifact or current recovery authority is unavailable"
+            ));
+        }
+    };
+    if artifact.task_id != task_id
+        || artifact.sha256 != reference.sha256
+        || usize::try_from(artifact.bytes).ok() != Some(reference.bytes)
+        || artifact.media_type != reference.media_type
+    {
+        return Err(anyhow::anyhow!(
+            "verifier artifact reference does not match its authorized stored artifact"
+        ));
+    }
+    let bytes = state.artifacts.read_verified(&artifact).await?;
+    // Object storage can be slow. Recheck the exact command, actor, room and
+    // source-artifact binding before returning bytes to the runner connection.
+    let current = state
+        .store
+        .verification_artifact_for_recovery(
+            command.id,
+            command.corp_id,
+            command.run_id,
+            &command.runner_id,
+        )
+        .await?;
+    let current = match current {
+        Some(current) => current,
+        None if !recovery_command_can_dispatch(state, command).await? => return Ok(false),
+        None => {
+            return Err(anyhow::anyhow!(
+                "recovery authority changed during verified artifact transfer"
+            ));
+        }
+    };
+    if current.id != artifact.id
+        || current.sha256 != artifact.sha256
+        || current.bytes != artifact.bytes
+        || current.media_type != artifact.media_type
+    {
+        return Err(anyhow::anyhow!(
+            "source artifact identity changed during verified transfer"
+        ));
+    }
+    reference.data_base64 = Some(BASE64.encode(bytes));
+    Ok(true)
+}
+
+fn validate_verification_artifact_reference(
+    reference: &VerificationArtifactReference,
+) -> anyhow::Result<()> {
+    if reference.data_base64.is_some()
+        || reference.bytes > crony_protocol::MAX_VERIFICATION_ARTIFACT_BYTES
+        || reference.sha256.len() != 64
+        || !reference
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(anyhow::anyhow!(
+            "durable verifier artifact reference is not a bounded metadata-only record"
+        ));
     }
     Ok(())
 }
@@ -1425,6 +1869,32 @@ fn decode_runner_command(
                 .context("breaker command omitted reason")?
                 .to_owned(),
         }),
+        "factory_workspace_checkpoint" => {
+            let payload: FactoryWorkspaceCheckpointRunnerCommandPayload =
+                serde_json::from_value(command.payload.clone())
+                    .context("decode factory workspace checkpoint runner command")?;
+            if payload.run_id != command.run_id || payload.corp_id != command.corp_id {
+                return Err(anyhow::anyhow!(
+                    "factory workspace checkpoint command identity mismatch"
+                ));
+            }
+            Ok(ServerToRunner::CheckpointWorkspace {
+                command_id: command.id,
+                corp_id: payload.corp_id,
+                room_id: payload.room_id,
+                mission_id: payload.mission_id,
+                task_id: payload.task_id,
+                run_id: payload.run_id,
+                workspace_run_id: payload.workspace_run_id,
+                agent_id: payload.agent_id,
+                assignment_token: payload.assignment_token,
+                source_repository: payload.source_repository,
+                source_base_ref: payload.source_base_ref,
+                source_base_commit: payload.source_base_commit,
+                workspace_base_commit: payload.workspace_base_commit,
+                expected_head_commit: payload.expected_head_commit,
+            })
+        }
         other => Err(anyhow::anyhow!("unknown runner command kind {other}")),
     }
 }
@@ -2287,6 +2757,52 @@ async fn upgrade_factory_source_commit(
     }))
 }
 
+async fn checkpoint_factory_workspace(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CheckpointFactoryWorkspaceRequest>,
+) -> Result<Json<CheckpointFactoryWorkspaceResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Recover,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .checkpoint_factory_workspace(CheckpointFactoryWorkspaceInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
+            source_run_id: request.source_run_id,
+            expected_head_commit: request.expected_head_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    if outcome.command_id.is_some() {
+        dispatch_pending_runner_commands(&state, &outcome.runner_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(Json(CheckpointFactoryWorkspaceResponse {
+        work_item: outcome.work_item,
+        claim_token: outcome.claim_token,
+        source_run_id: outcome.source_run_id,
+        command_id: outcome.command_id,
+        workspace_fingerprint: outcome.workspace_fingerprint,
+        replayed: outcome.replayed,
+    }))
+}
+
 async fn transition_factory_work_item(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2322,6 +2838,105 @@ async fn transition_factory_work_item(
         work_item: outcome.work_item,
         claim_token: outcome.claim_token,
         replayed: outcome.replayed,
+    }))
+}
+
+async fn get_factory_verification_recovery_context(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<FactoryVerificationRecoveryContextResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let context = state
+        .store
+        .factory_verification_recovery_context(corp_id, actor_id, work_item_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| {
+            ApiError::not_found("factory verification recovery context was not found")
+        })?;
+    Ok(Json(FactoryVerificationRecoveryContextResponse {
+        work_item: context.work_item,
+        recoveries: context.recoveries,
+        mission_id: context.mission_id,
+        task_id: context.task_id,
+        source_run_id: context.source_run_id,
+        remaining_attempts: context.remaining_attempts,
+        remaining_mission_tokens: context.remaining_mission_tokens,
+        remaining_mission_cost_microusd: context.remaining_mission_cost_microusd,
+        workspace_fingerprint: context.workspace_fingerprint,
+        expected_head_commit: context.expected_head_commit,
+    }))
+}
+
+async fn create_factory_verification_recovery(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateFactoryVerificationRecoveryRequest>,
+) -> Result<Json<CreateFactoryVerificationRecoveryResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Recover,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .create_factory_verification_recovery(CreateFactoryVerificationRecoveryInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            claim_token: request.claim_token,
+            expected_factory_version: request.expected_factory_version,
+            idempotency_key: request.idempotency_key,
+            source_run_id: request.source_run_id,
+            mode: request.mode,
+            reason: request.reason,
+            observed_source_revision: request.observed_source_revision,
+            reviewed_source_snapshot: request.reviewed_source_snapshot,
+            contract_revision_id: request.contract_revision_id,
+            expected_workspace_fingerprint: request.expected_workspace_fingerprint,
+            expected_head_commit: request.expected_head_commit,
+        })
+        .await
+        .map_err(map_store_error)?;
+    let (run_id, runner_id) = match &outcome.launch {
+        FactoryVerificationRecoveryLaunch::SourceCorrection(record) => {
+            (record.run_id, record.runner_id.clone())
+        }
+        FactoryVerificationRecoveryLaunch::VerifierOnly(record) => {
+            (record.run_id, record.runner_id.clone())
+        }
+    };
+    let recovery_id = outcome.recovery.id;
+    let replayed = outcome.replayed;
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    dispatch_pending_runner_commands(&state, &runner_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let (recovery, work_item) = state
+        .store
+        .factory_verification_recovery_status(corp_id, recovery_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(CreateFactoryVerificationRecoveryResponse {
+        recovery,
+        work_item,
+        run_id,
+        replayed,
     }))
 }
 
@@ -2377,6 +2992,37 @@ fn factory_materialization_failure_detail(rejection: &str) -> String {
     };
     let mut detail =
         format!("factory materialization rejected before mission creation: {sanitized}");
+    if detail.len() > 2_000 {
+        let mut end = 2_000;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+fn factory_recovery_dispatch_failure_detail(error: &anyhow::Error) -> String {
+    let sanitized = error
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = if sanitized.is_empty() {
+        "unspecified recovery dispatch error"
+    } else {
+        sanitized.as_str()
+    };
+    let mut detail = format!("factory recovery failed before runner dispatch: {sanitized}");
     if detail.len() > 2_000 {
         let mut end = 2_000;
         while !detail.is_char_boundary(end) {
@@ -3183,7 +3829,8 @@ async fn schedule_ready_tasks(
             source_base_ref: candidate.required_source_base_ref.as_deref(),
             source_base_commit: candidate.required_source_base_commit.as_deref(),
         };
-        let Some((runner_id, runner_tx)) = select_runner(state, corp_id, &requirements) else {
+        let Some((runner_id, connection_epoch)) = select_runner(state, corp_id, &requirements)
+        else {
             outcome.failures.push(format!(
                 "task {} {}",
                 candidate.task_id,
@@ -3264,8 +3911,11 @@ async fn schedule_ready_tasks(
                 continue;
             }
         };
-        if runner_tx
-            .send(ServerToRunner::StartRun {
+        if !send_command_to_current_runner(
+            &state.runners,
+            &runner_id,
+            connection_epoch,
+            ServerToRunner::StartRun {
                 corp_id: record.corp_id,
                 room_id: record.room_id,
                 mission_id: record.mission_id,
@@ -3284,10 +3934,9 @@ async fn schedule_ready_tasks(
                 write_scope: record.write_scope.clone(),
                 deliverable: record.deliverable.clone(),
                 secrets,
-            })
-            .is_err()
-        {
-            let reason = "runner disconnected before accepting the run";
+            },
+        ) {
+            let reason = "runner disconnected or changed epoch before accepting the run";
             if let Ok(event) = state
                 .store
                 .fail_run_before_dispatch(corp_id, record.run_id, reason)
@@ -3458,20 +4107,33 @@ async fn resolve_run_secrets(
     record: &LaunchRecord,
     runner_id: &str,
 ) -> anyhow::Result<Vec<ResolvedSecret>> {
+    resolve_secret_refs(
+        state,
+        record.corp_id,
+        record.task_id,
+        record.run_id,
+        runner_id,
+        &record.secret_refs,
+    )
+    .await
+}
+
+async fn resolve_secret_refs(
+    state: &AppState,
+    corp_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    runner_id: &str,
+    secret_refs: &[TaskSecretReference],
+) -> anyhow::Result<Vec<ResolvedSecret>> {
     let (grants, events) = state
         .store
-        .grant_run_secrets(
-            record.corp_id,
-            record.task_id,
-            record.run_id,
-            runner_id,
-            &record.secret_refs,
-        )
+        .grant_run_secrets(corp_id, task_id, run_id, runner_id, secret_refs)
         .await?;
     let mut resolved = Vec::with_capacity(grants.len());
     for grant in grants {
         let plaintext = state.secret_cipher.decrypt(
-            record.corp_id,
+            corp_id,
             grant.secret_id,
             &grant.name,
             &grant.ciphertext,
@@ -3630,12 +4292,20 @@ fn select_runner(
     state: &AppState,
     corp_id: Uuid,
     requirements: &RunnerRequirements<'_>,
-) -> Option<(String, mpsc::UnboundedSender<ServerToRunner>)> {
-    let mut runners = state
-        .runners
+) -> Option<(String, Uuid)> {
+    select_ready_runner(&state.runners, corp_id, requirements)
+}
+
+fn select_ready_runner(
+    connections: &DashMap<String, RunnerConnection>,
+    corp_id: Uuid,
+    requirements: &RunnerRequirements<'_>,
+) -> Option<(String, Uuid)> {
+    let mut runners = connections
         .iter()
         .filter(|entry| {
-            entry.corp_id == corp_id
+            entry.dispatch_ready
+                && entry.corp_id == corp_id
                 && runner_workspace_satisfies_requirement(
                     &entry.capabilities,
                     requirements.source_repository,
@@ -3651,7 +4321,7 @@ fn select_runner(
                     )
                 })
         })
-        .map(|entry| (entry.key().clone(), entry.tx.clone()))
+        .map(|entry| (entry.key().clone(), entry.connection_epoch))
         .collect::<Vec<_>>();
     runners.sort_by(|left, right| left.0.cmp(&right.0));
     runners.into_iter().next()
@@ -3762,18 +4432,24 @@ async fn resume_run(
         .create_resume_run(corp_id, source_run_id, requested_by)
         .await
         .map_err(ApiError::conflict)?;
-    let Some(runner) = state.runners.get(&record.runner_id) else {
+    let Some(runner) = state
+        .runners
+        .get(&record.runner_id)
+        .filter(|connection| connection.dispatch_ready)
+    else {
         let failure = state
             .store
             .fail_run_before_dispatch(
                 corp_id,
                 record.run_id,
-                "source run's runner is disconnected",
+                "source run's runner is disconnected or reconciling",
             )
             .await
             .map_err(ApiError::internal)?;
         publish(&state, failure);
-        return Err(ApiError::conflict("source run's runner is disconnected"));
+        return Err(ApiError::conflict(
+            "source run's runner is disconnected or reconciling",
+        ));
     };
     if runner.corp_id != corp_id {
         drop(runner);
@@ -3812,7 +4488,7 @@ async fn resume_run(
             "source run's runner no longer advertises the required repository checkout",
         ));
     }
-    let runner_tx = runner.tx.clone();
+    let connection_epoch = runner.connection_epoch;
     drop(runner);
     let launch_record = LaunchRecord {
         corp_id: record.corp_id,
@@ -3879,8 +4555,12 @@ async fn resume_run(
             ));
         }
     };
-    if runner_tx
-        .send(ServerToRunner::ResumeRun {
+    if !send_command_to_current_runner(
+        &state.runners,
+        &record.runner_id,
+        connection_epoch,
+        ServerToRunner::ResumeRun {
+            command_id: None,
             corp_id: record.corp_id,
             room_id: record.room_id,
             mission_id: record.mission_id,
@@ -3898,25 +4578,26 @@ async fn resume_run(
             source_base_ref: record.source_base_ref,
             source_base_commit: record.source_base_commit,
             workspace_base_commit: Some(record.workspace_base_commit),
+            expected_workspace_fingerprint: None,
+            expected_head_commit: None,
             verification_policy: record.verification_policy,
             write_scope: record.write_scope,
             deliverable: record.deliverable,
             secrets,
-        })
-        .is_err()
-    {
+        },
+    ) {
         let failure = state
             .store
             .fail_run_before_dispatch(
                 corp_id,
                 record.run_id,
-                "runner disconnected before accepting resume",
+                "runner disconnected or changed epoch before accepting resume",
             )
             .await
             .map_err(ApiError::internal)?;
         publish(&state, failure);
         return Err(ApiError::conflict(
-            "runner disconnected before accepting resume",
+            "runner disconnected or changed epoch before accepting resume",
         ));
     }
     publish(&state, event);
@@ -3943,11 +4624,20 @@ async fn decide_verification(
     .await?;
     let outcome = state
         .store
-        .decide_verification(corp_id, run_id, actor_id, request.approved, &request.note)
+        .decide_verification(
+            corp_id,
+            run_id,
+            actor_id,
+            request.approved,
+            &request.note,
+            request.decision_key,
+        )
         .await
         .map_err(map_store_error)?;
-    publish(&state, outcome.event);
-    if request.approved {
+    for event in outcome.events {
+        publish(&state, event);
+    }
+    if request.approved && !outcome.replayed {
         schedule_ready_corp(&state, outcome.corp_id)
             .await
             .map_err(ApiError::internal)?;
@@ -3955,6 +4645,7 @@ async fn decide_verification(
     Ok(Json(VerificationDecisionResponse {
         run_id: outcome.run_id,
         status: outcome.status,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -4506,6 +5197,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     RunnerConnection {
                         corp_id,
                         connection_epoch,
+                        dispatch_ready: false,
                         tx: command_tx.clone(),
                         capabilities: capabilities.clone(),
                     },
@@ -4556,37 +5248,91 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                                     .to_owned(),
                             });
                         }
-                        let accepted = outcome.accepted;
+                        let pending_recoveries = match pending_recovery_runs_at_reconnect(
+                            &state.store,
+                            &runner_id,
+                            corp_id,
+                            connection_epoch,
+                        )
+                        .await
+                        {
+                            Ok(run_ids) => run_ids,
+                            Err(error) => {
+                                warn!(%error, %runner_id, "runner recovery assignment capture failed");
+                                let _ = command_tx.send(ServerToRunner::Disconnect {
+                                    reason: "runner reconciliation failed; durable commands remain queued"
+                                        .to_owned(),
+                                    reconnect_delay_ms: 2_000,
+                                });
+                                // Let the writer deliver Registered (including the rotated
+                                // credential) and Disconnect before the peer closes.
+                                continue;
+                            }
+                        };
+                        let preserved =
+                            reconnect_preserved_run_ids(&outcome.accepted, pending_recoveries);
                         let finalize_state = state.clone();
                         let finalize_runner = runner_id.clone();
+                        let finalize_tx = command_tx.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            match finalize_state
-                                .store
-                                .mark_unclaimed_runner_runs_lost(
-                                    &finalize_runner,
-                                    connection_epoch,
-                                    &accepted,
-                                )
-                                .await
-                            {
-                                Ok(events) => {
+                            let finalized = enable_runner_after_reconciliation(
+                                &finalize_state.runners,
+                                &finalize_runner,
+                                connection_epoch,
+                                async {
+                                    let events = finalize_state
+                                        .store
+                                        .mark_unclaimed_runner_runs_lost(
+                                            &finalize_runner,
+                                            connection_epoch,
+                                            &preserved,
+                                        )
+                                        .await?;
                                     for event in events {
                                         publish(&finalize_state, event);
                                     }
+                                    Ok(())
+                                },
+                            )
+                            .await;
+                            match finalized {
+                                Ok(true) => {
+                                    if let Err(error) = dispatch_pending_runner_commands_for_epoch(
+                                        &finalize_state,
+                                        &finalize_runner,
+                                        connection_epoch,
+                                    )
+                                    .await
+                                    {
+                                        warn!(%error, runner_id = %finalize_runner,
+                                            "failed to dispatch durable commands after reconciliation");
+                                    }
+                                }
+                                Ok(false) => {
+                                    // A newer connection owns registration and dispatch.
                                 }
                                 Err(error) => {
-                                    warn!(%error, runner_id = %finalize_runner, "runner reconciliation finalization failed")
+                                    warn!(%error, runner_id = %finalize_runner, "runner reconciliation finalization failed");
+                                    let _ = finalize_tx.send(ServerToRunner::Disconnect {
+                                        reason:
+                                            "runner reconciliation failed; commands remain queued"
+                                                .to_owned(),
+                                        reconnect_delay_ms: 2_000,
+                                    });
                                 }
                             }
                         });
                     }
                     Err(error) => {
-                        warn!(%error, %runner_id, "runner active-run reconciliation failed")
+                        warn!(%error, %runner_id, "runner active-run reconciliation failed");
+                        let _ = command_tx.send(ServerToRunner::Disconnect {
+                            reason: "runner reconciliation failed; durable commands remain queued"
+                                .to_owned(),
+                            reconnect_delay_ms: 2_000,
+                        });
+                        continue;
                     }
-                }
-                if let Err(error) = dispatch_pending_runner_commands(&state, &runner_id).await {
-                    warn!(%error, %runner_id, "failed to dispatch durable runner commands");
                 }
                 info!(
                     %runner_id,
@@ -4620,6 +5366,18 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             active_run_count = active_runs.len(),
                             "runner heartbeat persisted"
                         );
+                        // A committed command may outlive the request that first tried
+                        // to dispatch it. Retry from the authenticated, current epoch;
+                        // this also retires stale terminal commands without UI activity.
+                        if let Err(error) = dispatch_pending_runner_commands_for_epoch(
+                            &state,
+                            &runner_id,
+                            connection_epoch,
+                        )
+                        .await
+                        {
+                            warn!(%error, %runner_id, "heartbeat command reconciliation failed");
+                        }
                     }
                     Ok(false) => {
                         warn!(%runner_id, "runner heartbeat epoch was rejected");
@@ -4767,140 +5525,154 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                         .await;
                 }
                 match result {
-                    Ok(Some(event)) => {
-                        if event.event_type == "run.deliverable"
-                            && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
-                                event
-                                    .payload
-                                    .get("artifact_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .and_then(|value| Uuid::parse_str(value).ok()),
-                                event
-                                    .payload
-                                    .get("artifact_role")
-                                    .and_then(serde_json::Value::as_str),
-                                event
-                                    .payload
-                                    .get("sha256")
-                                    .and_then(serde_json::Value::as_str),
-                            )
-                        {
-                            let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                run_id,
-                                artifact_id,
-                                artifact_role: artifact_role.to_owned(),
-                                sha256: sha256.to_owned(),
-                            });
-                        }
-                        let approval_expiry = if applied_event_type == "run.approval_requested" {
-                            event
-                                .payload
-                                .get("approval_id")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|value| Uuid::parse_str(value).ok())
-                                .map(|approval_id| {
-                                    let delay = event
+                    Ok(outcome) => {
+                        let RunnerEventOutcome {
+                            event,
+                            related_events,
+                        } = outcome;
+                        if let Some(event) = event {
+                            if event.event_type == "run.deliverable"
+                                && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
+                                    event
                                         .payload
-                                        .get("expires_in_seconds")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(300)
-                                        .clamp(1, 3_600);
-                                    (approval_id, delay)
-                                })
-                        } else {
-                            None
-                        };
-                        publish(&state, event);
-                        if let Some((approval_id, delay)) = approval_expiry {
-                            let expiry_state = state.clone();
-                            let expiry_runner_id = runner_id.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                                match expiry_state.store.expire_action_approval(approval_id).await {
-                                    Ok(Some(outcome)) => {
-                                        if let Some(event) = outcome.event {
-                                            publish(&expiry_state, event);
-                                        }
-                                        if let Err(error) = dispatch_pending_runner_commands(
-                                            &expiry_state,
-                                            &expiry_runner_id,
-                                        )
+                                        .get("artifact_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .and_then(|value| Uuid::parse_str(value).ok()),
+                                    event
+                                        .payload
+                                        .get("artifact_role")
+                                        .and_then(serde_json::Value::as_str),
+                                    event
+                                        .payload
+                                        .get("sha256")
+                                        .and_then(serde_json::Value::as_str),
+                                )
+                            {
+                                let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                    run_id,
+                                    artifact_id,
+                                    artifact_role: artifact_role.to_owned(),
+                                    sha256: sha256.to_owned(),
+                                });
+                            }
+                            let approval_expiry = if applied_event_type == "run.approval_requested"
+                            {
+                                event
+                                    .payload
+                                    .get("approval_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| Uuid::parse_str(value).ok())
+                                    .map(|approval_id| {
+                                        let delay = event
+                                            .payload
+                                            .get("expires_in_seconds")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(300)
+                                            .clamp(1, 3_600);
+                                        (approval_id, delay)
+                                    })
+                            } else {
+                                None
+                            };
+                            publish(&state, event);
+                            if let Some((approval_id, delay)) = approval_expiry {
+                                let expiry_state = state.clone();
+                                let expiry_runner_id = runner_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                    match expiry_state
+                                        .store
+                                        .expire_action_approval(approval_id)
                                         .await
-                                        {
-                                            warn!(
-                                                %error,
-                                                %approval_id,
-                                                "expired approval command dispatch failed"
-                                            );
+                                    {
+                                        Ok(Some(outcome)) => {
+                                            if let Some(event) = outcome.event {
+                                                publish(&expiry_state, event);
+                                            }
+                                            if let Err(error) = dispatch_pending_runner_commands(
+                                                &expiry_state,
+                                                &expiry_runner_id,
+                                            )
+                                            .await
+                                            {
+                                                warn!(
+                                                    %error,
+                                                    %approval_id,
+                                                    "expired approval command dispatch failed"
+                                                );
+                                            }
                                         }
+                                        Ok(None) => {}
+                                        Err(error) => warn!(
+                                            %error,
+                                            %approval_id,
+                                            "action approval expiry failed"
+                                        ),
+                                    }
+                                });
+                            }
+                            if matches!(
+                                applied_event_type.as_str(),
+                                "run.usage" | "run.tool_activity"
+                            ) {
+                                match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
+                                    Ok(outcome) => {
+                                        if let Some(event) = outcome.event {
+                                            publish(&state, event);
+                                        }
+                                        if outcome.command.is_some()
+                                            && let Err(error) =
+                                                dispatch_pending_runner_commands(&state, &runner_id)
+                                                    .await
+                                        {
+                                            warn!(%error, %runner_id, %run_id, "failed to dispatch circuit-breaker command");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(%error, %run_id, "circuit-breaker evaluation failed")
+                                    }
+                                }
+                            }
+                            if matches!(applied_event_type.as_str(), "run.completed" | "run.failed")
+                            {
+                                let schedule_state = state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        schedule_ready_corp(&schedule_state, corp_id).await
+                                    {
+                                        warn!(%error, %corp_id, "automatic Corp scheduling failed");
+                                    }
+                                });
+                            }
+                        } else {
+                            if let Some(sha256) = deliverable_ack_sha {
+                                match state
+                                    .store
+                                    .ready_artifact_for_run_role_digest(
+                                        corp_id,
+                                        run_id,
+                                        "source_deliverable",
+                                        &sha256,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(artifact)) => {
+                                        let _ = command_tx.send(ServerToRunner::ArtifactStored {
+                                            run_id,
+                                            artifact_id: artifact.id,
+                                            artifact_role: artifact.artifact_role,
+                                            sha256: artifact.sha256,
+                                        });
                                     }
                                     Ok(None) => {}
-                                    Err(error) => warn!(
-                                        %error,
-                                        %approval_id,
-                                        "action approval expiry failed"
-                                    ),
-                                }
-                            });
-                        }
-                        if matches!(
-                            applied_event_type.as_str(),
-                            "run.usage" | "run.tool_activity"
-                        ) {
-                            match state.store.evaluate_circuit_breaker(corp_id, run_id).await {
-                                Ok(outcome) => {
-                                    if let Some(event) = outcome.event {
-                                        publish(&state, event);
+                                    Err(error) => {
+                                        warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
                                     }
-                                    if outcome.command.is_some()
-                                        && let Err(error) =
-                                            dispatch_pending_runner_commands(&state, &runner_id)
-                                                .await
-                                    {
-                                        warn!(%error, %runner_id, %run_id, "failed to dispatch circuit-breaker command");
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(%error, %run_id, "circuit-breaker evaluation failed")
                                 }
                             }
                         }
-                        if matches!(applied_event_type.as_str(), "run.completed" | "run.failed") {
-                            let schedule_state = state.clone();
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    schedule_ready_corp(&schedule_state, corp_id).await
-                                {
-                                    warn!(%error, %corp_id, "automatic Corp scheduling failed");
-                                }
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        if let Some(sha256) = deliverable_ack_sha {
-                            match state
-                                .store
-                                .ready_artifact_for_run_role_digest(
-                                    corp_id,
-                                    run_id,
-                                    "source_deliverable",
-                                    &sha256,
-                                )
-                                .await
-                            {
-                                Ok(Some(artifact)) => {
-                                    let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                        run_id,
-                                        artifact_id: artifact.id,
-                                        artifact_role: artifact.artifact_role,
-                                        sha256: artifact.sha256,
-                                    });
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
-                                }
-                            }
+                        for related_event in related_events {
+                            publish(&state, related_event);
                         }
                     }
                     Err(error) => {
@@ -4966,7 +5738,7 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
 async fn process_runner_event(
     state: &AppState,
     input: RunnerEventInput,
-) -> anyhow::Result<Option<DomainEvent>> {
+) -> anyhow::Result<RunnerEventOutcome> {
     if !matches!(
         input.event_type.as_str(),
         "run.artifact_upload" | "run.deliverable_upload"
@@ -5003,7 +5775,10 @@ async fn process_runner_event(
     match prepared.status.as_str() {
         "ready" => {
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
-            Ok(None)
+            Ok(RunnerEventOutcome {
+                event: None,
+                related_events: Vec::new(),
+            })
         }
         "rejected" => {
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
@@ -5062,7 +5837,10 @@ async fn process_runner_event(
                 .finalize_artifact_upload(prepared.artifact.corp_id, prepared.artifact.id)
                 .await?;
             cleanup_prepared_artifact(&state.store, &state.artifacts, &prepared).await;
-            Ok(event)
+            Ok(RunnerEventOutcome {
+                event,
+                related_events: Vec::new(),
+            })
         }
         status => Err(anyhow::anyhow!("unknown prepared artifact status {status}")),
     }
@@ -5290,20 +6068,310 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crony_domain::{
         ManualVerificationGate, PlannedTask, TaskContract, TaskGraphPlan, VerificationPolicy,
         VerifierCheck,
     };
-    use crony_protocol::{FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel};
+    use crony_protocol::{
+        FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel, ServerToRunner,
+        VerificationArtifactReference,
+    };
+    use dashmap::DashMap;
     use serde_json::json;
+    use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
     use super::{
-        apply_mission_contract, apply_mission_description, apply_mission_source,
-        artifact_content_disposition, capability_satisfies_requirement,
-        enforce_factory_manual_gate, factory_materialization_failure_detail,
-        runner_requirement_mismatch,
+        RunnerConnection, RunnerRequirements, apply_mission_contract, apply_mission_description,
+        apply_mission_source, artifact_content_disposition, capability_satisfies_requirement,
+        enable_runner_after_reconciliation, enable_runner_dispatch, enforce_factory_manual_gate,
+        factory_materialization_failure_detail, reconnect_preserved_run_ids,
+        runner_requirement_mismatch, select_ready_runner, send_command_to_current_runner,
+        validate_verification_artifact_reference,
     };
+
+    fn reconnect_test_connection(
+        epoch: Uuid,
+    ) -> (RunnerConnection, mpsc::UnboundedReceiver<ServerToRunner>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            RunnerConnection {
+                corp_id: Uuid::from_u128(1),
+                connection_epoch: epoch,
+                dispatch_ready: false,
+                tx,
+                capabilities: Vec::new(),
+            },
+            rx,
+        )
+    }
+
+    fn reconnect_test_command(run_id: Uuid) -> ServerToRunner {
+        // Only exercise the in-memory delivery gate; no runner or provider is started.
+        ServerToRunner::StopRun {
+            run_id,
+            reason: "test delivery marker".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_dispatch_and_matching_wait_for_successful_finalization() {
+        let epoch = Uuid::from_u128(2);
+        let after_capture_run = Uuid::from_u128(3);
+        let runners = Arc::new(DashMap::new());
+        let (mut connection, mut received) = reconnect_test_connection(epoch);
+        connection.capabilities.push(RunnerCapability {
+            name: "fake-process".to_owned(),
+            available: true,
+            detail: None,
+            models: Vec::new(),
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        });
+        let corp_id = connection.corp_id;
+        runners.insert("runner".to_owned(), connection);
+        let requirements = RunnerRequirements {
+            adapter: "fake-process",
+            model: None,
+            reasoning_effort: None,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        };
+        let captured = reconnect_preserved_run_ids(&[], Vec::new());
+        assert!(!captured.contains(&after_capture_run));
+        let (finish_tx, finish_rx) = oneshot::channel::<anyhow::Result<()>>();
+        let finalizer_runners = runners.clone();
+        let finalizer = tokio::spawn(async move {
+            enable_runner_after_reconciliation(&finalizer_runners, "runner", epoch, async {
+                finish_rx.await.expect("test finalization sender")
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        // An authorization arriving after capture stays queued; neither direct
+        // scheduling nor durable delivery may start it during the loss sweep.
+        assert_eq!(select_ready_runner(&runners, corp_id, &requirements), None);
+        assert!(!send_command_to_current_runner(
+            &runners,
+            "runner",
+            epoch,
+            reconnect_test_command(after_capture_run),
+        ));
+        assert!(received.try_recv().is_err());
+        finish_tx.send(Ok(())).unwrap();
+        assert!(finalizer.await.unwrap().unwrap());
+        assert_eq!(
+            select_ready_runner(&runners, corp_id, &requirements),
+            Some(("runner".to_owned(), epoch)),
+        );
+        assert!(send_command_to_current_runner(
+            &runners,
+            "runner",
+            epoch,
+            reconnect_test_command(after_capture_run),
+        ));
+        assert!(received.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconnect_failed_or_superseded_finalization_keeps_dispatch_closed() {
+        let epoch = Uuid::from_u128(2);
+        let newer_epoch = Uuid::from_u128(3);
+        let runners = DashMap::new();
+        let (connection, _received) = reconnect_test_connection(epoch);
+        runners.insert("runner".to_owned(), connection);
+        assert!(
+            enable_runner_after_reconciliation(&runners, "runner", epoch, async {
+                Err(anyhow::anyhow!("test loss finalization failure"))
+            },)
+            .await
+            .is_err()
+        );
+        assert!(!runners.get("runner").unwrap().dispatch_ready);
+        let (replacement, _replacement_received) = reconnect_test_connection(newer_epoch);
+        assert!(
+            !enable_runner_after_reconciliation(&runners, "runner", epoch, async {
+                runners.insert("runner".to_owned(), replacement);
+                Ok(())
+            },)
+            .await
+            .unwrap()
+        );
+        assert_eq!(runners.get("runner").unwrap().connection_epoch, newer_epoch);
+        assert!(!runners.get("runner").unwrap().dispatch_ready);
+    }
+
+    #[test]
+    fn reconnect_preserves_offline_recovery_after_command_ack() {
+        let epoch = Uuid::from_u128(2);
+        let recovery_run = Uuid::from_u128(3);
+        let accepted = Vec::new(); // The reconnecting runner has not received this assignment.
+        let mut pending = vec![recovery_run];
+        let runners = DashMap::new();
+        let (connection, mut received) = reconnect_test_connection(epoch);
+        runners.insert("runner".to_owned(), connection);
+
+        assert!(!send_command_to_current_runner(
+            &runners,
+            "runner",
+            epoch,
+            reconnect_test_command(recovery_run),
+        ));
+        assert!(received.try_recv().is_err());
+
+        let preserved = reconnect_preserved_run_ids(&accepted, pending.clone());
+        assert!(enable_runner_dispatch(&runners, "runner", epoch));
+        assert!(send_command_to_current_runner(
+            &runners,
+            "runner",
+            epoch,
+            reconnect_test_command(recovery_run),
+        ));
+        assert!(matches!(received.try_recv().unwrap(),
+            ServerToRunner::StopRun { run_id, .. } if run_id == recovery_run));
+
+        pending.clear(); // CommandAck happens before the delayed loss sweep.
+        assert!(pending.is_empty());
+        assert!(!accepted.contains(&recovery_run));
+        assert!(preserved.contains(&recovery_run));
+        // A re-query of the now-empty command queue would reintroduce the race.
+        assert!(!reconnect_preserved_run_ids(&accepted, pending).contains(&recovery_run));
+    }
+
+    #[test]
+    fn reconnect_stale_epoch_cannot_enable_or_deliver_to_replacement_socket() {
+        let old_epoch = Uuid::from_u128(2);
+        let new_epoch = Uuid::from_u128(3);
+        let run_id = Uuid::from_u128(4);
+        let runners = DashMap::new();
+        let (old_connection, mut old_received) = reconnect_test_connection(old_epoch);
+        runners.insert("runner".to_owned(), old_connection);
+        assert!(enable_runner_dispatch(&runners, "runner", old_epoch));
+        let (new_connection, mut new_received) = reconnect_test_connection(new_epoch);
+        runners.insert("runner".to_owned(), new_connection);
+
+        assert!(!enable_runner_dispatch(&runners, "runner", old_epoch));
+        assert!(!runners.get("runner").unwrap().dispatch_ready);
+        assert!(!send_command_to_current_runner(
+            &runners,
+            "runner",
+            old_epoch,
+            reconnect_test_command(run_id),
+        ));
+        assert!(enable_runner_dispatch(&runners, "runner", new_epoch));
+        assert!(!send_command_to_current_runner(
+            &runners,
+            "runner",
+            old_epoch,
+            reconnect_test_command(run_id),
+        ));
+        assert!(send_command_to_current_runner(
+            &runners,
+            "runner",
+            new_epoch,
+            reconnect_test_command(run_id),
+        ));
+        assert!(old_received.try_recv().is_err());
+        assert!(new_received.try_recv().is_ok());
+        assert!(!enable_runner_dispatch(&runners, "missing", new_epoch));
+    }
+
+    #[test]
+    fn reconnect_preserves_pending_recoveries_beyond_one_dispatch_page() {
+        let accepted = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+        let pending = (2..=252).map(Uuid::from_u128).collect();
+        let preserved = reconnect_preserved_run_ids(&accepted, pending);
+        assert_eq!(preserved.len(), 252);
+        assert!(preserved.contains(&Uuid::from_u128(252)));
+        assert!(preserved.contains(&Uuid::from_u128(1)));
+        // A genuinely unclaimed run remains eligible for the existing loss policy.
+        assert!(!preserved.contains(&Uuid::from_u128(999)));
+    }
+
+    #[test]
+    fn reconnect_closed_socket_does_not_report_command_delivery() {
+        let epoch = Uuid::from_u128(2);
+        let run_id = Uuid::from_u128(3);
+        let runners = DashMap::new();
+        let (connection, received) = reconnect_test_connection(epoch);
+        runners.insert("runner".to_owned(), connection);
+        let preserved = reconnect_preserved_run_ids(&[], vec![run_id]);
+        assert!(enable_runner_dispatch(&runners, "runner", epoch));
+        drop(received);
+        assert!(!send_command_to_current_runner(
+            &runners,
+            "runner",
+            epoch,
+            reconnect_test_command(run_id),
+        ));
+        assert!(preserved.contains(&run_id));
+    }
+
+    #[test]
+    fn durable_verifier_references_reject_embedded_data_bad_digests_and_oversized_transfers() {
+        let reference = VerificationArtifactReference {
+            path: "legacy-provider.json".to_owned(),
+            sha256: "a".repeat(64),
+            bytes: 2,
+            media_type: "application/json".to_owned(),
+            data_base64: None,
+        };
+        validate_verification_artifact_reference(&reference).expect("bounded durable reference");
+        let mut invalid = reference.clone();
+        invalid.data_base64 = Some("e30=".to_owned());
+        assert!(validate_verification_artifact_reference(&invalid).is_err());
+        invalid = reference.clone();
+        invalid.bytes = crony_protocol::MAX_VERIFICATION_ARTIFACT_BYTES + 1;
+        assert!(validate_verification_artifact_reference(&invalid).is_err());
+        for digest in [
+            "A".repeat(64),
+            "g".repeat(64),
+            "a".repeat(63),
+            String::new(),
+        ] {
+            invalid = reference.clone();
+            invalid.sha256 = digest;
+            assert!(validate_verification_artifact_reference(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_command_rejects_cross_corp_and_cross_run_payloads() {
+        let corp_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let mut command = crony_store::PendingRunnerCommand {
+            id: Uuid::new_v4(),
+            corp_id,
+            run_id,
+            runner_id: "test-runner".to_owned(),
+            command_kind: "factory_workspace_checkpoint".to_owned(),
+            payload: json!({
+                "corp_id": Uuid::new_v4(),
+                "room_id": Uuid::new_v4(),
+                "mission_id": Uuid::new_v4(),
+                "task_id": Uuid::new_v4(),
+                "run_id": run_id,
+                "workspace_run_id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "assignment_token": Uuid::new_v4(),
+                "source_repository": null,
+                "source_base_ref": null,
+                "source_base_commit": null,
+                "workspace_base_commit": "a".repeat(40),
+                "expected_head_commit": "b".repeat(40),
+            }),
+        };
+        assert!(super::decode_runner_command(&command, None, false).is_err());
+        command.payload["corp_id"] = json!(corp_id);
+        command.payload["run_id"] = json!(Uuid::new_v4());
+        assert!(super::decode_runner_command(&command, None, false).is_err());
+        command.payload["run_id"] = json!(run_id);
+        assert!(super::decode_runner_command(&command, None, false).is_ok());
+    }
 
     fn model(id: &str, efforts: &[&str]) -> RunnerModel {
         RunnerModel {

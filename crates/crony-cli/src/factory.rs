@@ -14,11 +14,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use clap::Args;
-use crony_domain::{VerificationPolicy, write_scope_is_valid};
+use clap::{Args, ValueEnum};
+use crony_domain::{
+    FactoryVerificationRecoveryMode, TaskContract, VerificationPolicy, write_scope_is_valid,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
@@ -27,6 +30,7 @@ mod quota;
 
 const DEFAULT_GITHUB_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SOURCE_GIT_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const RECOVERY_SOURCE_REFERENCE_PREFIX: &str = "urn:ecorp:factory-reviewed-source:sha256:";
 
 #[derive(Debug, Args, Clone)]
 pub struct FactoryArgs {
@@ -96,6 +100,16 @@ pub struct FactoryArgs {
     #[arg(long)]
     pub issue: Option<i64>,
 
+    #[arg(
+        long,
+        value_enum,
+        requires_all = ["issue", "verification_recovery_reason"]
+    )]
+    pub verification_recovery: Option<VerificationRecoveryModeArg>,
+
+    #[arg(long, requires = "verification_recovery")]
+    pub verification_recovery_reason: Option<String>,
+
     #[arg(long)]
     pub dry_run: bool,
 
@@ -131,6 +145,21 @@ pub struct FactoryWatchArgs {
 
     #[arg(long, env = "ECORP_FACTORY_HEARTBEAT_SECONDS", default_value_t = 10)]
     pub heartbeat_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VerificationRecoveryModeArg {
+    SourceCorrection,
+    VerifierOnly,
+}
+
+impl From<VerificationRecoveryModeArg> for FactoryVerificationRecoveryMode {
+    fn from(value: VerificationRecoveryModeArg) -> Self {
+        match value {
+            VerificationRecoveryModeArg::SourceCorrection => Self::SourceCorrection,
+            VerificationRecoveryModeArg::VerifierOnly => Self::VerifierOnly,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +244,15 @@ struct ProjectFieldOption {
 #[derive(Debug, Clone)]
 struct ExistingFactoryItem {
     version: i64,
+    source_project_owner: String,
+    source_project_number: i64,
+    source_project_item_id: String,
+    source_repository_owner: String,
+    source_repository_name: String,
+    source_issue_number: i64,
+    source_issue_node_id: String,
+    source_issue_url: String,
+    source_title: String,
     source_revision: String,
     claim_owner_id: Uuid,
     state: String,
@@ -226,6 +264,18 @@ struct ExistingFactoryItem {
 struct ResolvedSourceCommit {
     commit: String,
     legacy_upgrade_required: bool,
+}
+
+struct FactoryRecoverySnapshot {
+    task_id: Uuid,
+    source_run_id: Uuid,
+    contract_version: i64,
+    contract: TaskContract,
+    verification_policy: VerificationPolicy,
+    workspace_fingerprint: Option<String>,
+    expected_head_commit: Option<String>,
+    contract_revisions: Vec<Value>,
+    active_recovery: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -349,12 +399,20 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     let preview_verification_policy = selected_index
         .map(|index| {
             if evaluated[index].recovery {
-                resolve_recovery_verification_policy(
-                    existing.get(&evaluated[index].project_item.id).context(
-                        "recoverable factory item disappeared from the selected-item lookup",
-                    )?,
-                    requested_verification_policy.as_ref(),
-                )
+                let item = existing.get(&evaluated[index].project_item.id).context(
+                    "recoverable factory item disappeared from the selected-item lookup",
+                )?;
+                if args.verification_recovery.is_some() {
+                    resolve_explicit_recovery_verification_policy(
+                        item,
+                        requested_verification_policy.as_ref(),
+                    )
+                } else {
+                    resolve_recovery_verification_policy(
+                        item,
+                        requested_verification_policy.as_ref(),
+                    )
+                }
             } else {
                 Ok(requested_verification_policy.clone())
             }
@@ -465,12 +523,17 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         selected_publication_base_ref(&args).to_owned()
     };
     let verification_policy = if refreshed.recovery {
-        resolve_recovery_verification_policy(
-            persisted
-                .as_ref()
-                .context("recoverable factory item disappeared from the selected-item lookup")?,
-            requested_verification_policy.as_ref(),
-        )?
+        let item = persisted
+            .as_ref()
+            .context("recoverable factory item disappeared from the selected-item lookup")?;
+        if args.verification_recovery.is_some() {
+            resolve_explicit_recovery_verification_policy(
+                item,
+                requested_verification_policy.as_ref(),
+            )?
+        } else {
+            resolve_recovery_verification_policy(item, requested_verification_policy.as_ref())?
+        }
     } else {
         requested_verification_policy.clone()
     };
@@ -522,18 +585,40 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         None
     };
     let claim_generation = persisted.as_ref().map(|item| item.version).unwrap_or(0);
+    let persisted_source = refreshed.recovery.then_some(persisted.as_ref()).flatten();
+    let (repository_owner, repository_name) = repository_parts(&args.repository)?;
     let claim_body = json!({
         "actor_id": args.actor_id,
-        "source_project_owner": args.owner,
-        "source_project_number": args.project_number,
-        "source_project_item_id": refreshed.project_item.id,
-        "source_repository_owner": repository_parts(&args.repository)?.0,
-        "source_repository_name": repository_parts(&args.repository)?.1,
-        "source_issue_number": refreshed.issue.number,
-        "source_issue_node_id": refreshed.issue.id,
-        "source_issue_url": refreshed.issue.url,
-        "source_title": refreshed.issue.title,
-        "source_revision": refreshed.issue.updated_at,
+        "source_project_owner": persisted_source
+            .map(|item| item.source_project_owner.as_str())
+            .unwrap_or(args.owner.as_str()),
+        "source_project_number": persisted_source
+            .map(|item| item.source_project_number)
+            .unwrap_or(i64::from(args.project_number)),
+        "source_project_item_id": persisted_source
+            .map(|item| item.source_project_item_id.as_str())
+            .unwrap_or(refreshed.project_item.id.as_str()),
+        "source_repository_owner": persisted_source
+            .map(|item| item.source_repository_owner.as_str())
+            .unwrap_or(repository_owner),
+        "source_repository_name": persisted_source
+            .map(|item| item.source_repository_name.as_str())
+            .unwrap_or(repository_name),
+        "source_issue_number": persisted_source
+            .map(|item| item.source_issue_number)
+            .unwrap_or(refreshed.issue.number),
+        "source_issue_node_id": persisted_source
+            .map(|item| item.source_issue_node_id.as_str())
+            .unwrap_or(refreshed.issue.id.as_str()),
+        "source_issue_url": persisted_source
+            .map(|item| item.source_issue_url.as_str())
+            .unwrap_or(refreshed.issue.url.as_str()),
+        "source_title": persisted_source
+            .map(|item| item.source_title.as_str())
+            .unwrap_or(refreshed.issue.title.as_str()),
+        "source_revision": persisted_source
+            .map(|item| item.source_revision.as_str())
+            .unwrap_or(refreshed.issue.updated_at.as_str()),
         "source_base_ref": args.source_base_ref,
         "source_base_commit": source_base_commit,
         "publication_base_ref": publication_base_ref,
@@ -770,7 +855,27 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     work_item_state = renewed.0;
     work_item_version = renewed.1;
 
-    let launch = match launch_or_recover(client, server, &args, mission_id).await {
+    let launch_result = if args.verification_recovery.is_some() {
+        recover_factory_verification(
+            client,
+            server,
+            &args,
+            &refreshed,
+            persisted
+                .as_ref()
+                .context("verification recovery lost its persisted factory item")?,
+            work_item_id,
+            control_token,
+            work_item_version,
+            mission_id,
+            &stable_prefix,
+            verification_policy.as_ref(),
+        )
+        .await
+    } else {
+        launch_or_recover(client, server, &args, mission_id).await
+    };
+    let launch = match launch_result {
         Ok(launch) => launch,
         Err(error) => {
             if work_item_state != "blocked" {
@@ -792,6 +897,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         }
     };
     let mission_status = launch.get("mission_status").and_then(Value::as_str);
+    if let Some(recovery_state) = launch.get("factory_state").and_then(Value::as_str) {
+        work_item_state = recovery_state.to_owned();
+    }
+    if let Some(recovery_version) = launch.get("factory_version").and_then(Value::as_i64) {
+        work_item_version = recovery_version;
+    }
     if matches!(mission_status, Some("failed" | "cancelled")) {
         let mission_terminal_state = mission_status.expect("matched terminal mission state");
         let terminal_state = if mission_terminal_state == "failed"
@@ -836,6 +947,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         .get("awaiting_approval")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let workspace_cleanup_pending = launch
+        .get("workspace_cleanup_pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if mission_awaiting_approval && work_item_state != "awaiting_approval" {
         let transitioned = transition_factory_state(
             client,
@@ -875,12 +990,11 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         work_item_version = transitioned.1;
         work_item_state = transitioned.0;
     }
-    if mission_completed
-        && matches!(
-            work_item_state.as_str(),
-            "mission_created" | "running" | "awaiting_approval" | "blocked"
-        )
-    {
+    if factory_completion_is_ready(
+        mission_completed,
+        workspace_cleanup_pending,
+        &work_item_state,
+    ) {
         let transitioned = transition_factory_state(
             client,
             server,
@@ -1328,6 +1442,26 @@ fn validate_args(args: &FactoryArgs) -> Result<()> {
     {
         bail!("factory verification policy file does not exist");
     }
+    match (
+        args.verification_recovery,
+        args.verification_recovery_reason.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(_), Some(reason)) => {
+            if args.issue.is_none() {
+                bail!("factory verification recovery requires an explicit --issue");
+            }
+            if reason.trim().is_empty()
+                || reason.len() > 4_000
+                || reason.chars().any(char::is_control)
+            {
+                bail!(
+                    "factory verification recovery reason must contain 1 to 4,000 printable bytes"
+                );
+            }
+        }
+        _ => bail!("factory verification recovery mode and reason must be supplied together"),
+    }
     Ok(())
 }
 
@@ -1358,6 +1492,10 @@ fn normalize_args(args: &mut FactoryArgs) -> Result<()> {
         .iter()
         .map(|scope| scope.trim().to_owned())
         .collect();
+    args.verification_recovery_reason = args
+        .verification_recovery_reason
+        .take()
+        .map(|reason| reason.trim().to_owned());
     Ok(())
 }
 
@@ -1396,6 +1534,23 @@ fn resolve_recovery_verification_policy(
         ),
         (None, None) => Ok(None),
     }
+}
+
+fn resolve_explicit_recovery_verification_policy(
+    item: &ExistingFactoryItem,
+    requested: Option<&VerificationPolicy>,
+) -> Result<Option<VerificationPolicy>> {
+    if let Some(requested) = requested {
+        return Ok(Some(requested.clone()));
+    }
+    item.policy
+        .get("verification_policy")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<VerificationPolicy>(value.clone())
+                .context("decode persisted factory verification policy")
+        })
+        .transpose()
 }
 
 pub(crate) fn normalize_github_component(value: &str, field: &str) -> Result<String> {
@@ -1851,7 +2006,38 @@ fn evaluate_items(
         }
         if let Some(factory_item) = existing.get(&item.id) {
             let recoverable_state = factory_state_is_recoverable(&factory_item.state);
-            if factory_item_recoverable_by(factory_item, args.actor_id, &issue.updated_at, now) {
+            let explicit_verified_replay = args.verification_recovery.is_none()
+                && args.issue == Some(issue.number)
+                && factory_item.state == "verified"
+                && factory_item.source_revision == issue.updated_at
+                && (factory_item.claim_owner_id == args.actor_id
+                    || factory_item.lease_expires_at <= now);
+            let explicit_verification_recovery = args.verification_recovery.is_some()
+                && matches!(
+                    factory_item.state.as_str(),
+                    "verification_failed" | "running" | "blocked" | "awaiting_approval"
+                )
+                && (factory_item.claim_owner_id == args.actor_id
+                    || factory_item.lease_expires_at <= now);
+            if factory_item.state == "verification_failed" && args.verification_recovery.is_none() {
+                reasons.push(
+                    "verification-failed work requires explicit --verification-recovery and --verification-recovery-reason"
+                        .to_owned(),
+                );
+            } else if args.verification_recovery.is_some()
+                && !matches!(
+                    factory_item.state.as_str(),
+                    "verification_failed" | "running" | "blocked" | "awaiting_approval"
+                )
+            {
+                reasons.push(format!(
+                    "verification recovery is incompatible with factory state {}",
+                    factory_item.state
+                ));
+            } else if explicit_verified_replay
+                || explicit_verification_recovery
+                || factory_item_recoverable_by(factory_item, args.actor_id, &issue.updated_at, now)
+            {
                 recovery = true;
             } else {
                 let detail = if recoverable_state
@@ -1873,6 +2059,22 @@ fn evaluate_items(
                     )
                 };
                 reasons.push(detail);
+            }
+        }
+        if args.verification_recovery.is_some() {
+            match existing.get(&item.id) {
+                Some(factory_item) if factory_item.mission_id.is_some() => {
+                    if !factory_recovery_source_matches(args, &item, &issue, factory_item) {
+                        reasons.push(
+                            "verification recovery must retain the original Project item and issue identity"
+                                .to_owned(),
+                        );
+                    }
+                }
+                _ => reasons.push(
+                    "verification recovery requires an existing factory item and mission; replacement work is not authorized"
+                        .to_owned(),
+                ),
             }
         }
         if recovery {
@@ -1936,6 +2138,40 @@ fn project_item_is_candidate(args: &FactoryArgs, item: &ProjectItem) -> bool {
         && args
             .issue
             .is_none_or(|number| number == item.content.number)
+}
+
+fn factory_recovery_source_matches(
+    args: &FactoryArgs,
+    item: &ProjectItem,
+    issue: &IssueView,
+    persisted: &ExistingFactoryItem,
+) -> bool {
+    persisted
+        .source_project_owner
+        .eq_ignore_ascii_case(&args.owner)
+        && persisted.source_project_number == i64::from(args.project_number)
+        && persisted.source_project_item_id == item.id
+        && format!(
+            "{}/{}",
+            persisted.source_repository_owner, persisted.source_repository_name
+        )
+        .eq_ignore_ascii_case(&args.repository)
+        && persisted.source_issue_number == issue.number
+        && persisted.source_issue_node_id == issue.id
+        && persisted.source_issue_url == issue.url
+}
+
+fn factory_completion_is_ready(
+    mission_completed: bool,
+    workspace_cleanup_pending: bool,
+    state: &str,
+) -> bool {
+    mission_completed
+        && !workspace_cleanup_pending
+        && matches!(
+            state,
+            "mission_created" | "running" | "awaiting_approval" | "blocked"
+        )
 }
 
 fn factory_state_is_recoverable(state: &str) -> bool {
@@ -2053,10 +2289,11 @@ fn revalidate_selected_for_effect(
     {
         reasons.push("Project item content is stale relative to the issue".to_owned());
     }
-    if !issue
-        .labels
-        .iter()
-        .any(|label| label.name == "factory:ready")
+    if args.verification_recovery.is_none()
+        && !issue
+            .labels
+            .iter()
+            .any(|label| label.name == "factory:ready")
     {
         reasons.push("missing factory:ready label".to_owned());
     }
@@ -2169,6 +2406,15 @@ fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFac
                 project_item_id,
                 ExistingFactoryItem {
                     version: value_i64(item, "/version")?,
+                    source_project_owner: value_string(item, "/source_project_owner")?,
+                    source_project_number: value_i64(item, "/source_project_number")?,
+                    source_project_item_id: value_string(item, "/source_project_item_id")?,
+                    source_repository_owner: value_string(item, "/source_repository_owner")?,
+                    source_repository_name: value_string(item, "/source_repository_name")?,
+                    source_issue_number: value_i64(item, "/source_issue_number")?,
+                    source_issue_node_id: value_string(item, "/source_issue_node_id")?,
+                    source_issue_url: value_string(item, "/source_issue_url")?,
+                    source_title: value_string(item, "/source_title")?,
                     source_revision: value_string(item, "/source_revision")?,
                     claim_owner_id: value_uuid(item, "/claim_owner_id")?,
                     state: value_string(item, "/state")?,
@@ -2335,6 +2581,648 @@ async fn transition_factory_state(
     ))
 }
 
+async fn load_factory_recovery_snapshot(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    mission_id: Uuid,
+    work_item_id: Uuid,
+    mode: FactoryVerificationRecoveryMode,
+    reason: &str,
+) -> Result<FactoryRecoverySnapshot> {
+    let context = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{work_item_id}/verification-recoveries?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await?;
+    if value_uuid(&context, "/work_item/id")? != work_item_id
+        || value_uuid(&context, "/mission_id")? != mission_id
+    {
+        bail!("factory recovery context does not match the selected work item");
+    }
+    let recoveries = context
+        .get("recoveries")
+        .and_then(Value::as_array)
+        .context("factory recovery context omitted recoveries")?;
+    let active_recoveries = recoveries
+        .iter()
+        .filter(|recovery| {
+            recovery
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "authorized" | "running"))
+        })
+        .collect::<Vec<_>>();
+    if active_recoveries.len() > 1 {
+        bail!("factory recovery context returned multiple active recoveries");
+    }
+    if let Some(active) = active_recoveries.first()
+        && active.get("mode").and_then(Value::as_str) != Some(mode.as_str())
+    {
+        bail!(
+            "factory work item already has an active {} recovery",
+            active
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        );
+    }
+    if let Some(active) = active_recoveries.first() {
+        if value_uuid(active, "/authorized_by")? != args.actor_id {
+            bail!("active factory recovery belongs to another authorizing actor");
+        }
+        if active.get("reason").and_then(Value::as_str) != Some(reason) {
+            bail!("active factory recovery reason does not match this replay");
+        }
+    }
+    let task_id = value_uuid(&context, "/task_id")?;
+    let source_run_id = value_uuid(&context, "/source_run_id")?;
+    if let Some(active) = active_recoveries.first()
+        && (value_uuid(active, "/corp_id")? != args.corp_id
+            || value_uuid(active, "/factory_work_item_id")? != work_item_id
+            || value_uuid(active, "/mission_id")? != mission_id
+            || value_uuid(active, "/task_id")? != task_id
+            || value_uuid(active, "/source_run_id")? != source_run_id)
+    {
+        bail!("active factory recovery does not match the selected source lineage");
+    }
+    let snapshot = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/snapshot?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await?;
+    let tasks = snapshot
+        .pointer("/snapshot/tasks")
+        .and_then(Value::as_array)
+        .context("factory recovery snapshot omitted tasks")?;
+    let runs = snapshot
+        .pointer("/snapshot/runs")
+        .and_then(Value::as_array)
+        .context("factory recovery snapshot omitted runs")?;
+    let source_run = runs
+        .iter()
+        .find(|run| {
+            run.get("id").and_then(Value::as_str) == Some(source_run_id.to_string().as_str())
+        })
+        .context("factory verification recovery source run is absent from the snapshot")?;
+    if value_uuid(source_run, "/task_id")? != task_id
+        || value_uuid(source_run, "/corp_id")? != args.corp_id
+    {
+        bail!("factory recovery context source run does not match its task");
+    }
+    let task = tasks
+        .iter()
+        .find(|task| task.get("id").and_then(Value::as_str) == Some(task_id.to_string().as_str()))
+        .context("factory verification recovery task is absent from the snapshot")?;
+    if value_uuid(task, "/mission_id")? != mission_id
+        || value_uuid(task, "/corp_id")? != args.corp_id
+    {
+        bail!("factory recovery task does not match the selected mission");
+    }
+    let contract: TaskContract = serde_json::from_value(
+        task.get("contract")
+            .cloned()
+            .context("factory recovery task omitted contract")?,
+    )
+    .context("decode factory recovery task contract")?;
+    let verification_policy: VerificationPolicy = serde_json::from_value(
+        task.get("verification_policy")
+            .cloned()
+            .context("factory recovery task omitted verification policy")?,
+    )
+    .context("decode factory recovery verification policy")?;
+    let workspace_fingerprint = context
+        .get("workspace_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let expected_head_commit = context
+        .get("expected_head_commit")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let contract_revisions = snapshot
+        .pointer("/snapshot/mission_contract_revisions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(FactoryRecoverySnapshot {
+        task_id,
+        source_run_id,
+        contract_version: value_i64(task, "/contract_version")?,
+        contract,
+        verification_policy,
+        workspace_fingerprint,
+        expected_head_commit,
+        contract_revisions,
+        active_recovery: active_recoveries
+            .first()
+            .map(|recovery| (*recovery).clone()),
+    })
+}
+
+fn reviewed_recovery_source(args: &FactoryArgs, selected: &EvaluatedItem) -> Value {
+    json!({
+        "repository": args.repository,
+        "project_item_id": selected.project_item.id,
+        "issue_number": selected.issue.number,
+        "issue_node_id": selected.issue.id,
+        "issue_url": selected.issue.url,
+        "title": selected.issue.title,
+        "source_revision": selected.issue.updated_at,
+        "body_sha256": format!("{:x}", Sha256::digest(selected.issue.body.as_bytes())),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_contract_request(
+    args: &FactoryArgs,
+    snapshot: &FactoryRecoverySnapshot,
+    issue: &IssueView,
+    mode: FactoryVerificationRecoveryMode,
+    source_changed: bool,
+    reason: &str,
+    replacement_policy: &VerificationPolicy,
+    reviewed_source_snapshot: &Value,
+) -> Result<Value> {
+    let mut contract = snapshot.contract.clone();
+    if mode == FactoryVerificationRecoveryMode::SourceCorrection || source_changed {
+        contract.objective = issue_objective(issue);
+        contract.expected_output = format!(
+            "A corrected, verified implementation for GitHub issue #{}.",
+            issue.number
+        );
+        let acceptance = acceptance_tests(&issue.body);
+        if !acceptance.is_empty() {
+            contract.acceptance_tests = acceptance;
+        }
+        if !contract.references.contains(&issue.url) {
+            contract.references.push(issue.url.clone());
+        }
+    }
+    // The revision schema has no reviewed-source field. Persist an inert provenance
+    // reference so source identity survives the store's objective normalization and
+    // size cap. This is not a URL or new source/tool authority. Keep operator refs.
+    contract
+        .references
+        .retain(|reference| !reference.starts_with(RECOVERY_SOURCE_REFERENCE_PREFIX));
+    contract.references.push(format!(
+        "{RECOVERY_SOURCE_REFERENCE_PREFIX}{:x}",
+        Sha256::digest(serde_json::to_vec(reviewed_source_snapshot)?)
+    ));
+    if contract.references.len() > 64 {
+        bail!("factory recovery contract has no room for its reviewed-source provenance reference");
+    }
+    let description = issue.body.replace("\r\n", "\n").replace('\r', "\n");
+    Ok(json!({
+        "actor_id": args.actor_id,
+        "task_id": snapshot.task_id,
+        "expected_contract_version": snapshot.contract_version,
+        "next_action": "resume",
+        "source_run_id": snapshot.source_run_id,
+        "reason": reason,
+        "description": description.trim(),
+        "contract": contract,
+        "verification_policy": replacement_policy,
+    }))
+}
+
+fn recovery_replacement_contract(request: &Value) -> Result<Value> {
+    const SEPARATOR: &str = "\n\nTASK-SPECIFIC OBJECTIVE:\n";
+    let description = value_string(request, "/description")?;
+    let mut contract = request
+        .get("contract")
+        .cloned()
+        .context("factory recovery revision request omitted its contract")?;
+    let objective = value_string(&contract, "/objective")?;
+    let objective = objective.trim();
+    // On replay, the task projection already includes the replacement description.
+    // Match the store's composed objective, not just a source substring or the reason.
+    let task_objective = if !description.is_empty() && objective == description {
+        ""
+    } else if !description.is_empty() {
+        objective
+            .strip_prefix(&description)
+            .and_then(|remainder| remainder.strip_prefix(SEPARATOR))
+            .unwrap_or(objective)
+    } else {
+        objective
+    };
+    let objective = if description.is_empty() {
+        task_objective.to_owned()
+    } else if task_objective.is_empty()
+        || description.len() + SEPARATOR.len() + task_objective.len() > 100_000
+    {
+        description
+    } else {
+        format!("{description}{SEPARATOR}{task_objective}")
+    };
+    contract["objective"] = json!(objective);
+    Ok(contract)
+}
+
+fn cached_recovery_contract_revision(
+    args: &FactoryArgs,
+    mission_id: Uuid,
+    snapshot: &FactoryRecoverySnapshot,
+    request: &Value,
+) -> Result<Option<Uuid>> {
+    let replacement_contract = recovery_replacement_contract(request)?;
+    let replacement_policy = &request["verification_policy"];
+    // A matching historical revision is not authority if another revision superseded
+    // it. Both its version and complete replacement must still be the task projection.
+    if replacement_contract != serde_json::to_value(&snapshot.contract)?
+        || replacement_policy != &serde_json::to_value(&snapshot.verification_policy)?
+    {
+        return Ok(None);
+    }
+    snapshot
+        .contract_revisions
+        .iter()
+        .find(|revision| {
+            revision["corp_id"] == json!(args.corp_id)
+                && revision["mission_id"] == json!(mission_id)
+                && revision["task_id"] == request["task_id"]
+                && revision["source_run_id"] == request["source_run_id"]
+                && revision["revised_by"] == request["actor_id"]
+                && revision["next_action"] == request["next_action"]
+                && revision["reason"] == request["reason"]
+                && revision["version"] == json!(snapshot.contract_version)
+                && revision["replacement_description"] == request["description"]
+                && revision["replacement_contract"] == replacement_contract
+                && &revision["replacement_verification_policy"] == replacement_policy
+        })
+        .map(|revision| value_uuid(revision, "/id"))
+        .transpose()
+}
+
+fn recovery_revision_required(
+    mode: FactoryVerificationRecoveryMode,
+    source_changed: bool,
+    policy_changed: bool,
+    snapshot: &FactoryRecoverySnapshot,
+) -> bool {
+    mode == FactoryVerificationRecoveryMode::SourceCorrection
+        || source_changed
+        || policy_changed
+        || snapshot.contract_revisions.iter().any(|revision| {
+            revision["task_id"] == json!(snapshot.task_id)
+                && revision["source_run_id"] == json!(snapshot.source_run_id)
+                && revision["version"] == json!(snapshot.contract_version)
+        })
+}
+
+fn recovery_revision_key(
+    corp_id: Uuid,
+    mission_id: Uuid,
+    work_item_id: Uuid,
+    mode: FactoryVerificationRecoveryMode,
+    reviewed_source_snapshot: &Value,
+    request: &Value,
+) -> Uuid {
+    // Include the complete request: changed policy or actor with the same reason
+    // must not collide with a revision that persisted before authorization failed.
+    stable_uuid(
+        &json!({
+            "operation": "factory-verification-recovery-contract-v2",
+            "corp_id": corp_id,
+            "mission_id": mission_id,
+            "factory_work_item_id": work_item_id,
+            "mode": mode,
+            "reviewed_source_snapshot": reviewed_source_snapshot,
+            "request": request,
+        })
+        .to_string(),
+    )
+}
+
+fn active_recovery_contract_revision(
+    active: &Value,
+    mode: FactoryVerificationRecoveryMode,
+    reviewed_source_snapshot: &Value,
+    replacement_policy: &VerificationPolicy,
+) -> Result<Option<Uuid>> {
+    if active["observed_source_revision"] != reviewed_source_snapshot["source_revision"]
+        || &active["reviewed_source_snapshot"] != reviewed_source_snapshot
+    {
+        bail!("active factory recovery reviewed source does not match this replay");
+    }
+    if active["replacement_verification_policy"] != serde_json::to_value(replacement_policy)? {
+        bail!("active factory recovery replacement verification policy does not match this replay");
+    }
+    let revision_id = match active.get("contract_revision_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(
+            Uuid::parse_str(id).context("active factory recovery contract revision is invalid")?,
+        ),
+        _ => bail!("active factory recovery omitted its contract revision identity"),
+    };
+    if mode == FactoryVerificationRecoveryMode::SourceCorrection && revision_id.is_none() {
+        bail!("active source-correction recovery has no contract revision");
+    }
+    Ok(revision_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_factory_verification(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    persisted: &ExistingFactoryItem,
+    work_item_id: Uuid,
+    claim_token: Uuid,
+    expected_factory_version: i64,
+    mission_id: Uuid,
+    stable_prefix: &str,
+    requested_verification_policy: Option<&VerificationPolicy>,
+) -> Result<Value> {
+    let mode_arg = args
+        .verification_recovery
+        .context("factory verification recovery mode is missing")?;
+    let mode: FactoryVerificationRecoveryMode = mode_arg.into();
+    let reason = args
+        .verification_recovery_reason
+        .as_deref()
+        .context("factory verification recovery reason is missing")?;
+    let mut snapshot = load_factory_recovery_snapshot(
+        client,
+        server,
+        args,
+        mission_id,
+        work_item_id,
+        mode,
+        reason,
+    )
+    .await?;
+    let reviewed_source_snapshot = reviewed_recovery_source(args, selected);
+    if let Some(active) = snapshot.active_recovery.as_ref() {
+        active_recovery_contract_revision(
+            active,
+            mode,
+            &reviewed_source_snapshot,
+            requested_verification_policy.unwrap_or(&snapshot.verification_policy),
+        )?;
+    }
+    let legacy_workspace_checkpointed = snapshot.workspace_fingerprint.is_none();
+    if legacy_workspace_checkpointed {
+        let expected_head_commit = snapshot
+            .expected_head_commit
+            .as_deref()
+            .context(
+                "legacy factory recovery requires a verification-linked head commit before workspace checkpointing",
+            )?;
+        let checkpoint = server_json(
+            client,
+            Method::POST,
+            format!(
+                "{server}/api/corps/{}/factory/work-items/{work_item_id}/workspace-checkpoint",
+                args.corp_id
+            ),
+            Some(json!({
+                "actor_id": args.actor_id,
+                "claim_token": claim_token,
+                "expected_version": expected_factory_version,
+                "idempotency_key": format!(
+                    "{stable_prefix}:workspace-checkpoint:{}",
+                    snapshot.source_run_id
+                ),
+                "source_run_id": snapshot.source_run_id,
+                "expected_head_commit": expected_head_commit,
+            })),
+        )
+        .await
+        .context("request preserved legacy workspace checkpoint")?;
+        if let Some(returned_token) = checkpoint.get("claim_token").and_then(Value::as_str) {
+            let returned_token = Uuid::parse_str(returned_token)
+                .context("workspace checkpoint claim token is invalid")?;
+            if returned_token != claim_token {
+                bail!("workspace checkpoint returned a different factory fencing token");
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while snapshot.workspace_fingerprint.is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            snapshot = load_factory_recovery_snapshot(
+                client,
+                server,
+                args,
+                mission_id,
+                work_item_id,
+                mode,
+                reason,
+            )
+            .await?;
+        }
+    }
+    let workspace_fingerprint = snapshot
+        .workspace_fingerprint
+        .clone()
+        .context("factory recovery source workspace checkpoint did not complete")?;
+    let replacement_policy = requested_verification_policy
+        .cloned()
+        .unwrap_or_else(|| snapshot.verification_policy.clone());
+    let source_changed = selected.issue.updated_at != persisted.source_revision;
+    let policy_changed = replacement_policy != snapshot.verification_policy;
+    let reason_digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
+    let contract_revision_id = if let Some(active) = snapshot.active_recovery.as_ref() {
+        active_recovery_contract_revision(
+            active,
+            mode,
+            &reviewed_source_snapshot,
+            &replacement_policy,
+        )?
+    } else if recovery_revision_required(mode, source_changed, policy_changed, &snapshot) {
+        let mut request = recovery_contract_request(
+            args,
+            &snapshot,
+            &selected.issue,
+            mode,
+            source_changed,
+            reason,
+            &replacement_policy,
+            &reviewed_source_snapshot,
+        )?;
+        if let Some(revision_id) =
+            cached_recovery_contract_revision(args, mission_id, &snapshot, &request)?
+        {
+            Some(revision_id)
+        } else {
+            request["idempotency_key"] = json!(recovery_revision_key(
+                args.corp_id,
+                mission_id,
+                work_item_id,
+                mode,
+                &reviewed_source_snapshot,
+                &request,
+            ));
+            let revision = server_json(
+                client,
+                Method::POST,
+                format!(
+                    "{server}/api/corps/{}/missions/{mission_id}/contract-revisions",
+                    args.corp_id
+                ),
+                Some(request),
+            )
+            .await
+            .context("persist factory verification recovery contract revision")?;
+            Some(value_uuid(&revision, "/revision/id")?)
+        }
+    } else {
+        None
+    };
+    let recovery_key = stable_uuid(&format!(
+        "{stable_prefix}:verification-recovery:{}:{}:{}",
+        snapshot.source_run_id,
+        mode.as_str(),
+        reason_digest,
+    ));
+    let recovery = server_json(
+        client,
+        Method::POST,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{work_item_id}/verification-recoveries",
+            args.corp_id
+        ),
+        Some(json!({
+            "actor_id": args.actor_id,
+            "claim_token": claim_token,
+            "expected_factory_version": expected_factory_version,
+            "idempotency_key": recovery_key,
+            "source_run_id": snapshot.source_run_id,
+            "mode": mode,
+            "reason": reason,
+            "observed_source_revision": selected.issue.updated_at,
+            "reviewed_source_snapshot": reviewed_source_snapshot,
+            "contract_revision_id": contract_revision_id,
+            "expected_workspace_fingerprint": workspace_fingerprint,
+            "expected_head_commit": snapshot.expected_head_commit,
+        })),
+    )
+    .await
+    .context("authorize factory verification recovery")?;
+    let recovery_status = value_string(&recovery, "/recovery/status")?;
+    let factory_state = value_string(&recovery, "/work_item/state")?;
+    let dispatch_failed = recovery_status == "failed" || factory_state == "verification_failed";
+    Ok(json!({
+        "recovered": recovery
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "verification_recovery": true,
+        "recovery_id": value_uuid(&recovery, "/recovery/id")?,
+        "recovery_mode": mode,
+        "legacy_workspace_checkpointed": legacy_workspace_checkpointed,
+        "run_id": value_uuid(&recovery, "/run_id")?,
+        "run_ids": [value_uuid(&recovery, "/run_id")?],
+        "mission_status": if dispatch_failed { "failed" } else { "running" },
+        "verification_failed": dispatch_failed,
+        "awaiting_approval": false,
+        "run_summary": recovery
+            .pointer("/work_item/failure_detail")
+            .and_then(Value::as_str),
+        "contract_revision_id": contract_revision_id,
+        "factory_state": factory_state,
+        "factory_version": value_i64(&recovery, "/work_item/version")?,
+    }))
+}
+
+fn stable_uuid(value: &str) -> Uuid {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn existing_factory_run_summary(snapshot: &Value, mission_id: Uuid) -> Result<Option<Value>> {
+    let (mission_status, task_ids, verification_failed, awaiting_approval) =
+        factory_mission_snapshot(snapshot, mission_id)?;
+    let existing_runs = snapshot
+        .pointer("/snapshot/runs")
+        .and_then(Value::as_array)
+        .context("ECorp snapshot omitted runs")?
+        .iter()
+        .filter(|run| {
+            run.get("task_id")
+                .and_then(Value::as_str)
+                .is_some_and(|task_id| task_ids.contains(task_id))
+        })
+        .collect::<Vec<_>>();
+    if existing_runs.is_empty() {
+        return Ok(None);
+    }
+    let terminal_mission = matches!(
+        mission_status.as_str(),
+        "completed" | "failed" | "cancelled"
+    );
+    let workspace_cleanup_pending = terminal_mission
+        && existing_runs.iter().any(|run| {
+            run.get("workspace_disposition")
+                .and_then(Value::as_str)
+                .is_none_or(|disposition| disposition == "active")
+        });
+    Ok(Some(json!({
+        "recovered": true,
+        "mission_status": mission_status,
+        "verification_failed": verification_failed,
+        "awaiting_approval": awaiting_approval,
+        "workspace_cleanup_pending": workspace_cleanup_pending,
+        "run_summary": existing_runs
+            .first()
+            .and_then(|run| run.get("summary"))
+            .and_then(Value::as_str),
+        "run_ids": existing_runs
+            .iter()
+            .filter_map(|run| run.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+async fn existing_factory_run_summary_after_workspace_finalization(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    snapshot: &Value,
+    mission_id: Uuid,
+) -> Result<Option<Value>> {
+    let Some(mut recovered) = existing_factory_run_summary(snapshot, mission_id)? else {
+        return Ok(None);
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while recovered
+        .get("workspace_cleanup_pending")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let refreshed = server_json(
+            client,
+            Method::GET,
+            format!(
+                "{server}/api/corps/{}/snapshot?actor_id={}",
+                args.corp_id, args.actor_id
+            ),
+            None,
+        )
+        .await?;
+        recovered = existing_factory_run_summary(&refreshed, mission_id)?
+            .context("factory run disappeared while awaiting workspace finalization")?;
+    }
+    Ok(Some(recovered))
+}
+
 async fn launch_or_recover(
     client: &Client,
     server: &str,
@@ -2351,35 +3239,14 @@ async fn launch_or_recover(
         None,
     )
     .await?;
-    let (mission_status, task_ids, verification_failed, awaiting_approval) =
-        factory_mission_snapshot(&snapshot, mission_id)?;
-    let existing_runs = snapshot
-        .pointer("/snapshot/runs")
-        .and_then(Value::as_array)
-        .context("ECorp snapshot omitted runs")?
-        .iter()
-        .filter(|run| {
-            run.get("task_id")
-                .and_then(Value::as_str)
-                .is_some_and(|task_id| task_ids.contains(task_id))
-        })
-        .collect::<Vec<_>>();
-    if !existing_runs.is_empty() {
-        return Ok(json!({
-            "recovered": true,
-            "mission_status": mission_status,
-            "verification_failed": verification_failed,
-            "awaiting_approval": awaiting_approval,
-            "run_summary": existing_runs
-                .first()
-                .and_then(|run| run.get("summary"))
-                .and_then(Value::as_str),
-            "run_ids": existing_runs
-                .iter()
-                .filter_map(|run| run.get("id").and_then(Value::as_str))
-                .collect::<Vec<_>>(),
-        }));
+    if let Some(recovered) = existing_factory_run_summary_after_workspace_finalization(
+        client, server, args, &snapshot, mission_id,
+    )
+    .await?
+    {
+        return Ok(recovered);
     }
+    let (mission_status, _, _, _) = factory_mission_snapshot(&snapshot, mission_id)?;
     if mission_status != "ready" {
         bail!("factory mission is {mission_status} without a recoverable run");
     }
@@ -2412,34 +3279,12 @@ async fn launch_or_recover(
             None,
         )
         .await?;
-        let (mission_status, task_ids, verification_failed, awaiting_approval) =
-            factory_mission_snapshot(&refreshed, mission_id)?;
-        let existing_runs = refreshed
-            .pointer("/snapshot/runs")
-            .and_then(Value::as_array)
-            .context("ECorp snapshot omitted runs after launch conflict")?
-            .iter()
-            .filter(|run| {
-                run.get("task_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|task_id| task_ids.contains(task_id))
-            })
-            .collect::<Vec<_>>();
-        if !existing_runs.is_empty() {
-            return Ok(json!({
-                "recovered": true,
-                "mission_status": mission_status,
-                "verification_failed": verification_failed,
-                "awaiting_approval": awaiting_approval,
-                "run_summary": existing_runs
-                    .first()
-                    .and_then(|run| run.get("summary"))
-                    .and_then(Value::as_str),
-                "run_ids": existing_runs
-                    .iter()
-                    .filter_map(|run| run.get("id").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-            }));
+        if let Some(recovered) = existing_factory_run_summary_after_workspace_finalization(
+            client, server, args, &refreshed, mission_id,
+        )
+        .await?
+        {
+            return Ok(recovered);
         }
     }
     bail!("factory mission launch failed with {status}: {body}")
@@ -2955,17 +3800,610 @@ fn value_optional_uuid(value: &Value, pointer: &str) -> Result<Option<Uuid>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use chrono::{Duration, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::{
-        ExistingFactoryItem, FactoryArgs, acceptance_tests, blocked_dependency_numbers,
-        factory_item_recoverable_by, graphql_envelope_has_errors, issue_numbers,
-        normalize_github_component, parse_exact_project_item, parse_github_repository_identity,
-        publication_base_branch, resolve_recovery_publication_base_ref, sanitize_failure_detail,
+        EvaluatedItem, ExistingFactoryItem, FactoryArgs, FactoryRecoverySnapshot,
+        FactoryVerificationRecoveryMode, IssueLabel, IssueView, ProjectContent, ProjectItem,
+        RECOVERY_SOURCE_REFERENCE_PREFIX, VerificationRecoveryModeArg, acceptance_tests,
+        active_recovery_contract_revision, blocked_dependency_numbers,
+        cached_recovery_contract_revision, evaluate_items, factory_completion_is_ready,
+        factory_item_recoverable_by, factory_recovery_source_matches, graphql_envelope_has_errors,
+        issue_numbers, normalize_github_component, parse_exact_project_item,
+        parse_github_repository_identity, publication_base_branch, recovery_contract_request,
+        recovery_replacement_contract, recovery_revision_key, recovery_revision_required,
+        resolve_recovery_publication_base_ref, reviewed_recovery_source, sanitize_failure_detail,
         selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
     };
+
+    struct RecoveryFixture {
+        args: FactoryArgs,
+        selected: EvaluatedItem,
+        snapshot: FactoryRecoverySnapshot,
+        mission_id: Uuid,
+        work_item_id: Uuid,
+        revision_id: Uuid,
+    }
+
+    impl RecoveryFixture {
+        fn new() -> Self {
+            let args = FactoryArgs {
+                corp_id: Uuid::from_u128(1),
+                actor_id: Uuid::from_u128(2),
+                owner: "owner".to_owned(),
+                project_number: 3,
+                repository: "owner/repo".to_owned(),
+                source_base_ref: "main".to_owned(),
+                publication_base_ref: None,
+                source_repository_path: ".".into(),
+                adapter: "github-copilot".to_owned(),
+                allowed_adapters: Vec::new(),
+                strategy: "single".to_owned(),
+                model: Some("reviewed-model".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+                budget_tokens: 10_000,
+                budget_cost_microusd: 100_000,
+                lease_seconds: 300,
+                write_scope: vec!["src/**".to_owned()],
+                verification_policy_file: None,
+                issue: Some(113),
+                verification_recovery: Some(VerificationRecoveryModeArg::SourceCorrection),
+                verification_recovery_reason: Some("Correct the reviewed check".to_owned()),
+                dry_run: false,
+                github_cli: "must-not-run-github".into(),
+                github_budget: Default::default(),
+                active_issue: Default::default(),
+            };
+            let issue = IssueView {
+                id: "issue-node".to_owned(),
+                number: 113,
+                title: "Governed correction".to_owned(),
+                body: "## Acceptance criteria\n- [ ] Preserve the original work".to_owned(),
+                url: "https://github.com/owner/repo/issues/113".to_owned(),
+                state: "OPEN".to_owned(),
+                created_at: "2026-09-01T00:00:00Z".to_owned(),
+                updated_at: "2026-09-06T00:00:00Z".to_owned(),
+                labels: vec![IssueLabel {
+                    name: "factory:ready".to_owned(),
+                }],
+            };
+            let project_item = ProjectItem {
+                id: "project-item".to_owned(),
+                status: "Todo".to_owned(),
+                content: ProjectContent {
+                    body: issue.body.clone(),
+                    number: issue.number,
+                    repository: args.repository.clone(),
+                    title: issue.title.clone(),
+                    kind: "Issue".to_owned(),
+                    url: issue.url.clone(),
+                },
+            };
+            Self {
+                args,
+                selected: EvaluatedItem {
+                    project_item,
+                    issue,
+                    dependencies: Vec::new(),
+                    reasons: Vec::new(),
+                    recovery: true,
+                },
+                snapshot: FactoryRecoverySnapshot {
+                    task_id: Uuid::from_u128(3),
+                    source_run_id: Uuid::from_u128(4),
+                    contract_version: 1,
+                    contract: serde_json::from_value(json!({
+                        "objective": "Original task objective",
+                        "expected_output": "Verified source",
+                        "source_repository": "owner/repo",
+                        "source_base_ref": "main",
+                        "source_base_commit": "a".repeat(40),
+                        "acceptance_tests": ["Keep source identity"],
+                        "allowed_tools": ["filesystem"],
+                        "prohibited_actions": ["No replacement mission"],
+                        "references": ["docs/SECURITY.md"],
+                        "write_scope": ["src/**"],
+                        "budget_tokens": 10_000,
+                        "budget_cost_microusd": 100_000,
+                        "escalation": "Ask the owner",
+                        "model": "reviewed-model",
+                        "reasoning_effort": "high",
+                        "deliverable": {
+                            "form": "commit_branch", "commit_after_verification": true,
+                            "paths": ["src/**"]
+                        }
+                    }))
+                    .unwrap(),
+                    verification_policy: serde_json::from_value(json!({
+                        "checks": [{"type": "file", "path": "src/result.rs", "min_bytes": 1}],
+                        "manual_gate": {
+                            "type": "independent_review", "roles": ["manager"],
+                            "exclude_requester": true
+                        }
+                    }))
+                    .unwrap(),
+                    workspace_fingerprint: Some("b".repeat(64)),
+                    expected_head_commit: Some("c".repeat(40)),
+                    contract_revisions: Vec::new(),
+                    active_recovery: None,
+                },
+                mission_id: Uuid::from_u128(5),
+                work_item_id: Uuid::from_u128(6),
+                revision_id: Uuid::from_u128(7),
+            }
+        }
+
+        fn reviewed_source(&self) -> Value {
+            reviewed_recovery_source(&self.args, &self.selected)
+        }
+
+        fn request(&self) -> Value {
+            recovery_contract_request(
+                &self.args,
+                &self.snapshot,
+                &self.selected.issue,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                true,
+                self.args.verification_recovery_reason.as_deref().unwrap(),
+                &self.snapshot.verification_policy,
+                &self.reviewed_source(),
+            )
+            .unwrap()
+        }
+
+        fn cache_revision(&mut self) {
+            let request = self.request();
+            self.cache_request(request);
+        }
+
+        fn cache_request(&mut self, request: Value) {
+            let contract = recovery_replacement_contract(&request).unwrap();
+            self.snapshot.contract = serde_json::from_value(contract.clone()).unwrap();
+            self.snapshot.verification_policy =
+                serde_json::from_value(request["verification_policy"].clone()).unwrap();
+            self.snapshot.contract_version += 1;
+            self.snapshot.contract_revisions.push(json!({
+                "id": self.revision_id,
+                "corp_id": self.args.corp_id,
+                "mission_id": self.mission_id,
+                "task_id": self.snapshot.task_id,
+                "source_run_id": self.snapshot.source_run_id,
+                "revised_by": self.args.actor_id,
+                "next_action": "resume",
+                "reason": request["reason"],
+                "version": self.snapshot.contract_version,
+                "replacement_description": request["description"],
+                "replacement_contract": contract,
+                "replacement_verification_policy": request["verification_policy"],
+            }));
+        }
+
+        fn cached_id(&self, request: &Value) -> Option<Uuid> {
+            cached_recovery_contract_revision(&self.args, self.mission_id, &self.snapshot, request)
+                .unwrap()
+        }
+
+        fn persisted_item(&self) -> ExistingFactoryItem {
+            ExistingFactoryItem {
+                version: 1,
+                source_project_owner: self.args.owner.clone(),
+                source_project_number: i64::from(self.args.project_number),
+                source_project_item_id: self.selected.project_item.id.clone(),
+                source_repository_owner: "owner".to_owned(),
+                source_repository_name: "repo".to_owned(),
+                source_issue_number: self.selected.issue.number,
+                source_issue_node_id: self.selected.issue.id.clone(),
+                source_issue_url: self.selected.issue.url.clone(),
+                source_title: self.selected.issue.title.clone(),
+                source_revision: "2026-09-01T00:00:00Z".to_owned(),
+                claim_owner_id: self.args.actor_id,
+                state: "verification_failed".to_owned(),
+                mission_id: Some(self.mission_id),
+                policy: json!({}),
+                lease_expires_at: Utc::now() + Duration::minutes(5),
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_completion_preserves_catch_up_states_and_cleanup_gate() {
+        for state in ["mission_created", "running", "awaiting_approval", "blocked"] {
+            assert!(factory_completion_is_ready(true, false, state));
+            assert!(!factory_completion_is_ready(true, true, state));
+            assert!(!factory_completion_is_ready(false, false, state));
+        }
+        for state in [
+            "claimed",
+            "verification_failed",
+            "failed",
+            "cancelled",
+            "verified",
+            "published",
+        ] {
+            assert!(!factory_completion_is_ready(true, false, state));
+        }
+    }
+
+    #[test]
+    fn recovery_cached_revision_replays_the_exact_current_replacement() {
+        let mut fixture = RecoveryFixture::new();
+        assert_eq!(fixture.cached_id(&fixture.request()), None);
+        fixture.cache_revision();
+        assert_eq!(
+            fixture.cached_id(&fixture.request()),
+            Some(fixture.revision_id)
+        );
+        assert_eq!(
+            fixture.cached_id(&fixture.request()),
+            Some(fixture.revision_id)
+        );
+    }
+
+    #[test]
+    fn recovery_legacy_unbound_revision_requires_a_new_explicit_binding() {
+        let mut fixture = RecoveryFixture::new();
+        assert!(!recovery_revision_required(
+            FactoryVerificationRecoveryMode::VerifierOnly,
+            false,
+            false,
+            &fixture.snapshot,
+        ));
+        fixture.cache_revision();
+        fixture
+            .snapshot
+            .contract
+            .references
+            .retain(|reference| !reference.starts_with(RECOVERY_SOURCE_REFERENCE_PREFIX));
+        fixture.snapshot.contract_revisions[0]["replacement_contract"] =
+            serde_json::to_value(&fixture.snapshot.contract).unwrap();
+        assert_eq!(fixture.cached_id(&fixture.request()), None);
+        assert!(recovery_revision_required(
+            FactoryVerificationRecoveryMode::VerifierOnly,
+            false,
+            false,
+            &fixture.snapshot,
+        ));
+    }
+
+    #[test]
+    fn recovery_verifier_only_policy_revision_replays_after_a_lost_authorization_response() {
+        let mut fixture = RecoveryFixture::new();
+        let mut policy = serde_json::to_value(&fixture.snapshot.verification_policy).unwrap();
+        policy["checks"][0]["path"] = json!("src/corrected.rs");
+        let policy = serde_json::from_value(policy).unwrap();
+        let build_request = |fixture: &RecoveryFixture| {
+            recovery_contract_request(
+                &fixture.args,
+                &fixture.snapshot,
+                &fixture.selected.issue,
+                FactoryVerificationRecoveryMode::VerifierOnly,
+                false,
+                fixture
+                    .args
+                    .verification_recovery_reason
+                    .as_deref()
+                    .unwrap(),
+                &policy,
+                &fixture.reviewed_source(),
+            )
+            .unwrap()
+        };
+        let request = build_request(&fixture);
+        fixture.cache_request(request);
+        assert!(recovery_revision_required(
+            FactoryVerificationRecoveryMode::VerifierOnly,
+            false,
+            false,
+            &fixture.snapshot,
+        ));
+        assert_eq!(
+            fixture.cached_id(&build_request(&fixture)),
+            Some(fixture.revision_id)
+        );
+    }
+
+    #[test]
+    fn recovery_cached_revision_rejects_changed_reviewed_source() {
+        for change in ["revision", "body", "title", "node", "item"] {
+            let mut fixture = RecoveryFixture::new();
+            fixture.cache_revision();
+            match change {
+                "revision" => fixture.selected.issue.updated_at.push_str("-new"),
+                "body" => fixture
+                    .selected
+                    .issue
+                    .body
+                    .push_str("\nReviewed new acceptance."),
+                "title" => fixture.selected.issue.title.push_str(" changed"),
+                "node" => fixture.selected.issue.id.push_str("-new"),
+                "item" => fixture.selected.project_item.id.push_str("-new"),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                fixture.cached_id(&fixture.request()),
+                None,
+                "reused stale {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cached_revision_rejects_changed_policy_with_same_source_and_reason() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.cache_revision();
+        let mut request = fixture.request();
+        request["verification_policy"]["checks"][0]["path"] = json!("src/corrected.rs");
+        assert_eq!(fixture.cached_id(&request), None);
+        fixture.snapshot.verification_policy =
+            serde_json::from_value(request["verification_policy"].clone()).unwrap();
+        assert_eq!(fixture.cached_id(&request), None);
+    }
+
+    #[test]
+    fn recovery_cached_revision_rejects_wrong_attribution_or_superseded_contract() {
+        for (field, value) in [
+            ("corp_id", json!(Uuid::from_u128(99))),
+            ("mission_id", json!(Uuid::from_u128(99))),
+            ("task_id", json!(Uuid::from_u128(99))),
+            ("source_run_id", json!(Uuid::from_u128(99))),
+            ("revised_by", json!(Uuid::from_u128(99))),
+            ("next_action", json!("redispatch")),
+            ("reason", json!("Different authority")),
+            ("version", json!(1)),
+            ("replacement_description", json!("Older source")),
+        ] {
+            let mut fixture = RecoveryFixture::new();
+            fixture.cache_revision();
+            fixture.snapshot.contract_revisions[0][field] = value;
+            assert_eq!(
+                fixture.cached_id(&fixture.request()),
+                None,
+                "reused wrong {field}"
+            );
+        }
+        let mut fixture = RecoveryFixture::new();
+        fixture.cache_revision();
+        fixture.snapshot.contract.write_scope = vec!["src/narrow/**".to_owned()];
+        assert_eq!(fixture.cached_id(&fixture.request()), None);
+    }
+
+    #[test]
+    fn recovery_source_binding_survives_objective_size_cap_and_description_normalization() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.selected.issue.body = "x".repeat(70_000);
+        fixture.cache_revision();
+        assert_eq!(
+            fixture.snapshot.contract.objective,
+            fixture.selected.issue.body
+        );
+        assert_eq!(
+            fixture.cached_id(&fixture.request()),
+            Some(fixture.revision_id)
+        );
+        fixture.selected.issue.updated_at.push_str("-new");
+        assert_eq!(
+            recovery_replacement_contract(&fixture.request()).unwrap()["objective"],
+            json!(fixture.snapshot.contract.objective),
+        );
+        assert_eq!(fixture.cached_id(&fixture.request()), None);
+
+        let mut fixture = RecoveryFixture::new();
+        fixture.selected.issue.body = "  Reviewed\r\nsource  ".to_owned();
+        fixture.cache_revision();
+        assert_eq!(
+            fixture.cached_id(&fixture.request()),
+            Some(fixture.revision_id)
+        );
+        fixture.selected.issue.body = "Reviewed\nsource".to_owned();
+        assert_eq!(fixture.cached_id(&fixture.request()), None);
+    }
+
+    #[test]
+    fn recovery_revision_keys_bind_policy_actor_source_and_exact_request() {
+        let fixture = RecoveryFixture::new();
+        let request = fixture.request();
+        let key = |request: &Value, source: &Value| {
+            recovery_revision_key(
+                fixture.args.corp_id,
+                fixture.mission_id,
+                fixture.work_item_id,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                source,
+                request,
+            )
+        };
+        let source = fixture.reviewed_source();
+        let original = key(&request, &source);
+        assert_eq!(original, key(&request, &source));
+        for (pointer, value) in [
+            ("/actor_id", json!(Uuid::from_u128(99))),
+            ("/task_id", json!(Uuid::from_u128(99))),
+            ("/source_run_id", json!(Uuid::from_u128(99))),
+            ("/expected_contract_version", json!(2)),
+            ("/reason", json!("Another authorization")),
+            ("/contract/write_scope", json!(["src/narrow/**"])),
+            (
+                "/verification_policy/checks/0/path",
+                json!("src/corrected.rs"),
+            ),
+        ] {
+            let mut changed = request.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert_ne!(original, key(&changed, &source), "unbound {pointer}");
+        }
+        let mut changed_source = source.clone();
+        changed_source["source_revision"] = json!("2026-09-06T01:00:00Z");
+        assert_ne!(original, key(&request, &changed_source));
+    }
+
+    #[test]
+    fn recovery_contract_preserves_authority_and_replaces_only_its_provenance_marker() {
+        let mut fixture = RecoveryFixture::new();
+        let original = serde_json::to_value(&fixture.snapshot.contract).unwrap();
+        fixture.cache_revision();
+        fixture.selected.issue.updated_at.push_str("-new");
+        let request = fixture.request();
+        for field in [
+            "source_repository",
+            "source_base_ref",
+            "source_base_commit",
+            "allowed_tools",
+            "prohibited_actions",
+            "write_scope",
+            "budget_tokens",
+            "budget_cost_microusd",
+            "deadline_at",
+            "escalation",
+            "secret_refs",
+            "model",
+            "reasoning_effort",
+            "deliverable",
+        ] {
+            assert_eq!(
+                request["contract"][field], original[field],
+                "changed {field}"
+            );
+        }
+        let references = request["contract"]["references"].as_array().unwrap();
+        assert!(references.contains(&json!("docs/SECURITY.md")));
+        assert_eq!(
+            references
+                .iter()
+                .filter(|reference| reference
+                    .as_str()
+                    .unwrap()
+                    .starts_with(RECOVERY_SOURCE_REFERENCE_PREFIX))
+                .count(),
+            1
+        );
+        assert_eq!(request["actor_id"], json!(fixture.args.actor_id));
+        assert_eq!(
+            request["verification_policy"],
+            serde_json::to_value(&fixture.snapshot.verification_policy).unwrap()
+        );
+    }
+
+    #[test]
+    fn recovery_active_replay_requires_the_same_reviewed_source_and_policy() {
+        let fixture = RecoveryFixture::new();
+        let source = fixture.reviewed_source();
+        let policy = &fixture.snapshot.verification_policy;
+        let active = json!({
+            "observed_source_revision": source["source_revision"],
+            "reviewed_source_snapshot": source,
+            "replacement_verification_policy": policy,
+            "contract_revision_id": fixture.revision_id,
+        });
+        assert_eq!(
+            active_recovery_contract_revision(
+                &active,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                &source,
+                policy,
+            )
+            .unwrap(),
+            Some(fixture.revision_id)
+        );
+        let mut changed_source = source.clone();
+        changed_source["body_sha256"] = json!("changed");
+        assert!(
+            active_recovery_contract_revision(
+                &active,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                &changed_source,
+                policy,
+            )
+            .is_err()
+        );
+        let mut changed_active = active.clone();
+        changed_active["replacement_verification_policy"]["checks"][0]["path"] =
+            json!("src/old.rs");
+        assert!(
+            active_recovery_contract_revision(
+                &changed_active,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                &source,
+                policy,
+            )
+            .is_err()
+        );
+        changed_active = active;
+        changed_active["contract_revision_id"] = Value::Null;
+        assert!(
+            active_recovery_contract_revision(
+                &changed_active,
+                FactoryVerificationRecoveryMode::SourceCorrection,
+                &source,
+                policy,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            active_recovery_contract_revision(
+                &changed_active,
+                FactoryVerificationRecoveryMode::VerifierOnly,
+                &source,
+                policy,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_never_falls_back_to_new_factory_work_or_another_issue() {
+        let fixture = RecoveryFixture::new();
+        for persisted in [
+            None,
+            Some({
+                let mut item = fixture.persisted_item();
+                item.mission_id = None;
+                item
+            }),
+        ] {
+            let existing = persisted
+                .into_iter()
+                .map(|item| (fixture.selected.project_item.id.clone(), item))
+                .collect();
+            let mut issue_cache = HashMap::from([(
+                fixture.selected.issue.number,
+                fixture.selected.issue.clone(),
+            )]);
+            let evaluated = evaluate_items(
+                &fixture.args,
+                vec![fixture.selected.project_item.clone()],
+                &existing,
+                &mut issue_cache,
+            )
+            .unwrap();
+            assert!(!evaluated[0].eligible());
+            assert!(
+                evaluated[0]
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("replacement work is not authorized"))
+            );
+        }
+        let persisted = fixture.persisted_item();
+        assert!(factory_recovery_source_matches(
+            &fixture.args,
+            &fixture.selected.project_item,
+            &fixture.selected.issue,
+            &persisted,
+        ));
+        let mut changed = persisted;
+        changed.source_issue_node_id = "replacement-issue".to_owned();
+        assert!(!factory_recovery_source_matches(
+            &fixture.args,
+            &fixture.selected.project_item,
+            &fixture.selected.issue,
+            &changed,
+        ));
+    }
 
     #[test]
     fn graphql_error_envelope_must_be_absent_or_an_empty_array() {
@@ -3135,6 +4573,8 @@ Blocked by #999 outside the section.
             write_scope: vec!["**".to_owned()],
             verification_policy_file: None,
             issue: None,
+            verification_recovery: None,
+            verification_recovery_reason: None,
             dry_run: true,
             github_cli: "gh".into(),
             github_budget: Default::default(),
@@ -3150,6 +4590,15 @@ Blocked by #999 outside the section.
         let now = Utc::now();
         let mut item = ExistingFactoryItem {
             version: 1,
+            source_project_owner: "owner".to_owned(),
+            source_project_number: 1,
+            source_project_item_id: "item".to_owned(),
+            source_repository_owner: "owner".to_owned(),
+            source_repository_name: "repo".to_owned(),
+            source_issue_number: 1,
+            source_issue_node_id: "issue".to_owned(),
+            source_issue_url: "https://github.com/owner/repo/issues/1".to_owned(),
+            source_title: "Issue".to_owned(),
             source_revision: "2026-09-02T00:00:00Z".to_owned(),
             claim_owner_id: Uuid::new_v4(),
             state: "running".to_owned(),
@@ -3181,6 +4630,8 @@ Blocked by #999 outside the section.
             write_scope: vec!["**".to_owned()],
             verification_policy_file: None,
             issue: None,
+            verification_recovery: None,
+            verification_recovery_reason: None,
             dry_run: true,
             github_cli: "gh".into(),
             github_budget: Default::default(),
@@ -3203,6 +4654,15 @@ Blocked by #999 outside the section.
         let replacement = Uuid::new_v4();
         let mut item = ExistingFactoryItem {
             version: 1,
+            source_project_owner: "owner".to_owned(),
+            source_project_number: 1,
+            source_project_item_id: "item".to_owned(),
+            source_repository_owner: "owner".to_owned(),
+            source_repository_name: "repo".to_owned(),
+            source_issue_number: 1,
+            source_issue_node_id: "issue".to_owned(),
+            source_issue_url: "https://github.com/owner/repo/issues/1".to_owned(),
+            source_title: "Issue".to_owned(),
             source_revision: "2026-09-01T14:00:00Z".to_owned(),
             claim_owner_id: owner,
             state: "running".to_owned(),

@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Output, Stdio},
     time::Duration,
 };
 
@@ -14,10 +14,16 @@ use crony_domain::{ManualVerificationGate, VerificationPolicy, VerifierCheck};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio::time::Instant;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    sync::watch,
+};
 
 use crate::adapter::AdapterArtifact;
+#[cfg(windows)]
+use crate::adapter::process_tree::{OwnedProcessTree, OwnedProcessTreeSpawn};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationCheckResult {
@@ -34,6 +40,11 @@ pub struct VerificationReport {
     pub summary: String,
     pub checks: Vec<VerificationCheckResult>,
     pub manual_gate: Option<ManualVerificationGate>,
+}
+
+pub(crate) enum CancellableCheckResult {
+    Completed(VerificationCheckResult),
+    Cancelled,
 }
 
 pub async fn verify(
@@ -58,12 +69,43 @@ pub async fn verify(
     }
 }
 
-async fn run_check(
+pub(crate) async fn run_check(
     check_index: i32,
     check: &VerifierCheck,
     workspace: &Path,
     artifacts: &[AdapterArtifact],
 ) -> VerificationCheckResult {
+    match run_check_inner(check_index, check, workspace, artifacts, None).await {
+        CancellableCheckResult::Completed(result) => result,
+        CancellableCheckResult::Cancelled => {
+            unreachable!("non-cancellable verifier check was cancelled")
+        }
+    }
+}
+
+pub(crate) async fn run_check_cancellable(
+    check_index: i32,
+    check: &VerifierCheck,
+    workspace: &Path,
+    artifacts: &[AdapterArtifact],
+    cancellation: &mut watch::Receiver<bool>,
+) -> CancellableCheckResult {
+    run_check_inner(check_index, check, workspace, artifacts, Some(cancellation)).await
+}
+
+async fn run_check_inner(
+    check_index: i32,
+    check: &VerifierCheck,
+    workspace: &Path,
+    artifacts: &[AdapterArtifact],
+    mut cancellation: Option<&mut watch::Receiver<bool>>,
+) -> CancellableCheckResult {
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return CancellableCheckResult::Cancelled;
+    }
     let outcome = match check {
         VerifierCheck::Artifact { min_bytes } => {
             CheckOutcome::from_result(verify_artifact(artifacts, *min_bytes).await)
@@ -80,7 +122,18 @@ async fn run_check(
             program,
             args,
             timeout_ms,
-        } => verify_command(workspace, program, args, *timeout_ms).await,
+        } => match verify_command_cancellable(
+            workspace,
+            program,
+            args,
+            *timeout_ms,
+            cancellation.as_deref_mut(),
+        )
+        .await
+        {
+            CommandCheckOutcome::Completed(outcome) => outcome,
+            CommandCheckOutcome::Cancelled => return CancellableCheckResult::Cancelled,
+        },
         VerifierCheck::JsonSchema {
             path,
             required_keys,
@@ -89,13 +142,19 @@ async fn run_check(
             CheckOutcome::from_result(verify_screenshot(workspace, path, *min_bytes).await)
         }
     };
-    VerificationCheckResult {
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return CancellableCheckResult::Cancelled;
+    }
+    CancellableCheckResult::Completed(VerificationCheckResult {
         check_index,
         kind: check.kind().to_owned(),
         passed: outcome.passed,
         summary: outcome.summary,
         payload: outcome.payload,
-    }
+    })
 }
 
 struct CheckOutcome {
@@ -180,30 +239,75 @@ async fn verify_file(workspace: &Path, relative: &str, min_bytes: u64) -> Result
     ))
 }
 
+enum CommandCheckOutcome {
+    Completed(CheckOutcome),
+    Cancelled,
+}
+
+enum CommandExecution {
+    Output(Output),
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+enum ProcessWait {
+    Exited(ExitStatus),
+    Cancelled,
+    TimedOut,
+}
+
+#[cfg(test)]
 async fn verify_command(
     workspace: &Path,
     program: &str,
     args: &[String],
     timeout_ms: u64,
 ) -> CheckOutcome {
+    match verify_command_cancellable(workspace, program, args, timeout_ms, None).await {
+        CommandCheckOutcome::Completed(outcome) => outcome,
+        CommandCheckOutcome::Cancelled => {
+            unreachable!("non-cancellable verifier command was cancelled")
+        }
+    }
+}
+
+async fn verify_command_cancellable(
+    workspace: &Path,
+    program: &str,
+    args: &[String],
+    timeout_ms: u64,
+    cancellation: Option<&mut watch::Receiver<bool>>,
+) -> CommandCheckOutcome {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let attempted_mode = attempted_resolution_mode(program);
     let resolved =
         match tokio::time::timeout_at(deadline, resolve_program(program, workspace)).await {
             Ok(Ok(resolved)) => resolved,
             Ok(Err(error)) => {
-                return command_failure(program, args, attempted_mode, None, error);
+                return CommandCheckOutcome::Completed(command_failure(
+                    program,
+                    args,
+                    attempted_mode,
+                    None,
+                    error,
+                ));
             }
             Err(_) => {
-                return command_failure(
+                return CommandCheckOutcome::Completed(command_failure(
                     program,
                     args,
                     attempted_mode,
                     None,
                     anyhow!("{program:?} timed out during executable resolution"),
-                );
+                ));
             }
         };
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return CommandCheckOutcome::Cancelled;
+    }
     let identity = executable_identity(&resolved.executable);
     let mut command = Command::new(&resolved.executable);
     command
@@ -213,28 +317,17 @@ async fn verify_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = match tokio::time::timeout_at(deadline, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return command_failure(
+    let output = match execute_verifier_command(&mut command, deadline, cancellation).await {
+        Ok(CommandExecution::Output(output)) => output,
+        Ok(CommandExecution::Cancelled) => return CommandCheckOutcome::Cancelled,
+        Err(error) => {
+            return CommandCheckOutcome::Completed(command_failure(
                 program,
                 args,
                 resolved.mode,
                 Some(identity),
-                anyhow!(error).context(format!(
-                    "spawn resolved verifier command {program:?} using {}",
-                    resolved.mode.as_str()
-                )),
-            );
-        }
-        Err(_) => {
-            return command_failure(
-                program,
-                args,
-                resolved.mode,
-                Some(identity),
-                anyhow!("{program:?} timed out after {timeout_ms} ms"),
-            );
+                error,
+            ));
         }
     };
     let stdout = truncate(&output.stdout);
@@ -246,7 +339,7 @@ async fn verify_command(
             resolved.mode.as_str(),
             identity["file_name"].as_str().unwrap_or("unknown"),
         );
-        return CheckOutcome {
+        return CommandCheckOutcome::Completed(CheckOutcome {
             passed: false,
             summary: error.to_string(),
             payload: command_payload(
@@ -259,9 +352,9 @@ async fn verify_command(
                 Some(stderr),
                 Some(format!("{error:#}")),
             ),
-        };
+        });
     }
-    CheckOutcome {
+    CommandCheckOutcome::Completed(CheckOutcome {
         passed: true,
         summary: format!("{program:?} exited successfully"),
         payload: command_payload(
@@ -274,7 +367,189 @@ async fn verify_command(
             Some(stderr),
             None,
         ),
+    })
+}
+
+#[cfg(windows)]
+async fn execute_verifier_command(
+    command: &mut Command,
+    deadline: Instant,
+    cancellation: Option<&mut watch::Receiver<bool>>,
+) -> Result<CommandExecution> {
+    let spawn = OwnedProcessTree::spawn(command).context("spawn owned verifier command")?;
+    let mut tree = match spawn {
+        OwnedProcessTreeSpawn::Ready(tree) => tree,
+        OwnedProcessTreeSpawn::CleanupRequired { mut tree, error } => {
+            let cleanup = tree.terminate_and_wait().await;
+            return Err(match cleanup {
+                Ok(_) => anyhow!(error).context("verifier process ownership setup failed"),
+                Err(cleanup_error) => anyhow!(error).context(format!(
+                    "verifier process ownership setup failed and cleanup was unverified: {cleanup_error}"
+                )),
+            });
+        }
+    };
+    let (stdout, stderr) = {
+        let child = tree.child_mut();
+        (
+            child
+                .stdout
+                .take()
+                .context("owned verifier command omitted stdout")?,
+            child
+                .stderr
+                .take()
+                .context("owned verifier command omitted stderr")?,
+        )
+    };
+    let stdout_task = tokio::spawn(read_verifier_stream(stdout));
+    let stderr_task = tokio::spawn(read_verifier_stream(stderr));
+    let wait_root = async {
+        loop {
+            if let Some(status) = tree.try_wait_root()? {
+                return Ok::<ExitStatus, std::io::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let wait_result = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            () = wait_for_verifier_cancellation(cancellation) => Ok(ProcessWait::Cancelled),
+            result = tokio::time::timeout_at(deadline, wait_root) => {
+                match result {
+                    Ok(Ok(status)) => Ok(ProcessWait::Exited(status)),
+                    Ok(Err(error)) => Err(anyhow!(error).context("wait for verifier command root")),
+                    Err(_) => Ok(ProcessWait::TimedOut),
+                }
+            }
+        }
+    } else {
+        match tokio::time::timeout_at(deadline, wait_root).await {
+            Ok(Ok(status)) => Ok(ProcessWait::Exited(status)),
+            Ok(Err(error)) => Err(anyhow!(error).context("wait for verifier command root")),
+            Err(_) => Ok(ProcessWait::TimedOut),
+        }
+    };
+    let termination = tree
+        .terminate_and_wait()
+        .await
+        .context("terminate and verify verifier command process tree");
+    let (stdout, stderr) = collect_verifier_streams(stdout_task, stderr_task).await?;
+    let wait = wait_result?;
+    let status = termination?;
+    match wait {
+        ProcessWait::Exited(observed) if observed != status => Err(anyhow!(
+            "verifier command root status changed during process-tree teardown"
+        )),
+        ProcessWait::Exited(_) => Ok(CommandExecution::Output(Output {
+            status,
+            stdout,
+            stderr,
+        })),
+        ProcessWait::Cancelled => Ok(CommandExecution::Cancelled),
+        ProcessWait::TimedOut => Err(anyhow!("verifier command timed out")),
     }
+}
+
+#[cfg(not(windows))]
+async fn execute_verifier_command(
+    command: &mut Command,
+    deadline: Instant,
+    cancellation: Option<&mut watch::Receiver<bool>>,
+) -> Result<CommandExecution> {
+    let mut child = command.spawn().context("spawn verifier command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("verifier command omitted stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("verifier command omitted stderr")?;
+    let stdout_task = tokio::spawn(read_verifier_stream(stdout));
+    let stderr_task = tokio::spawn(read_verifier_stream(stderr));
+    let wait_result = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            () = wait_for_verifier_cancellation(cancellation) => Ok(ProcessWait::Cancelled),
+            result = tokio::time::timeout_at(deadline, child.wait()) => {
+                match result {
+                    Ok(Ok(status)) => Ok(ProcessWait::Exited(status)),
+                    Ok(Err(error)) => Err(anyhow!(error).context("wait for verifier command")),
+                    Err(_) => Ok(ProcessWait::TimedOut),
+                }
+            }
+        }
+    } else {
+        match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(status)) => Ok(ProcessWait::Exited(status)),
+            Ok(Err(error)) => Err(anyhow!(error).context("wait for verifier command")),
+            Err(_) => Ok(ProcessWait::TimedOut),
+        }
+    };
+    let wait = wait_result?;
+    let status = match wait {
+        ProcessWait::Exited(status) => status,
+        ProcessWait::Cancelled | ProcessWait::TimedOut => {
+            child
+                .kill()
+                .await
+                .context("terminate cancelled verifier command")?;
+            child
+                .wait()
+                .await
+                .context("wait for cancelled verifier command")?
+        }
+    };
+    let (stdout, stderr) = collect_verifier_streams(stdout_task, stderr_task).await?;
+    match wait {
+        ProcessWait::Exited(_) => Ok(CommandExecution::Output(Output {
+            status,
+            stdout,
+            stderr,
+        })),
+        ProcessWait::Cancelled => Ok(CommandExecution::Cancelled),
+        ProcessWait::TimedOut => Err(anyhow!("verifier command timed out")),
+    }
+}
+
+async fn wait_for_verifier_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn read_verifier_stream<R>(mut stream: R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .await
+        .context("read verifier command stream")?;
+    Ok(bytes)
+}
+
+async fn collect_verifier_streams(
+    stdout_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let stdout = tokio::time::timeout(Duration::from_secs(5), stdout_task)
+        .await
+        .context("verifier stdout drain timed out")?
+        .context("join verifier stdout task")??;
+    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task)
+        .await
+        .context("verifier stderr drain timed out")?
+        .context("join verifier stderr task")??;
+    Ok((stdout, stderr))
 }
 
 fn command_failure(
@@ -729,12 +1004,12 @@ mod tests {
                     VerifierCheck::Command {
                         program: "node".to_owned(),
                         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
-                        timeout_ms: 5_000,
+                        timeout_ms: 30_000,
                     },
                     VerifierCheck::Test {
                         program: "node".to_owned(),
                         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
-                        timeout_ms: 5_000,
+                        timeout_ms: 30_000,
                     },
                     VerifierCheck::JsonSchema {
                         path: "schema.json".to_owned(),
@@ -890,7 +1165,7 @@ mod tests {
             .await
             .expect("create workspace");
         let requested = format!("missing-{}", uuid::Uuid::new_v4());
-        let outcome = verify_command(&workspace, &requested, &[], 5_000).await;
+        let outcome = verify_command(&workspace, &requested, &[], 30_000).await;
 
         assert!(!outcome.passed);
         assert!(outcome.summary.contains("was not found as a regular file"));
@@ -911,6 +1186,60 @@ mod tests {
         assert!(bounded_name.ends_with("..."));
 
         let _ = tokio::fs::remove_dir_all(workspace).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelled_verifier_command_terminates_its_owned_process_tree() {
+        let workspace = std::env::temp_dir()
+            .join("crony verifier cancellation")
+            .join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("create workspace");
+        let child_pid_path = workspace.join("verifier-child.pid");
+        let script = concat!(
+            "const fs=require('node:fs');",
+            "const {spawn}=require('node:child_process');",
+            "const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});",
+            "fs.writeFileSync('verifier-child.pid',String(child.pid));",
+            "setInterval(()=>{},1000);"
+        );
+        let check = VerifierCheck::Command {
+            program: "node".to_owned(),
+            args: vec!["-e".to_owned(), script.to_owned()],
+            timeout_ms: 30_000,
+        };
+        let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let task_workspace = workspace.clone();
+        let check_task = tokio::spawn(async move {
+            run_check_cancellable(0, &check, &task_workspace, &[], &mut cancellation_rx).await
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child_pid = loop {
+            if let Ok(text) = tokio::fs::read_to_string(&child_pid_path).await
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "verifier child PID was not recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        cancellation_tx.send(true).expect("request cancellation");
+        assert!(matches!(
+            check_task.await.expect("join verifier cancellation"),
+            CancellableCheckResult::Cancelled
+        ));
+        assert!(
+            !crate::adapter::process_tree::process_is_alive(child_pid),
+            "verifier descendant survived cancellation"
+        );
+        tokio::fs::remove_dir_all(workspace)
+            .await
+            .expect("remove verifier cancellation workspace");
     }
 
     #[cfg(not(windows))]

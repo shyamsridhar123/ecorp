@@ -1,3 +1,4 @@
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import {
@@ -7,10 +8,7 @@ import {
 } from 'node:child_process'
 import {
   existsSync,
-  openSync,
-  readFileSync,
   rmSync,
-  writeFileSync,
 } from 'node:fs'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -18,6 +16,7 @@ import { promisify } from 'node:util'
 
 const execFile = promisify(execFileCallback)
 const root = path.resolve(import.meta.dirname, '..')
+const sourceRoot = path.resolve(process.env.ECORP_TEST_SOURCE_REPOSITORY ?? root)
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
@@ -47,7 +46,7 @@ process.on('exit', () => {
   }
 })
 const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-  cwd: root,
+  cwd: sourceRoot,
   encoding: 'utf8',
   windowsHide: true,
 }).trim()
@@ -172,7 +171,7 @@ async function runController(demo, issueNumber) {
       '--repository',
       'shyamsridhar123/ecorp',
       '--source-repository-path',
-      root,
+      sourceRoot,
       '--source-base-ref',
       'HEAD',
       '--publication-base-ref',
@@ -293,6 +292,9 @@ async function runPublisher(
     if (expectCrash) {
       throw new Error(`publisher did not crash at ${crashAfter}`)
     }
+    if (expectFailure) {
+      assert.fail('publisher unexpectedly succeeded while a rejection was required')
+    }
     assert.equal(stdout.includes(publisherToken), false)
     assert.equal(stderr.includes(publisherToken), false)
     for (const credential of publisherCredentialSecrets) {
@@ -319,85 +321,14 @@ async function runPublisher(
 }
 
 async function restartLocalServer() {
-  const pidPath =
-    process.env.CRONY_TEST_SERVER_PID_FILE ??
-    path.join(root, 'output', 'local-pids.json')
-  if (!existsSync(pidPath)) {
-    throw new Error(`test-owned server PID file does not exist: ${pidPath}`)
-  }
-  const jsonPidFile = pidPath.endsWith('.json')
-  const pidState = jsonPidFile
-    ? JSON.parse(readFileSync(pidPath, 'utf8'))
-    : { server: Number(readFileSync(pidPath, 'utf8').trim()) }
-  const serverPid = Number(pidState.server)
-  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) {
-    throw new Error(`test-owned server PID is invalid: ${serverPid}`)
-  }
-  process.kill(serverPid, 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const serverBinary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const logDir =
-    process.env.CRONY_TEST_SERVER_LOG_DIR ?? path.dirname(path.resolve(pidPath))
-  const stdout = openSync(
-    path.join(logDir, 'publication-server-restart.stdout.log'),
-    'a',
-  )
-  const stderr = openSync(
-    path.join(logDir, 'publication-server-restart.stderr.log'),
-    'a',
-  )
-  const child = spawn(
-    serverBinary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout, stderr],
-    },
-  )
-  if (jsonPidFile) {
-    writeFileSync(
-      pidPath,
-      `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`,
-    )
-  } else {
-    writeFileSync(pidPath, `${child.pid}\n`)
-  }
-  child.unref()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return child.pid
-    } catch {
-      // The test-owned server is restarting and the runner is reconnecting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  throw new Error('server or runner did not recover after publication restart')
+  return restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'publication-restart' })
 }
 
 async function psql(sql) {
   const invocation = await psqlInvocation()
+  if (invocation.mode === 'python') {
+    return pythonPsql(sql)
+  }
   const { stdout } = await execFile(
     invocation.command,
     [
@@ -417,14 +348,66 @@ async function psql(sql) {
   return stdout.trim()
 }
 
+function pythonPsql(sql) {
+  const script = [
+    'import os, sys, psycopg',
+    'def render(value):',
+    '  if isinstance(value, memoryview): value = value.tobytes()',
+    "  if isinstance(value, (bytes, bytearray)): value = value.decode('utf-8')",
+    "  return 't' if value is True else 'f' if value is False else '' if value is None else str(value)",
+    "with psycopg.connect(os.environ['ECORP_TEST_DATABASE_URL'], autocommit=True) as connection:",
+    '  with connection.cursor() as cursor:',
+    '    cursor.execute(sys.stdin.read(), prepare=False)',
+    '    output = []',
+    '    while True:',
+    '      if cursor.description:',
+    "        output = ['|'.join(render(value) for value in row) for row in cursor.fetchall()]",
+    '      if not cursor.nextset(): break',
+    "    print('\\n'.join(output))",
+  ].join('\n')
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.env.ECORP_TEST_PYTHON ?? 'python', ['-c', script], {
+      cwd: root,
+      windowsHide: true,
+      env: { ...process.env, ECORP_TEST_DATABASE_URL: databaseUrl },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    child.on('error', reject)
+    child.on('close', (code) => {
+      const output = Buffer.concat(stdout).toString('utf8').trim()
+      if (code === 0) {
+        resolve(output)
+      } else {
+        reject(
+          new Error(
+            `python psql failed with exit ${code}: ${Buffer.concat(stderr).toString('utf8').trim()}`,
+          ),
+        )
+      }
+    })
+    child.stdin.end(sql)
+  })
+}
+
 async function psqlInvocation() {
+  if (!psqlMode && process.env.ECORP_TEST_POSTGRES_CONTAINER) {
+    psqlMode = 'docker'
+  }
   if (!psqlMode) {
     try {
       await execFile('psql', ['--version'], { cwd: root, windowsHide: true })
       psqlMode = 'direct'
     } catch {
-      psqlMode = 'docker'
+      psqlMode =
+        process.env.ECORP_TEST_PYTHON_PSQL === '1' ? 'python' : 'docker'
     }
+  }
+  if (psqlMode === 'python') {
+    return { mode: 'python' }
   }
   if (psqlMode === 'direct') {
     return { command: 'psql', args: [databaseUrl] }
@@ -867,9 +850,10 @@ async function waitForPublicationLeaseExpiry(demo, workItemId) {
   await new Promise((resolve) => setTimeout(resolve, delay))
 }
 
-await rm(statePath, { force: true })
-await rm(remotePath, { recursive: true, force: true })
-await execFile('git', ['clone', '--quiet', '--bare', root, remotePath], {
+if (existsSync(statePath) || existsSync(remotePath)) {
+  throw new Error('Unique publication fixture paths already exist; preserve them instead of resetting.')
+}
+await execFile('git', ['clone', '--quiet', '--bare', sourceRoot, remotePath], {
   cwd: root,
   windowsHide: true,
 })
@@ -1527,9 +1511,20 @@ await psql(
 const initialAttempt = await postPublicationStartOk(publicationPath, {
   ...publicationRequest,
   idempotency_key: `${effectKey}:initial-authority-attempt`,
-  lease_seconds: 30,
+  // This attempt covers many independent credential/role/room/breaker rejections.
+  // Keep its bounded lease live so a slow host cannot turn the intended authority
+  // failure into an unrelated expired-lease 409. It is explicitly released below.
+  lease_seconds: 300,
 })
 assert.ok(initialAttempt.publisher_token)
+await psql(`
+  UPDATE pull_request_publications
+  SET provenance =
+        jsonb_set(provenance, '{schema_version}', '1'::jsonb, false)
+        #- '{source_issue,claimed_revision}'
+        #- '{source_issue,recovery_id}'
+  WHERE id = ${sqlLiteral(initialAttempt.publication.id)}::uuid;
+`)
 const humanOnlyRenewRejected = await post(
   publicationRenewPath(demo, initialAttempt.publication.id),
   {
@@ -1687,7 +1682,7 @@ const roleRenewRejected = await renewPublicationAttempt(
   initialAttempt.publisher_token,
   `${effectKey}:renew-role-rejected`,
 )
-assert.equal(roleRenewRejected.response.status, 400)
+assert.equal(roleRenewRejected.response.status, 400, roleRenewRejected.body.error)
 assert.match(roleRenewRejected.body.error, /authorization role changed/)
 assert.equal(await remoteBranchExists(branch), false)
 await psql(
@@ -1702,7 +1697,7 @@ const postStartBreakerRejected = await renewPublicationAttempt(
   initialAttempt.publisher_token,
   `${effectKey}:renew-breaker-rejected`,
 )
-assert.equal(postStartBreakerRejected.response.status, 400)
+assert.equal(postStartBreakerRejected.response.status, 400, postStartBreakerRejected.body.error)
 assert.match(postStartBreakerRejected.body.error, /circuit breaker/)
 assert.equal(await remoteBranchExists(branch), false)
 await psql(
@@ -2032,7 +2027,23 @@ const stalePublisherAttempt = runPublisher(demo, workItem.id, {
 })
 let projectEffectMembershipRevoked = false
 try {
-  await waitForFile(projectEffectPauseMarker)
+  // This fixture traverses >1,000 Project items and may spend up to 60s
+  // acquiring a publication lease. Wait for the actual barrier, not an
+  // unrelated 10s wall clock; fail immediately if the child settles first.
+  let earlyPublisherResult = null
+  void stalePublisherAttempt.then(
+    () => { earlyPublisherResult = new Error('publisher exited before the authority-revocation barrier') },
+    (error) => { earlyPublisherResult = error },
+  )
+  const markerDeadline = Date.now() + 90_000
+  while (!existsSync(projectEffectPauseMarker)) {
+    if (earlyPublisherResult) throw earlyPublisherResult
+    if (Date.now() >= markerDeadline) {
+      throw new Error('publisher never reached the authority-revocation barrier')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  if (earlyPublisherResult) throw earlyPublisherResult
   await revokeMissionRoomMembership(workItem.mission_id, demo.alice_actor_id)
   projectEffectMembershipRevoked = true
   await stalePublisherAttempt
@@ -2079,6 +2090,11 @@ assert.equal(concurrent[0].publication.id, concurrent[1].publication.id)
 const finalSnapshot = await snapshot(demo)
 const finalPublicationContext = await publicationContext(demo, workItem.id)
 const publication = finalPublicationContext.publication
+assert.equal(publication.provenance.schema_version, 2)
+assert.equal(
+  publication.provenance.source_issue.claimed_revision,
+  publication.provenance.source_issue.revision,
+)
 assert.equal(publication.state, 'published')
 assert.equal(publication.pull_request_number, 41)
 assert.equal(publication.pull_request_url, authorizedPullRequest.url)
@@ -2346,6 +2362,7 @@ const report = {
   cross_corp_publisher_credential_rejection:
     crossCorpCredentialRenewRejected.response.status,
   publisher_workload_auth_survived_restart: true,
+  legacy_provenance_upgraded: true,
   credential_non_disclosure:
     !durableText.includes(publisherToken) &&
     publisherCredentialSecrets.every(

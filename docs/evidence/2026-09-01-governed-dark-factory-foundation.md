@@ -197,6 +197,31 @@ and that a stalled GitHub mutation could outlive its lease. Provider-backed fact
 a manual verification gate, factory state exposes `awaiting_approval`, GitHub subprocesses are
 bounded, and the controller renews again immediately before each effect.
 
+## September 4, 2026 verification-recovery review hardening
+
+This narrow update records the regression coverage added during PR #143 review. It does not claim a
+new full repository gate or a completed recovery-to-publication remote-effect run.
+
+- Runner unit regression
+  `verifier_snapshot_is_physical_isolated_and_excludes_git_control` creates a physical snapshot,
+  verifies that `.git` is excluded, copies untracked and ignored source files, mutates the snapshot
+  without changing the preserved worktree, and verifies explicit cleanup. Runtime snapshot copying
+  rejects symbolic links and Windows reparse points whose resolved targets escape the worktree.
+- `tools/e2e_factory_verification_recovery.mjs` adds a direct-command verifier side effect. The
+  original run writes the source file once; verifier-only recovery increments it and corrupts
+  `result.md` in one check's snapshot. A later file check receives a fresh snapshot, and the
+  preserved source still contains the original value and valid result. Snapshot cleanup completes
+  before accepted verification, then the runner fingerprints the preserved source.
+- The E2E also proves exact work-item recovery lookup survives 101 newer history rows, and an
+  interrupted recovery releases its active slot and permits a new authorization from the preserved
+  cancelled run.
+- Store unit regressions select the reviewed source revision and recovery ID from the chosen run's
+  resume lineage, fall back to the claimed revision without recovery, and preserve compatibility
+  with schema-version-1 in-flight publication provenance.
+- Publication provenance retains both `source_issue.claimed_revision` and the effective
+  `source_issue.revision`, plus `source_issue.recovery_id` when applicable. New records use schema
+  version 2, while revalidation keeps schema-version-1 operations resumable by their original claim.
+
 ## Browser evidence
 
 The live web application was exercised at `http://127.0.0.1:5187` in Chromium.
