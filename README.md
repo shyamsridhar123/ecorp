@@ -56,7 +56,7 @@ Publication never enables auto-merge and does not merge or deploy.
 
 ## How the factory works
 
-[![ECorp architecture: web, desktop, and CLI clients connect to a Rust/Axum control plane with Postgres and private artifact storage. Outbound runners execute and verify work in isolated worktrees before human-authorized pull-request publication.](docs/assets/architecture/ecorp-architecture-retro.jpg)](docs/assets/architecture/ecorp-architecture-retro.jpg)
+[![ECorp architecture: web, desktop, and CLI clients connect to the ECorp Control Server, which owns missions, policies, and events backed by Postgres and private artifact storage. Outbound runners execute and verify work in isolated worktrees before human-authorized pull-request publication.](docs/assets/architecture/ecorp-architecture-retro-v2.jpg)](docs/assets/architecture/ecorp-architecture-retro-v2.jpg)
 
 **One company. Three planes.** The **experience plane** is your shared front office. The
 **control plane** owns missions, policy, and durable state. The **execution plane** runs the crew

@@ -1,6 +1,6 @@
 # ECorp architecture artwork
 
-[Open the full-resolution architecture illustration](ecorp-architecture-retro.jpg).
+[Open the current full-resolution architecture illustration](ecorp-architecture-retro-v2.jpg).
 
 ## Origin and branding
 
@@ -13,10 +13,14 @@ The final JPEG is **2752 × 1536**, downloaded at native resolution without crop
 retouching, or upscaling. It preserves ECorp's ivory, navy, coral, and teal retro-futuristic sprite
 theme. The existing hero and logo were not modified.
 
+The corrected diagram names the central component **ECorp Control Server**. **Rust + Axum**
+appears only as a smaller implementation annotation, not as the component's architectural identity.
+The [previous image](ecorp-architecture-retro.jpg) is retained for reference.
+
 SHA-256:
 
 ```text
-f3458fd51212f8899a78c05d94cc3f36172974cdbdf8a16da26a3b62f6e9678d
+1bb05beb712257f7c1739986d2bc495f3ee0c260bd1aaf6b17ed633c82a36fb3
 ```
 
 ## Architecture scope
