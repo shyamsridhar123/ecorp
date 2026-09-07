@@ -174,3 +174,16 @@ containers were not stopped. No database, volume, branch, or worktree was delete
 PR #162 remains draft. Issue #164 separately tracks the manual Studio build that spent its
 specialist allocations on handoffs and never reached integration. That mission was not reset or
 rerun, and its hard-stopped provider lineages remain terminal.
+
+### Follow-up: the two runtime failures are repaired
+
+The [September 7 runtime-fix report](2026-09-07-recovery-publication-runtime-fixes.md)
+records the native lock-upgrade reproduction and correction (#165), exact recovered-parent
+artifact selection (#166), and passing complete publication and recovery suites.
+It retains the original failed databases and source evidence. The new runs use isolated
+synthetic databases inside one existing QA container, which was stopped afterward.
+
+This does not retroactively turn the earlier failed runs into passes. The independent
+review's pre-existing generic pre-dispatch state gap is tracked as #167, and PR #162
+remains draft. Budget-boundary recovery and a newly completed real-provider game are
+still separate outstanding work.

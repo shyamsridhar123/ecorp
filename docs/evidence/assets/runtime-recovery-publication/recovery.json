@@ -1,0 +1,196 @@
+{
+  "report": {
+    "passed": true,
+    "started_at": "2026-09-07T06:46:34.039Z",
+    "verifier_only": {
+      "factory_work_item_id": "4838610a-a3e5-4c2e-8f3b-dce941ec4e18",
+      "mission_id": "af2de8e2-e6d8-42c0-8e8a-a97246298f83",
+      "source_run_id": "7a2ed579-2f39-4055-a765-fa4ddeedc93c",
+      "recovery_run_id": "f05d4ec2-2b78-47f0-9a48-f248c3f3cb5b",
+      "decision_replay": true,
+      "decision_event_order": {
+        "rejection": [
+          {
+            "id": "adf21077-defe-4b4b-8ecf-01bbfa7049b6",
+            "seq": 32,
+            "type": "factory.verification_failed"
+          },
+          {
+            "id": "1fcd371b-00e1-4b9f-8ef8-5488d420d666",
+            "seq": 33,
+            "type": "verification.rejected"
+          }
+        ],
+        "approval": [
+          {
+            "id": "e62099e9-6920-4c2e-9873-22301464f0ee",
+            "seq": 65,
+            "type": "factory.verified"
+          },
+          {
+            "id": "8efde1b8-1ff8-4964-b9b3-c5c902616c85",
+            "seq": 66,
+            "type": "verification.approved"
+          }
+        ]
+      },
+      "decision_live_replay_exact": true,
+      "controller_replay": true,
+      "same_workspace_lineage": true,
+      "same_head_commit": true,
+      "legacy_workspace_checkpointed": true,
+      "original_signed_provider_metadata_preserved": true,
+      "verifier_side_effect_isolated": true,
+      "provider_events_on_recovery": 0,
+      "final_factory_state": "verified",
+      "run_count": 2
+    },
+    "source_correction": {
+      "factory_work_item_id": "9c398f65-1db1-4b7a-bcf4-977f1b5ecd67",
+      "mission_id": "e2ebe943-aee0-49b0-9c32-4d3ba4610637",
+      "source_run_id": "989abb39-1922-4bbe-ae9c-0c01255376ce",
+      "verifier_only_bridge_run_id": "13eccb19-0863-41b7-b809-f0630e304a7f",
+      "other_mission_active_agent_fenced": true,
+      "mission_worker_reactivation_exercised": true,
+      "recovery_run_id": "efbcefe7-a935-4bcb-9b55-053f5b099a3f",
+      "contract_revision_id": "1c87779f-041c-4957-a7ef-4d9f08ebabce",
+      "server_restart_exercised": true,
+      "unaudited_revision_rejected": true,
+      "weakened_policy_rejected_before_revision": true,
+      "secret_dispatch_failure_terminalized": true,
+      "failed_dispatch_run_id": "7ec7e6ab-7bdc-4586-a291-104c6ae3f0ef",
+      "failed_dispatch_recovery_id": "2e0e1c83-58ec-43f9-82a4-37575455b208",
+      "retry_after_dispatch_failure": true,
+      "same_provider_session": true,
+      "provider_session_inherited_across_verifier_only": true,
+      "durable_artifact_transferred_without_source_copy": true,
+      "missing_file_check_not_manufactured": true,
+      "artifact_transfer_absent_from_durable_commands": true,
+      "terminal_recovery_command_retired_without_execution": true,
+      "same_workspace": true,
+      "same_workspace_lineage": true,
+      "contract_version": 3,
+      "attempt_count": 4,
+      "final_factory_state": "verified",
+      "run_count": 4,
+      "member_generic_resume_rejection": {
+        "status": 409,
+        "new_runs": 0
+      }
+    },
+    "cancelled_recovery": {
+      "factory_work_item_id": "442a4fbc-9f0e-4639-9887-e210f6506a90",
+      "mission_id": "c45555c6-292d-492e-8536-b7a98442ca72",
+      "first_recovery_id": "3d00b31f-8c5b-4810-aee7-78f9ca94e67f",
+      "first_cancelled_run_id": "8d9305dd-6911-4058-b9a6-f9040e7a23d5",
+      "second_recovery_id": "cb02cc60-cc81-40ae-b2f8-dd7bcfcec634",
+      "second_cancelled_run_id": "aee695b1-fc86-494e-ba4c-afe7ac1607e1",
+      "active_slot_released": true,
+      "stale_manual_request_closed": true,
+      "exact_context_selected_cancelled_source": true,
+      "fresh_recovery_authorized": true
+    },
+    "exhausted_attempts": {
+      "factory_work_item_id": "36af42c0-a988-48bc-9150-85b676ed8ba7",
+      "mission_id": "398bd09a-5452-46fa-8318-6a56a94aa5c8",
+      "attempt_count": 3,
+      "max_attempts": 3,
+      "second_generation_inherited_artifact_verified": true,
+      "rejected_fourth_run": true,
+      "run_count": 3
+    },
+    "upstream_then_later_recovery": {
+      "factory_work_item_id": "240562e7-de54-4c72-bcf0-035b22008d4f",
+      "mission_id": "c67a2546-9a99-4285-9d98-35d6c8184ecb",
+      "upstream_recovery_id": "19336d19-b5e2-4133-a868-61ffafb31e3a",
+      "later_recovery_id": "74da25ec-190f-49a0-93d0-b89bc29db221",
+      "upstream_settled_before_mission": true,
+      "synthesis_dependency_handoffs": [
+        {
+          "artifact_id": "7cdf477b-0690-4585-b15f-8810613178b0",
+          "artifact_role": "provider_evidence",
+          "files": [],
+          "run_id": "28b94c7e-95bc-4545-bd53-c83b07291903",
+          "sha256": "88fd6cb537e4e4983add77cfeef133919d3e23309995b28a61b2c4980021fd53",
+          "task_id": "84ea1979-689c-495d-9870-2003ee76974e",
+          "verification_run_id": "1fc3dd37-0c37-4058-81f5-5883ed0f0652"
+        },
+        {
+          "artifact_id": "0834e204-2b7d-48cb-93a7-9913cb072c07",
+          "artifact_role": "provider_evidence",
+          "files": [],
+          "run_id": "03c117f0-ebfd-450a-a135-08275f32e4da",
+          "sha256": "bd5e5e85df22c8762d5a135b9cbc0428dea89da2078babbff9146491510110dd",
+          "task_id": "22b113db-e058-4fbd-bf83-e75f7c067e16",
+          "verification_run_id": "03c117f0-ebfd-450a-a135-08275f32e4da"
+        }
+      ],
+      "synthesis_dependency_context_sha256": "b13c814144e1ba4a3c8b9f738cb24b0b0caa757ae00c7609f1a005d23b1c7fb4",
+      "original_provider_artifacts_retained": true,
+      "later_recovery_admitted": true,
+      "mission_status": "completed",
+      "original_graph_task_count": 3,
+      "run_count": 5
+    },
+    "gate_free_recovery": {
+      "factory_work_item_id": "7f7734ba-1ffc-4085-b595-377b00f0abd2",
+      "mission_id": "14b5535a-94d5-4fde-adeb-3a5070802bb3",
+      "recovery_id": "be986063-9b77-4953-b79c-18ff3d415641",
+      "run_id": "0fdb1b7e-983e-4f4e-a827-fb3962e4533e",
+      "manual_decisions": 0,
+      "same_source_fingerprint": true,
+      "recovery_status": "completed"
+    },
+    "acknowledged_verifier_loss": {
+      "factory_work_item_id": "8531fe1f-9958-4661-9eac-f4f9c06d853e",
+      "mission_id": "b8a2ca68-0394-4a34-a04a-a679e5291a24",
+      "runner_id": "runner-recovery-full-20260907",
+      "prior_epoch": "1e12ad5c-e8db-49a7-8309-4eb0783a44ce",
+      "reconnected_epoch": "4751f82e-c896-4997-a1a7-099a63951833",
+      "source_run_id": "b89f0611-dd3a-46b7-ade2-6cfa6275527b",
+      "lost_run_id": "1903bfef-a2f9-4665-b945-06836ff95810",
+      "retry_run_id": "f7c7bd57-3483-4299-945c-cf7b1facf0d4",
+      "disconnected_at": "2026-09-07T06:54:22.406Z",
+      "acknowledged_before_loss": true,
+      "loss_did_not_mint_trust": true,
+      "mismatched_checkpoint_rejected": true,
+      "consumed_command_replay_created_runs": 0,
+      "unconfirmed_context_and_admissions_rejected": true,
+      "stale_ancestor_rejected": true,
+      "missing_head_rejected": true,
+      "latest_preserved_run_reauthorized": true,
+      "recovery_source_run_id": "1903bfef-a2f9-4665-b945-06836ff95810",
+      "contract_revision_id": null,
+      "revised_policy_source_correction": false,
+      "native_provider_session_retained": null,
+      "attempt_count": 3
+    },
+    "lost_verifier_revision": {
+      "factory_work_item_id": "3a063cd0-1d58-4229-a568-f9ab14369a71",
+      "mission_id": "77314607-e4d4-44ab-8185-4a5f01c4f724",
+      "runner_id": "runner-recovery-full-20260907",
+      "prior_epoch": "4751f82e-c896-4997-a1a7-099a63951833",
+      "reconnected_epoch": "f75185d8-d5c4-4bf6-a658-1234700ac309",
+      "source_run_id": "9823ae7d-11de-4567-9d20-283869b0fbd7",
+      "lost_run_id": "6116bfaa-4089-47e8-bf48-4c427484a351",
+      "retry_run_id": "6e9197cf-835e-49ae-b1ab-9c5be74cfb46",
+      "disconnected_at": "2026-09-07T06:55:45.58Z",
+      "acknowledged_before_loss": true,
+      "loss_did_not_mint_trust": true,
+      "mismatched_checkpoint_rejected": true,
+      "consumed_command_replay_created_runs": 0,
+      "unconfirmed_context_and_admissions_rejected": true,
+      "stale_ancestor_rejected": true,
+      "missing_head_rejected": true,
+      "latest_preserved_run_reauthorized": true,
+      "recovery_source_run_id": "6116bfaa-4089-47e8-bf48-4c427484a351",
+      "contract_revision_id": "f5a44b5c-d284-4437-81a6-11808bb82e97",
+      "revised_policy_source_correction": true,
+      "native_provider_session_retained": true,
+      "attempt_count": 3
+    },
+    "completed_at": "2026-09-07T06:56:43.613Z"
+  },
+  "boundary": "Real local stack with deterministic fake-process/Codex protocol fixtures; not real-provider inference",
+  "real_provider": false
+}

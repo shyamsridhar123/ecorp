@@ -1,0 +1,26 @@
+{
+  "checked_at": "2026-09-07T06:17:29.7066454Z",
+  "rows_changed": 0,
+  "read_only": true,
+  "result": {
+    "count": 2,
+    "handoffs": [
+      {
+        "task_id": "638a4b48-98aa-4bf8-bf9e-1613f5e6b802",
+        "artifact_id": "4224f21c-23cf-4974-a6bd-2192666da6c9",
+        "producer_run_id": "cdade9ce-37b1-4633-990a-3ec8ce0cbbb1",
+        "verification_run_id": "f3e0c30d-f37e-48f0-bd86-54b906766062",
+        "sha256": "69615d5dd3e32513250ee9045f64762ba0688165b3f1a82a97d792c62b53840e"
+      },
+      {
+        "task_id": "4583f87b-3578-4ed1-9062-5bb01e0523a9",
+        "artifact_id": "44ab16b1-8c23-4819-80aa-de927f5c3d10",
+        "producer_run_id": "dcd3e905-73c0-4567-a6c6-3bc78ceb1adc",
+        "verification_run_id": "dcd3e905-73c0-4567-a6c6-3bc78ceb1adc",
+        "sha256": "6507e9a8f836afd772823af38220bc9c04e321442396cc2500760e7151f322b3"
+      }
+    ]
+  },
+  "providers_started": 0,
+  "source_sha256": "006227AAB2B25B757556EC1578432AD72EA71831926D534EE896D4037A041FA7"
+}

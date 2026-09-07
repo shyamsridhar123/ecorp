@@ -676,11 +676,31 @@ its reviewed source revision and recovery ID; recovery selection follows the cho
 run's resume lineage; a non-recovery publication retains the original claimed revision with a null
 recovery ID; and legacy schema-version-1 provenance remains resumable while version 2 requires the
 claimed/effective/recovery tuple. Earlier deterministic publication coverage passed, but the
-September 7, 2026 follow-up on the current integration failed its concurrent-publication case
-with a database deadlock. The expanded recovery drill also timed out while waiting for an
-upstream recovery to settle before its mission completed. Those failures remain open release
-gates; unit-test success is not complete runtime acceptance. These are local fixture results,
-not a new real-GitHub recovery-to-publication effect claim.
+early September 7, 2026 follow-up failed its concurrent-publication case with a database
+deadlock. The expanded recovery drill also stalled because synthesis could not consume its
+recovered parent's artifact. Issues #165/#166 repair those defects, and both complete local
+suites now pass; see [the runtime-fix report](evidence/2026-09-07-recovery-publication-runtime-fixes.md).
+The earlier failures remain preserved as evidence. These are local fixture results, not a
+new real-GitHub recovery-to-publication effect claim. The separate pre-dispatch state-coherence
+gap in #167 remains open.
+
+Two opt-in SQLx regressions additionally exercise the actual `dependency_artifacts` store
+method with recovered-parent metadata, multiple verifier-only generations, stale runs,
+cycles and cross-boundary/mismatched evidence. Run them with `DATABASE_URL` scoped to an
+explicitly owned QA PostgreSQL maintenance database:
+`cargo test -p crony-store dependency_artifacts_ -- --ignored --test-threads=1`.
+SQLx creates its isolated test databases; ordinary workspace test runs list these as
+ignored unless explicitly selected. These metadata fixtures do not replace real signed
+artifact verification in the full recovery drill.
+
+`tools/e2e_publication_credential_lock.mjs` uses the exact credential-lock SQL selected by
+`publication.rs` and native PostgreSQL sessions to reproduce the shared-lock upgrade
+deadlock. It waits for an observed lock, not a guessed sleep, then verifies both transactions
+complete with the update lock taken upfront. It requires explicit opt-in and an already
+running owned loopback QA container, creates only a uniquely named synthetic schema,
+terminates only its own tagged sessions, removes that schema, and checks that the real
+publisher-credential fingerprint is unchanged. It starts no server, provider or container.
+Complete publication acceptance still requires the server/runner/CLI/Git E2E.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,

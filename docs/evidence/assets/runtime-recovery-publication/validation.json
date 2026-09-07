@@ -1,0 +1,116 @@
+{
+  "hosted_actions": false,
+  "manual_health": {
+    "status": "ok",
+    "service": "crony-server",
+    "runners": 1,
+    "mode": "development"
+  },
+  "new_synthetic_databases": [
+    "ecorp_publication_acceptance_20260907",
+    "ecorp_recovery_acceptance_20260907"
+  ],
+  "explicit_sqlx_passed": 2,
+  "real_provider_runs": 0,
+  "code_hashes": [
+    {
+      "path": "crates/crony-server/src/main.rs",
+      "sha256": "77E8BD96602C3220D1FA40D838CC5F20B0DB8BA642C3838C9F24D83C6A595A95"
+    },
+    {
+      "path": "crates/crony-store/src/lib.rs",
+      "sha256": "006227AAB2B25B757556EC1578432AD72EA71831926D534EE896D4037A041FA7"
+    },
+    {
+      "path": "crates/crony-store/src/publication.rs",
+      "sha256": "4C2B71E94E1E7170A083DF3A6CD2BF3E1EE2CE445C077A741AD654C100F4C517"
+    },
+    {
+      "path": "tools/e2e_factory_verification_recovery.mjs",
+      "sha256": "A2FBDDF29A53C6CEB0807D162C69C02B9A593B032598D331AE5AE813FAE38EDD"
+    },
+    {
+      "path": "tools/e2e_publication_credential_lock.mjs",
+      "sha256": "3DC00B68FAD38341D2A4E6F69BCEB5336ECA0E76B99DA5856E67CE5F9916C209"
+    }
+  ],
+  "source_base_commit": "f34f5241dc531fd2ed9fcfbccbdf82a683db9ac8",
+  "historical_databases_reset": 0,
+  "containers_created": 0,
+  "full_publication_passed": true,
+  "remaining_gap": 167,
+  "frontend_tests_passed": 104,
+  "qa_teardown_complete": true,
+  "rust_default_ignored": 2,
+  "rust_default_passed": 334,
+  "checked_at": "2026-09-07T07:00:11.2300669Z",
+  "full_recovery_passed": true,
+  "gates": [
+    {
+      "command": "node tools/check_migrations.mjs",
+      "name": "migrations",
+      "seconds": 0.6759736,
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --check",
+      "name": "format",
+      "seconds": 6.0981921,
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "name": "clippy",
+      "seconds": 118.9863973,
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --workspace",
+      "name": "rust-tests",
+      "seconds": 408.5158235,
+      "exit_code": 0
+    },
+    {
+      "command": "cargo build --workspace --bins",
+      "name": "binaries",
+      "seconds": 103.817142,
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm build:web",
+      "name": "web-build",
+      "seconds": 53.7017689,
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm lint:web",
+      "name": "web-lint",
+      "seconds": 13.175528,
+      "exit_code": 0
+    },
+    {
+      "command": "node --test C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\factoryPolling.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\missionPreview.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\missionRuntime.test.mjs tools/office_model.test.mjs tools/owned_test_stack.test.mjs",
+      "name": "frontend-tests",
+      "seconds": 1.3967072,
+      "exit_code": 0
+    },
+    {
+      "command": "node --check tools/e2e_publication_credential_lock.mjs",
+      "name": "credential-script",
+      "seconds": 0.4105948,
+      "exit_code": 0
+    },
+    {
+      "command": "node --check tools/e2e_factory_verification_recovery.mjs",
+      "name": "recovery-script",
+      "seconds": 0.4033297,
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "name": "diff-check",
+      "seconds": 0.7111066,
+      "exit_code": 0
+    }
+  ]
+}

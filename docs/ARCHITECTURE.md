@@ -480,6 +480,16 @@ The scheduler:
 - injects verified dependency artifacts into synthesis prompts
 - marks the mission complete only after every task completes
 
+Dependency handoffs distinguish the signed artifact's producer from the run that most
+recently verified the parent task. A completed verifier-only recovery may reuse the exact
+original provider artifact through a bounded, acyclic, governed recovery chain. Every edge
+retains the same Corp, mission, task, agent, runner, workspace and source identity; the
+current run's artifact metadata must still match the signed object. A newer unverified
+run cannot fall back to an older completed run. Typed source deliverables retain their
+existing verification-linked run binding. Artifact signature, retention, digest and byte
+checks still occur before dispatch. The prompt and `run.dependency_context` event record
+both producer `run_id` and `verification_run_id`; recovery does not forge a new producer.
+
 ## Mission specifications and contract revisions
 
 Mission titles remain bounded labels. The durable `missions.description` field carries the complete
@@ -847,6 +857,12 @@ require both current human authority and the independently authenticated publish
 server derives the publisher ID from that workload credential and requires the request's publisher
 ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
 publication request header.
+
+Transaction-local publisher revalidation takes the update lock required by its
+`last_used_at` write at the first credential read. Two requests using one credential
+therefore wait before, rather than deadlock during, a shared-to-write lock upgrade.
+Corp, publisher, hash, revocation and expiry predicates are unchanged; this uses native
+PostgreSQL row locking rather than an application retry or additional approval.
 
 Publisher planning does not use the bounded browser snapshot as an index. An exact Corp-authorized
 publication-context read loads the requested work item, its durable publication, and every source
