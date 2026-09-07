@@ -174,8 +174,11 @@ the source checkout. Native mutations also enforce the run's persisted task writ
 directory-create may create only a granted path or an ancestor needed to reach it. This authority
 is rebuilt from the current task on resume. Ordinary Unix executable permission bits are honored;
 privilege bits and invalid modes are rejected before creating a file.
-The SDK-registered `ecorp_mkdir` tool accepts only a relative path and invokes that same scoped
-provider. It is idempotent, cannot delete or chmod, and never starts a command interpreter.
+The SDK-registered `ecorp_mkdir` tool accepts a worktree-relative path or an absolute path
+contained in the assigned worktree and invokes that same scoped provider. Unlike native SDK
+filesystem requests, this tool has no authority over the isolated state directory. It rejects
+root, traversal, Git-internal, link, and out-of-scope targets. It is idempotent, cannot delete
+or chmod, and never starts a command interpreter.
 Its finite directory-creation authority comes from the persisted run contract; the SDK tool
 declaration suppresses a redundant permission prompt for this one guarded primitive, not for
 shell or other tools.

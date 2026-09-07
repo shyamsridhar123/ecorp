@@ -92,16 +92,23 @@ impl ToolHandler for NativeDirectoryTool {
         invocation: ToolInvocation,
     ) -> Result<ToolResult, github_copilot_sdk::Error> {
         let args: DirectoryArguments = invocation.params()?;
-        if invocation.tool_name != "ecorp_mkdir"
-            || !crony_domain::repository_relative_path_is_valid(&args.path)
-        {
+        if invocation.tool_name != "ecorp_mkdir" {
             return Err(github_copilot_sdk::Error::with_message(
                 github_copilot_sdk::ErrorKind::InvalidConfig,
-                "ecorp_mkdir requires one worktree-relative directory path",
+                "unsupported directory tool",
             ));
         }
+        let path = self
+            .filesystem
+            .worktree_directory_path(&args.path)
+            .map_err(|_| {
+                github_copilot_sdk::Error::with_message(
+                    github_copilot_sdk::ErrorKind::InvalidConfig,
+                    "ecorp_mkdir requires a worktree-relative or contained worktree-absolute directory path",
+                )
+            })?;
         self.filesystem
-            .mkdir(&args.path, true, None)
+            .mkdir(&path, true, None)
             .await
             .map_err(|_| {
                 github_copilot_sdk::Error::with_message(
@@ -115,7 +122,7 @@ impl ToolHandler for NativeDirectoryTool {
 
 fn native_directory_tool(filesystem: Arc<ContainedSessionFs>) -> Tool {
     Tool::new("ecorp_mkdir")
-        .with_description("Create a directory and its parents inside the task write scope. Use before native create when a parent directory is missing. No shell, network, deletion, or permissions changes.")
+        .with_description("Create a directory and its parents inside the task write scope using a worktree-relative path or an absolute path contained in the assigned worktree. Use before native create when a parent directory is missing. No state-directory or Git-internal access, shell, network, deletion, or permissions changes.")
         .with_parameters(json!({
             "type": "object",
             "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 500}},
@@ -1775,8 +1782,9 @@ mod tests {
     }
     #[tokio::test]
     async fn typed_directory_tool_is_idempotent_and_cannot_expand_authority() {
-        let root = std::env::temp_dir().join(format!("crony-native-mkdir-{}", Uuid::new_v4()));
-        let workspace = root.join("workspace");
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("crony-native-mkdir-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace with spaces");
         let state = root.join("state");
         tokio::fs::create_dir_all(&workspace)
             .await
@@ -1785,37 +1793,139 @@ mod tests {
         let fs = Arc::new(
             ContainedSessionFs::new(
                 workspace.clone(),
-                state,
-                vec!["scenarios/game/**".to_owned()],
+                state.clone(),
+                vec![
+                    "handoffs/visual.md".to_owned(),
+                    "scenarios/game/**".to_owned(),
+                ],
             )
             .expect("capability roots"),
         );
         let tool = native_directory_tool(fs.clone());
         let handler = tool.handler().expect("directory handler");
-        for _ in 0..2 {
-            let mut invocation = ToolInvocation::default();
-            invocation.tool_name = "ecorp_mkdir".to_owned();
-            invocation.arguments = json!({"path":"scenarios/game/assets"});
-            assert!(handler.call(invocation).await.is_ok());
+        let paths = [
+            workspace.join("handoffs").to_string_lossy().into_owned(),
+            "handoffs".to_owned(),
+            workspace
+                .join("scenarios/game/assets")
+                .to_string_lossy()
+                .into_owned(),
+            "scenarios/game/assets".to_owned(),
+        ];
+        for path in paths {
+            for _ in 0..2 {
+                let mut invocation = ToolInvocation::default();
+                invocation.tool_name = "ecorp_mkdir".to_owned();
+                invocation.arguments = json!({"path": path});
+                assert!(handler.call(invocation).await.is_ok(), "{path}");
+            }
         }
         for arguments in [
+            json!({"path":""}),
+            json!({"path":"."}),
+            json!({"path":workspace}),
+            json!({"path":workspace,"mode":0}),
             json!({"path":"../outside"}),
+            json!({"path":workspace.join("../outside")}),
+            json!({"path":root.join("workspace with spaces-other/handoffs")}),
             json!({"path":"/session-state"}),
+            json!({"path":"/session-state/custom"}),
+            json!({"path":state.join("custom")}),
+            json!({"path":"/workspace/scenarios/game/assets"}),
             json!({"path":"scenarios/other"}),
+            json!({"path":workspace.join("scenarios/other")}),
             json!({"path":".git/hooks"}),
+            json!({"path":workspace.join(".git/hooks")}),
+            json!({"path":workspace.join("scenarios/game/NUL")}),
+            json!({"path":workspace.join("scenarios/game/file:stream")}),
+            json!({"path":"scenarios/game/new\nfolder"}),
             json!({"path":"scenarios/game/assets","command":"Remove-Item"}),
+            json!({"path":workspace.join("scenarios/game/assets"),"mode":493}),
+            json!({"path":"scenarios/game/assets","recursive":false}),
         ] {
             let mut invocation = ToolInvocation::default();
             invocation.tool_name = "ecorp_mkdir".to_owned();
             invocation.arguments = arguments;
             assert!(handler.call(invocation).await.is_err());
         }
+        #[cfg(unix)]
+        for path in [
+            r"scenarios\game\escape".to_owned(),
+            workspace
+                .join(r"scenarios\game\escape")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let mut invocation = ToolInvocation::default();
+            invocation.tool_name = "ecorp_mkdir".to_owned();
+            invocation.arguments = json!({"path": path});
+            assert!(handler.call(invocation).await.is_err(), "{path}");
+            assert!(!workspace.join(r"scenarios\game\escape").exists());
+        }
+        let mut wrong_tool = ToolInvocation::default();
+        wrong_tool.tool_name = "chmod".to_owned();
+        wrong_tool.arguments = json!({"path":workspace.join("handoffs")});
+        assert!(handler.call(wrong_tool).await.is_err());
+        assert!(workspace.join("handoffs").is_dir());
         assert!(workspace.join("scenarios/game/assets").is_dir());
         assert!(!root.join("outside").exists());
+        assert!(!root.join("workspace with spaces-other").exists());
         assert!(!workspace.join("scenarios/other").exists());
         assert!(!workspace.join(".git").exists());
+        assert!(!state.join("custom").exists());
         drop(tool);
         drop(fs);
+        assert!(root.starts_with(&temporary));
         tokio::fs::remove_dir_all(root).await.expect("cleanup");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn typed_directory_tool_rejects_relative_and_absolute_symlink_paths() {
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("crony-native-mkdir-links-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        for directory in [&workspace, &state, &outside] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .expect("fixture root");
+        }
+        for (name, target) in [
+            ("linked", outside.clone()),
+            ("dangling", root.join("missing")),
+        ] {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, workspace.join(name)).expect("directory symlink");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(target, workspace.join(name))
+                .expect("directory symlink");
+        }
+        let fs = Arc::new(
+            ContainedSessionFs::new(workspace.clone(), state, vec!["**".to_owned()])
+                .expect("capability roots"),
+        );
+        let tool = native_directory_tool(fs.clone());
+        let handler = tool.handler().expect("directory handler");
+        for relative in ["linked", "linked/new", "dangling", "dangling/new"] {
+            for path in [
+                relative.to_owned(),
+                workspace.join(relative).to_string_lossy().into_owned(),
+            ] {
+                let mut invocation = ToolInvocation::default();
+                invocation.tool_name = "ecorp_mkdir".to_owned();
+                invocation.arguments = json!({"path": path});
+                assert!(handler.call(invocation).await.is_err(), "{path}");
+            }
+        }
+        assert!(!outside.join("new").exists());
+        assert!(!root.join("missing").exists());
+        drop(tool);
+        drop(fs);
+        assert!(root.starts_with(&temporary));
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("fixture cleanup");
     }
 }
