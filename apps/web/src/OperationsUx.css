@@ -219,3 +219,50 @@
   .app-shell .operations-review-decision { padding: 12px; }
   .operations-run-metadata > div { flex-basis: 100%; }
 }
+.mission-submit-note.mission-plan-summary {
+  max-inline-size: 54rem;
+  text-align: left;
+  font-size: 0.94rem;
+}
+
+.mission-plan-summary .operations-approval-note {
+  margin-block: 0.35rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.mission-plan-summary .evidence-checks {
+  margin-block: 0.75rem;
+}
+
+.mission-plan-summary .evidence-check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  font-size: 0.875rem;
+}
+
+.mission-plan-summary .evidence-check strong {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mission-allocation-details {
+  margin-block: 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.mission-allocation-details summary {
+  min-block-size: 2.75rem;
+  display: list-item;
+  align-content: center;
+  cursor: pointer;
+}
+
+.mission-allocation-details ul {
+  margin-block: 0.5rem;
+  padding-inline-start: 1.25rem;
+}

@@ -162,6 +162,13 @@ boundaries in the architecture and security guides.
 Run targeted tests for the changed behavior. For user-visible behavior, exercise the complete
 browser-to-server-to-runner path; unit tests alone are insufficient.
 
+Keep local QA resource ownership explicit. Reuse an owned fixture instead of creating a new
+database container for every attempt. Never run destructive fixtures against a manual session's
+database or source checkout. Record process, port, and container identities before starting a
+test; on completion or failure, stop only those owned services and preserve their data and
+evidence. Do not leave parallel QA stacks running merely to retain their results, and do not
+prune unrelated containers, volumes, or worktrees as cleanup.
+
 The repository gate is:
 
 ```powershell

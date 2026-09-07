@@ -18,6 +18,10 @@ import {
   STUDIO_STRATEGY, STUDIO_STRATEGY_LABEL, usesDeterministicHarness, workspaceCapability,
 } from './missionRuntime'
 import type { RepositoryTarget, RunnerCapability, RunnerNode } from './missionRuntime'
+import {
+  buildMissionRequest, currentMissionPreview, missionRequestScope, startMissionPreview,
+} from './missionPreview'
+import type { MissionPreviewLoad, MissionRequestScope } from './missionPreview'
 
 type Actor = {
   id: string
@@ -4276,6 +4280,73 @@ function RoomPanel({
   )
 }
 
+function MissionAllocationPreview({
+  scope,
+}: {
+  scope: MissionRequestScope
+}) {
+  const [load, setLoad] = useState<MissionPreviewLoad | null>(null)
+  const [refresh, setRefresh] = useState(0)
+  const { key, corpId, actorId, body, strategy } = scope
+  useEffect(() => startMissionPreview({ key, corpId, actorId, body, strategy }, api, setLoad),
+    [key, corpId, actorId, body, strategy, refresh])
+  const current = currentMissionPreview(scope, load)
+  const quote = current?.status === 'ready' ? current.quote : null
+  return (
+    <div
+      data-testid="mission-allocation-preview"
+      data-preview-status={current?.status ?? 'pending'}
+      aria-busy={!current || current.status === 'pending'}
+    >
+      {quote ? (
+        <>
+          <p className="operations-approval-note" role="status">
+            Server-checked allocation · <strong>{quote.budget_tokens.toLocaleString()} total tokens</strong>
+          </p>
+          <ul className="evidence-checks" aria-label="Exact task token allocations">
+            {quote.tasks.map((task) => (
+              <li className="evidence-check" key={task.key} data-task-key={task.key}>
+                <strong title={task.title}>
+                  {statusLabel(task.key)}<span className="sr-only">: {task.title}</span>
+                </strong>
+                <span>{task.budget_tokens.toLocaleString()} tokens</span>
+              </li>
+            ))}
+          </ul>
+          <details className="mission-allocation-details">
+            <summary>Dependencies, retries and cost policy</summary>
+            <ul>
+              {quote.tasks.map((task) => (
+                <li key={task.key}>
+                  <strong>{statusLabel(task.key)}:</strong>{' '}
+                  {task.depends_on.length ? `after ${task.depends_on.map(statusLabel).join(', ')}` : 'no dependencies'}
+                  {' · '}{task.max_attempts} attempt{task.max_attempts === 1 ? '' : 's'} maximum.
+                </li>
+              ))}
+            </ul>
+            <p>Reported-cost limit: {formatUsd(quote.budget_cost_microusd)}. This is a policy on reported usage, not a provider billing estimate.</p>
+          </details>
+        </>
+      ) : (
+        <p className="operations-approval-note" role={current?.status === 'error' ? 'alert' : 'status'}>
+          {current?.error ?? 'Fetching exact allocation for these settings… No current task allocation is available yet.'}
+        </p>
+      )}
+      <p className="operations-approval-note">
+        Preview starts no work and grants no approval. Launch revalidates the current request on the server.
+      </p>
+      {current?.status === 'error' ? (
+        <button className="button button-secondary" type="button" onClick={() => {
+          setLoad(null)
+          setRefresh((value) => value + 1)
+        }}>
+          Retry preview
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null)
   const [data, setData] = useState<SnapshotResponse | null>(null)
@@ -4651,6 +4722,32 @@ function App() {
   const missionVerifierErrors = customVerification && !deterministicHarness
     ? verificationPolicyErrors(missionVerificationPolicy)
     : []
+  const missionRequest = selectedActor && selectedMissionSource ? buildMissionRequest({
+    title: missionTitle,
+    description: missionDescription,
+    actorId: selectedActor.id,
+    strategy: missionStrategy,
+    adapter: effectiveMissionAdapter,
+    model: missionModel,
+    selectedModel,
+    reasoningEffort: missionReasoningEffort,
+    source: selectedMissionSource,
+    budgetTokens: missionBudgetTokens,
+    deliverableForm: missionDeliverable,
+    commitDeliverable,
+    contract: missionContractHasInput ? missionContract : null,
+    customVerification,
+    verificationPolicy: missionVerificationPolicy,
+  }) : null
+  const missionRequestBody = missionRequest ? JSON.stringify(missionRequest) : null
+  const missionCorpId = bootstrap?.corp_id
+  const missionActorId = selectedActor?.id
+  const currentMissionRequest = missionCorpId && missionActorId && missionRequestBody
+    ? missionRequestScope(missionCorpId, missionActorId, missionRequestBody) : null
+  const missionPreviewEnabled = !missionComposerCollapsed && activeWorkspaceView === 'missions' &&
+    Boolean(currentMissionRequest && selectedMissionSource && selectedActor && canOperate(selectedActor.role)) &&
+    Boolean(missionTitle.trim()) && missionSourceConfirmed && !busy &&
+    !runtimeError && missionVerifierErrors.length === 0
 
   const selectActor = (actor: Actor) => {
     setSelectedActorId(actor.id)
@@ -4670,6 +4767,7 @@ function App() {
     if (
       !bootstrap ||
       !selectedActor ||
+      !currentMissionRequest ||
       !missionTitle.trim() ||
       !selectedMissionSource ||
       !missionSourceConfirmed ||
@@ -4684,36 +4782,7 @@ function App() {
     try {
       const created = await api<CreateMissionResponse>(`/api/corps/${bootstrap.corp_id}/missions`, {
         method: 'POST',
-        body: JSON.stringify({
-          title: missionTitle,
-          description: missionDescription,
-          requested_by: selectedActor.id,
-          preferred_adapter: effectiveMissionAdapter,
-          preferred_model: !deterministicHarness && selectedModel ? missionModel : null,
-          reasoning_effort:
-            !deterministicHarness &&
-            selectedModel?.supported_reasoning_efforts.includes(missionReasoningEffort)
-              ? missionReasoningEffort
-              : null,
-          strategy: missionStrategy,
-          source: {
-            repository: selectedMissionSource.repository,
-            base_ref: selectedMissionSource.baseRef,
-            base_commit: selectedMissionSource.baseCommit,
-          },
-          budget_tokens: deterministicHarness ? null : missionBudgetTokens,
-          deliverable: {
-            form: missionDeliverable,
-            commit_after_verification:
-              commitDeliverable || missionDeliverable === 'commit_branch',
-            paths: [],
-          },
-          contract: missionContractHasInput ? missionContract : null,
-          verification_policy:
-            !deterministicHarness && customVerification
-              ? missionVerificationPolicy
-              : null,
-        }),
+        body: currentMissionRequest.body,
       })
       let launched: LaunchMissionResponse | null = null
       if (!pauseAfterPlanning) {
@@ -6407,6 +6476,26 @@ function App() {
               ) : null}
             </section>
 
+            <section className="mission-submit-note mission-plan-summary" aria-label="Mission settings and allocation">
+              <strong>Current settings · {missionStrategy === 'single' ? 'Solo run' : statusLabel(missionStrategy)}</strong>
+              <p className="operations-approval-note">
+                Strategy and budget stay selected between missions.
+                {!missionPreviewEnabled ? (deterministicHarness ? ' Fixture-owned budget.' : ` Requested limit: ${missionBudgetTokens.toLocaleString()} tokens.`) : ''}
+              </p>
+              {studioTeam ? (
+                <p className="operations-approval-note">
+                  Studio: 3 handoffs, then integration after all three complete.
+                </p>
+              ) : null}
+              {missionPreviewEnabled && currentMissionRequest ? (
+                <MissionAllocationPreview key={currentMissionRequest.key} scope={currentMissionRequest} />
+              ) : (
+                <p className="operations-approval-note" role="status">
+                  {busy ? 'Submission in progress; no preview is current.'
+                    : 'Select an authorized operator, complete valid inputs and confirm the source to preview exact task allocations.'}
+                </p>
+              )}
+            </section>
             <div className="arcade-form-controls">
               {missionComposerStep !== 'brief' ? (
                 <button

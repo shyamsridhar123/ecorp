@@ -52,8 +52,8 @@ use crony_protocol::{
     LookupFactoryWorkItemsRequest, LookupFactoryWorkItemsResponse,
     MaterializeFactoryMissionRequest, MaterializeFactoryMissionResponse,
     MissionBudgetRevisionResponse, MissionContractRevisionResponse, MissionSource,
-    PreflightFactoryMissionRequest, PreflightFactoryMissionResponse,
-    ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
+    PreflightFactoryMissionRequest, PreflightFactoryMissionResponse, PreviewMissionResponse,
+    PreviewMissionTask, ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
     PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
     RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
     RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
@@ -468,6 +468,10 @@ async fn main() -> anyhow::Result<()> {
             get(download_artifact),
         )
         .route("/api/corps/{corp_id}/missions", post(create_mission))
+        .route(
+            "/api/corps/{corp_id}/missions/preview",
+            post(preview_mission),
+        )
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
@@ -2058,6 +2062,28 @@ struct MissionPlanInput<'a> {
     require_factory_manual_gate: bool,
 }
 
+impl<'a> MissionPlanInput<'a> {
+    fn from_create_request(request: &'a CreateMissionRequest, actor_id: Uuid) -> Self {
+        Self {
+            actor_id,
+            title: &request.title,
+            description: &request.description,
+            preferred_adapter: request.preferred_adapter.as_deref(),
+            preferred_model: request.preferred_model.as_deref(),
+            reasoning_effort: request.reasoning_effort.as_deref(),
+            strategy: request.strategy.as_deref(),
+            source: request.source.as_ref(),
+            secret_refs: &request.secret_refs,
+            budget_tokens: request.budget_tokens,
+            budget_cost_microusd: request.budget_cost_microusd,
+            deliverable: request.deliverable.as_ref(),
+            contract: request.contract.as_ref(),
+            verification_policy: request.verification_policy.as_ref(),
+            require_factory_manual_gate: false,
+        }
+    }
+}
+
 async fn plan_mission(
     state: &AppState,
     corp_id: Uuid,
@@ -2439,42 +2465,79 @@ fn append_unique(target: &mut Vec<String>, values: &[String]) {
     }
 }
 
-async fn create_mission(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    Path(corp_id): Path<Uuid>,
-    Json(request): Json<CreateMissionRequest>,
-) -> Result<Json<CreateMissionResponse>, ApiError> {
+async fn plan_create_mission(
+    state: &AppState,
+    principal: &Principal,
+    corp_id: Uuid,
+    request: &CreateMissionRequest,
+) -> Result<(Uuid, TaskGraphPlan), ApiError> {
     let requested_by = authorize_actor(
-        &state,
-        &principal,
+        state,
+        principal,
         corp_id,
         Some(request.requested_by),
         Permission::Operate,
     )
     .await?;
     let plan = plan_mission(
-        &state,
+        state,
         corp_id,
-        MissionPlanInput {
-            actor_id: requested_by,
-            title: &request.title,
-            description: &request.description,
-            preferred_adapter: request.preferred_adapter.as_deref(),
-            preferred_model: request.preferred_model.as_deref(),
-            reasoning_effort: request.reasoning_effort.as_deref(),
-            strategy: request.strategy.as_deref(),
-            source: request.source.as_ref(),
-            secret_refs: &request.secret_refs,
-            budget_tokens: request.budget_tokens,
-            budget_cost_microusd: request.budget_cost_microusd,
-            deliverable: request.deliverable.as_ref(),
-            contract: request.contract.as_ref(),
-            verification_policy: request.verification_policy.as_ref(),
-            require_factory_manual_gate: false,
-        },
+        MissionPlanInput::from_create_request(request, requested_by),
     )
     .await?;
+    Ok((requested_by, plan))
+}
+
+fn mission_preview_response(plan: &TaskGraphPlan) -> PreviewMissionResponse {
+    PreviewMissionResponse {
+        strategy: plan.strategy.clone(),
+        budget_tokens: plan.budget_tokens,
+        budget_cost_microusd: plan.budget_cost_microusd,
+        tasks: plan
+            .tasks
+            .iter()
+            .map(|task| PreviewMissionTask {
+                key: task.key.clone(),
+                title: task.title.clone(),
+                budget_tokens: task.contract.budget_tokens,
+                budget_cost_microusd: task.contract.budget_cost_microusd,
+                depends_on: task.depends_on.clone(),
+                max_attempts: task.max_attempts,
+            })
+            .collect(),
+    }
+}
+
+async fn preview_mission(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<CreateMissionRequest>,
+) -> Result<Json<PreviewMissionResponse>, ApiError> {
+    let (requested_by, plan) = plan_create_mission(&state, &principal, corp_id, &request).await?;
+    state
+        .store
+        .validate_mission_creation(
+            corp_id,
+            requested_by,
+            &request.title,
+            &request.description,
+            &plan,
+        )
+        .await
+        .map_err(map_store_error)?;
+    // Do not persist, publish, or dispatch. This response grants no launch or
+    // staffing authority; create_mission repeats planning against current state.
+    Ok(Json(mission_preview_response(&plan)))
+}
+
+async fn create_mission(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(corp_id): Path<Uuid>,
+    Json(request): Json<CreateMissionRequest>,
+) -> Result<Json<CreateMissionResponse>, ApiError> {
+    let (requested_by, plan) = plan_create_mission(&state, &principal, corp_id, &request).await?;
     let (ids, events) = state
         .store
         .create_mission(
@@ -6078,8 +6141,8 @@ mod tests {
         VerifierCheck,
     };
     use crony_protocol::{
-        FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel, ServerToRunner,
-        VerificationArtifactReference,
+        CreateMissionRequest, FactoryMissionContract, MissionSource, RunnerCapability, RunnerModel,
+        ServerToRunner, VerificationArtifactReference,
     };
     use dashmap::DashMap;
     use serde_json::json;
@@ -6087,13 +6150,194 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        RunnerConnection, RunnerRequirements, apply_mission_contract, apply_mission_description,
-        apply_mission_source, artifact_content_disposition, capability_satisfies_requirement,
-        enable_runner_after_reconciliation, enable_runner_dispatch, enforce_factory_manual_gate,
-        factory_materialization_failure_detail, reconnect_preserved_run_ids,
-        runner_requirement_mismatch, select_ready_runner, send_command_to_current_runner,
-        validate_verification_artifact_reference,
+        MissionPlanInput, RunnerConnection, RunnerRequirements, apply_mission_contract,
+        apply_mission_description, apply_mission_source, artifact_content_disposition,
+        capability_satisfies_requirement, enable_runner_after_reconciliation,
+        enable_runner_dispatch, enforce_factory_manual_gate,
+        factory_materialization_failure_detail, mission_preview_response,
+        reconnect_preserved_run_ids, runner_requirement_mismatch, select_ready_runner,
+        send_command_to_current_runner, validate_verification_artifact_reference,
     };
+
+    fn mission_preview_test_request() -> CreateMissionRequest {
+        serde_json::from_value(json!({
+            "title": "ECorp preview",
+            "description": "PRIVATE_PREVIEW_SPECIFICATION",
+            "requested_by": Uuid::from_u128(11),
+            "preferred_adapter": "github-copilot",
+            "preferred_model": "fixture-model",
+            "reasoning_effort": "high",
+            "strategy": "single",
+            "source": {
+                "repository": "fixture/preview",
+                "base_ref": "reviewed",
+                "base_commit": "1".repeat(40)
+            },
+            "secret_refs": [{
+                "secret_id": Uuid::from_u128(12),
+                "env_name": "PRIVATE_PREVIEW_SECRET",
+                "tool": "shell",
+                "resource": "fixture/preview"
+            }],
+            "budget_tokens": 100_003,
+            "budget_cost_microusd": 300_007,
+            "deliverable": {
+                "form": "review_only_report",
+                "paths": ["result.md"],
+                "commit_after_verification": false
+            },
+            "contract": {
+                "objective": "PRIVATE_PREVIEW_OBJECTIVE",
+                "expected_output": "PRIVATE_PREVIEW_OUTPUT",
+                "acceptance_tests": ["review the exact result"],
+                "allowed_tools": ["filesystem"],
+                "prohibited_actions": ["do not publish"],
+                "references": ["PRIVATE_PREVIEW_REFERENCE"],
+                "write_scope": ["result.md"]
+            },
+            "verification_policy": {
+                "checks": [{"type": "file", "path": "result.md", "min_bytes": 1}],
+                "manual_gate": {
+                    "type": "independent_review",
+                    "roles": ["member"],
+                    "exclude_requester": true
+                }
+            }
+        }))
+        .expect("complete preview/create request")
+    }
+
+    #[test]
+    fn mission_preview_and_create_mapping_preserve_every_request_field() {
+        let request = mission_preview_test_request();
+        let authenticated_actor = Uuid::from_u128(13);
+        let input = MissionPlanInput::from_create_request(&request, authenticated_actor);
+        assert_eq!(input.actor_id, authenticated_actor);
+        assert_ne!(input.actor_id, request.requested_by);
+        assert_eq!(input.title, request.title);
+        assert_eq!(input.description, request.description);
+        assert_eq!(
+            input.preferred_adapter,
+            request.preferred_adapter.as_deref()
+        );
+        assert_eq!(input.preferred_model, request.preferred_model.as_deref());
+        assert_eq!(input.reasoning_effort, request.reasoning_effort.as_deref());
+        assert_eq!(input.strategy, request.strategy.as_deref());
+        assert!(std::ptr::eq(
+            input.source.unwrap(),
+            request.source.as_ref().unwrap()
+        ));
+        assert_eq!(input.secret_refs, request.secret_refs.as_slice());
+        assert_eq!(input.budget_tokens, request.budget_tokens);
+        assert_eq!(input.budget_cost_microusd, request.budget_cost_microusd);
+        assert!(std::ptr::eq(
+            input.deliverable.unwrap(),
+            request.deliverable.as_ref().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            input.contract.unwrap(),
+            request.contract.as_ref().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            input.verification_policy.unwrap(),
+            request.verification_policy.as_ref().unwrap()
+        ));
+        assert!(!input.require_factory_manual_gate);
+    }
+
+    #[test]
+    fn mission_preview_and_create_mapping_leave_defaults_to_the_shared_planner() {
+        let request: CreateMissionRequest = serde_json::from_value(json!({
+            "title": "ECorp preview defaults",
+            "requested_by": Uuid::from_u128(11)
+        }))
+        .expect("legacy minimal create request");
+        let input = MissionPlanInput::from_create_request(&request, request.requested_by);
+        assert_eq!(input.actor_id, request.requested_by);
+        assert_eq!(input.title, request.title);
+        assert_eq!(input.description, "");
+        assert!(input.preferred_adapter.is_none());
+        assert!(input.preferred_model.is_none());
+        assert!(input.reasoning_effort.is_none());
+        assert!(input.strategy.is_none());
+        assert!(input.source.is_none());
+        assert!(input.secret_refs.is_empty());
+        assert!(input.budget_tokens.is_none());
+        assert!(input.budget_cost_microusd.is_none());
+        assert!(input.deliverable.is_none());
+        assert!(input.contract.is_none());
+        assert!(input.verification_policy.is_none());
+        assert!(!input.require_factory_manual_gate);
+    }
+
+    #[test]
+    fn mission_preview_projects_the_actual_plan_without_identity_or_contract_data() {
+        let request = mission_preview_test_request();
+        for (strategy, task_count) in [
+            ("single", 1),
+            ("parallel-specialists", 3),
+            ("studio-swarm", 4),
+        ] {
+            let (agents, proposed) =
+                super::staffing::candidates(Uuid::from_u128(10), strategy, "github-copilot", &[])
+                    .expect("read-only staffing candidates");
+            let mut plan = super::StrategyRegistry::new()
+                .plan(
+                    strategy,
+                    &super::PlanningRequest {
+                        mission_title: &request.description,
+                        preferred_adapter: request.preferred_adapter.as_deref(),
+                        preferred_model: request.preferred_model.as_deref(),
+                        reasoning_effort: request.reasoning_effort.as_deref(),
+                        secret_refs: &[],
+                        budget_tokens: request.budget_tokens,
+                        budget_cost_microusd: request.budget_cost_microusd,
+                        deliverable: request.deliverable.as_ref(),
+                        handoff_root: Some("handoffs"),
+                    },
+                    &agents,
+                )
+                .expect("actual registered strategy");
+            super::staffing::attach_used_identities(&mut plan, proposed);
+            assert!(!plan.staffing.is_empty());
+            // Retain the planner's ceiling, not a UI-side sum or redistribution.
+            plan.budget_tokens += 11;
+            plan.budget_cost_microusd += 13;
+            for task in &mut plan.tasks {
+                task.contract.secret_refs = request.secret_refs.clone();
+                task.contract
+                    .references
+                    .push("PRIVATE_PREVIEW_REFERENCE".to_owned());
+            }
+            apply_mission_source(&mut plan, request.source.as_ref().unwrap());
+            let before = serde_json::to_value(&plan).expect("original plan");
+            let preview = mission_preview_response(&plan);
+            assert_eq!(preview.strategy, plan.strategy);
+            assert_eq!(preview.budget_tokens, plan.budget_tokens);
+            assert_eq!(preview.budget_cost_microusd, plan.budget_cost_microusd);
+            assert_eq!(preview.tasks.len(), task_count);
+            for (task, planned) in preview.tasks.iter().zip(&plan.tasks) {
+                assert_eq!(task.key, planned.key);
+                assert_eq!(task.title, planned.title);
+                assert_eq!(task.budget_tokens, planned.contract.budget_tokens);
+                assert_eq!(
+                    task.budget_cost_microusd,
+                    planned.contract.budget_cost_microusd
+                );
+                assert_eq!(task.depends_on, planned.depends_on);
+                assert_eq!(task.max_attempts, planned.max_attempts);
+            }
+            let wire = serde_json::to_string(&preview).expect("preview wire data");
+            assert!(!wire.contains("PRIVATE_PREVIEW"));
+            assert!(!wire.contains("fixture-model"));
+            assert!(!wire.contains("fixture/preview"));
+            assert!(!wire.contains(&request.secret_refs[0].secret_id.to_string()));
+            for agent in &plan.staffing {
+                assert!(!wire.contains(&agent.id.to_string()));
+            }
+            assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+        }
+    }
 
     fn reconnect_test_connection(
         epoch: Uuid,

@@ -459,6 +459,26 @@ pub struct CreateMissionResponse {
     pub strategy: String,
 }
 
+/// Informational only: creation replans and revalidates current authority.
+/// Provisional staffing identities and task contracts are deliberately omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewMissionResponse {
+    pub strategy: String,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub tasks: Vec<PreviewMissionTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewMissionTask {
+    pub key: String,
+    pub title: String,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub depends_on: Vec<String>,
+    pub max_attempts: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimFactoryWorkItemRequest {
     pub actor_id: Uuid,
@@ -1072,6 +1092,65 @@ pub struct SetBudgetPolicyRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mission_preview_wire_shape_is_only_the_public_graph_summary() {
+        let response = super::PreviewMissionResponse {
+            strategy: "parallel-specialists".to_owned(),
+            budget_tokens: 10_001,
+            budget_cost_microusd: 20_003,
+            tasks: vec![
+                super::PreviewMissionTask {
+                    key: "prepare".to_owned(),
+                    title: "Prepare".to_owned(),
+                    budget_tokens: 4_000,
+                    budget_cost_microusd: 8_000,
+                    depends_on: Vec::new(),
+                    max_attempts: 2,
+                },
+                super::PreviewMissionTask {
+                    key: "deliver".to_owned(),
+                    title: "Deliver".to_owned(),
+                    budget_tokens: 6_001,
+                    budget_cost_microusd: 12_003,
+                    depends_on: vec!["prepare".to_owned()],
+                    max_attempts: 1,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&response).expect("serialize preview");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "strategy": "parallel-specialists",
+                "budget_tokens": 10_001,
+                "budget_cost_microusd": 20_003,
+                "tasks": [
+                    {
+                        "key": "prepare",
+                        "title": "Prepare",
+                        "budget_tokens": 4_000,
+                        "budget_cost_microusd": 8_000,
+                        "depends_on": [],
+                        "max_attempts": 2
+                    },
+                    {
+                        "key": "deliver",
+                        "title": "Deliver",
+                        "budget_tokens": 6_001,
+                        "budget_cost_microusd": 12_003,
+                        "depends_on": ["prepare"],
+                        "max_attempts": 1
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::PreviewMissionResponse>(wire)
+                .expect("deserialize preview"),
+            response
+        );
+    }
+
     #[test]
     fn launch_replay_flag_is_backward_compatible_with_prior_responses() {
         let run_id = uuid::Uuid::new_v4();

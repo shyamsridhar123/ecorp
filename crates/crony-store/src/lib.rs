@@ -5602,6 +5602,23 @@ impl PgStore {
         })
     }
 
+    /// Checks the same admission as creation using only reads and row locks.
+    /// No staffing, graph, event, or identifier reservation is persisted.
+    pub async fn validate_mission_creation(
+        &self,
+        corp_id: Uuid,
+        requested_by: Uuid,
+        title: &str,
+        description: &str,
+        plan: &TaskGraphPlan,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        mission_creation_admission_tx(&mut tx, corp_id, requested_by, title, description, plan)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn create_mission(
         &self,
         corp_id: Uuid,
@@ -10666,6 +10683,22 @@ async fn mark_runner_runs_lost_tx(
     Ok(events)
 }
 
+async fn mission_creation_admission_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    requested_by: Uuid,
+    title: &str,
+    description: &str,
+    plan: &TaskGraphPlan,
+) -> Result<(String, String, Uuid)> {
+    let title = normalize_mission_title(title)?;
+    let description = normalize_mission_description(description)?;
+    assert_mission_operator_tx(tx, corp_id, requested_by).await?;
+    staffing::validate_staffing(plan)?;
+    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
+    Ok((title, description, room_id))
+}
+
 async fn create_mission_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -10674,13 +10707,8 @@ async fn create_mission_tx(
     description: &str,
     plan: &TaskGraphPlan,
 ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
-    let title = normalize_mission_title(title)?;
-    let description = normalize_mission_description(description)?;
-    assert_mission_operator_tx(tx, corp_id, requested_by).await?;
-    staffing::validate_staffing(plan)?;
-
-    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
-
+    let (title, description, room_id) =
+        mission_creation_admission_tx(tx, corp_id, requested_by, title, description, plan).await?;
     let mission_id = Uuid::new_v4();
     sqlx::query(
         r#"

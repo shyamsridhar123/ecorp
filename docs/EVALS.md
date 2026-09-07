@@ -675,9 +675,12 @@ Store unit regressions cover recovery-aware publication provenance. A completed 
 its reviewed source revision and recovery ID; recovery selection follows the chosen deliverable
 run's resume lineage; a non-recovery publication retains the original claimed revision with a null
 recovery ID; and legacy schema-version-1 provenance remains resumable while version 2 requires the
-claimed/effective/recovery tuple. The complete deterministic publication E2E also passes after this
-change, including restart recovery and exact publication-context lookup. This is local fixture
-evidence, not a new real-GitHub recovery-to-publication effect claim.
+claimed/effective/recovery tuple. Earlier deterministic publication coverage passed, but the
+September 7, 2026 follow-up on the current integration failed its concurrent-publication case
+with a database deadlock. The expanded recovery drill also timed out while waiting for an
+upstream recovery to settle before its mission completed. Those failures remain open release
+gates; unit-test success is not complete runtime acceptance. These are local fixture results,
+not a new real-GitHub recovery-to-publication effect claim.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,

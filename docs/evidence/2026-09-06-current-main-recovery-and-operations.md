@@ -154,3 +154,23 @@ These findings are not waived by the passing tests. The previous publication reg
 before its intended breaker assertion because its 30-second fixture lease had expired. The
 fixture now requests a bounded 300-second initial authority-test lease and retains strict status,
 error, and no-effect assertions; fresh full-stack publication acceptance is still required.
+
+### Follow-up runtime checkpoint: September 7, 2026, 03:28 UTC
+
+The follow-up results do **not** establish release readiness:
+
+- The expanded recovery drill exited with failure after timing out while waiting for an
+  upstream recovery to settle before its mission completed.
+- The publication drill exited with failure after PostgreSQL reported a deadlock during the
+  concurrent-publication case.
+- The retained UI fixture passed its read-only browser continuation. Its independent-review
+  decision was not repeated.
+
+Both failed drill databases, logs, and source workspaces remain preserved. Their owned test
+processes and database containers were stopped, together with other idle QA stacks, after the
+manual user's Docker-cleanup request. The manual ECorp session and unrelated Open Notebook
+containers were not stopped. No database, volume, branch, or worktree was deleted.
+
+PR #162 remains draft. Issue #164 separately tracks the manual Studio build that spent its
+specialist allocations on handoffs and never reached integration. That mission was not reset or
+rerun, and its hard-stopped provider lineages remain terminal.
