@@ -364,6 +364,75 @@ pub(super) async fn resume_tx(
     Ok(())
 }
 
+pub(super) async fn release_failed_run_agent_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    agent_id: Uuid,
+    run_id: Uuid,
+) -> Result<()> {
+    // Keep this lock at the old failure-cleanup UPDATE position. Native run
+    // admission also locks the agent before allocating an assignment. Check
+    // detached ownership in a fresh statement after any wait on that lock.
+    let agent = sqlx::query(
+        "SELECT status, current_run_id FROM agents WHERE id=$1 AND corp_id=$2 FOR UPDATE",
+    )
+    .bind(agent_id)
+    .bind(corp_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(agent) = agent else {
+        return Ok(());
+    };
+    let current_run_id: Option<Uuid> = agent.get("current_run_id");
+    if current_run_id != Some(run_id) {
+        if current_run_id.is_some() || agent.get::<String, _>("status") != "reviewing" {
+            return Ok(());
+        }
+        // Artifact finalization legitimately detaches a reviewing agent. Only
+        // its uniquely latest, now-failed assignment can release that state;
+        // equal timestamps are ambiguous, not authority from a UUID tie-break.
+        let owns_detached_review: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM runs failed
+                WHERE failed.id=$1 AND failed.corp_id=$2 AND failed.agent_id=$3
+                  AND failed.status='failed'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs other
+                      WHERE other.corp_id=failed.corp_id AND other.agent_id=failed.agent_id
+                        AND other.id<>failed.id
+                        AND (
+                            other.created_at>=failed.created_at
+                            OR other.status IN (
+                                'provisioning', 'starting', 'running',
+                                'waiting_for_input', 'waiting_for_approval', 'verifying'
+                            )
+                        )
+                  )
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .bind(agent_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !owns_detached_review {
+            return Ok(());
+        }
+    }
+    sqlx::query(
+        "UPDATE agents SET status='idle', station=NULL, current_run_id=NULL
+         WHERE id=$1 AND corp_id=$2 AND current_run_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(agent_id)
+    .bind(corp_id)
+    .bind(current_run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,5 +1795,345 @@ mod tests {
         }
         blocker.rollback().await.unwrap();
         assert_eq!(state(&store).await["factory"][0]["state"], "running");
+    }
+
+    async fn detached_review_fixture(pool: PgPool) -> PgStore {
+        let store = fixture(pool).await;
+        sqlx::query(
+            "INSERT INTO runner_nodes (id,corp_id,hostname,os,connection_epoch,status)
+             VALUES ('issue169-runner',$1,'isolated-sqlx-fixture','test',$2,'connected')",
+        )
+        .bind(CORP)
+        .bind(Uuid::from_u128(20))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE tasks SET attempt_count=1, status='running',
+                contract=jsonb_set(contract,'{deliverable}',$1) WHERE id=$2",
+        )
+        .bind(json!({
+            "form":"typed_artifact_set","commit_after_verification":false,"paths":["result.md"]
+        }))
+        .bind(TASK)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET status='running' WHERE id=$1")
+            .bind(RUN)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agents SET status='working',station='terminal' WHERE id=$1")
+            .bind(AGENT)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state(&store).await["agents"][0]["current_run_id"],
+            json!(RUN)
+        );
+
+        // Exercise the actual store reservation/finalization lifecycle, not a
+        // seeded detached agent. These metadata fixtures do not verify object
+        // bytes/signatures or claim server/runner transport acceptance.
+        for role in ["provider_evidence", "source_deliverable"] {
+            let event_type = if role == "provider_evidence" {
+                "run.artifact_upload"
+            } else {
+                "run.deliverable_upload"
+            };
+            let bytes =
+                serde_json::to_vec(&json!({"fixture":"detached-review","role":role})).unwrap();
+            let digest = hex::encode(Sha256::digest(&bytes));
+            let metadata = if role == "source_deliverable" {
+                json!({
+                    "form":"typed_artifact_set","verification_sha256":"c".repeat(64),
+                    "base_commit":"a".repeat(40),"head_commit":null,"branch":"crony/fixture",
+                    "integration_state":"ready_for_review"
+                })
+            } else {
+                json!({})
+            };
+            let input = input_for(
+                RUN,
+                TOKEN,
+                event_type,
+                json!({"artifact_role":role,"sha256":digest,"bytes":bytes.len(),"metadata":metadata}),
+            );
+            let artifact = StoredArtifact {
+                id: input.event_id,
+                corp_id: CORP,
+                task_id: TASK,
+                run_id: RUN,
+                producer_agent_id: AGENT,
+                producer_runner_id: "issue169-runner".to_owned(),
+                verifier: "isolated-store-fixture".to_owned(),
+                object_key: format!("corps/{CORP}/{role}/{digest}"),
+                uri: format!("/api/corps/{CORP}/artifacts/{}", input.event_id),
+                sha256: digest,
+                media_type: "application/json".to_owned(),
+                bytes: bytes.len() as i64,
+                artifact_role: role.to_owned(),
+                file_name: format!("{role}.json"),
+                metadata,
+                provenance_signature: "d".repeat(64),
+                retention_until: Utc::now() + chrono::Duration::days(1),
+            };
+            let staging_key = format!("staging/corps/{CORP}/{}", artifact.id);
+            let prepared = store
+                .prepare_artifact_upload(input, artifact.clone(), &staging_key)
+                .await
+                .unwrap();
+            assert_eq!(prepared.status, "staged");
+            let event = store
+                .finalize_artifact_upload(CORP, artifact.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.payload["artifact_role"], role);
+            let detached = state(&store).await;
+            assert_eq!(detached["agents"][0]["status"], "reviewing");
+            assert_eq!(detached["agents"][0]["station"], "review");
+            assert!(detached["agents"][0]["current_run_id"].is_null());
+            if role == "provider_evidence" {
+                store
+                    .apply_runner_event(input_for(
+                        RUN,
+                        TOKEN,
+                        "run.verification_started",
+                        json!({}),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(state(&store).await["agents"][0]["current_run_id"].is_null());
+            }
+        }
+        store
+    }
+
+    async fn detached_review_other_assignment(store: &PgStore, status: &str, offset_seconds: f64) {
+        sqlx::query(
+            "INSERT INTO tasks
+                (id,corp_id,mission_id,title,objective,status,assigned_agent_id,
+                 plan_key,contract,verification_policy,attempt_count,max_attempts)
+             SELECT $1,corp_id,mission_id,'Other assignment',objective,'review',assigned_agent_id,
+                    'other-detached-review',contract,verification_policy,1,2
+             FROM tasks WHERE id=$2",
+        )
+        .bind(Uuid::from_u128(50))
+        .bind(TASK)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+                (id,corp_id,task_id,agent_id,runner_id,assignment_token,status,
+                 workspace_run_id,created_at)
+             SELECT $1,corp_id,$2,agent_id,runner_id,$3,$4,$1,
+                    created_at+make_interval(secs=>$5)
+             FROM runs WHERE id=$6",
+        )
+        .bind(Uuid::from_u128(51))
+        .bind(Uuid::from_u128(50))
+        .bind(Uuid::from_u128(52))
+        .bind(status)
+        .bind(offset_seconds)
+        .bind(RUN)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn assert_detached_review_preserved(store: &PgStore) {
+        let before = state(store).await;
+        store.apply_runner_event(failure()).await.unwrap();
+        let after = state(store).await;
+        assert_eq!(after["agents"], before["agents"]);
+        assert_eq!(after["factory"], before["factory"]);
+        assert_eq!(after["tasks"][0]["status"], "ready");
+        assert_eq!(after["missions"][0]["status"], "running");
+        assert!(
+            store
+                .schedulable_mission_ids(CORP)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .schedulable_tasks(CORP, MISSION, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_artifact_failure_releases_native_retry(pool: PgPool) {
+        let store = detached_review_fixture(pool).await;
+        let before = state(&store).await;
+        let artifacts_before: Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(artifact) ORDER BY id) FROM artifacts artifact",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(artifacts_before.as_array().unwrap().len(), 2);
+        assert!(
+            artifacts_before
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|artifact| artifact["status"] == "ready")
+        );
+        assert!(
+            store
+                .schedulable_mission_ids(CORP)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let outcome = store.apply_runner_event(failure()).await.unwrap();
+        let after = state(&store).await;
+        let missions = store.schedulable_mission_ids(CORP).await.unwrap();
+        let tasks = store.schedulable_tasks(CORP, MISSION, false).await.unwrap();
+        assert_eq!(
+            (
+                after["agents"][0]["status"].clone(),
+                after["agents"][0]["current_run_id"].clone(),
+                missions,
+                tasks.iter().map(|task| task.task_id).collect::<Vec<_>>(),
+            ),
+            (json!("idle"), Value::Null, vec![MISSION], vec![TASK]),
+        );
+        assert!(after["agents"][0]["station"].is_null());
+        assert_eq!(after["tasks"][0]["status"], "ready");
+        assert_eq!(after["tasks"][0]["attempt_count"], 1);
+        assert_eq!(after["tasks"][0]["max_attempts"], 2);
+        assert_eq!(after["missions"][0]["status"], "running");
+        assert_eq!(after["factory"], before["factory"]);
+        assert!(outcome.related_events.is_empty());
+        for key in [
+            "evidence",
+            "deliverables",
+            "queued",
+            "requests",
+            "recoveries",
+        ] {
+            assert_eq!(after[key], before[key], "{key}");
+        }
+        for field in [
+            "provider_session_id",
+            "workspace_run_id",
+            "workspace_path",
+            "workspace_branch",
+            "workspace_fingerprint",
+            "source_repository",
+            "source_base_ref",
+            "source_base_commit",
+            "input_tokens",
+            "output_tokens",
+            "cost_microusd",
+            "budget_tokens_limit",
+            "budget_cost_microusd_limit",
+        ] {
+            assert_eq!(after["runs"][0][field], before["runs"][0][field], "{field}");
+        }
+        let artifacts_after: Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(artifact) ORDER BY id) FROM artifacts artifact",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(artifacts_after, artifacts_before);
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_keeps_attached_exact_run_cleanup(pool: PgPool) {
+        let store = fixture(pool).await;
+        store.apply_runner_event(failure()).await.unwrap();
+        let after = state(&store).await;
+        assert_eq!(after["agents"][0]["status"], "idle");
+        assert!(after["agents"][0]["current_run_id"].is_null());
+        assert!(after["agents"][0]["station"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_pointer(pool: PgPool) {
+        let store = detached_review_fixture(pool).await;
+        // The failed run is newer and the other run is not active: pointer
+        // fencing must protect this assignment independently of both queries.
+        detached_review_other_assignment(&store, "completed", -1.0).await;
+        sqlx::query("UPDATE agents SET current_run_id=$1 WHERE id=$2")
+            .bind(Uuid::from_u128(51))
+            .bind(AGENT)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_detached_review_preserved(&store).await;
+    }
+
+    async fn detached_review_active_negative(pool: PgPool, status: &str) {
+        let store = detached_review_fixture(pool).await;
+        // Older active work must block cleanup even when this failed run is
+        // the uniquely newest assignment and the agent has no current pointer.
+        detached_review_other_assignment(&store, status, -1.0).await;
+        assert_detached_review_preserved(&store).await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_provisioning(pool: PgPool) {
+        detached_review_active_negative(pool, "provisioning").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_starting(pool: PgPool) {
+        detached_review_active_negative(pool, "starting").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_running(pool: PgPool) {
+        detached_review_active_negative(pool, "running").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_waiting_for_input(pool: PgPool) {
+        detached_review_active_negative(pool, "waiting_for_input").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_waiting_for_approval(pool: PgPool) {
+        detached_review_active_negative(pool, "waiting_for_approval").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_other_verifying(pool: PgPool) {
+        detached_review_active_negative(pool, "verifying").await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_preserves_later_terminal_assignment(pool: PgPool) {
+        let store = detached_review_fixture(pool).await;
+        detached_review_other_assignment(&store, "completed", 1.0).await;
+        assert_detached_review_preserved(&store).await;
+    }
+
+    #[sqlx::test(migrations = "../../db/migrations")]
+    #[ignore = "requires the approved isolated issue169 SQLx loader"]
+    async fn issue169_detached_review_rejects_ambiguous_assignment_order(pool: PgPool) {
+        let store = detached_review_fixture(pool).await;
+        detached_review_other_assignment(&store, "completed", 0.0).await;
+        assert_detached_review_preserved(&store).await;
     }
 }
