@@ -742,6 +742,7 @@ pub struct PreparedArtifactUpload {
 #[derive(Debug, Clone)]
 pub struct DependencyArtifactContext {
     pub task_id: Uuid,
+    pub verification_run_id: Uuid,
     pub plan_key: String,
     pub task_title: String,
     pub run_summary: Option<String>,
@@ -7226,6 +7227,7 @@ impl PgStore {
         let rows = sqlx::query(
             r#"
                 SELECT parent.id AS dependency_task_id,
+                       run.id AS verification_run_id,
                        parent.plan_key,
                        parent.title AS task_title,
                        parent.contract AS dependency_contract,
@@ -7257,9 +7259,8 @@ impl PgStore {
                 JOIN LATERAL (
                     SELECT r.* FROM runs r
                     WHERE r.task_id = parent.id AND r.corp_id = parent.corp_id
-                      AND r.status = 'completed'
                     ORDER BY r.created_at DESC, r.id DESC LIMIT 1
-                ) run ON run.verification_status = 'passed'
+                ) run ON run.status = 'completed' AND run.verification_status = 'passed'
                 LEFT JOIN source_deliverables deliverable
                   ON deliverable.run_id = run.id AND deliverable.task_id = parent.id
                  AND deliverable.corp_id = parent.corp_id
@@ -7267,17 +7268,71 @@ impl PgStore {
                   ON artifact.id = CASE
                     WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
                       THEN deliverable.artifact_id ELSE run.artifact_id END
-                 AND artifact.run_id = run.id AND artifact.task_id = parent.id
+                 AND artifact.task_id = parent.id
                  AND artifact.corp_id = parent.corp_id
+                 AND artifact.producer_agent_id = run.agent_id
+                 AND artifact.producer_runner_id = run.runner_id
                  AND artifact.status = 'ready'
                  AND CASE
                     WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
                     THEN artifact.artifact_role = 'source_deliverable'
+                      AND artifact.run_id = run.id
                       AND deliverable.form = 'typed_artifact_set'
                       AND deliverable.verification_sha256 = run.verification_sha256
                       AND deliverable.base_commit = run.workspace_base_commit
                       AND artifact.sha256 = run.deliverable_sha256
-                    ELSE artifact.artifact_role = 'provider_evidence' END
+                    ELSE artifact.artifact_role = 'provider_evidence'
+                      AND artifact.sha256 = run.artifact_sha256
+                      AND artifact.media_type = run.artifact_media_type
+                      AND artifact.provenance_signature = run.artifact_signature
+                      AND EXISTS (
+                        -- Verifier-only runs reuse, never re-sign or reproduce, the
+                        -- exact provider artifact inherited through governed recovery.
+                        WITH RECURSIVE evidence_lineage AS (
+                            SELECT run.id, run.resumed_from_run_id, run.execution_mode,
+                                   0 AS depth, ARRAY[run.id] AS visited
+                            UNION ALL
+                            SELECT source.id, source.resumed_from_run_id,
+                                   source.execution_mode, lineage.depth + 1,
+                                   lineage.visited || source.id
+                            FROM evidence_lineage lineage
+                            JOIN factory_verification_recoveries recovery
+                              ON recovery.replacement_run_id = lineage.id
+                             AND recovery.source_run_id = lineage.resumed_from_run_id
+                             AND recovery.corp_id = parent.corp_id
+                             AND recovery.task_id = parent.id
+                             AND recovery.mission_id = parent.mission_id
+                             AND recovery.mode = 'verifier_only'
+                             AND (
+                                 (lineage.depth = 0 AND recovery.status = 'completed')
+                                 OR (lineage.depth > 0
+                                     AND recovery.status IN ('completed', 'failed'))
+                             )
+                            JOIN factory_work_items item
+                              ON item.id = recovery.factory_work_item_id
+                             AND item.corp_id = parent.corp_id
+                             AND item.mission_id = parent.mission_id
+                            JOIN runs source
+                              ON source.id = recovery.source_run_id
+                             AND source.corp_id = run.corp_id
+                             AND source.task_id = run.task_id
+                             AND source.agent_id = run.agent_id
+                             AND source.runner_id = run.runner_id
+                             AND source.workspace_run_id = run.workspace_run_id
+                             AND source.source_repository IS NOT DISTINCT FROM run.source_repository
+                             AND source.source_base_ref IS NOT DISTINCT FROM run.source_base_ref
+                             AND source.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
+                             AND source.artifact_id = run.artifact_id
+                             AND source.artifact_sha256 = artifact.sha256
+                             AND source.artifact_media_type = artifact.media_type
+                             AND source.artifact_signature = artifact.provenance_signature
+                            WHERE lineage.execution_mode = 'verification_only'
+                              AND NOT source.id = ANY(lineage.visited)
+                              AND lineage.depth < 64
+                        )
+                        SELECT 1 FROM evidence_lineage
+                        WHERE id = artifact.run_id AND execution_mode = 'provider'
+                      ) END
                 WHERE child.id = $1 AND child.corp_id = $2
                 ORDER BY parent.plan_key
             "#,
@@ -7295,6 +7350,7 @@ impl PgStore {
         rows.into_iter()
             .map(|row| {
                 let dependency_task_id = row.get("dependency_task_id");
+                let verification_run_id = row.get("verification_run_id");
                 let plan_key = row.get("plan_key");
                 let task_title = row.get("task_title");
                 let run_summary = row.get("run_summary");
@@ -7304,6 +7360,7 @@ impl PgStore {
                 let artifact = map_stored_artifact(row);
                 Ok(DependencyArtifactContext {
                     task_id: dependency_task_id,
+                    verification_run_id,
                     plan_key,
                     task_title,
                     run_summary,
@@ -14750,6 +14807,292 @@ mod tests {
         should_retry_runner_failure, validate_factory_lease_seconds,
         validate_factory_plan_against_policy,
     };
+
+    // These opt-in SQL regressions use only SQLx's disposable test database and
+    // exercise the real selection method, not a second implementation of its query.
+    async fn dependency_artifact_fixture(pool: sqlx::PgPool) -> super::PgStore {
+        let corp = Uuid::from_u128(1);
+        let mission = Uuid::from_u128(2);
+        let parent = Uuid::from_u128(3);
+        let child = Uuid::from_u128(4);
+        let provider = Uuid::from_u128(5);
+        let recovered = Uuid::from_u128(6);
+        let artifact = Uuid::from_u128(7);
+        let agent = Uuid::from_u128(8);
+        let recovery = Uuid::from_u128(9);
+        let item = Uuid::from_u128(10);
+        let peer = Uuid::from_u128(11);
+        let peer_run = Uuid::from_u128(12);
+        let peer_artifact = Uuid::from_u128(13);
+        sqlx::raw_sql(&format!(
+            r#"
+            CREATE TABLE tasks (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}',
+                mission_id UUID DEFAULT '{mission}', plan_key TEXT, title TEXT DEFAULT 'handoff',
+                contract JSONB DEFAULT '{{}}', status TEXT DEFAULT 'completed',
+                verification_status TEXT DEFAULT 'passed'
+            );
+            CREATE TABLE task_dependencies (task_id UUID, depends_on_task_id UUID);
+            CREATE TABLE runs (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', task_id UUID,
+                agent_id UUID DEFAULT '{agent}', runner_id TEXT DEFAULT 'fixture-runner',
+                workspace_run_id UUID DEFAULT '{provider}', resumed_from_run_id UUID,
+                source_repository TEXT DEFAULT 'fixture/repo', source_base_ref TEXT DEFAULT 'main',
+                source_base_commit TEXT DEFAULT 'base', workspace_base_commit TEXT DEFAULT 'base',
+                status TEXT DEFAULT 'completed', verification_status TEXT DEFAULT 'passed',
+                execution_mode TEXT DEFAULT 'provider', summary TEXT,
+                artifact_id UUID, artifact_sha256 TEXT DEFAULT 'digest',
+                artifact_media_type TEXT DEFAULT 'text/plain',
+                artifact_signature TEXT DEFAULT 'fixture-signature',
+                verification_sha256 TEXT DEFAULT 'verification', deliverable_sha256 TEXT,
+                created_at TIMESTAMPTZ DEFAULT '2000-01-01 00:00:00+00'
+            );
+            CREATE TABLE artifacts (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', task_id UUID, run_id UUID,
+                producer_agent_id UUID DEFAULT '{agent}',
+                producer_runner_id TEXT DEFAULT 'fixture-runner', verifier TEXT DEFAULT 'runner',
+                object_key TEXT DEFAULT 'fixture', uri TEXT DEFAULT 'fixture',
+                sha256 TEXT DEFAULT 'digest', media_type TEXT DEFAULT 'text/plain',
+                bytes BIGINT DEFAULT 1, artifact_role TEXT DEFAULT 'provider_evidence',
+                file_name TEXT DEFAULT 'result.md', metadata JSONB DEFAULT '{{}}',
+                provenance_signature TEXT DEFAULT 'fixture-signature',
+                retention_until TIMESTAMPTZ DEFAULT (now() + interval '1 day'),
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE source_deliverables (
+                run_id UUID, task_id UUID, corp_id UUID, artifact_id UUID, form TEXT,
+                base_commit TEXT, verification_sha256 TEXT
+            );
+            CREATE TABLE factory_work_items (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', mission_id UUID DEFAULT '{mission}'
+            );
+            CREATE TABLE factory_verification_recoveries (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}',
+                mission_id UUID DEFAULT '{mission}', task_id UUID DEFAULT '{parent}',
+                factory_work_item_id UUID DEFAULT '{item}', source_run_id UUID,
+                replacement_run_id UUID, mode TEXT DEFAULT 'verifier_only',
+                status TEXT DEFAULT 'completed'
+            );
+            INSERT INTO tasks (id, plan_key) VALUES
+                ('{parent}', 'specialist-a'), ('{peer}', 'specialist-b'), ('{child}', 'synthesis');
+            INSERT INTO task_dependencies VALUES ('{child}', '{parent}'), ('{child}', '{peer}');
+            INSERT INTO runs (id, task_id, artifact_id, status, verification_status)
+                VALUES ('{provider}', '{parent}', '{artifact}', 'failed', 'failed');
+            INSERT INTO runs (id, task_id, artifact_id, execution_mode, resumed_from_run_id, created_at)
+                VALUES ('{recovered}', '{parent}', '{artifact}', 'verification_only',
+                        '{provider}', '2000-01-03 00:00:00+00');
+            INSERT INTO runs (id, task_id, artifact_id, workspace_run_id)
+                VALUES ('{peer_run}', '{peer}', '{peer_artifact}', '{peer_run}');
+            INSERT INTO artifacts (id, task_id, run_id)
+                VALUES ('{artifact}', '{parent}', '{provider}'), ('{peer_artifact}', '{peer}', '{peer_run}');
+            INSERT INTO factory_work_items (id) VALUES ('{item}');
+            INSERT INTO factory_verification_recoveries (id, source_run_id, replacement_run_id)
+                VALUES ('{recovery}', '{provider}', '{recovered}');
+            "#
+        ))
+        .execute(&pool)
+        .await
+        .expect("create isolated dependency metadata fixture");
+        sqlx::query("UPDATE tasks SET contract = $1")
+            .bind(json!({
+                "objective": "handoff", "expected_output": "result.md",
+                "acceptance_tests": ["verified artifact"], "allowed_tools": ["filesystem"],
+                "prohibited_actions": [], "references": [], "write_scope": ["result.md"],
+                "budget_tokens": 100, "deadline_at": null, "escalation": "stop"
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+        super::PgStore { pool }
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn dependency_artifacts_bind_recovered_parent_and_reject_invalid_metadata(
+        pool: sqlx::PgPool,
+    ) {
+        let store = dependency_artifact_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let child = Uuid::from_u128(4);
+        let handoffs = store.dependency_artifacts(corp, child).await.unwrap();
+        assert_eq!(handoffs.len(), 2);
+        assert_eq!(handoffs[0].verification_run_id, Uuid::from_u128(6));
+        assert_eq!(handoffs[0].artifact.id, Uuid::from_u128(7));
+        assert_eq!(handoffs[0].artifact.run_id, Uuid::from_u128(5));
+        assert_eq!(handoffs[1].artifact.run_id, Uuid::from_u128(12));
+        let foreign_id = "'00000000-0000-0000-0000-000000000063'";
+        let peer_task = "'00000000-0000-0000-0000-00000000000b'";
+        let peer_run = "'00000000-0000-0000-0000-00000000000c'";
+        let peer_artifact = "'00000000-0000-0000-0000-00000000000d'";
+
+        // Each edit is confined to the disposable fixture and restored before
+        // the next assertion. No missing edge may fall back to another artifact.
+        for (table, column, id, invalid) in [
+            ("artifacts", "status", 7, "'staged'"),
+            ("artifacts", "artifact_role", 7, "'source_deliverable'"),
+            ("artifacts", "corp_id", 7, foreign_id),
+            ("artifacts", "task_id", 7, peer_task),
+            ("artifacts", "run_id", 7, peer_run),
+            ("artifacts", "producer_agent_id", 7, foreign_id),
+            ("artifacts", "producer_runner_id", 7, "'other-runner'"),
+            ("artifacts", "sha256", 7, "'other-digest'"),
+            ("artifacts", "media_type", 7, "'application/json'"),
+            ("artifacts", "provenance_signature", 7, "'tampered'"),
+            ("runs", "artifact_id", 6, "NULL"),
+            ("runs", "artifact_id", 6, foreign_id),
+            ("runs", "artifact_id", 6, peer_artifact),
+            ("runs", "artifact_sha256", 6, "'other-digest'"),
+            ("runs", "artifact_media_type", 6, "'application/json'"),
+            ("runs", "artifact_signature", 6, "'other-signature'"),
+            ("runs", "execution_mode", 6, "'provider'"),
+            ("runs", "verification_status", 6, "'failed'"),
+            ("runs", "status", 6, "'waiting_for_approval'"),
+            ("runs", "resumed_from_run_id", 6, "NULL"),
+            ("runs", "corp_id", 5, foreign_id),
+            ("runs", "task_id", 5, peer_task),
+            ("runs", "agent_id", 5, foreign_id),
+            ("runs", "runner_id", 5, "'other-runner'"),
+            ("runs", "workspace_run_id", 5, foreign_id),
+            ("runs", "source_repository", 5, "'other/repo'"),
+            ("runs", "source_base_ref", 5, "'other-ref'"),
+            ("runs", "source_base_commit", 5, "'other-base'"),
+            ("runs", "artifact_id", 5, "NULL"),
+            ("runs", "artifact_signature", 5, "'other-signature'"),
+            (
+                "factory_verification_recoveries",
+                "source_run_id",
+                9,
+                "NULL",
+            ),
+            (
+                "factory_verification_recoveries",
+                "replacement_run_id",
+                9,
+                "NULL",
+            ),
+            ("factory_verification_recoveries", "corp_id", 9, foreign_id),
+            ("factory_verification_recoveries", "task_id", 9, peer_task),
+            (
+                "factory_verification_recoveries",
+                "mission_id",
+                9,
+                foreign_id,
+            ),
+            (
+                "factory_verification_recoveries",
+                "mode",
+                9,
+                "'source_correction'",
+            ),
+            ("factory_verification_recoveries", "status", 9, "'running'"),
+            ("factory_verification_recoveries", "status", 9, "'failed'"),
+            ("factory_work_items", "corp_id", 10, foreign_id),
+            ("factory_work_items", "mission_id", 10, foreign_id),
+            ("tasks", "verification_status", 3, "'failed'"),
+            ("tasks", "mission_id", 3, foreign_id),
+            (
+                "tasks",
+                "contract",
+                3,
+                r#"jsonb_set(contract, '{deliverable}', '{"form":"typed_artifact_set"}')"#,
+            ),
+        ] {
+            let id = Uuid::from_u128(id);
+            let original: String = sqlx::query_scalar(&format!(
+                "SELECT quote_nullable({column}) FROM {table} WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = {invalid} WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            let rejected = store.dependency_artifacts(corp, child).await;
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = {original} WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                rejected.unwrap_err().to_string(),
+                "dependency handoff is incomplete or unverified: expected 2, found 1",
+                "accepted {table}.{column} = {invalid}"
+            );
+        }
+        assert_eq!(
+            store.dependency_artifacts(corp, child).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn dependency_artifacts_follow_multiple_recoveries_without_stale_or_cyclic_fallback(
+        pool: sqlx::PgPool,
+    ) {
+        let store = dependency_artifact_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let parent = Uuid::from_u128(3);
+        let child = Uuid::from_u128(4);
+        let provider = Uuid::from_u128(5);
+        let recovered = Uuid::from_u128(6);
+        let artifact = Uuid::from_u128(7);
+        let bridge = Uuid::from_u128(14);
+        let bridge_recovery = Uuid::from_u128(15);
+        sqlx::raw_sql(&format!(
+            r#"
+            INSERT INTO runs (id, task_id, artifact_id, execution_mode, resumed_from_run_id,
+                              status, verification_status, created_at)
+                VALUES ('{bridge}', '{parent}', '{artifact}', 'verification_only',
+                        '{provider}', 'failed', 'failed', '2000-01-02 00:00:00+00');
+            UPDATE runs SET resumed_from_run_id = '{bridge}' WHERE id = '{recovered}';
+            UPDATE factory_verification_recoveries SET source_run_id = '{bridge}'
+                WHERE replacement_run_id = '{recovered}';
+            INSERT INTO factory_verification_recoveries (id, source_run_id, replacement_run_id, status)
+                VALUES ('{bridge_recovery}', '{provider}', '{bridge}', 'failed');
+            "#
+        ))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let handoffs = store.dependency_artifacts(corp, child).await.unwrap();
+        assert_eq!(handoffs.len(), 2);
+        assert_eq!(handoffs[0].artifact.run_id, provider);
+        assert_eq!(handoffs[0].verification_run_id, recovered);
+
+        sqlx::query("UPDATE runs SET created_at = '2000-01-04 00:00:00+00' WHERE id = $1")
+            .bind(bridge)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.dependency_artifacts(corp, child).await.is_err());
+        sqlx::query("UPDATE runs SET created_at = '2000-01-02 00:00:00+00' WHERE id = $1")
+            .bind(bridge)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.dependency_artifacts(corp, child).await.unwrap().len(),
+            2
+        );
+
+        sqlx::raw_sql(&format!(
+            "UPDATE runs SET resumed_from_run_id = '{recovered}' WHERE id = '{bridge}'; \
+             UPDATE factory_verification_recoveries SET source_run_id = '{recovered}' \
+             WHERE id = '{bridge_recovery}';"
+        ))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.dependency_artifacts(corp, child).await.is_err());
+    }
 
     #[test]
     fn recovery_generic_resume_fences_failed_and_revised_factory_work() {

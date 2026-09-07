@@ -2070,6 +2070,7 @@ async function upstreamThenLaterTaskRecovery() {
   const peer = fixture.tasks.find((task) => task.plan_key === 'specialist-b')
   const later = fixture.tasks.find((task) => task.plan_key === 'synthesis')
   assert.ok(upstream && peer && later)
+  assert.deepEqual([...later.depends_on].sort(), [upstream.id, peer.id].sort())
   await post(`/api/corps/${demo.corp_id}/missions/${fixture.missionId}/launch`, {
     requested_by: demo.alice_actor_id,
   })
@@ -2079,6 +2080,7 @@ async function upstreamThenLaterTaskRecovery() {
   await decideFixtureRun(demo, firstUpstream.value.id, false, 'Recheck the upstream task in place.')
   const recoveredUpstream = await authorizeFixtureRecovery(fixture, 'Authorize the same upstream checkpoint.')
   assert.equal(recoveredUpstream.context.task_id, upstream.id)
+  assert.equal(recoveredUpstream.context.source_run_id, firstUpstream.value.id)
   const upstreamReview = await waitForReviewRun(demo, upstream.id, recoveredUpstream.result.run_id)
   await decideFixtureRun(demo, upstreamReview.value.id, true, 'Accept the recovered upstream task.')
   const upstreamSettled = await waitFor(demo, (state) => {
@@ -2092,9 +2094,57 @@ async function upstreamThenLaterTaskRecovery() {
     entry.factory_work_item_id === fixture.workItemId && ['authorized', 'running'].includes(entry.status),
   ).length, 0)
   const firstLater = await waitForReviewRun(demo, later.id)
+  const dependencyEvents = firstLater.state.snapshot.events.filter((event) =>
+    event.aggregate_id === firstLater.value.id && event.type === 'run.dependency_context',
+  )
+  assert.equal(dependencyEvents.length, 1, 'Synthesis must record its verified dependency handoff')
+  const dependencyEvent = dependencyEvents[0]
+  assert.equal(dependencyEvent.corp_id, demo.corp_id)
+  assert.equal(dependencyEvent.correlation_id, fixture.missionId)
+  assert.match(dependencyEvent.payload.context_sha256, /^[0-9a-f]{64}$/u)
+  const handoffs = dependencyEvent.payload.handoffs
+  assert.equal(handoffs.length, 2, 'Synthesis must receive both parents, including the recovered upstream')
+  assert.deepEqual(handoffs.map((entry) => entry.task_id).sort(), [upstream.id, peer.id].sort())
+  for (const [providerRun, completedRunId] of [
+    [firstUpstream.value, recoveredUpstream.result.run_id],
+    [firstPeer.value, firstPeer.value.id],
+  ]) {
+    const parent = upstreamSettled.state.snapshot.tasks.find((task) => task.id === providerRun.task_id)
+    const completedRun = upstreamSettled.state.snapshot.runs.find((run) => run.id === completedRunId)
+    assert.equal(parent?.status, 'completed')
+    assert.equal(parent.verification_status, 'passed')
+    assert.equal(completedRun?.status, 'completed')
+    assert.equal(completedRun.verification_status, 'passed')
+    assert.equal(completedRun.corp_id, demo.corp_id)
+    assert.equal(completedRun.task_id, parent.id)
+    assert.equal(providerRun.execution_mode, 'provider')
+    assert.ok(providerRun.artifact_id)
+    assert.match(providerRun.artifact_sha256, /^[0-9a-f]{64}$/u)
+    assert.ok(providerRun.artifact_signature)
+    assert.equal(completedRun.artifact_id, providerRun.artifact_id)
+    assert.equal(completedRun.artifact_sha256, providerRun.artifact_sha256)
+    assert.equal(completedRun.artifact_signature, providerRun.artifact_signature)
+    const handoff = handoffs.find((entry) => entry.task_id === parent.id)
+    // Receipt run_id is the signed artifact's original producer, not the verifier-only run.
+    assert.equal(handoff.run_id, providerRun.id)
+    assert.equal(handoff.verification_run_id, completedRunId)
+    assert.equal(handoff.artifact_id, providerRun.artifact_id)
+    assert.equal(handoff.sha256, providerRun.artifact_sha256)
+    assert.equal(handoff.artifact_role, 'provider_evidence')
+    const approvedEvent = firstLater.state.snapshot.events.find((event) =>
+      event.aggregate_id === completedRunId && event.type === 'verification.approved',
+    )
+    assert.ok(approvedEvent && approvedEvent.seq < dependencyEvent.seq)
+    assert.equal(approvedEvent.actor_id, demo.bob_actor_id)
+  }
+  const startedEvent = firstLater.state.snapshot.events.find((event) =>
+    event.aggregate_id === firstLater.value.id && event.type === 'run.started',
+  )
+  assert.ok(startedEvent && startedEvent.seq > dependencyEvent.seq)
   await decideFixtureRun(demo, firstLater.value.id, false, 'Recheck the later task without replacing the graph.')
   const recoveredLater = await authorizeFixtureRecovery(fixture, 'Authorize the same later-task checkpoint.')
   assert.equal(recoveredLater.context.task_id, later.id)
+  assert.equal(recoveredLater.context.source_run_id, firstLater.value.id)
   assert.notEqual(recoveredLater.result.recovery.id, recoveredUpstream.result.recovery.id)
   const laterReview = await waitForReviewRun(demo, later.id, recoveredLater.result.run_id)
   await decideFixtureRun(demo, laterReview.value.id, true, 'Accept the recovered final task.')
@@ -2108,14 +2158,59 @@ async function upstreamThenLaterTaskRecovery() {
   }, 'both task recoveries completed in the original graph')
   const runs = finished.state.snapshot.runs.filter((run) => fixture.tasks.some((task) => task.id === run.task_id))
   assert.equal(runs.length, 5)
-  assert.equal(finished.state.snapshot.tasks.filter((task) => task.mission_id === fixture.missionId).length, 3)
+  const finalTasks = finished.state.snapshot.tasks.filter((task) => task.mission_id === fixture.missionId)
+  assert.equal(finalTasks.length, 3)
+  assert.deepEqual(finalTasks.map((task) => task.id).sort(), fixture.tasks.map((task) => task.id).sort())
+  assert.ok(finalTasks.every((task) => task.status === 'completed' && task.verification_status === 'passed'))
+  assert.deepEqual(
+    [...finalTasks.find((task) => task.id === later.id).depends_on].sort(),
+    [upstream.id, peer.id].sort(),
+  )
+  assert.equal(finished.state.snapshot.missions.find((mission) => mission.id === fixture.missionId)?.status, 'completed')
+  for (const [providerRun, authorized] of [
+    [firstUpstream.value, recoveredUpstream],
+    [firstLater.value, recoveredLater],
+  ]) {
+    const recovery = finished.value.find((entry) => entry.id === authorized.result.recovery.id)
+    const recoveredRun = runs.find((run) => run.id === authorized.result.run_id)
+    const originalRun = runs.find((run) => run.id === providerRun.id)
+    assert.equal(providerRun.execution_mode, 'provider')
+    assert.ok(providerRun.artifact_id)
+    assert.ok(providerRun.artifact_signature)
+    assert.equal(recovery?.mode, 'verifier_only')
+    assert.equal(recovery.corp_id, demo.corp_id)
+    assert.equal(recovery.mission_id, fixture.missionId)
+    assert.equal(recovery.task_id, providerRun.task_id)
+    assert.equal(recovery.source_run_id, providerRun.id)
+    assert.equal(recovery.replacement_run_id, recoveredRun?.id)
+    assert.equal(originalRun?.status, 'failed')
+    assert.equal(originalRun.verification_status, 'failed')
+    assert.equal(recoveredRun?.status, 'completed')
+    assert.equal(recoveredRun.verification_status, 'passed')
+    assert.equal(recoveredRun.execution_mode, 'verification_only')
+    assert.equal(recoveredRun.provider_session_id, null)
+    assert.equal(recoveredRun.resumed_from_run_id, providerRun.id)
+    for (const field of [
+      'corp_id', 'task_id', 'agent_id', 'runner_id', 'workspace_run_id', 'workspace_branch',
+      'workspace_fingerprint', 'source_repository', 'source_base_ref', 'source_base_commit',
+      'artifact_id', 'artifact_sha256', 'artifact_signature',
+    ]) {
+      assert.equal(recoveredRun[field], providerRun[field], `Recovery changed ${field}`)
+    }
+    assert.equal(runs.filter((run) => run.task_id === providerRun.task_id).length, 2)
+  }
+  assert.equal(runs.find((run) => run.id === firstPeer.value.id)?.status, 'completed')
   return {
     factory_work_item_id: fixture.workItemId,
     mission_id: fixture.missionId,
     upstream_recovery_id: recoveredUpstream.result.recovery.id,
     later_recovery_id: recoveredLater.result.recovery.id,
     upstream_settled_before_mission: true,
+    synthesis_dependency_handoffs: handoffs,
+    synthesis_dependency_context_sha256: dependencyEvent.payload.context_sha256,
+    original_provider_artifacts_retained: true,
     later_recovery_admitted: true,
+    mission_status: 'completed',
     original_graph_task_count: 3,
     run_count: runs.length,
   }

@@ -4042,11 +4042,12 @@ async fn resolve_dependency_context(
     for dependency in dependencies {
         let bytes = state.artifacts.read_verified(&dependency.artifact).await?;
         let header = format!(
-            "\n--- {} / {} / task {} / run {} / artifact {} / sha256 {} ---\n",
+            "\n--- {} / {} / task {} / run {} / verification run {} / artifact {} / sha256 {} ---\n",
             dependency.plan_key,
             dependency.task_title,
             dependency.task_id,
             dependency.artifact.run_id,
+            dependency.verification_run_id,
             dependency.artifact.id,
             dependency.artifact.sha256,
         );
@@ -4124,6 +4125,7 @@ async fn resolve_dependency_context(
         }
         handoffs.push(json!({
             "task_id": dependency.task_id, "run_id": dependency.artifact.run_id,
+            "verification_run_id": dependency.verification_run_id,
             "artifact_id": dependency.artifact.id, "sha256": dependency.artifact.sha256,
             "artifact_role": dependency.artifact.artifact_role, "files": source_files,
         }));
