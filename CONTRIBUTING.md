@@ -68,9 +68,11 @@ with the recorded parent branch only after coordinating the landing order.
 A contributor clone contains the ECorp dark-factory implementation. OpenAI Symphony inspired parts
 of the operating model, but Symphony is not an ECorp dependency and does not need to be installed.
 Contributors supply their own provider identity and private runner workspace. A local server is
-appropriate for solo testing or a disjoint backlog. Factories consuming the same backlog must
-coordinate through one authoritative ECorp control plane and its claim database; sharing a GitHub
-Project alone does not provide atomic cross-machine claims.
+appropriate for solo testing or a disjoint backlog. Factories consuming the same backlog must use
+the **same authenticated server/control plane, the same Corp, and the same claim namespace**
+(the same canonical GitHub Project owner, Project number, and Project item identity).
+Database co-location, separate Corps on one server, or a shared GitHub Project alone do not unify
+claim authority.
 
 Prerequisites are Git, Windows PowerShell, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
 Compose, GitHub CLI authenticated for the repository and Project #3, and any provider entitlement
@@ -145,8 +147,9 @@ Personal factory hosts do not create personal backlogs. Every contributor must u
 
 Separate local servers can both observe an eligible issue before either changes its Project status.
 GitHub status and labels are not an atomic execution lock. Do not run unattended consumers of the
-same backlog against independent ECorp databases. Use a shared control plane with separate enrolled
-runners, or explicitly partition the eligible issue sets. Automatic enforcement and multi-host
+same backlog against independent ECorp databases. Use the same server/control plane, same Corp,
+and same claim namespace with separately enrolled runners, or explicitly partition the eligible
+issue sets. Merely placing databases on one host is not coordination. Automatic enforcement and multi-host
 acceptance remain tracked in [#161](https://github.com/shyamsridhar123/ecorp/issues/161); this guidance
 does not claim that the gap is fixed.
 

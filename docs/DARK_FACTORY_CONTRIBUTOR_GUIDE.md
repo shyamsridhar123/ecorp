@@ -76,9 +76,11 @@ The following boundaries are non-negotiable:
 - **Publication is not integration.** Creating or recovering a pull request does not authorize
   auto-merge, merge, deployment, or another irreversible effect.
 
-Contributors consuming one backlog need one authoritative ECorp claim database, accessed through
-the shared authenticated server with separate enrolled runners. Independent local databases do
-not share a claim lock merely because they read the same GitHub Project. Until the enforcement
+Contributors consuming one backlog must use the **same authenticated server/control plane, the
+same Corp, and the same claim namespace**: canonical GitHub Project owner, Project number, and
+Project item identity. Enroll separate runners into that shared Corp. Separate Corps on one server
+and co-located databases still have independent claim authority; reading the same GitHub Project
+does not give them a shared lock. Until the enforcement
 and multi-host acceptance in [#161](https://github.com/shyamsridhar123/ecorp/issues/161) are complete,
 use that shared authority or explicitly disjoint eligible issue sets; do not rely on a Project
 status change as an atomic cross-machine fence.

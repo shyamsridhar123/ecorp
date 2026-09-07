@@ -147,6 +147,26 @@
 .app-shell .operations-identity select { min-width: 0; width: 100%; max-width: 100%; min-height: 44px; }
 .operations-identity > small { color: #526058; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 
+.app-shell #missions .operations-approval-note {
+  display: block;
+  margin: 6px 0 0;
+  color: #526058;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.app-shell #missions .factory-recovery-details > summary {
+  min-height: 44px;
+  padding: 10px 0;
+  color: #4b3b25;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.app-shell #missions .factory-recovery-details > dl { margin: 8px 0 0; }
+
 /* The policy editor uses the same light, readable surface as run evidence. */
 #missions .verification-policy-editor {
   color: #202b36;
@@ -183,6 +203,10 @@
 #missions .field-warning { color: #86243a; background: #fff3f4; padding: 8px 12px; font-size: 13px; line-height: 1.5; }
 #missions .contract-error { color: #86243a; background: #fff3f4; padding: 10px 12px; font: inherit; line-height: 1.5; }
 #missions :is(.strategy-chip, .contract-version-chip) { color: #354650; background: #edf1ee; border: 1px solid #c8cec9; padding: 4px 7px; font-family: inherit; font-size: 12px; font-weight: 600; line-height: 1.4; }
+
+@media (max-width: 720px) {
+  .app-shell .operator-console .operations-identity { grid-column: 1 / -1; width: 100%; }
+}
 
 @media (max-width: 480px) {
   .app-shell #missions > .operations-mission-toolbar { padding: 12px; }

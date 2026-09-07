@@ -12,6 +12,8 @@
 // The current App supplies "<Bob's name> rejected the recorded verification evidence."
 // It has no editable review-reason field. We verify that real handler-generated note.
 // Verifier-editor changes stay in an UNSAVED draft; no mission form is submitted.
+// Pure, offline regression checks only: node tools/e2e_recovery_operations_browser.mjs --pure-test
+// This separate mode reads source and uses in-memory test records, never the persisted UI fixture.
 
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
@@ -138,6 +140,16 @@ async function readView(actorId) {
   assert.equal(evidence.length, 11, 'Require eleven persisted evidence records')
   assert.deepEqual(evidence.map((row) => row.check_index), Array.from({ length: 11 }, (_, i) => i))
   assert.ok(evidence.every((row) => row.task_id === task.id && row.status === 'passed'))
+  const runTotals = [
+    ...s.events.filter((event) => event.type === 'run.verification_started'
+      && event.aggregate_type === 'run' && event.aggregate_id === run.id)
+      .map((event) => event.payload.check_count),
+    ...s.factory_verification_recoveries.filter((recovery) =>
+      recovery.replacement_run_id === run.id && recovery.task_id === task.id)
+      .map((recovery) => recovery.replacement_verification_policy?.checks?.length),
+  ]
+  assert.ok(runTotals.length > 0 && runTotals.every((count) => count === 11),
+    'This 11/11 acceptance requires an exact run-bound count receipt; missing/conflicting history must remain unknown in the UI')
   return { mission, task, item, run, review: reviews[0], alice, bob, evidence, tasks, runs, agents: s.agents }
 }
 
@@ -302,7 +314,21 @@ async function identityHelp() {
   assert.ok(focus.height >= 44, 'Identity selector is below the touch-target floor')
   const copy = await appearance(help)
   assert.ok(copy.contrast >= 4.5, 'Identity help contrast is below 4.5:1')
-  return { focus, help: copy }
+  const row = await appearance(page.locator('.operations-identity'))
+  const consoleRow = await appearance(page.locator('.operator-console'))
+  if (page.viewportSize().width <= 720) {
+    const availableWidth = await page.locator('.operator-console').evaluate((el) => {
+      const style = getComputedStyle(el)
+      return el.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+    })
+    assert.ok(Math.abs(row.width - availableWidth) <= 2, 'Mobile identity/help must span the full operator row')
+    const columns = await page.locator('.operations-identity').evaluate((el) => {
+      const style = getComputedStyle(el)
+      return [style.gridColumnStart, style.gridColumnEnd]
+    })
+    assert.deepEqual(columns, ['1', '-1'], 'The wrapper, not just its nested label, must span both columns')
+  }
+  return { focus, help: copy, row, operator_console: consoleRow }
 }
 
 // Parse the copied PowerShell single-quote grammar; never execute the command.
@@ -364,6 +390,30 @@ function expectedCommand(view, mode) {
 async function copiedCommands(card, view) {
   const recovery = card.getByTestId('factory-verification-recovery')
   await recovery.waitFor({ state: 'visible' })
+  await until('loaded exact recovery context',
+    () => recovery.getAttribute('data-recovery-context-status'), (value) => value === 'ready')
+  const context = await until('observed App recovery-context GET',
+    () => report.recovery_contexts.findLast((row) => row.actor_id === fixture.alice_actor_id
+      && row.work_item_id === fixture.factory_work_item_id && row.version === view.item.version),
+    Boolean)
+  assert.equal(await recovery.getAttribute('data-recovery-run-id'), context.source_run_id,
+    'Recovery controls must use the source selected by the exact endpoint')
+  assert.equal(await recovery.getAttribute('data-recovery-task-id'), context.task_id)
+  assert.equal(await recovery.getAttribute('data-recovery-item-version'), String(context.version))
+  assert.equal(context.source_run_id, fixture.run_id, 'This acceptance fixture must remain the selected source')
+  assert.equal(await recovery.getAttribute('data-recovery-state'), context.has_checkpoint ? 'ready' : 'checkpoint_required')
+  assert.match(normalizedText(await recovery.innerText()), /Copying is not granting and executes nothing/)
+  assert.equal(await card.getByRole('button', { name: 'Resume agent session', exact: true }).count(), 0,
+    'Factory verification failure must use governed recovery, not generic ancestor resume')
+  const metadata = recovery.locator('.factory-recovery-details')
+  assert.equal(await metadata.evaluate((element) => element.open), false, 'Technical recovery details must default closed')
+  await metadata.locator('summary').focus()
+  await page.keyboard.press('Enter')
+  assert.equal(await metadata.evaluate((element) => element.open), true)
+  assert.equal(await metadata.locator(`[title="${context.source_run_id}"]`).isVisible(), true)
+  await metadata.locator('summary').focus()
+  await page.keyboard.press('Space')
+  assert.equal(await metadata.evaluate((element) => element.open), false)
   const results = []
   for (const [mode, label, feedback] of [
     ['verifier-only', 'Copy verifier-only command', 'Verifier command copied'],
@@ -378,7 +428,7 @@ async function copiedCommands(card, view) {
     // Reads the real clipboard only after the App reports a successful UI copy.
     const command = await page.evaluate(() => navigator.clipboard.readText())
     assert.deepEqual(commandWords(command), expectedCommand(view, mode), 'Incomplete or incorrectly scoped recovery CLI')
-    results.push({ mode, command, sha256: digest(command), executed: false, reason_is_operator_template: true })
+    results.push({ mode, command, sha256: digest(command), executed: false, reason_is_operator_template: true, recovery_details_keyboard_operable: true })
   }
   return results
 }
@@ -389,6 +439,21 @@ async function verifierTabs(name, width) {
   const newMission = missions.getByRole('button', { name: 'New mission', exact: true })
   if (await newMission.isVisible()) await newMission.click()
   const stages = missions.locator('.mission-stage-nav')
+  await stages.getByRole('button', { name: 'Run setup', exact: true }).click()
+  const strategy = missions.getByLabel('Execution strategy', { exact: true })
+  const originalStrategy = await strategy.inputValue()
+  const approvalExpectations = []
+  for (const [value, expected] of [
+    ['single', /Solo run can still need decisions for risky actions/],
+    ['parallel-specialists', /Two specialists and synthesis can request different scoped actions/],
+  ]) {
+    await strategy.selectOption(value)
+    const text = normalizedText(await missions.locator('#mission-strategy-policy').innerText())
+    assert.match(text, expected)
+    assert.match(text, /not duplicate grants for the same action/)
+    approvalExpectations.push({ strategy: value, text })
+  }
+  await strategy.selectOption(originalStrategy)
   await stages.getByRole('button', { name: 'Verification', exact: true }).click()
   const custom = missions.getByRole('checkbox', { name: /Custom verification/ })
   assert.equal(await custom.isEnabled(), true, 'Use the normal composer, not a deterministic cartridge')
@@ -419,7 +484,7 @@ async function verifierTabs(name, width) {
   }
   const layout = await noOverflow(width)
   const image = await screenshot(`${name}-verifier-tabs-unsaved`)
-  return { measurements, layout, screenshot: image, submitted: false }
+  return { measurements, approval_expectations: approvalExpectations, layout, screenshot: image, submitted: false }
 }
 
 async function viewportCase(name, width, height) {
@@ -441,6 +506,8 @@ async function viewportCase(name, width, height) {
   const review = card.getByTestId('review-decision')
   await review.waitFor({ state: 'visible' })
   const automated = card.getByTestId('verification-evidence')
+  assert.equal(await automated.getAttribute('data-check-total'), '11',
+    'The visible denominator must come from the exact run-bound receipt validated in preflight')
   assert.equal(await automated.evaluate((el) => el.open), false, 'Automated evidence must default closed after rejection')
   assert.match(await automated.locator('summary').innerText(), /Automated verification/)
   assert.equal(normalizedText(await automated.locator('.operations-verification-score').innerText()), '11/11 passed')
@@ -534,6 +601,7 @@ async function main() {
     emulated_reduced_motion: 'reduce',
     bootstrap_forwarded: 0, bootstrap_validated: 0, rejection_forwarded: 0,
     cases: [], screenshots: [], errors: [], warnings: [], blocked_requests: [],
+    recovery_contexts: [], recovery_context_aborts: [],
   }
   try {
     const health = await getJson('/health')
@@ -619,6 +687,12 @@ async function main() {
       if (message.type() === 'warning' && report.warnings.length < 30) report.warnings.push(safeError(message.text()))
     })
     page.on('requestfailed', (request) => {
+      const contextPath = `/api/corps/${fixture.corp_id}/factory/work-items/${fixture.factory_work_item_id}/verification-recoveries`
+      if (request.method() === 'GET' && new URL(request.url()).pathname === contextPath
+        && request.failure()?.errorText === 'net::ERR_ABORTED') {
+        report.recovery_context_aborts.push({ url: safeUrl(request.url()), reason: 'Scope change/navigation cancelled this read-only lookup' })
+        return
+      }
       if (!closing) report.errors.push(`request: ${safeUrl(request.url())}: ${safeError(request.failure()?.errorText)}`)
     })
     page.on('response', (response) => {
@@ -629,6 +703,32 @@ async function main() {
           for (const key of ['corp_id', 'alice_actor_id', 'bob_actor_id']) assert.equal(body[key], fixture[key], `App bootstrap ${key} differs from pre-seeded fixture`)
           report.bootstrap_validated++
         })().catch((error) => report.errors.push(`bootstrap identity: ${safeError(error)}`))
+        responseTasks.add(task)
+        void task.finally(() => responseTasks.delete(task))
+      }
+      const responseUrl = new URL(response.url())
+      if (response.request().method() === 'GET' && responseUrl.origin === server &&
+        responseUrl.pathname === `/api/corps/${fixture.corp_id}/factory/work-items/${fixture.factory_work_item_id}/verification-recoveries`) {
+        const task = (async () => {
+          if (!response.ok()) return // Already recorded as an HTTP error above.
+          const body = await response.json()
+          const actorId = responseUrl.searchParams.get('actor_id')
+          assert.ok([fixture.alice_actor_id, fixture.bob_actor_id].includes(actorId))
+          assert.equal(body.work_item.id, fixture.factory_work_item_id)
+          assert.equal(body.work_item.corp_id, fixture.corp_id)
+          assert.equal(body.mission_id, fixture.mission_id)
+          assert.equal(typeof body.task_id, 'string')
+          assert.equal(typeof body.source_run_id, 'string')
+          // Only source IDs/version and checkpoint presence enter evidence; no private policy or credentials.
+          report.recovery_contexts.push({
+            actor_id: actorId, work_item_id: body.work_item.id, version: body.work_item.version,
+            task_id: body.task_id, source_run_id: body.source_run_id, has_checkpoint: Boolean(body.workspace_fingerprint),
+          })
+        })().catch((error) => {
+          if (!closing && response.request().failure()?.errorText !== 'net::ERR_ABORTED') {
+            report.errors.push(`recovery context: ${safeError(error)}`)
+          }
+        })
         responseTasks.add(task)
         void task.finally(() => responseTasks.delete(task))
       }
@@ -691,7 +791,343 @@ async function main() {
   }
 }
 
-await main().catch((error) => {
-  console.error(safeError(error))
-  process.exitCode = 1
-})
+async function pureTests() {
+  const { test } = await import('node:test')
+  const { runInNewContext } = await import('node:vm')
+  const appPath = new URL('../apps/web/src/App.tsx', import.meta.url)
+  const appSource = await readFile(appPath, 'utf8')
+  const css = await readFile(new URL('../apps/web/src/OperationsUx.css', import.meta.url), 'utf8')
+  const require = createRequire(new URL('../apps/web/package.json', import.meta.url))
+  const ts = require('typescript')
+  const parsed = ts.createSourceFile('App.tsx', appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const names = [
+    'automatedVerificationPresentation', 'factoryRecoveryScopeKey', 'currentFactoryRecoveryLoad',
+    'requestFactoryRecoveryContext', 'factoryRecoveryPresentation',
+  ]
+  const declarations = names.map((name) => {
+    const declaration = parsed.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name)
+    assert.ok(declaration, `Missing actual App helper: ${name}`)
+    return declaration.getText(parsed)
+  })
+  // Compile the actual helpers in memory, never mount App or initialize Playwright.
+  // Async tests supply local deferred API/timer stubs; no fetch/service/fixture access.
+  const compiled = ts.transpileModule(declarations.join('\n'), {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+    },
+    reportDiagnostics: true,
+  })
+  assert.deepEqual(compiled.diagnostics?.filter((item) => item.category === ts.DiagnosticCategory.Error)
+    .map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')), [])
+  let apiHandler = () => Promise.reject(new Error('No network is allowed in pure tests'))
+  let timerId = 0
+  const timers = new Map()
+  const helpers = runInNewContext(`${compiled.outputText}\n({${names.join(',')}})`, {
+    api: (url, init) => apiHandler(url, init),
+    AbortController, Error,
+    setTimeout: (callback) => { const id = ++timerId; timers.set(id, callback); return id },
+    clearTimeout: (id) => timers.delete(id),
+  }, { timeout: 1000 })
+  const automated = (...args) => JSON.parse(JSON.stringify(helpers.automatedVerificationPresentation(...args)))
+  const recovery = (...args) => JSON.parse(JSON.stringify(helpers.factoryRecoveryPresentation(...args)))
+  const policy = (count) => ({ checks: Array.from({ length: count }, () => ({ type: 'file', path: 'proof.txt', min_bytes: 1 })), manual_gate: null })
+  const run = {
+    id: 'run-current', task_id: 'task-a', workspace_run_id: 'workspace-a',
+    status: 'failed', verification_status: 'failed', breaker_stage: null,
+    workspace_disposition: 'preserved', workspace_fingerprint: 'a'.repeat(64),
+  }
+  const rows = (count, status = 'passed') => Array.from({ length: count }, (_, index) => ({
+    id: `evidence-${index}`, run_id: run.id, task_id: run.task_id, check_index: index, status,
+  }))
+  const event = (count, runId = run.id) => ({
+    type: 'run.verification_started', aggregate_type: 'run', aggregate_id: runId, payload: { check_count: count },
+  })
+  const mission = { id: 'mission-a', status: 'failed' }
+  const task = { id: run.task_id, mission_id: mission.id, status: 'verification_failed', max_attempts: 4, attempt_count: 1, verification_policy: policy(12) }
+  const item = { id: 'factory-a', corp_id: 'corp-a', version: 7, mission_id: mission.id, state: 'verification_failed' }
+  const history = {
+    id: 'recovery-a', factory_work_item_id: item.id, mission_id: mission.id, task_id: task.id,
+    source_run_id: 'run-ancestor', replacement_run_id: run.id, status: 'failed',
+    previous_verification_policy: policy(9), replacement_verification_policy: policy(11),
+  }
+  const context = {
+    work_item: item, recoveries: [], mission_id: mission.id, task_id: task.id,
+    source_run_id: run.id, remaining_attempts: 3, remaining_mission_tokens: 500,
+    remaining_mission_cost_microusd: 1000, workspace_fingerprint: 'b'.repeat(64),
+    expected_head_commit: null,
+  }
+  const scope = { corpId: item.corp_id, actorId: 'alice', missionId: mission.id, itemId: item.id, version: item.version, reload: 0 }
+  const clone = (value) => JSON.parse(JSON.stringify(value))
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const deferred = () => {
+    let resolve, reject
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+    return { promise, resolve, reject }
+  }
+  const start = (selectedScope, loads) => helpers.requestFactoryRecoveryContext(selectedScope,
+    (load) => loads.push(clone(load)))
+
+  await test('historical 11/11 remains independent of a revised 12-check task and rejected review', () => {
+    const result = automated(run, rows(11), [event(11)], [])
+    assert.equal(task.verification_policy.checks.length, 12)
+    assert.deepEqual([result.total, result.passed, result.status, result.score], [11, 11, 'passed', '11/11 passed'])
+    assert.doesNotMatch(declarations[0], /taskById|task\.verification_policy|previous_verification_policy/)
+    assert.match(appSource, /automatedVerificationPresentation\(latestRun, evidence, events, factoryRecoveries\)/)
+  })
+  await test('exact replacement-run policy supplies a total after its journal receipt is absent', () => {
+    const result = automated(run, rows(11), [], [history])
+    assert.equal(result.total, 11)
+    assert.equal(result.status, 'passed')
+  })
+  await test('source-run or later revision policy is not replacement-run authority', () => {
+    const unrelated = { ...history, source_run_id: run.id, replacement_run_id: 'later-run', replacement_verification_policy: policy(12) }
+    const result = automated(run, rows(11), [], [unrelated])
+    assert.equal(result.total, null)
+    assert.equal(result.status, 'pending')
+  })
+  await test('eleven passing records alone never establish a verified total', () => {
+    const result = automated(run, rows(11), [], [])
+    assert.equal(result.total, null)
+    assert.equal(result.status, 'pending')
+    assert.equal(result.score, '11 passed · total unknown')
+  })
+  await test('partial and absent evidence keep the exact total without claiming completeness', () => {
+    for (const count of [0, 3]) {
+      const result = automated(run, rows(count), [event(11)], [])
+      assert.deepEqual([result.total, result.passed, result.missing, result.status], [11, count, 11 - count, 'pending'])
+    }
+  })
+  await test('failed automated checks stay failed independently of the run-level decision', () => {
+    const evidence = rows(11)
+    evidence[10].status = 'failed'
+    const result = automated(run, evidence, [event(11)], [])
+    assert.deepEqual([result.passed, result.failed, result.status], [10, 1, 'failed'])
+  })
+  await test('conflicting or malformed exact receipts fail closed to unknown', () => {
+    for (const extra of [event(12), event('11'), event(0)]) {
+      const result = automated(run, rows(11), [event(11), extra], [])
+      assert.equal(result.total, null)
+      assert.equal(result.status, 'pending')
+    }
+    assert.equal(automated(run, rows(11), [event(11)], [{ ...history, replacement_verification_policy: policy(12) }]).total, null)
+  })
+  await test('other run/task receipts and evidence cannot substitute a denominator or result', () => {
+    const result = automated(run, [...rows(3), { ...rows(1)[0], task_id: 'other-task' }],
+      [event(11), event(12, 'other-run')], [{ ...history, task_id: 'other-task', replacement_verification_policy: policy(12) }])
+    assert.deepEqual([result.total, result.records.length, result.missing], [11, 3, 8])
+  })
+  await test('duplicate, unknown-status or out-of-range records never produce a passing aggregate', () => {
+    for (const evidence of [
+      [...rows(10), rows(1)[0]],
+      [...rows(10), { ...rows(1)[0], check_index: 11 }],
+      [...rows(10), { ...rows(11)[10], status: 'unknown' }],
+    ]) {
+      const result = automated(run, evidence, [event(11)], [])
+      assert.equal(result.status, 'pending')
+      assert.match(result.score, /completeness unknown/)
+    }
+  })
+  await test('exact context selects source and checkpoint instead of the newest snapshot candidate', () => {
+    const newest = { ...run, id: 'newer-pre-start-failure', workspace_fingerprint: 'c'.repeat(64) }
+    const result = recovery(context, [newest, run])
+    assert.equal(result.run.id, context.source_run_id)
+    assert.equal(result.checkpoint, context.workspace_fingerprint)
+    assert.notEqual(result.checkpoint, run.workspace_fingerprint)
+    assert.match(result.detail, /controller rechecks authorization before running/)
+  })
+  await test('legacy missing fingerprint retains the native owning-runner checkpoint path', () => {
+    const result = recovery({ ...context, workspace_fingerprint: null }, [run])
+    assert.equal(result.state, 'checkpoint_required')
+    assert.equal(result.checkpoint, null)
+    assert.match(result.detail, /controller can ask the owning runner to seal/)
+    assert.equal('canRequest' in result, false)
+  })
+  await test('server-selected lost or cancelled sources are not rejected by frontend status rules', () => {
+    for (const status of ['lost', 'cancelled']) {
+      const result = recovery(context, [{ ...run, status }])
+      assert.equal(result.run.status, status)
+      assert.equal(result.state, 'ready')
+      assert.equal(result.checkpoint, context.workspace_fingerprint)
+    }
+  })
+  await test('remaining attempts, budgets and breaker state are not a second frontend eligibility engine', () => {
+    const result = recovery({ ...context, remaining_attempts: 0, remaining_mission_tokens: 0, remaining_mission_cost_microusd: 0 },
+      [{ ...run, breaker_stage: 'stop' }])
+    assert.equal(result.state, 'ready')
+    assert.equal('canRequest' in result, false)
+    assert.doesNotMatch(declarations.find((text) => text.startsWith('function factoryRecoveryPresentation')),
+      /max_attempts|attempt_count|remaining_mission|breaker_stage|failedTasks/)
+  })
+  await test('known quarantine warns and hides hashes without manufacturing an authorization decision', () => {
+    const quarantined = { ...run, id: 'quarantined-descendant', workspace_disposition: 'quarantined' }
+    for (const runs of [[run, quarantined], [quarantined]]) {
+      const result = recovery(context, runs)
+      assert.equal(result.state, 'quarantined')
+      assert.equal(result.checkpoint, null)
+      assert.equal('canRequest' in result, false)
+    }
+  })
+  await test('exact context stays usable when its source row is outside the bounded snapshot', () => {
+    const result = recovery(context, [])
+    assert.equal(result.run, undefined)
+    assert.equal(result.state, 'ready')
+    assert.equal(result.checkpoint, context.workspace_fingerprint)
+    assert.ok(appSource.includes('The exact endpoint returns task/source IDs, not the task contract or adapter.'))
+  })
+  await test('active recovery uses exact context history, with no snapshot-count fence or duplicate grant', () => {
+    const result = recovery({ ...context, recoveries: [{ ...history, status: 'running' }] }, [run])
+    assert.equal(result.state, 'active')
+    assert.equal(result.checkpoint, null)
+    assert.match(result.detail, /do not create a duplicate grant/)
+  })
+  await test('context loader uses only the exact actor-scoped GET through the existing API helper', async () => {
+    const loads = [], calls = []
+    apiHandler = (url, init) => { calls.push({ url, init }); return Promise.resolve(context) }
+    const cleanup = start(scope, loads)
+    assert.equal(loads[0].status, 'loading')
+    assert.equal(loads[0].data, null)
+    await flush()
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].url, `/api/corps/${scope.corpId}/factory/work-items/${scope.itemId}/verification-recoveries?actor_id=${scope.actorId}`)
+    assert.equal(calls[0].init.method, 'GET')
+    assert.ok(calls[0].init.signal instanceof AbortSignal)
+    assert.equal(loads.at(-1).data.source_run_id, context.source_run_id)
+    assert.equal(loads.at(-1).status, 'ready')
+    cleanup()
+    assert.equal(timers.size, 0)
+  })
+  await test('render-time scope fencing hides prior actor, item, version, mission and reload data/errors', () => {
+    for (const change of [
+      { actorId: 'bob' }, { itemId: 'other-item' }, { version: 8 },
+      { corpId: 'other-corp' }, { missionId: 'other-mission' }, { reload: 1 },
+    ]) {
+      for (const status of ['ready', 'error', 'loading']) {
+        const old = { scopeKey: helpers.factoryRecoveryScopeKey(scope), status, data: context, error: 'old error' }
+        assert.equal(helpers.currentFactoryRecoveryLoad({ ...scope, ...change }, old), null)
+      }
+    }
+    assert.equal(helpers.currentFactoryRecoveryLoad(null, { scopeKey: helpers.factoryRecoveryScopeKey(scope), data: context }), null)
+  })
+  await test('actor switch aborts and ignores an old success even when transport completes late', async () => {
+    const old = deferred(), next = deferred(), loads = [], signals = []
+    apiHandler = (url, init) => { signals.push(init.signal); return url.endsWith('alice') ? old.promise : next.promise }
+    const stopOld = start(scope, loads)
+    stopOld()
+    const bobScope = { ...scope, actorId: 'bob' }
+    const stopNext = start(bobScope, loads)
+    next.resolve(context)
+    await flush()
+    const length = loads.length
+    old.resolve({ ...context, workspace_fingerprint: 'stale-fingerprint' })
+    await flush()
+    assert.equal(signals[0].aborted, true)
+    assert.equal(loads.length, length)
+    assert.equal(loads.at(-1).scopeKey, helpers.factoryRecoveryScopeKey(bobScope))
+    assert.equal(loads.at(-1).data.workspace_fingerprint, context.workspace_fingerprint)
+    stopNext()
+    assert.equal(timers.size, 0)
+  })
+  await test('cancelled lookup cannot publish a late error after version/item change or unmount', async () => {
+    const pending = deferred(), loads = []
+    apiHandler = () => pending.promise
+    const cleanup = start(scope, loads)
+    cleanup()
+    pending.reject(new Error('late obsolete failure'))
+    await flush()
+    assert.deepEqual(loads.map((load) => load.status), ['loading'])
+    assert.equal(timers.size, 0)
+  })
+  await test('server errors remain explicit and never fall back to an ancestor snapshot', async () => {
+    const loads = []
+    apiHandler = () => Promise.reject(new Error('No authoritative source context'))
+    const cleanup = start(scope, loads)
+    await flush()
+    assert.equal(loads.at(-1).status, 'error')
+    assert.equal(loads.at(-1).data, null)
+    assert.match(loads.at(-1).error, /No authoritative source context/)
+    cleanup()
+  })
+  await test('mismatched context scope or version is rejected before displaying a source hash', async () => {
+    for (const body of [
+      { ...context, work_item: { ...item, version: 8 } },
+      { ...context, work_item: { ...item, id: 'other-item' } },
+      { ...context, work_item: { ...item, corp_id: 'other-corp' } },
+      { ...context, mission_id: 'other-mission' },
+    ]) {
+      const loads = []
+      apiHandler = () => Promise.resolve(body)
+      const cleanup = start(scope, loads)
+      await flush()
+      assert.equal(loads.at(-1).status, 'error')
+      assert.equal(loads.at(-1).data, null)
+      cleanup()
+    }
+  })
+  await test('missing response fields are reported as a gap, not inferred from snapshot data', async () => {
+    const loads = []
+    apiHandler = () => Promise.resolve({ ...context, workspace_fingerprint: undefined })
+    const cleanup = start(scope, loads)
+    await flush()
+    assert.equal(loads.at(-1).status, 'error')
+    assert.match(loads.at(-1).error, /missing required source, checkpoint/)
+    cleanup()
+  })
+  await test('bounded lookup timeout reports an error and ignores a late response', async () => {
+    const pending = deferred(), loads = []
+    let signal
+    apiHandler = (_url, init) => { signal = init.signal; return pending.promise }
+    const cleanup = start(scope, loads)
+    assert.equal(timers.size, 1)
+    ;[...timers.values()][0]()
+    assert.equal(signal.aborted, true)
+    assert.equal(loads.at(-1).status, 'error')
+    assert.match(loads.at(-1).error, /timed out/)
+    const count = loads.length
+    pending.resolve(context)
+    await flush()
+    assert.equal(loads.length, count)
+    cleanup()
+    assert.equal(timers.size, 0)
+  })
+  await test('actual markup uses context IDs/counters and gates copy on fresh metadata, not eligibility', () => {
+    assert.equal(recovery(null, [run]), null)
+    assert.match(appSource, /recoveryItemState === 'verification_failed'/)
+    assert.match(appSource, /currentFactoryRecoveryLoad\(recoveryScope, recoveryContextLoad\)/)
+    assert.match(appSource, /requestFactoryRecoveryContext\(recoveryScope, setRecoveryContextLoad\)/)
+    assert.match(appSource, /recoveryCommandAvailable && canAuthorizeRecovery/)
+    assert.match(appSource, /data-recovery-run-id=\{recoveryContext\?\.source_run_id\}/)
+    assert.match(appSource, /recoveryContext\.remaining_attempts/)
+    assert.match(appSource, /recoveryCopyKey\('verifier-only'\)/)
+    assert.doesNotMatch(appSource, /recovery\??\.canRequest/)
+    assert.match(appSource, /resumableRun && activeRuns === 0 && factoryItem\?\.state !== 'verification_failed'/)
+  })
+  await test('mobile identity wrapper spans the same 720px breakpoint as the operator grid', () => {
+    assert.match(css, /@media \(max-width: 720px\)\s*\{\s*\.app-shell \.operator-console \.operations-identity\s*\{[^}]*grid-column: 1 \/ -1;[^}]*width: 100%/s)
+  })
+  await test('approval copy keeps exact scope, Solo/parallel expectations and three-worker studio semantics', () => {
+    for (const copy of [
+      'only the exact action and scope shown', 'does not need a duplicate grant',
+      'Solo run can still need decisions for risky actions',
+      'Two specialists and synthesis can request different scoped actions',
+      'does not create a fourth concurrent worker or a grant per artifact',
+      'ECorp provisions 3 distinct mission workers on GitHub Copilot.',
+    ]) assert.ok(appSource.includes(copy), `Missing scoped approval/studio copy: ${copy}`)
+  })
+  await test('same-backlog guidance requires same server, Corp and claim namespace', async () => {
+    for (const file of ['../CONTRIBUTING.md', '../docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md']) {
+      const text = normalizedText((await readFile(new URL(file, import.meta.url), 'utf8')).replaceAll('**', ''))
+      assert.match(text, /same authenticated server\/control plane, the same Corp, and the same claim namespace/)
+    }
+  })
+}
+
+if (process.argv.includes('--pure-test')) {
+  assert.deepEqual(process.argv.slice(2), ['--pure-test'], 'Pure tests accept no runtime arguments')
+  await pureTests()
+} else {
+  await main().catch((error) => {
+    console.error(safeError(error))
+    process.exitCode = 1
+  })
+}

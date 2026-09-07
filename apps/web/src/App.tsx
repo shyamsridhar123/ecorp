@@ -389,6 +389,7 @@ type MissionBudgetRevisionInput = {
 
 type FactoryWorkItem = {
   id: string
+  corp_id: string
   source_project_owner: string
   source_project_number: number
   source_project_item_id: string
@@ -453,8 +454,39 @@ type FactoryVerificationRecovery = {
   reason: string
   observed_source_revision: string
   contract_revision_id: string | null
+  previous_verification_policy: VerificationPolicy
+  replacement_verification_policy: VerificationPolicy
   created_at: string
   updated_at: string
+}
+
+type FactoryVerificationRecoveryContextResponse = {
+  work_item: FactoryWorkItem
+  recoveries: FactoryVerificationRecovery[]
+  mission_id: string
+  task_id: string
+  source_run_id: string
+  remaining_attempts: number
+  remaining_mission_tokens: number
+  remaining_mission_cost_microusd: number
+  workspace_fingerprint: string | null
+  expected_head_commit: string | null
+}
+
+type FactoryRecoveryContextScope = {
+  corpId: string
+  actorId: string
+  missionId: string
+  itemId: string
+  version: number
+  reload: number
+}
+
+type FactoryRecoveryContextLoad = {
+  scopeKey: string
+  status: 'loading' | 'ready' | 'error'
+  data: FactoryVerificationRecoveryContextResponse | null
+  error: string | null
 }
 
 type DomainEvent = {
@@ -3046,6 +3078,159 @@ function BudgetRevisionPanel({
   )
 }
 
+// Only exact run-bound receipts establish a total. Task policies can be revised
+// without starting a run, and the absence of older history in a snapshot proves nothing.
+function automatedVerificationPresentation(
+  run: Run | undefined,
+  evidence: VerificationEvidence[],
+  events: DomainEvent[],
+  recoveries: FactoryVerificationRecovery[],
+) {
+  const records = run
+    ? evidence.filter((item) => item.run_id === run.id && item.task_id === run.task_id)
+        .toSorted((left, right) => left.check_index - right.check_index)
+    : []
+  const receipts = run ? [
+    ...events.filter((event) =>
+      event.type === 'run.verification_started' &&
+      event.aggregate_type === 'run' && event.aggregate_id === run.id,
+    ).map((event) => event.payload.check_count),
+    ...recoveries.filter((recovery) =>
+      recovery.replacement_run_id === run.id && recovery.task_id === run.task_id,
+    ).map((recovery) => recovery.replacement_verification_policy?.checks?.length),
+  ] : []
+  const validReceipts = receipts.filter(
+    (count): count is number => typeof count === 'number' && Number.isSafeInteger(count) && count > 0,
+  )
+  const totals = new Set(validReceipts)
+  const conflicting = receipts.length !== validReceipts.length || totals.size > 1
+  const total = !conflicting && totals.size === 1 ? [...totals][0] : null
+  const inconsistent = new Set(records.map((item) => item.check_index)).size !== records.length ||
+    records.some((item) => !Number.isInteger(item.check_index) || item.check_index < 0 ||
+      !['passed', 'failed'].includes(item.status) ||
+      (total !== null && item.check_index >= total))
+  const passed = records.filter((item) => item.status === 'passed').length
+  const failed = records.filter((item) => item.status === 'failed').length
+  const missing = total !== null && !inconsistent ? total - records.length : null
+  const complete = missing === 0 && failed === 0
+  const status = failed > 0 ? 'failed' : complete ? 'passed' : 'pending'
+  const summary = inconsistent
+    ? 'Check records are inconsistent; inspect the recorded evidence.'
+    : conflicting
+      ? 'Run-bound check count is inconsistent; completeness is unknown.'
+      : total === null
+        ? 'Run-bound check total unavailable; recorded results only.'
+        : records.length === 0
+          ? 'No check results recorded'
+          : failed > 0
+            ? `${failed} check${failed === 1 ? '' : 's'} failed`
+            : complete ? 'All recorded checks passed' : 'Recorded checks passed; evidence is incomplete.'
+  const score = inconsistent
+    ? `${passed} passing records · completeness unknown`
+    : total === null ? `${passed} passed · total unknown` : `${passed}/${total} passed`
+  return { records, total, passed, failed, missing, status, summary, score }
+}
+
+function factoryRecoveryScopeKey(scope: FactoryRecoveryContextScope): string {
+  return JSON.stringify([
+    scope.corpId, scope.actorId, scope.missionId, scope.itemId, scope.version, scope.reload,
+  ])
+}
+
+function currentFactoryRecoveryLoad(
+  scope: FactoryRecoveryContextScope | null,
+  load: FactoryRecoveryContextLoad | null,
+) {
+  return scope && load?.scopeKey === factoryRecoveryScopeKey(scope) ? load : null
+}
+
+// Exact, authenticated, read-only context. A cleanup fences even a transport that
+// finishes after abort; the render-time scope check also hides old data immediately.
+function requestFactoryRecoveryContext(
+  scope: FactoryRecoveryContextScope,
+  publish: (load: FactoryRecoveryContextLoad) => void,
+) {
+  const controller = new AbortController()
+  const scopeKey = factoryRecoveryScopeKey(scope)
+  let current = true
+  publish({ scopeKey, status: 'loading', data: null, error: null })
+  const timeout = setTimeout(() => {
+    if (current && !controller.signal.aborted) {
+      publish({ scopeKey, status: 'error', data: null, error: 'Recovery context request timed out. Retry the read-only lookup.' })
+      controller.abort()
+    }
+  }, 15_000)
+  void api<FactoryVerificationRecoveryContextResponse>(
+    `/api/corps/${encodeURIComponent(scope.corpId)}/factory/work-items/${encodeURIComponent(scope.itemId)}/verification-recoveries?actor_id=${encodeURIComponent(scope.actorId)}`,
+    { method: 'GET', signal: controller.signal },
+  ).then((data) => {
+    if (!current || controller.signal.aborted) return
+    if (data.work_item?.id !== scope.itemId || data.work_item.corp_id !== scope.corpId ||
+      data.work_item.version !== scope.version || data.work_item.mission_id !== scope.missionId ||
+      data.mission_id !== scope.missionId) {
+      throw new Error('Recovery context does not match the current item/version. Wait for refreshed state or retry the lookup.')
+    }
+    if (typeof data.task_id !== 'string' || !data.task_id ||
+      typeof data.source_run_id !== 'string' || !data.source_run_id ||
+      !Array.isArray(data.recoveries) ||
+      !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+      ![data.remaining_attempts, data.remaining_mission_tokens, data.remaining_mission_cost_microusd].every(Number.isFinite)) {
+      throw new Error('Recovery context is missing required source, checkpoint or remaining-budget fields. No snapshot fallback is used.')
+    }
+    publish({ scopeKey, status: 'ready', data, error: null })
+  }).catch((error: unknown) => {
+    if (!current || controller.signal.aborted) return
+    publish({
+      scopeKey, status: 'error', data: null,
+      error: error instanceof Error ? error.message : 'Recovery context could not be loaded.',
+    })
+  }).finally(() => clearTimeout(timeout))
+  return () => {
+    current = false
+    clearTimeout(timeout)
+    controller.abort()
+  }
+}
+
+// Presentation only: selection, attempts and budgets belong to the exact endpoint.
+// Snapshot records add warnings/status labels, never eligibility or fallback sources.
+function factoryRecoveryPresentation(
+  context: FactoryVerificationRecoveryContextResponse | null,
+  runs: Run[],
+) {
+  if (!context) return null
+  const run = runs.find((candidate) =>
+    candidate.id === context.source_run_id && candidate.task_id === context.task_id,
+  )
+  const quarantined = runs.some((candidate) =>
+    candidate.workspace_disposition === 'quarantined' &&
+    (!run || candidate.workspace_run_id === run.workspace_run_id),
+  )
+  const active = context.recoveries.find((recovery) =>
+    recovery.status === 'authorized' || recovery.status === 'running',
+  )
+  const state = quarantined ? 'quarantined' : active ? 'active'
+    : context.workspace_fingerprint ? 'ready' : 'checkpoint_required'
+  return {
+    run,
+    state,
+    heading: quarantined ? 'Quarantine warning — inspect controller context'
+      : active ? 'Recovery already authorized'
+        : context.workspace_fingerprint ? 'Recover preserved work' : 'Checkpoint and recheck',
+    detail: quarantined
+      ? run
+        ? 'A visible record in the selected source lineage is quarantined. Its checkpoint hash is withheld. Inspect the native controller before executing a copied request; this lookup does not authorize recovery.'
+        : 'A visible mission workspace is quarantined, but this endpoint does not include source-workspace lineage details. The checkpoint hash is withheld until the native controller can resolve that warning.'
+      : active
+        ? 'An existing recovery is authorized or running. Inspect that operation through the controller; do not create a duplicate grant. Copied templates are not a new authorization.'
+        : context.workspace_fingerprint
+          ? 'Recheck saved work without a model call, or request a focused correction in the same session. The controller rechecks authorization before running.'
+          : 'The controller can ask the owning runner to seal this older workspace before rechecking it. The original work stays in place; copying a command executes nothing.',
+    checkpoint: quarantined || active ? null : context.workspace_fingerprint,
+    recoveryCount: context.recoveries.length,
+  }
+}
+
 function MissionCard({
   corpId,
   mission,
@@ -3061,6 +3246,7 @@ function MissionCard({
   actionApprovals,
   factoryItem,
   factoryRecoveries,
+  events,
   actorId,
   actorRole,
   busy,
@@ -3088,6 +3274,7 @@ function MissionCard({
   actionApprovals: ActionApproval[]
   factoryItem: FactoryWorkItem | undefined
   factoryRecoveries: FactoryVerificationRecovery[]
+  events: DomainEvent[]
   actorId: string
   actorRole: string
   busy: boolean
@@ -3113,7 +3300,23 @@ function MissionCard({
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
-  const [copiedRecoveryMode, setCopiedRecoveryMode] = useState<string | null>(null)
+  const [copiedRecoveryCommand, setCopiedRecoveryCommand] = useState<string | null>(null)
+  const [recoveryContextLoad, setRecoveryContextLoad] = useState<FactoryRecoveryContextLoad | null>(null)
+  const [recoveryReload, setRecoveryReload] = useState(0)
+  const recoveryItemId = factoryItem?.id
+  const recoveryItemVersion = factoryItem?.version
+  const recoveryItemState = factoryItem?.state
+  const recoveryScope = useMemo<FactoryRecoveryContextScope | null>(() =>
+    recoveryItemId && recoveryItemVersion !== undefined && recoveryItemState === 'verification_failed'
+      ? { corpId, actorId, missionId: mission.id, itemId: recoveryItemId, version: recoveryItemVersion, reload: recoveryReload }
+      : null,
+  [corpId, actorId, mission.id, recoveryItemId, recoveryItemVersion, recoveryItemState, recoveryReload])
+  useEffect(() => {
+    if (!recoveryScope) return
+    return requestFactoryRecoveryContext(recoveryScope, setRecoveryContextLoad)
+  }, [recoveryScope])
+  const scopedRecoveryLoad = currentFactoryRecoveryLoad(recoveryScope, recoveryContextLoad)
+  const recoveryContext = scopedRecoveryLoad?.status === 'ready' ? scopedRecoveryLoad.data : null
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
@@ -3154,26 +3357,8 @@ function MissionCard({
   const pendingActionApprovals = actionApprovals.filter(
     (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
   )
-  const latestEvidence = latestRun
-    ? evidence
-        .filter((item) => item.run_id === latestRun.id)
-        .toSorted((left, right) => left.check_index - right.check_index)
-    : []
-  const totalAutomatedChecks = Math.max(
-    latestEvidence.length,
-    latestRun ? taskById.get(latestRun.task_id)?.verification_policy.checks.length ?? 0 : 0,
-  )
-  const passedAutomatedChecks = latestEvidence.filter((item) => item.status === 'passed').length
-  const failedAutomatedChecks = latestEvidence.filter((item) => item.status === 'failed').length
-  const missingAutomatedChecks = totalAutomatedChecks - latestEvidence.length
-  const automatedVerificationStatus = failedAutomatedChecks > 0
-    ? 'failed'
-    : missingAutomatedChecks > 0 || latestEvidence.length === 0 ? 'pending' : 'passed'
-  const automatedVerificationSummary = latestEvidence.length === 0
-    ? 'No check results recorded'
-    : failedAutomatedChecks > 0
-      ? `${failedAutomatedChecks} check${failedAutomatedChecks === 1 ? '' : 's'} failed`
-      : 'All recorded checks passed'
+  const automated = automatedVerificationPresentation(latestRun, evidence, events, factoryRecoveries)
+  const latestEvidence = automated.records
   const latestVerificationRequest = latestRun
     ? verificationRequests.find(
         (request) => request.run_id === latestRun.id && request.task_id === latestRun.task_id,
@@ -3197,35 +3382,36 @@ function MissionCard({
     latestRun && terminalRun(latestRun.status)
       ? latestRun.summary ?? latestRun.verification_summary
       : null
-  const failedTask = tasks.find((task) => task.status === 'verification_failed')
-  const failedRun = failedTask
-    ? runs.find(
-        (run) =>
-          run.task_id === failedTask.id &&
-          run.status === 'failed' &&
-          run.verification_status === 'failed',
-      )
+  const recovery = factoryRecoveryPresentation(recoveryContext, runs)
+  // The endpoint selects the task. This exact-ID lookup supplies command metadata
+  // only; absence is a field gap, never permission to pick a different task/source.
+  const recoveryTask = recoveryContext
+    ? tasks.find((task) => task.id === recoveryContext.task_id && task.mission_id === recoveryContext.mission_id)
     : undefined
+  const recoveryItem = recoveryContext?.work_item
   const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
-  const recoveryAgent = failedTask?.assigned_agent_id
-    ? agents.find((agent) => agent.id === failedTask.assigned_agent_id)
+  const recoveryAgent = recoveryTask?.assigned_agent_id
+    ? agents.find((agent) => agent.id === recoveryTask.assigned_agent_id)
     : undefined
-  const recoveryAdapter = failedTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
+  const recoveryAdapter = recoveryTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
+  const recoverySourceBase = typeof recoveryItem?.policy.source_base_ref === 'string'
+    ? recoveryItem.policy.source_base_ref : recoveryTask?.contract.source_base_ref
+  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase)
   const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
-    if (!factoryItem || !failedTask || !recoveryAdapter) return ''
+    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase) return ''
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
     const command = [
       'crony factory',
       quote(corpId),
       quote(actorId),
       '--owner',
-      quote(factoryItem.source_project_owner),
+      quote(recoveryItem.source_project_owner),
       '--project-number',
-      String(factoryItem.source_project_number),
+      String(recoveryItem.source_project_number),
       '--repository',
-      quote(`${factoryItem.source_repository_owner}/${factoryItem.source_repository_name}`),
+      quote(`${recoveryItem.source_repository_owner}/${recoveryItem.source_repository_name}`),
       '--source-base-ref',
-      quote(failedTask.contract.source_base_ref ?? 'HEAD'),
+      quote(recoverySourceBase),
       '--adapter',
       quote(recoveryAdapter),
       '--budget-tokens',
@@ -3233,28 +3419,32 @@ function MissionCard({
       '--budget-cost-microusd',
       String(mission.budget_cost_microusd),
       '--issue',
-      String(factoryItem.source_issue_number),
+      String(recoveryItem.source_issue_number),
       '--verification-recovery',
       mode,
       '--verification-recovery-reason',
       quote('Explain why this bounded recovery is authorized.'),
     ]
-    if (failedTask.contract.model) {
-      command.push('--model', quote(failedTask.contract.model))
+    if (recoveryTask.contract.model) {
+      command.push('--model', quote(recoveryTask.contract.model))
     }
-    if (failedTask.contract.reasoning_effort) {
-      command.push('--reasoning-effort', quote(failedTask.contract.reasoning_effort))
+    if (recoveryTask.contract.reasoning_effort) {
+      command.push('--reasoning-effort', quote(recoveryTask.contract.reasoning_effort))
     }
     return command.join(' ')
   }
+  const recoveryCopyKey = (mode: 'verifier-only' | 'source-correction') =>
+    `${scopedRecoveryLoad?.scopeKey}:${recoveryContext?.source_run_id}:${recoveryCommand(mode)}`
   const copyRecoveryCommand = async (
     mode: 'verifier-only' | 'source-correction',
   ) => {
+    const command = recoveryCommand(mode)
+    if (!command || !canAuthorizeRecovery) return
     try {
-      await navigator.clipboard.writeText(recoveryCommand(mode))
-      setCopiedRecoveryMode(mode)
+      await navigator.clipboard.writeText(command)
+      setCopiedRecoveryCommand(recoveryCopyKey(mode))
     } catch {
-      setCopiedRecoveryMode(null)
+      setCopiedRecoveryCommand(null)
     }
   }
   return (
@@ -3480,23 +3670,22 @@ function MissionCard({
       (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
         <details
           key={`verification-${latestRun.id}`}
-          className={`verification-box operations-verification verification-${automatedVerificationStatus}`}
+          className={`verification-box operations-verification verification-${automated.status}`}
           data-testid="verification-evidence"
+          data-check-total={automated.total ?? 'unknown'}
         >
           <summary>
             <span className="operations-verification-copy">
               <strong>Automated verification</strong>
               <small>
-                {automatedVerificationSummary}
-                {missingAutomatedChecks > 0
-                  ? ` · ${missingAutomatedChecks} result${missingAutomatedChecks === 1 ? '' : 's'} not yet recorded`
+                {automated.summary}
+                {automated.missing !== null && automated.missing > 0
+                  ? ` · ${automated.missing} result${automated.missing === 1 ? '' : 's'} not recorded`
                   : ''}
               </small>
             </span>
             <span className="operations-verification-score">
-              {totalAutomatedChecks > 0
-                ? `${passedAutomatedChecks}/${totalAutomatedChecks} passed`
-                : 'No check records'}
+              {automated.score}
             </span>
             <span className="operations-disclosure-mark" aria-hidden="true">+</span>
           </summary>
@@ -3545,58 +3734,94 @@ function MissionCard({
           ) : null}
           <p className="operations-review-next">
             <strong>Next step: </strong>
-            {factoryItem?.state === 'verification_failed' && failedTask && failedRun
-              ? 'Use the governed recovery controls below to request a bounded correction or evidence recheck. A new review decision is still required.'
-              : 'Ask an authorized operator to resolve the findings and submit new evidence through the governed verification flow.'}
+            {recoveryScope
+              ? 'Inspect the governed recovery controls below with an authorized operator. The controller selects the source and revalidates the request; a new outcome review is still required.'
+                : 'Ask an authorized operator to resolve the findings and submit new evidence through the governed verification flow.'}
           </p>
         </section>
       ) : null}
-      {factoryItem?.state === 'verification_failed' && failedTask && failedRun ? (
+      {factoryItem && recoveryScope ? (
         <section
           className="factory-recovery-callout"
           aria-labelledby={`factory-recovery-${factoryItem.id}`}
           data-testid="factory-verification-recovery"
+          data-recovery-state={recovery?.state ?? scopedRecoveryLoad?.status ?? 'loading'}
+          data-recovery-context-status={scopedRecoveryLoad?.status ?? 'loading'}
+          data-recovery-run-id={recoveryContext?.source_run_id}
+          data-recovery-task-id={recoveryContext?.task_id}
+          data-recovery-item-version={recoveryContext?.work_item.version}
+          aria-busy={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
         >
           <div className="factory-recovery-heading">
             <div>
               <span>Governed recovery</span>
               <strong id={`factory-recovery-${factoryItem.id}`}>
-                The failed work is preserved
+                {recovery?.heading ?? (scopedRecoveryLoad?.status === 'error'
+                  ? 'Recovery context unavailable' : 'Loading recovery context…')}
               </strong>
             </div>
-            <span className="status-chip status-chip-failed">Verification failed</span>
+            <span className="status-chip status-chip-failed">
+              {recovery?.state === 'quarantined' ? 'Quarantine warning'
+                : recovery?.run ? `Source ${statusLabel(recovery.run.status)}` : 'Controller context'}
+            </span>
           </div>
-          <p>
-            Choose a provider-free recheck when the source is correct, or resume the same
-            provider session for a bounded source correction. The trusted controller validates
-            the Project issue, policy, budget, worktree, and lineage before creating one run.
+          <p role={scopedRecoveryLoad?.status === 'error' ? 'alert' : 'status'}>
+            {recovery?.detail ?? scopedRecoveryLoad?.error ??
+              'Reading the exact work-item recovery context. No cached source or checkpoint is displayed.'}
           </p>
+          {!recovery && runs.some((run) => run.workspace_disposition === 'quarantined') ? (
+            <p className="factory-recovery-role-note">
+              A visible mission workspace is quarantined. Preserve it; only the controller can resolve
+              the selected source context. No snapshot hash is substituted.
+            </p>
+          ) : null}
+          <button className="button button-secondary" type="button"
+            disabled={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
+            onClick={() => setRecoveryReload((value) => value + 1)}>
+            Refresh recovery context
+          </button>
+          {recoveryContext && recovery ? <>
+          <details className="factory-recovery-details">
+          <summary>Recovery details</summary>
           <dl>
             <div>
               <dt>Attempts remaining</dt>
-              <dd>{Math.max(0, failedTask.max_attempts - failedTask.attempt_count)}</dd>
+              <dd>{recoveryContext.remaining_attempts}</dd>
             </div>
             <div>
-              <dt>Workspace</dt>
-              <dd>{failedRun.workspace_disposition ?? 'unknown'}</dd>
+              <dt>Server-selected source</dt>
+              <dd title={recoveryContext.source_run_id}>{shortId(recoveryContext.source_run_id)}</dd>
             </div>
             <div>
-              <dt>Checkpoint</dt>
-              <dd>{failedRun.workspace_fingerprint ? `${shortId(failedRun.workspace_fingerprint)}…` : 'Unavailable'}</dd>
+              <dt>Remaining mission tokens</dt>
+              <dd>{recoveryContext.remaining_mission_tokens.toLocaleString()}</dd>
             </div>
             <div>
-              <dt>Prior recovery attempts</dt>
-              <dd>{factoryRecoveries.length}</dd>
+              <dt>Remaining mission budget</dt>
+              <dd>{formatUsd(recoveryContext.remaining_mission_cost_microusd)}</dd>
+            </div>
+            <div>
+              <dt>Recorded checkpoint</dt>
+              <dd>{recovery.checkpoint ? `${shortId(recovery.checkpoint)}…`
+                : recovery.state === 'checkpoint_required' ? 'Owning runner checkpoints through the controller' : 'Withheld; inspect controller context'}</dd>
+            </div>
+            <div>
+              <dt>Visible recovery records</dt>
+              <dd>{recovery.recoveryCount}</dd>
             </div>
           </dl>
-          {canAuthorizeRecovery && recoveryAdapter ? (
+          </details>
+          <p className="factory-recovery-role-note">
+            Copying is not granting and executes nothing.
+          </p>
+          {recoveryCommandAvailable && canAuthorizeRecovery ? (
             <div className="factory-recovery-actions">
               <button
                 className="button button-secondary"
                 type="button"
                 onClick={() => void copyRecoveryCommand('verifier-only')}
               >
-                {copiedRecoveryMode === 'verifier-only'
+                {copiedRecoveryCommand === recoveryCopyKey('verifier-only')
                   ? 'Verifier command copied'
                   : 'Copy verifier-only command'}
               </button>
@@ -3605,7 +3830,7 @@ function MissionCard({
                 type="button"
                 onClick={() => void copyRecoveryCommand('source-correction')}
               >
-                {copiedRecoveryMode === 'source-correction'
+                {copiedRecoveryCommand === recoveryCopyKey('source-correction')
                   ? 'Correction command copied'
                   : 'Copy source-correction command'}
               </button>
@@ -3613,14 +3838,15 @@ function MissionCard({
           ) : (
             <p className="factory-recovery-role-note">
               {canAuthorizeRecovery
-                ? 'Recovery command metadata is incomplete; inspect the persisted task contract.'
+                ? 'The exact endpoint returns task/source IDs, not the task contract or adapter. Selected-task command metadata is missing in this snapshot; inspect the native controller. No substitute is inferred.'
                 : 'An owner, admin, or manager must authorize the recovery.'}
             </p>
           )}
-          <details>
+          {recoveryCommandAvailable && canAuthorizeRecovery ? <details>
             <summary>Show trusted controller command</summary>
             <code>{recoveryCommand('verifier-only')}</code>
-          </details>
+          </details> : null}
+          </> : null}
         </section>
       ) : null}
       {latestRun && terminalRun(latestRun.status) ? (
@@ -3704,6 +3930,11 @@ function MissionCard({
               <div className="mission-approval-item" key={approval.id}>
                 <span>{approval.action}</span>
                 <small>{approval.risk} risk · {approval.rationale}</small>
+                <p className="operations-approval-note">
+                  Allowed tools make an action requestable, not pre-approved. This decision covers
+                  only the exact action and scope shown; it grants no blanket access. A current
+                  authorization for that same action and scope does not need a duplicate grant.
+                </p>
                 <div>
                   <button
                     className="button button-primary"
@@ -3727,7 +3958,7 @@ function MissionCard({
           })}
         </div>
       ) : null}
-      {resumableRun && activeRuns === 0 ? (
+      {resumableRun && activeRuns === 0 && factoryItem?.state !== 'verification_failed' ? (
         <>
           <button
             className="button button-secondary mission-launch"
@@ -5923,7 +6154,7 @@ function App() {
                       <select
                         id="mission-strategy"
                         value={missionStrategy}
-                        aria-describedby={studioTeam ? 'mission-strategy-help mission-strategy-policy' : 'mission-strategy-help'}
+                        aria-describedby="mission-strategy-help mission-strategy-policy"
                         onChange={(event) => {
                           const strategy = event.target.value
                           setMissionStrategy(strategy)
@@ -5957,13 +6188,19 @@ function App() {
                             ? 'One bounded worker owns the outcome.'
                             : 'A deterministic product-behavior fixture.'}
                       </small>
-                      {studioTeam ? (
-                        <small id="mission-strategy-policy">
-                          Native file work stays in isolated worktrees within the approved write scope.
-                          Configure persisted test commands and review gates under Verification.
-                          Shell, network, and other risky effects still require approval.
-                        </small>
-                      ) : null}
+                      <small id="mission-strategy-policy" className="operations-approval-note">
+                        {studioTeam
+                          ? 'Three workers hand off verified work to a later integration pass; this does not create a fourth concurrent worker or a grant per artifact.'
+                          : missionStrategy === 'parallel-specialists'
+                            ? 'Two specialists and synthesis can request different scoped actions; choosing parallel work does not pre-approve them.'
+                            : missionStrategy === 'single'
+                              ? 'One worker limits coordination, not authorization: a Solo run can still need decisions for risky actions.'
+                              : 'Fixture checks exercise recorded evidence and the configured review gate, not blanket permissions.'}
+                        {' '}Reuse the harness within current authorized scope. Shell, network and
+                        other risky effects need their existing scoped authorization, not duplicate
+                        grants for the same action. Persisted verifier checks and required outcome
+                        review remain separate.
+                      </small>
                     </div>
                   </div>
                   <div className="loadout-switches">
@@ -6303,6 +6540,7 @@ function App() {
                   factoryRecoveries={data.snapshot.factory_verification_recoveries.filter(
                     (recovery) => recovery.mission_id === selectedMission.id,
                   )}
+                  events={data.snapshot.events}
                   actorId={selectedActor.id}
                   actorRole={selectedActor.role}
                   busy={busy}
