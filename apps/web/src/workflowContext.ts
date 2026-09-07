@@ -79,9 +79,8 @@ export function selectMissionEvidenceRun<T extends ReviewRun>(
   reviews: readonly RunReview[],
   selectedRunId: string | null = null,
 ): T | undefined {
-  return runs.find((run) => run.id === selectedRunId)
-    ?? runs.find((run) => pendingReviewForRun(run, reviews))
-    ?? runs[0]
+  if (selectedRunId !== null) return runs.find((run) => run.id === selectedRunId)
+  return runs.find((run) => pendingReviewForRun(run, reviews)) ?? runs[0]
 }
 
 export function missionIdForLink(link: WorkLink, context: WorkContext): string | null {
