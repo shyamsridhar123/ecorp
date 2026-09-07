@@ -13,6 +13,7 @@
 <p>
 <a href="https://ecorp-front-office.shyam-sridhar16.chatgpt.site"><strong>ENTER THE FRONT OFFICE</strong></a> ·
 <a href="#start-locally">RUN ECORP</a> ·
+<a href="#how-the-factory-works">HOW IT WORKS</a> ·
 <a href="docs/README.md">READ THE HANDBOOK</a> ·
 <a href="docs/SECURITY.md">TRUST & SAFETY</a>
 </p>
@@ -52,6 +53,19 @@ engineering contract. Here is what the current alpha can do.
 6. **Launch the verified pull request.** Export the exact patch, archive, typed artifact set, commit and branch bundle, or review report that passed. For factory missions, a separately authorized publisher opens one recoverable PR from that result.
 
 Publication never enables auto-merge and does not merge or deploy.
+
+## How the factory works
+
+[![ECorp architecture: web, desktop, and CLI clients connect to a Rust/Axum control plane with Postgres and private artifact storage. Outbound runners execute and verify work in isolated worktrees before human-authorized pull-request publication.](docs/assets/architecture/ecorp-architecture-retro.jpg)](docs/assets/architecture/ecorp-architecture-retro.jpg)
+
+**One company. Three planes.** The **experience plane** is your shared front office. The
+**control plane** owns missions, policy, and durable state. The **execution plane** runs the crew
+in isolated worktrees, verifies the output, and returns the evidence. Human authorization and a
+trusted publisher take verified artifacts to a pull request—not an automatic merge or deployment.
+
+Click the image for full resolution. This is a logical architecture view; worktrees are not full
+OS sandboxes. Explore the [architecture](docs/ARCHITECTURE.md),
+[security boundaries](docs/SECURITY.md), and [artwork provenance](docs/assets/architecture/README.md).
 
 ## The office is operational
 
