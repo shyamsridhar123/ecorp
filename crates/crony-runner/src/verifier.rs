@@ -56,6 +56,29 @@ pub async fn verify(
     for (index, check) in policy.checks.iter().enumerate() {
         checks.push(run_check(index as i32, check, workspace, artifacts).await);
     }
+    verification_report(policy, checks)
+}
+
+pub(crate) async fn verify_cancellable(
+    policy: &VerificationPolicy,
+    workspace: &Path,
+    artifacts: &[AdapterArtifact],
+    cancellation: &mut watch::Receiver<bool>,
+) -> Option<VerificationReport> {
+    let mut checks = Vec::with_capacity(policy.checks.len());
+    for (index, check) in policy.checks.iter().enumerate() {
+        match run_check_cancellable(index as i32, check, workspace, artifacts, cancellation).await {
+            CancellableCheckResult::Completed(result) => checks.push(result),
+            CancellableCheckResult::Cancelled => return None,
+        }
+    }
+    Some(verification_report(policy, checks))
+}
+
+fn verification_report(
+    policy: &VerificationPolicy,
+    checks: Vec<VerificationCheckResult>,
+) -> VerificationReport {
     let failed = checks.iter().filter(|check| !check.passed).count();
     VerificationReport {
         passed: failed == 0,
@@ -514,7 +537,7 @@ async fn execute_verifier_command(
     }
 }
 
-async fn wait_for_verifier_cancellation(cancellation: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_for_verifier_cancellation(cancellation: &mut watch::Receiver<bool>) {
     loop {
         if *cancellation.borrow() {
             return;
