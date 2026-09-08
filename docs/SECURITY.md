@@ -406,6 +406,14 @@ trailing newline.
 The CLI reads the publisher credential from a file before its first publication API mutation and
 never places it in arguments, plans, output, events, snapshots, or durable publication records.
 
+Publication of an explicitly recovered checkpoint starts no provider. Its model-budget
+exception is derived from exact native origin events, immutable checkpoint authority,
+completed zero-provider recovery, retained fingerprint and the ready verified export.
+The authorization never resets spending or permits another model session; unrelated enforced
+stops, explicit stops, loops and current scoped authority remain guards. New publication
+checkpoints repeat current authority/provenance validation instead of relying on a live lease
+alone. Metadata bindings do not replace the publisher's signed-byte and Git-bundle validation.
+
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.
 For an unfinished publication, the publisher renews authority before remote reads, refreshes the

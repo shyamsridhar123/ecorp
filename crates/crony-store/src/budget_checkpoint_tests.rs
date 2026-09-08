@@ -56,6 +56,16 @@ async fn fixture_with_deliverable(
     explicit_stop: bool,
     deliverable: Option<DeliverableSpec>,
 ) -> PgStore {
+    fixture_with_publication_policy(pool, needs_artifact, explicit_stop, deliverable, false).await
+}
+
+async fn fixture_with_publication_policy(
+    pool: PgPool,
+    needs_artifact: bool,
+    explicit_stop: bool,
+    deliverable: Option<DeliverableSpec>,
+    publication_authorized: bool,
+) -> PgStore {
     sqlx::raw_sql(
         r#"
         INSERT INTO corps(id,slug,name) VALUES
@@ -136,6 +146,15 @@ async fn fixture_with_deliverable(
     });
     if let Some(deliverable) = &contract.deliverable {
         factory_policy["deliverable_form"] = json!(deliverable.form.as_str());
+    }
+    if publication_authorized {
+        // Present before the original run/checkpoint; never widen a stopped case.
+        factory_policy["auto_merge"] = json!(false);
+        factory_policy["publication"] = json!({
+            "allowed":true,"repository_allowlist":["fixture/source"],
+            "base_ref":"main","branch_prefix":"ecorp/","status_before":"In Progress",
+            "review_status":"In Review","auto_merge":false,"merge":false,"deploy":false
+        });
     }
     sqlx::query(
         "INSERT INTO factory_work_items(id,corp_id,source_kind,source_project_owner,
@@ -1108,7 +1127,14 @@ fn retention_event(command: &PendingRunnerCommand) -> RunnerEventInput {
 }
 
 async fn waiting_export_fixture(pool: PgPool) -> (PgStore, PendingRunnerCommand, Uuid) {
-    let store = fixture_with_deliverable(
+    waiting_export_fixture_with_publication(pool, false).await
+}
+
+async fn waiting_export_fixture_with_publication(
+    pool: PgPool,
+    publication_authorized: bool,
+) -> (PgStore, PendingRunnerCommand, Uuid) {
+    let store = fixture_with_publication_policy(
         pool,
         false,
         false,
@@ -1117,6 +1143,7 @@ async fn waiting_export_fixture(pool: PgPool) -> (PgStore, PendingRunnerCommand,
             commit_after_verification: true,
             paths: vec!["result.md".to_owned()],
         }),
+        publication_authorized,
     )
     .await;
     sqlx::query(
@@ -1705,4 +1732,680 @@ async fn issue148_checkpoint_retention_unclaimed_reconnect_preserves_only_bound_
         tx.rollback().await.unwrap();
         assert_eq!(state(&store).await, before);
     }
+}
+
+// Publication tests reuse native checkpoint, staged/finalized artifact metadata,
+// independent review and publisher credentials. No publisher process, Git effect,
+// object download, signature validation or real Git-bundle bytes are claimed.
+async fn publication_fixture(
+    pool: PgPool,
+) -> (
+    PgStore,
+    PendingRunnerCommand,
+    Uuid,
+    StartPullRequestPublicationInput,
+) {
+    let (store, command, artifact_id) = waiting_export_fixture_with_publication(pool, true).await;
+    store
+        .apply_runner_event(retention_event(&command))
+        .await
+        .unwrap();
+    store
+        .decide_verification(
+            CORP,
+            command.run_id,
+            REVIEWER,
+            true,
+            "Independent SQLx metadata review",
+            Some(Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+    let publisher_hash = digest(&"issue148 SQLx-only publisher credential");
+    store
+        .create_publication_publisher_credential(
+            CORP,
+            OWNER,
+            "issue148-store-publisher",
+            &publisher_hash,
+            Utc::now() + Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let deliverable_id =
+        sqlx::query_scalar("SELECT id FROM source_deliverables WHERE artifact_id=$1")
+            .bind(artifact_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    let snapshot = state(&store).await;
+    assert_eq!(snapshot["item"]["state"], "verified");
+    assert_eq!(snapshot["recoveries"][0]["status"], "completed");
+    assert_eq!(
+        retained_run(&snapshot, command.run_id)["status"],
+        "completed"
+    );
+    let input = StartPullRequestPublicationInput {
+        corp_id: CORP,
+        work_item_id: ITEM,
+        actor_id: OWNER,
+        actor_role: "owner".to_owned(),
+        source_deliverable_id: deliverable_id,
+        target_repository: "fixture/source".to_owned(),
+        base_ref: "main".to_owned(),
+        branch: "ecorp/issue148-checkpoint".to_owned(),
+        title: "Reviewed checkpoint metadata".to_owned(),
+        body: "Closes https://github.com/fixture/source/issues/148\nSQLx metadata only.".to_owned(),
+        authorization_id: Uuid::new_v4(),
+        authorization_reason: "Publish this exact reviewed export".to_owned(),
+        effect_key: Uuid::new_v4().to_string(),
+        idempotency_key: Uuid::new_v4().to_string(),
+        publisher_id: "issue148-store-publisher".to_owned(),
+        publisher_credential_hash: publisher_hash,
+        lease_seconds: 300,
+    };
+    (store, command, artifact_id, input)
+}
+
+fn publication_renewal(
+    input: &StartPullRequestPublicationInput,
+    started: &PullRequestPublicationOutcome,
+) -> RenewPullRequestPublicationInput {
+    RenewPullRequestPublicationInput {
+        corp_id: CORP,
+        publication_id: started.publication.id,
+        actor_id: input.actor_id,
+        publisher_id: input.publisher_id.clone(),
+        publisher_credential_hash: input.publisher_credential_hash.clone(),
+        publisher_token: started.publisher_token.unwrap(),
+        expected_version: started.publication.version,
+        idempotency_key: Uuid::new_v4().to_string(),
+        lease_seconds: 300,
+    }
+}
+
+async fn publication_state(store: &PgStore) -> Value {
+    let mut snapshot = state(store).await;
+    snapshot["publication"] = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+          'rows',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY id),'[]') FROM pull_request_publications p),
+          'attempts',(SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY id),'[]') FROM pull_request_publication_attempts a),
+          'operations',(SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY idempotency_key),'[]') FROM pull_request_publication_operations o),
+          'credentials',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY id),'[]') FROM publication_publisher_credentials c))",
+    ).fetch_one(&store.pool).await.unwrap();
+    snapshot
+}
+
+fn assert_publication_preserves_models(before: &Value, after: &Value) {
+    for key in [
+        "source",
+        "runs",
+        "tasks",
+        "missions",
+        "agents",
+        "recoveries",
+        "commands",
+        "artifacts",
+        "deliverables",
+        "verification_evidence",
+        "verification_requests",
+    ] {
+        assert_eq!(after[key], before[key], "publication must not change {key}");
+    }
+    let prefix = before["events"].as_array().unwrap();
+    let events = after["events"].as_array().unwrap();
+    assert_eq!(&events[..prefix.len()], prefix.as_slice());
+    assert!(
+        events[prefix.len()..]
+            .iter()
+            .all(|event| !event["type"].as_str().unwrap().starts_with("run."))
+    );
+    assert_eq!(after["source"]["input_tokens"], 6000);
+    assert_eq!(after["source"]["breaker_stage"], "stop");
+    assert_eq!(after["task"]["attempt_count"], 2);
+    assert_eq!(after["task"]["max_attempts"], 2);
+}
+
+async fn reject_publication(
+    store: &PgStore,
+    input: &StartPullRequestPublicationInput,
+    renewal: Option<&RenewPullRequestPublicationInput>,
+) {
+    let before = publication_state(store).await;
+    if let Some(renewal) = renewal {
+        assert!(
+            store
+                .renew_pull_request_publication(renewal.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            publication_state(store).await,
+            before,
+            "failed renewal must roll back"
+        );
+        // A rejected, current-version native checkpoint metadata request.
+        // No Git runs here and no branch effect is claimed to have happened.
+        assert!(
+            store
+                .record_pull_request_publication_checkpoint(
+                    RecordPullRequestPublicationCheckpointInput {
+                        corp_id: CORP,
+                        publication_id: renewal.publication_id,
+                        actor_id: renewal.actor_id,
+                        publisher_id: renewal.publisher_id.clone(),
+                        publisher_credential_hash: renewal.publisher_credential_hash.clone(),
+                        publisher_token: renewal.publisher_token,
+                        expected_version: before["publication"]["rows"][0]["version"]
+                            .as_i64()
+                            .unwrap(),
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        checkpoint: PullRequestPublicationCheckpointInput::BranchPushed {
+                            commit_sha: "d".repeat(40),
+                        },
+                    }
+                )
+                .await
+                .is_err()
+        );
+    } else {
+        assert!(
+            store
+                .start_pull_request_publication(input.clone())
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        publication_state(store).await,
+        before,
+        "rejected publication must roll back"
+    );
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_start_renew_replay_preserves_provenance_and_spend(
+    pool: PgPool,
+) {
+    let (store, command, _, input) = publication_fixture(pool).await;
+    let before = state(&store).await;
+    let authority: budget_checkpoint::Authority =
+        serde_json::from_value(before["recoveries"][0]["checkpoint_authority"].clone()).unwrap();
+    let authority_sha256 = digest(&authority);
+    let source_event = |kind: &str| {
+        before["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["aggregate_id"] == json!(SOURCE) && event["type"] == kind)
+            .unwrap()["id"]
+            .clone()
+    };
+    assert_eq!(
+        json!(authority.checkpoint_event_id),
+        source_event("run.workspace_preserved")
+    );
+    assert_eq!(
+        json!(authority.termination_event_id),
+        source_event("run.session_terminated")
+    );
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    assert!(!started.replayed && !started.busy);
+    assert_eq!(started.publication.run_id, command.run_id);
+    assert_eq!(started.publication.provenance["schema_version"], 2);
+    assert_eq!(
+        started.publication.provenance["checkpoint"],
+        json!({
+            "schema_version":1,"recovery_id":before["recoveries"][0]["id"],
+            "origin_run_id":SOURCE,"workspace_run_id":SOURCE,
+            "checkpoint_event_id":authority.checkpoint_event_id,"termination_event_id":authority.termination_event_id,
+            "workspace_fingerprint":"b".repeat(64),"source_base_commit":"a".repeat(40),
+            "original_head_commit":"a".repeat(40),"verified_head_commit":"d".repeat(40),
+            "authority_sha256":authority_sha256,"execution_mode":"verification_only",
+        })
+    );
+    let replayed = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    assert!(replayed.replayed && !replayed.busy);
+    assert_eq!(replayed.publication.id, started.publication.id);
+    assert_eq!(replayed.publisher_token, started.publisher_token);
+    let renewal = publication_renewal(&input, &started);
+    let renewed = store
+        .renew_pull_request_publication(renewal.clone())
+        .await
+        .unwrap();
+    let renewed_again = store.renew_pull_request_publication(renewal).await.unwrap();
+    assert!(renewed_again.replayed);
+    assert_eq!(
+        renewed.publication.provenance,
+        started.publication.provenance
+    );
+    assert_eq!(
+        renewed_again.publication.version,
+        renewed.publication.version
+    );
+    assert_eq!(renewed_again.publication.attempt_count, 1); // Publisher, not model attempts.
+    let after = publication_state(&store).await;
+    assert_publication_preserves_models(&before, &after);
+    assert_eq!(after["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(after["publication"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after["publication"]["attempts"].as_array().unwrap().len(),
+        1
+    );
+    assert!(
+        !renewed.publication.auto_merge_enabled
+            && !renewed.publication.merge_authorized
+            && !renewed.publication.deployment_authorized
+    );
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_healthy_history_ignores_only_retrospective_model_budget(
+    pool: PgPool,
+) {
+    let (store, command, _, input) = publication_fixture(pool).await;
+    let historical_task = Uuid::from_u128(60);
+    let historical_run = Uuid::from_u128(61);
+    // Historical metadata: another completed task, not an extra checkpoint
+    // descendant. Its own spend is healthy; shared mission/actor/Corp spend is not.
+    sqlx::query(
+        "INSERT INTO tasks SELECT (jsonb_populate_record(NULL::tasks,to_jsonb(t) ||
+          jsonb_build_object('id',$1::uuid,'plan_key','historical','attempt_count',1,
+            'created_at',now()-interval '1 hour','updated_at',now()-interval '1 hour'))).*
+         FROM tasks t WHERE id=$2",
+    )
+    .bind(historical_task)
+    .bind(TASK)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO runs SELECT (jsonb_populate_record(NULL::runs,to_jsonb(r) ||
+          jsonb_build_object('id',$1::uuid,'task_id',$2::uuid,'assignment_token',$3::uuid,
+            'workspace_run_id',$1::uuid,'resumed_from_run_id',NULL,'execution_mode','provider',
+            'provider_session_id','historical-session','model','fixture-model','input_tokens',1000,
+            'budget_tokens_limit',100000,'budget_cost_microusd_limit',1000000,
+            'workspace_path','historical-worktree','workspace_branch','crony/historical',
+            'deliverable_sha256',NULL,'created_at',now()-interval '1 hour',
+            'updated_at',now()-interval '1 hour'))).* FROM runs r WHERE id=$4",
+    )
+    .bind(historical_run)
+    .bind(historical_task)
+    .bind(Uuid::new_v4())
+    .bind(command.run_id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO verification_evidence SELECT (jsonb_populate_record(NULL::verification_evidence,
+          to_jsonb(e) || jsonb_build_object('id',$1::uuid,'run_id',$2::uuid,'task_id',$3::uuid))).*
+         FROM verification_evidence e WHERE run_id=$4 AND check_index=0",
+    ).bind(Uuid::new_v4()).bind(historical_run).bind(historical_task).bind(command.run_id)
+        .execute(&store.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO verification_requests SELECT (jsonb_populate_record(NULL::verification_requests,
+          to_jsonb(v) || jsonb_build_object('run_id',$1::uuid,'task_id',$2::uuid,'decision_key',$3::uuid))).*
+         FROM verification_requests v WHERE run_id=$4",
+    ).bind(historical_run).bind(historical_task).bind(Uuid::new_v4()).bind(command.run_id)
+        .execute(&store.pool).await.unwrap();
+    sqlx::query("INSERT INTO corp_budget_policies(corp_id,actor_tokens_per_24h,corp_tokens_per_24h) VALUES($1,7000,7000)")
+        .bind(CORP).execute(&store.pool).await.unwrap();
+    let before = state(&store).await;
+    assert_eq!(
+        retained_run(&before, historical_run)["breaker_stage"],
+        "healthy"
+    );
+    assert_eq!(
+        before["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["input_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        7000
+    );
+    assert_eq!(before["mission"]["budget_tokens"], 5000);
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    store
+        .renew_pull_request_publication(renewal.clone())
+        .await
+        .unwrap();
+    assert_publication_preserves_models(&before, &state(&store).await);
+    for (field, denied, restored) in [
+        ("breaker_stage", json!("stop"), json!("healthy")),
+        ("breaker_stage", json!("suspend"), json!("healthy")),
+        ("repeated_tool_count", json!(5), json!(0)),
+        ("no_progress_events", json!(8), json!(0)),
+    ] {
+        let update = format!(
+            "UPDATE runs SET {field}=(jsonb_populate_record(NULL::runs,jsonb_build_object('{field}',$2::jsonb))).{field} WHERE id=$1"
+        );
+        sqlx::query(&update)
+            .bind(historical_run)
+            .bind(denied)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query(&update)
+            .bind(historical_run)
+            .bind(restored)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .renew_pull_request_publication(renewal.clone())
+            .await
+            .unwrap()
+            .replayed
+    );
+    let mut tx = store.pool.begin().await.unwrap();
+    append_event_tx(
+        &mut tx,
+        NewEvent::new(
+            CORP,
+            Some(OWNER),
+            "run.stop_requested",
+            "run",
+            historical_run,
+            Uuid::new_v4().to_string(),
+            json!({"reason":"Explicit stop in another task of this mission"}),
+        ),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    reject_publication(&store, &input, Some(&renewal)).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_requires_checkpoint_mode_and_native_origin_events(
+    pool: PgPool,
+) {
+    let (store, command, _, input) = publication_fixture(pool).await;
+    let before = state(&store).await;
+    let recovery = &before["recoveries"][0];
+    // The same zero-limit verifier cannot borrow a checkpoint exemption when
+    // its persisted recovery is ordinary verifier_only instead.
+    sqlx::query(
+        "UPDATE factory_verification_recoveries SET mode='verifier_only',checkpoint_authority=NULL,
+         request=jsonb_set(request,'{mode}','\"verifier_only\"') WHERE replacement_run_id=$1",
+    )
+    .bind(command.run_id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    reject_publication(&store, &input, None).await;
+    sqlx::query(
+        "UPDATE factory_verification_recoveries SET mode='checkpoint_verification',
+         checkpoint_authority=$2,request=$3 WHERE replacement_run_id=$1",
+    )
+    .bind(command.run_id)
+    .bind(&recovery["checkpoint_authority"])
+    .bind(&recovery["request"])
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    for (key, kind) in [
+        ("termination_event_id", "run.session_terminated"),
+        ("checkpoint_event_id", "run.workspace_preserved"),
+    ] {
+        let id = Uuid::parse_str(recovery["checkpoint_authority"][key].as_str().unwrap()).unwrap();
+        sqlx::query("UPDATE events SET type='fixture.withdrawn' WHERE id=$1")
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, None).await;
+        sqlx::query("UPDATE events SET type=$2 WHERE id=$1")
+            .bind(id)
+            .bind(kind)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    let started = store.start_pull_request_publication(input).await.unwrap();
+    assert_eq!(started.publication.run_id, command.run_id);
+    assert_publication_preserves_models(&before, &state(&store).await);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_rechecks_source_policy_checkpoint_and_quarantine(
+    pool: PgPool,
+) {
+    let (store, command, _, input) = publication_fixture(pool).await;
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    store
+        .renew_pull_request_publication(renewal.clone())
+        .await
+        .unwrap();
+    for (changed, restored) in [
+        (
+            "UPDATE runs SET source_base_commit=repeat('e',40) WHERE id=$1",
+            "UPDATE runs SET source_base_commit=repeat('a',40) WHERE id=$1",
+        ),
+        (
+            "UPDATE tasks SET verification_policy=jsonb_set(verification_policy,'{checks,0,min_bytes}','2') WHERE id=(SELECT task_id FROM runs WHERE id=$1)",
+            "UPDATE tasks SET verification_policy=jsonb_set(verification_policy,'{checks,0,min_bytes}','1') WHERE id=(SELECT task_id FROM runs WHERE id=$1)",
+        ),
+        (
+            "UPDATE events SET payload=jsonb_set(payload,'{source_checkpoint,head_commit}',to_jsonb(repeat('e',40))) WHERE type='run.workspace_preserved' AND aggregate_id=(SELECT workspace_run_id FROM runs WHERE id=$1)",
+            "UPDATE events SET payload=jsonb_set(payload,'{source_checkpoint,head_commit}',to_jsonb(repeat('a',40))) WHERE type='run.workspace_preserved' AND aggregate_id=(SELECT workspace_run_id FROM runs WHERE id=$1)",
+        ),
+        (
+            "UPDATE runs SET workspace_disposition='quarantined' WHERE id=(SELECT workspace_run_id FROM runs WHERE id=$1)",
+            "UPDATE runs SET workspace_disposition='preserved' WHERE id=(SELECT workspace_run_id FROM runs WHERE id=$1)",
+        ),
+        (
+            "UPDATE runs SET workspace_fingerprint=repeat('e',64) WHERE id=$1",
+            "UPDATE runs SET workspace_fingerprint=repeat('b',64) WHERE id=$1",
+        ),
+    ] {
+        sqlx::query(changed)
+            .bind(command.run_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query(restored)
+            .bind(command.run_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    // A valid live checkpoint cannot excuse absent or altered persisted
+    // publication provenance on renewal or a native publication checkpoint.
+    for changed in [
+        "UPDATE pull_request_publications SET provenance=provenance-'checkpoint' WHERE id=$1",
+        "UPDATE pull_request_publications SET provenance=jsonb_set(provenance,'{checkpoint,authority_sha256}',to_jsonb(repeat('e',64))) WHERE id=$1",
+    ] {
+        sqlx::query(changed)
+            .bind(started.publication.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query("UPDATE pull_request_publications SET provenance=$2 WHERE id=$1")
+            .bind(started.publication.id)
+            .bind(&started.publication.provenance)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .renew_pull_request_publication(renewal)
+            .await
+            .unwrap()
+            .replayed
+    );
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_requires_ready_unexpired_exact_artifact_metadata(
+    pool: PgPool,
+) {
+    let (store, _, artifact_id, input) = publication_fixture(pool).await;
+    let original = state(&store).await;
+    let artifact = original["artifacts"][0].clone();
+    let deliverable = original["deliverables"][0].clone();
+    // Delete before publication (whose FKs intentionally restrict deletion).
+    // Restore only these exact synthetic metadata rows for subsequent cases.
+    sqlx::query("DELETE FROM artifacts WHERE id=$1")
+        .bind(artifact_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_publication(&store, &input, None).await;
+    sqlx::query("INSERT INTO artifacts SELECT * FROM jsonb_populate_record(NULL::artifacts,$1)")
+        .bind(&artifact)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_deliverables SELECT * FROM jsonb_populate_record(NULL::source_deliverables,$1)")
+        .bind(&deliverable).execute(&store.pool).await.unwrap();
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    store
+        .renew_pull_request_publication(renewal.clone())
+        .await
+        .unwrap();
+    for changed in [
+        "UPDATE artifacts SET status='staged',finalized_at=NULL WHERE id=$1",
+        "UPDATE artifacts SET artifact_role='provider_evidence' WHERE id=$1",
+        "UPDATE artifacts SET run_id='00000000-0000-0000-0000-000000000004' WHERE id=$1",
+        "UPDATE artifacts SET sha256=repeat('e',64) WHERE id=$1",
+        "UPDATE artifacts SET created_at=now()-interval '2 hours',retention_until=now()-interval '1 hour' WHERE id=$1",
+    ] {
+        sqlx::query(changed)
+            .bind(artifact_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query(
+            "UPDATE artifacts a SET status=p.status,finalized_at=p.finalized_at,artifact_role=p.artifact_role,
+             run_id=p.run_id,sha256=p.sha256,created_at=p.created_at,retention_until=p.retention_until
+             FROM jsonb_populate_record(NULL::artifacts,$2) p WHERE a.id=$1",
+        ).bind(artifact_id).bind(&artifact).execute(&store.pool).await.unwrap();
+    }
+    assert!(
+        store
+            .renew_pull_request_publication(renewal)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_publication_preserves_models(&original, &state(&store).await);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_rechecks_actor_room_and_publisher_credentials(
+    pool: PgPool,
+) {
+    let (store, _, _, input) = publication_fixture(pool).await;
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    store
+        .renew_pull_request_publication(renewal.clone())
+        .await
+        .unwrap();
+    let before = publication_state(&store).await;
+    for (changed, restored) in [
+        (
+            "UPDATE actors SET role='member' WHERE id=$1",
+            "UPDATE actors SET role='owner' WHERE id=$1",
+        ),
+        (
+            "DELETE FROM room_memberships WHERE actor_id=$1 AND room_id='00000000-0000-0000-0000-000000000006'",
+            "INSERT INTO room_memberships(actor_id,room_id) VALUES($1,'00000000-0000-0000-0000-000000000006')",
+        ),
+    ] {
+        sqlx::query(changed)
+            .bind(OWNER)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, None).await; // Also fences exact start replay.
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query(restored)
+            .bind(OWNER)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    for mismatched_publisher in [false, true] {
+        let mut bad_start = input.clone();
+        let mut bad_renewal = renewal.clone();
+        if mismatched_publisher {
+            bad_start.publisher_id = "another-publisher".to_owned();
+            bad_renewal.publisher_id = bad_start.publisher_id.clone();
+        } else {
+            bad_start.publisher_credential_hash = "f".repeat(64);
+            bad_renewal.publisher_credential_hash = bad_start.publisher_credential_hash.clone();
+        }
+        reject_publication(&store, &bad_start, None).await;
+        reject_publication(&store, &bad_start, Some(&bad_renewal)).await;
+    }
+    let credential = &before["publication"]["credentials"][0];
+    let credential_id = Uuid::parse_str(credential["id"].as_str().unwrap()).unwrap();
+    for changed in [
+        "UPDATE publication_publisher_credentials SET created_at=now()-interval '2 hours',expires_at=now()-interval '1 hour' WHERE id=$1",
+        "UPDATE publication_publisher_credentials SET revoked_at=now() WHERE id=$1",
+    ] {
+        sqlx::query(changed)
+            .bind(credential_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_publication(&store, &input, None).await;
+        reject_publication(&store, &input, Some(&renewal)).await;
+        sqlx::query(
+            "UPDATE publication_publisher_credentials c SET created_at=p.created_at,expires_at=p.expires_at,
+             revoked_at=p.revoked_at FROM jsonb_populate_record(NULL::publication_publisher_credentials,$2) p WHERE c.id=$1",
+        ).bind(credential_id).bind(credential).execute(&store.pool).await.unwrap();
+    }
+    assert!(
+        store
+            .start_pull_request_publication(input)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert!(
+        store
+            .renew_pull_request_publication(renewal)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_publication_preserves_models(&before, &state(&store).await);
 }

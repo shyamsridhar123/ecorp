@@ -68,6 +68,7 @@ struct PublicationPrerequisites {
     task_ids: Vec<Uuid>,
     run_ids: Vec<Uuid>,
     evidence_ids: Vec<Uuid>,
+    checkpoint: Option<checkpoint_publication::CheckpointPublication>,
 }
 
 struct PublicationPrerequisiteRequest<'a> {
@@ -467,6 +468,7 @@ impl PgStore {
             "run_ids": prerequisites.run_ids,
             "verification_evidence_ids": prerequisites.evidence_ids,
             "verification_sha256": prerequisites.verification_sha256,
+            "checkpoint": prerequisites.checkpoint.as_ref().map(|checkpoint| &checkpoint.provenance),
             "deliverable": {
                 "id": normalized.source_deliverable_id,
                 "artifact_id": prerequisites.artifact_id,
@@ -885,6 +887,17 @@ impl PgStore {
             },
         )
         .await?;
+
+        // A lease is not a substitute for current source/review/actor authority.
+        // Reject new progress if those bindings changed after the remote effect;
+        // a later authorized publisher can adopt the exact existing remote result.
+        revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
+        // Revalidation can upgrade a legacy provenance record. Do not overwrite
+        // that upgrade with the pre-validation copy while applying this checkpoint.
+        let (current, _) =
+            publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                .await?
+                .context("publication disappeared after authority revalidation")?;
 
         let mut events = Vec::new();
         let (publication, replayed) = match checkpoint {
@@ -1626,6 +1639,13 @@ async fn revalidate_publication_authority_tx(
         || provenance_deliverable_sha != Some(prerequisites.deliverable_sha256.as_str())
         || provenance_verification_sha != Some(prerequisites.verification_sha256.as_str())
         || source_provenance == PublicationSourceProvenanceState::Invalid
+        || !checkpoint_publication::provenance_matches(
+            &publication.provenance,
+            prerequisites
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| &checkpoint.provenance),
+        )
     {
         return Err(anyhow!(
             "conflict: publication authority no longer matches its verified provenance"
@@ -1912,6 +1932,15 @@ async fn validate_publication_prerequisites(
         })
         .collect::<Vec<_>>();
     let selected_lineage = publication_resume_lineage(selected_run_id, &resume_edges)?;
+    let checkpoint = checkpoint_publication::authority_tx(
+        tx,
+        request.corp_id,
+        work_item.id,
+        selected_run_id,
+        &selected_lineage,
+        &commit_sha,
+    )
+    .await?;
     if run_rows.iter().any(|run| {
         selected_lineage.contains(&run.get::<Uuid, _>("id"))
             && run
@@ -1961,6 +1990,21 @@ async fn validate_publication_prerequisites(
             run_ids.push(run_id);
             continue;
         }
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.origin_run_id == run_id)
+        {
+            // This exact measured budget stop produced the authorized checkpoint.
+            // Publishing its reviewed bytes starts no model; loops are not waived.
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
+            run_ids.push(run_id);
+            continue;
+        }
         if historical_suspend_is_recovered(
             run_id,
             selected_run_id,
@@ -1976,14 +2020,27 @@ async fn validate_publication_prerequisites(
             run_ids.push(run_id);
             continue;
         }
-        ensure_run_not_hard_blocked_tx(
-            tx,
-            request.corp_id,
-            run_id,
-            &breaker_stage,
-            "pull-request publication",
-        )
-        .await?;
+        if checkpoint.is_some() {
+            // Healthy historical tasks must not inherit a new model-budget veto
+            // from the shared mission/actor counters during this zero-provider effect.
+            // Their real stop/suspend state and current loop limits still apply.
+            ensure_breaker_allows_human_progress(&breaker_stage, "pull-request publication")?;
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
+        } else {
+            ensure_run_not_hard_blocked_tx(
+                tx,
+                request.corp_id,
+                run_id,
+                &breaker_stage,
+                "pull-request publication",
+            )
+            .await?;
+        }
         run_ids.push(run_id);
     }
     let evidence_ids = sqlx::query_scalar::<_, Uuid>(
@@ -2025,6 +2082,7 @@ async fn validate_publication_prerequisites(
         task_ids,
         run_ids,
         evidence_ids,
+        checkpoint,
     })
 }
 

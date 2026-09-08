@@ -894,6 +894,11 @@ schema version 2; authority revalidation accepts legacy schema-version-1 records
 claimed revision so an in-flight publication can survive deployment. Without a completed recovery,
 both revisions are the claimed revision and `recovery_id` is null.
 
+Checkpoint publications additionally retain the original native checkpoint/termination event
+IDs, workspace/fingerprint, original HEAD, verified export HEAD and authority digest under
+`provenance.checkpoint`. That value is reconstructed from current native authority on renewal
+and before new publication checkpoints; missing or changed bindings fail closed.
+
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
 expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
@@ -955,11 +960,18 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
-The selected deliverable run is always checked against current budget and breaker authority. A
+The selected deliverable run is always checked against current budget and breaker authority. By default, a
 `stop` stage anywhere in the mission remains terminal. A historical `suspend` is accepted only when
 it is an explicit resumed ancestor of the selected verified run and its current no-progress and
 repeated-tool counters remain below the current policy limits. Unrelated suspends, stop-level loop
 metrics, and missing, duplicate, or cyclic resume lineage fail closed.
+
+An explicit publication of a completed, exactly bound checkpoint-verification result is a
+zero-provider operation. It may proceed past that checkpoint's measured model-budget stop and
+retrospective shared model counters without changing spending. Other actual stop/suspend state,
+explicit stops, loop limits, quarantine, source/verification identity, actor/room and publisher
+credentials remain effective. This is not a general exemption for publishing arbitrary results.
+See [the native publication and restart evidence](evidence/2026-09-08-checkpoint-publication.md).
 For the Project effect, the publisher reads the exact Project and Status identities, renews
 authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
 state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a
