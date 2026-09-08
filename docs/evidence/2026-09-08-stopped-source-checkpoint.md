@@ -95,3 +95,49 @@ ordinary verification begins still lacks an original pre-verification checkpoint
 No manual service, runner identity, provider home, application database, retained
 mission, or protected #172 QA relay was changed. No container, real-provider run,
 hosted Actions, auto-merge, or deployment was used for these checks.
+
+## Server/browser follow-up: retained failure and correction
+
+The separate, previously owned QA fixture at API `18574` / UI `15574` was reused
+without a new container or database reset. Its expired test-role login lease was
+renewed without replacing the password or privileges. Existing source, workload
+credential, signing configuration and history were retained. The manual app and
+the protected #172 transport were untouched.
+
+A browser-created 500K-ceiling mission using `[budget-stream-ui]` received 600K
+**synthetic protocol tokens**, not vendor inference or billing. Its exact file
+check and `base.txt` write scope were submitted through the real composer.
+Mission `2d32c649-9251-4781-acdc-2af330db6ab1`, run
+`f345625a-5df4-4b21-bcf8-7b6e7190a736`, remains a retained failure:
+
+- hard stop followed the two native usage events;
+- the adapter's final local transcript became an attempted post-stop upload;
+- the server rejected that upload and recorded failure before termination
+  telemetry could be accepted;
+- checkpoint evidence and original source were preserved, but the required
+  termination/checkpoint sequence was **not** proven.
+
+The native executor regression was expanded to emit an adapter artifact after a
+hard directive. Against the prior sink it failed **0 passed / 1 failed**, exit
+101. The fix now ignores artifact egress before file reads when that assignment
+has already received a hard directive. Transcript bytes remain in the retained
+worktree; no rejection or fabricated accepted artifact is substituted.
+
+The corrected source passed the full local gate: **368 Rust tests**, including
+**17 new checkpoint tests** and **139 runner tests**, with 96 opt-in SQLx cases
+still ignored; migration/format/Clippy/web/whitespace checks passed. The additive
+API driver and protocol-fixture regressions passed **95 pure Node tests**.
+The driver has no reset, enrollment, SQL, policy-revision or provider-resume path.
+The original `[budget-stream]` remains 3K twice; the explicit UI-only marker is
+300K twice to exercise the UI's unchanged 500K preset.
+
+This correction does not resolve an artifact already queued before control
+delivery; exact-assignment late termination telemetry is tracked in #193.
+The wider #148 recovery-to-publication acceptance remains separate.
+
+Original screenshots, the failed browser snapshot and red-test output are under
+`C:\Users\shyamsridhar\.codex\dogfood\issue190-runtime-20260908`.
+The corrected source gate is
+`C:\Users\shyamsridhar\.codex\dogfood\remaining-work-20260908\issue190-runtime-fix-20260908T121229935\result.json`.
+Corrected-candidate server/browser acceptance must be recorded separately; the
+failed browser run is not overwritten or relabeled as successful.

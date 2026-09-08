@@ -1539,6 +1539,12 @@ impl AdapterEventSink for RunnerEventSink {
                     "text": text,
                 }),
             ),
+            AdapterEvent::Artifact(_) if self.assignment.hard_boundary_requested() => {
+                // Native adapters may finish their local transcript on interruption.
+                // Keep those bytes in the retained worktree, but do not turn a known
+                // hard stop into a rejected upload and premature run.failed event.
+                return;
+            }
             AdapterEvent::Artifact(artifact) => match std::fs::read(&artifact.path) {
                 Ok(bytes) => {
                     if let Ok(mut artifacts) = self.artifacts.lock() {

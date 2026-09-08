@@ -323,6 +323,22 @@ mod tests {
             self.ready.notify_one();
             let control = controls.recv().await.expect("native control");
             assert!(matches!(control, AdapterControl::CircuitBreaker { .. }));
+            if matches!(&control, AdapterControl::CircuitBreaker { stage, .. }
+                if matches!(stage.as_str(), "suspend" | "stop"))
+            {
+                // Real adapters can emit their final local transcript even
+                // after native interruption. It must not become a late upload.
+                let evidence = request.workspace.join(".crony/provider-evidence.txt");
+                std::fs::create_dir_all(evidence.parent().unwrap())?;
+                let bytes = b"stopped provider transcript\n";
+                std::fs::write(&evidence, bytes)?;
+                sink.emit(AdapterEvent::Artifact(AdapterArtifact {
+                    path: evidence,
+                    sha256: hex::encode(sha2::Sha256::digest(bytes)),
+                    bytes: bytes.len(),
+                    media_type: "text/plain".to_owned(),
+                }));
+            }
             if self.uncertain {
                 sink.emit(AdapterEvent::TeardownUncertain {
                     detail: "fixture cannot prove provider teardown".to_owned(),
@@ -469,6 +485,7 @@ mod tests {
                     "run.verification_started"
                         | "run.verification_passed"
                         | "run.completed"
+                        | "run.artifact_upload"
                         | "run.deliverable_upload"
                 )
             }));
@@ -791,6 +808,33 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn issue190_stopped_artifact_callback_cannot_fail_an_unreadable_local_artifact() {
+        let (root, _workspaces, workspace, assignment) = fixture().await;
+        assert!(assignment.hard_boundary_checkpoint.request());
+        let outbound = OutboundBus::default();
+        let terminal = Arc::new(Mutex::new(None));
+        let sink = RunnerEventSink {
+            outbound: outbound.clone(),
+            runner_id: "runner-stopped-artifact".to_owned(),
+            assignment,
+            workspace: workspace.clone(),
+            artifacts: Arc::new(Mutex::new(Vec::new())),
+            terminal: terminal.clone(),
+            teardown_uncertain: Arc::new(AtomicBool::new(false)),
+        };
+        sink.emit(AdapterEvent::Artifact(AdapterArtifact {
+            path: workspace.path.join("never-created-transcript.txt"),
+            sha256: "a".repeat(64),
+            bytes: 10,
+            media_type: "text/plain".to_owned(),
+        }));
+        assert!(events(&outbound).is_empty());
+        assert!(terminal.lock().unwrap().is_none());
+        assert!(workspace.path.join("sentinel.txt").exists());
+        remove_fixture(root);
     }
 
     #[tokio::test]

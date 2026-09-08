@@ -171,13 +171,17 @@ function startTurn(message) {
     completedAtMs: Date.now(),
   })
 
-  if (prompt.includes('[budget-stream]')) {
+  if (prompt.includes('[budget-stream]') || prompt.includes('[budget-stream-ui]')) {
+    // The browser's smallest normal preset is 500K. Keep its real request
+    // unchanged and scale only this deterministic fixture's reported usage.
+    // These are synthetic protocol counters, never vendor billing evidence.
+    const tokensPerEvent = prompt.includes('[budget-stream-ui]') ? 300_000 : 3_000
     emitUsageOnFinish = false
     setTimeout(() => {
-      if (!terminal) emitUsage(3_000, 0)
+      if (!terminal) emitUsage(tokensPerEvent, 0)
     }, 40)
     setTimeout(() => {
-      if (!terminal) emitUsage(3_000, 0)
+      if (!terminal) emitUsage(tokensPerEvent, 0)
     }, 120)
     completionTimer = setTimeout(() => finish('completed'), 1_000)
   } else if (prompt.includes('[fail]') && !resumed) {
