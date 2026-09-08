@@ -929,3 +929,590 @@ async fn issue183_next_native_recovery_keeps_the_cleaned_lost_source_binding(poo
         );
     }
 }
+
+// Issue #186 exercises the missing-start backfill, not just admission after a
+// successful cleanup. Each binding mutation happens after native ACK/loss and
+// before the first cleanup, without changing the original source run.
+const ISSUE186_ASSIGNMENT_FIELDS: [&str; 4] = [
+    "workspace_path",
+    "workspace_branch",
+    "workspace_base_ref",
+    "workspace_base_commit",
+];
+const ISSUE186_TERMINAL_ERROR: &str = "factory recovery requires failed verification on a terminal source or an exactly bound lost recovery";
+const ISSUE186_PRESERVED_ERROR: &str = "source run has no confirmed preserved workspace checkpoint";
+
+fn issue186_assert_missing_assignment(snapshot: &Value) {
+    for field in ISSUE186_ASSIGNMENT_FIELDS {
+        assert_eq!(snapshot["run"][field], Value::Null, "{field}");
+    }
+    assert!(
+        snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["type"].as_str().unwrap() != "run.started")
+    );
+}
+
+async fn issue186_unstarted_loss(pool: PgPool) -> PgStore {
+    let store = fixture(pool, "source_correction").await;
+    let original = state(&store).await;
+    issue186_assert_missing_assignment(&original);
+    assert_eq!(original["run"]["workspace_fingerprint"], Value::Null);
+    let events = acknowledge_and_lose(&store).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "factory.verification_failed");
+    assert_eq!(events[1].event_type, "run.lost");
+    let lost = state(&store).await;
+    issue186_assert_missing_assignment(&lost);
+    assert_eq!(lost["run"]["status"], "lost");
+    assert_eq!(lost["run"]["verification_status"], "failed");
+    assert_eq!(lost["run"]["workspace_fingerprint"], Value::Null);
+    assert_eq!(lost["recovery"]["status"], "failed");
+    assert_eq!(lost["item"]["state"], "verification_failed");
+    assert_eq!(lost["item"]["version"], 4);
+    assert_eq!(lost["source"], original["source"]);
+    store
+}
+
+fn issue186_cleanup() -> RunnerEventInput {
+    event(
+        "run.workspace_preserved",
+        json!({
+            "disposition":"preserved",
+            "detail":"issue186 native cleanup report",
+            "workspace_fingerprint":"c".repeat(64),
+            "workspace_quarantined":false,
+            // These report fields are not assignment authority.
+            "workspace":"issue186-untrusted-path",
+            "workspace_branch":"issue186-untrusted-branch",
+            "workspace_base_ref":"issue186-untrusted-ref",
+            "workspace_base_commit":"f".repeat(40)
+        }),
+    )
+}
+
+async fn issue186_apply_cleanup_without_backfill(
+    store: &PgStore,
+    cleanup: RunnerEventInput,
+) -> Value {
+    let before = state(store).await;
+    let event_id = cleanup.event_id;
+    let outcome = store.apply_runner_event(cleanup).await.unwrap();
+    let recorded = outcome.event.unwrap();
+    assert_eq!(recorded.id, event_id);
+    assert_eq!(recorded.event_type, "run.workspace_preserved");
+    assert!(outcome.related_events.is_empty());
+    let after = state(store).await;
+    for object in [
+        "source", "task", "mission", "item", "recovery", "agent", "command",
+    ] {
+        assert_eq!(after[object], before[object], "{object}");
+    }
+    for (field, value) in before["run"].as_object().unwrap() {
+        if !matches!(
+            field.as_str(),
+            "workspace_disposition" | "workspace_detail" | "workspace_fingerprint" | "updated_at"
+        ) {
+            assert_eq!(&after["run"][field], value, "{field}");
+        }
+    }
+    assert_eq!(after["run"]["status"], "lost");
+    assert_eq!(after["source"]["workspace_fingerprint"], "b".repeat(64));
+    let prior_events = before["events"].as_array().unwrap();
+    let current_events = after["events"].as_array().unwrap();
+    assert_eq!(current_events.len(), prior_events.len() + 1);
+    assert_eq!(&current_events[..prior_events.len()], prior_events);
+    assert_eq!(current_events.last().unwrap()["id"], event_id.to_string());
+    after
+}
+
+async fn issue186_admission_counts(store: &PgStore) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM runs),
+                (SELECT count(*) FROM factory_verification_recoveries),
+                (SELECT count(*) FROM runner_commands),
+                (SELECT count(*) FROM mission_contract_revisions)",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap()
+}
+
+async fn issue186_assert_recovery_denied(store: &PgStore, expected_error: &str) {
+    let before = state(store).await;
+    let counts = issue186_admission_counts(store).await;
+    let context_error = store
+        .factory_verification_recovery_context(CORP, OWNER, ITEM)
+        .await
+        .unwrap_err();
+    assert_eq!(context_error.to_string(), expected_error);
+    // A fresh key tests admission, not replay. The exact checkpoint error must
+    // precede the minimal fixture's policy and mode-specific dispatch checks.
+    let admission_error = store
+        .create_factory_verification_recovery(CreateFactoryVerificationRecoveryInput {
+            corp_id: CORP,
+            work_item_id: ITEM,
+            actor_id: OWNER,
+            claim_token: Uuid::from_u128(15),
+            expected_factory_version: 4,
+            idempotency_key: Uuid::new_v4(),
+            source_run_id: RUN,
+            mode: FactoryVerificationRecoveryMode::VerifierOnly,
+            reason: "Issue186 must reject an unbound or quarantined checkpoint".to_owned(),
+            observed_source_revision: "revision-1".to_owned(),
+            reviewed_source_snapshot: json!({"source_revision":"revision-1","issue_number":183}),
+            contract_revision_id: None,
+            expected_workspace_fingerprint: "c".repeat(64),
+            expected_head_commit: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(admission_error.to_string(), expected_error);
+    assert_eq!(issue186_admission_counts(store).await, counts);
+    assert_eq!(state(store).await, before);
+}
+
+async fn issue186_assert_unbound_cleanup(store: &PgStore, cleanup: RunnerEventInput) {
+    issue186_assert_missing_assignment(&state(store).await);
+    let after = issue186_apply_cleanup_without_backfill(store, cleanup.clone()).await;
+    issue186_assert_missing_assignment(&after);
+    assert_eq!(after["run"]["workspace_disposition"], "preserved");
+    // A first authenticated cleanup seal is valid even when assignment backfill
+    // is denied. It must neither replace the parent's seal nor admit recovery.
+    assert_eq!(after["run"]["workspace_fingerprint"], "c".repeat(64));
+    issue186_assert_recovery_denied(store, ISSUE186_TERMINAL_ERROR).await;
+    let replay = store.apply_runner_event(cleanup.clone()).await.unwrap();
+    assert!(replay.event.is_none());
+    assert!(replay.related_events.is_empty());
+    assert_eq!(state(store).await, after);
+    let mut replacement = cleanup;
+    replacement.event_id = Uuid::new_v4();
+    replacement.payload["workspace_fingerprint"] = json!("d".repeat(64));
+    let error = store.apply_runner_event(replacement).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "workspace fingerprint cannot change after it is recorded"
+    );
+    assert_eq!(state(store).await, after);
+}
+
+async fn issue186_cleanup_negative(pool: PgPool, mutation: &str, row_id: Uuid) {
+    let store = issue186_unstarted_loss(pool).await;
+    assert_eq!(
+        sqlx::query(mutation)
+            .bind(row_id)
+            .execute(&store.pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    issue186_assert_unbound_cleanup(&store, issue186_cleanup()).await;
+}
+
+async fn issue186_change_uuid_binding(
+    store: &PgStore,
+    mutation: &str,
+    replacement: Uuid,
+    row_id: Uuid,
+) {
+    assert_eq!(
+        sqlx::query(mutation)
+            .bind(replacement)
+            .bind(row_id)
+            .execute(&store.pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+}
+
+async fn issue186_other_mission(store: &PgStore) -> Uuid {
+    let other = Uuid::from_u128(18601);
+    sqlx::query(
+        "INSERT INTO missions(id,corp_id,room_id,requested_by,title,status,budget_tokens,
+                              original_budget_tokens,original_budget_cost_microusd)
+         SELECT $1,corp_id,room_id,requested_by,'Issue186 other mission','failed',budget_tokens,
+                original_budget_tokens,original_budget_cost_microusd
+         FROM missions WHERE id=$2",
+    )
+    .bind(other)
+    .bind(MISSION)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    other
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_completed_receipt_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries SET status='completed' WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_missing_receipt_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "DELETE FROM factory_verification_recoveries WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_missing_replacement_identity_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries SET replacement_run_id=NULL WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_replaced_receipt_identity_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries SET replacement_run_id=source_run_id WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_wrong_receipt_mode_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries SET mode='verifier_only' WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_wrong_source_run_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries SET source_run_id=replacement_run_id WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_missing_resume_parent_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE runs SET resumed_from_run_id=NULL WHERE id=$1",
+        RUN,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_foreign_receipt_corp_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let other = Uuid::from_u128(18602);
+    sqlx::query(
+        "INSERT INTO corps(id,slug,name) VALUES($1,'issue186-other','Issue186 other Corp')",
+    )
+    .bind(other)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    issue186_change_uuid_binding(
+        &store,
+        "UPDATE factory_verification_recoveries SET corp_id=$1 WHERE id=$2",
+        other,
+        RECOVERY,
+    )
+    .await;
+    issue186_assert_unbound_cleanup(&store, issue186_cleanup()).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_foreign_receipt_mission_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let other = issue186_other_mission(&store).await;
+    issue186_change_uuid_binding(
+        &store,
+        "UPDATE factory_verification_recoveries SET mission_id=$1 WHERE id=$2",
+        other,
+        RECOVERY,
+    )
+    .await;
+    issue186_assert_unbound_cleanup(&store, issue186_cleanup()).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_foreign_receipt_task_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let other = Uuid::from_u128(18603);
+    sqlx::query(
+        "INSERT INTO tasks(id,corp_id,mission_id,title,objective,status,assigned_agent_id,
+                           plan_key,contract,verification_policy,attempt_count,max_attempts)
+         SELECT $1,corp_id,mission_id,'Issue186 other task',objective,'ready',assigned_agent_id,
+                'issue186-other',contract,verification_policy,0,max_attempts
+         FROM tasks WHERE id=$2",
+    )
+    .bind(other)
+    .bind(TASK)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    issue186_change_uuid_binding(
+        &store,
+        "UPDATE factory_verification_recoveries SET task_id=$1 WHERE id=$2",
+        other,
+        RECOVERY,
+    )
+    .await;
+    issue186_assert_unbound_cleanup(&store, issue186_cleanup()).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_foreign_factory_item_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let mission = issue186_other_mission(&store).await;
+    let other = Uuid::from_u128(18604);
+    sqlx::query(
+        "INSERT INTO factory_work_items(id,corp_id,source_kind,source_project_owner,
+              source_project_number,source_project_item_id,source_repository_owner,
+              source_repository_name,source_issue_number,source_issue_node_id,source_issue_url,
+              source_title,source_revision,state,claim_owner_id,claim_token,
+              lease_expires_at,mission_id,policy)
+         SELECT $1,corp_id,source_kind,source_project_owner,source_project_number,
+                'issue186-other-item',source_repository_owner,source_repository_name,
+                186,'issue186-other-node','https://github.com/fixture/source/issues/186',
+                'Issue186 other item',source_revision,'failed',claim_owner_id,$2,
+                lease_expires_at,$3,policy
+         FROM factory_work_items WHERE id=$4",
+    )
+    .bind(other)
+    .bind(Uuid::new_v4())
+    .bind(mission)
+    .bind(ITEM)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    issue186_change_uuid_binding(
+        &store,
+        "UPDATE factory_verification_recoveries SET factory_work_item_id=$1 WHERE id=$2",
+        other,
+        RECOVERY,
+    )
+    .await;
+    issue186_assert_unbound_cleanup(&store, issue186_cleanup()).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_agent_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let actor = Uuid::from_u128(18605);
+    let other = Uuid::from_u128(18606);
+    sqlx::query(
+        "INSERT INTO actors(id,corp_id,name,kind,role)
+         VALUES($1,$2,'Issue186 other worker','agent','worker')",
+    )
+    .bind(actor)
+    .bind(CORP)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agents(id,corp_id,actor_id,name,role,adapter,status,accent)
+         SELECT $1,corp_id,$2,'Issue186 other worker',role,adapter,'idle',accent
+         FROM agents WHERE id=$3",
+    )
+    .bind(other)
+    .bind(actor)
+    .bind(AGENT)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    issue186_change_uuid_binding(
+        &store,
+        "UPDATE runs SET agent_id=$1 WHERE id=$2",
+        other,
+        RUN,
+    )
+    .await;
+    let mut cleanup = issue186_cleanup();
+    cleanup.agent_id = other;
+    issue186_assert_unbound_cleanup(&store, cleanup).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_runner_cannot_backfill_missing_assignment(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let other = "issue186-other-runner";
+    store
+        .runner_connected(RunnerConnectInput {
+            id: other.to_owned(),
+            corp_id: CORP,
+            hostname: "issue186-fixture".to_owned(),
+            os: "windows".to_owned(),
+            capabilities: json!({}),
+            connection_epoch: EPOCH,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query("UPDATE runs SET runner_id=$1 WHERE id=$2")
+            .bind(other)
+            .bind(RUN)
+            .execute(&store.pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    let mut cleanup = issue186_cleanup();
+    cleanup.runner_id = other.to_owned();
+    issue186_assert_unbound_cleanup(&store, cleanup).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_workspace_root_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(pool, "UPDATE runs SET workspace_run_id=id WHERE id=$1", RUN).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_source_repository_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE runs SET source_repository='other/source' WHERE id=$1",
+        RUN,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_source_ref_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE runs SET source_base_ref='release' WHERE id=$1",
+        RUN,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_source_commit_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE runs SET source_base_commit=repeat('d',40) WHERE id=$1",
+        RUN,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_missing_source_tuple_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE runs SET source_repository=NULL,source_base_ref=NULL,source_base_commit=NULL WHERE id=$1",
+        RUN,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_changed_authorized_fingerprint_cannot_backfill_missing_assignment(pool: PgPool) {
+    issue186_cleanup_negative(
+        pool,
+        "UPDATE factory_verification_recoveries
+         SET request=jsonb_set(request,'{expected_workspace_fingerprint}',to_jsonb(repeat('e',64)))
+         WHERE id=$1",
+        RECOVERY,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_quarantine_blocks_later_preserved_report_and_first_fingerprint(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let mut quarantine = issue186_cleanup();
+    quarantine.payload["workspace_quarantined"] = json!(true);
+    let quarantined = issue186_apply_cleanup_without_backfill(&store, quarantine).await;
+    issue186_assert_missing_assignment(&quarantined);
+    assert_eq!(quarantined["run"]["workspace_disposition"], "quarantined");
+    assert_eq!(quarantined["run"]["workspace_fingerprint"], Value::Null);
+    issue186_assert_recovery_denied(&store, ISSUE186_PRESERVED_ERROR).await;
+
+    // A new event defeats duplicate-event short-circuiting. Neither the false
+    // quarantine flag nor a later valid fingerprint can manufacture a checkpoint.
+    let mut later = issue186_cleanup();
+    later.payload["workspace_fingerprint"] = json!("d".repeat(64));
+    let after = issue186_apply_cleanup_without_backfill(&store, later).await;
+    issue186_assert_missing_assignment(&after);
+    assert_eq!(after["run"]["workspace_disposition"], "quarantined");
+    assert_eq!(after["run"]["workspace_fingerprint"], Value::Null);
+    issue186_assert_recovery_denied(&store, ISSUE186_PRESERVED_ERROR).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue186_quarantine_keeps_existing_fingerprint_after_later_preserved_report(pool: PgPool) {
+    let store = issue186_unstarted_loss(pool).await;
+    let original = state(&store).await;
+    // Establish the existing seal through native cleanup, not SQL backfill or a
+    // fabricated start report. Intact authority still uses the original parent.
+    store.apply_runner_event(issue186_cleanup()).await.unwrap();
+    let sealed = state(&store).await;
+    for field in ISSUE186_ASSIGNMENT_FIELDS {
+        assert_eq!(sealed["run"][field], original["source"][field], "{field}");
+    }
+    assert_eq!(sealed["source"], original["source"]);
+    assert_eq!(sealed["run"]["workspace_fingerprint"], "c".repeat(64));
+    let context = store
+        .factory_verification_recovery_context(CORP, OWNER, ITEM)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.source_run_id, RUN);
+    assert_eq!(context.workspace_fingerprint, Some("c".repeat(64)));
+
+    let mut quarantine = issue186_cleanup();
+    quarantine.payload["workspace_quarantined"] = json!(true);
+    quarantine.payload["workspace_fingerprint"] = json!("d".repeat(64));
+    let quarantined = issue186_apply_cleanup_without_backfill(&store, quarantine).await;
+    assert_eq!(quarantined["run"]["workspace_disposition"], "quarantined");
+    assert_eq!(quarantined["run"]["workspace_fingerprint"], "c".repeat(64));
+    issue186_assert_recovery_denied(&store, ISSUE186_PRESERVED_ERROR).await;
+
+    let mut later = issue186_cleanup();
+    later.payload["workspace_fingerprint"] = json!("e".repeat(64));
+    let after = issue186_apply_cleanup_without_backfill(&store, later).await;
+    assert_eq!(after["run"]["workspace_disposition"], "quarantined");
+    assert_eq!(after["run"]["workspace_fingerprint"], "c".repeat(64));
+    issue186_assert_recovery_denied(&store, ISSUE186_PRESERVED_ERROR).await;
+}
