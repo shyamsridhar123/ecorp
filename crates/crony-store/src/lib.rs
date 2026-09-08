@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod budget_checkpoint;
 mod budget_revision;
+mod checkpoint_retention;
 mod contract_revision;
 mod factory_controller;
 mod factory_run_failure;
@@ -3717,6 +3718,20 @@ impl PgStore {
             ],
         )
         .await?;
+
+        if let Some(outcome) = checkpoint_retention::request_review_checkpoint_tx(
+            &mut tx,
+            &input,
+            &expected_head_commit,
+            &idempotency_key,
+            &command_idempotency_key,
+            &operation_request,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(outcome);
+        }
 
         let existing_command = sqlx::query(
             r#"
@@ -11140,6 +11155,11 @@ async fn mark_runner_runs_lost_tx(
     for row in rows {
         let run_id: Uuid = row.get("run_id");
         let corp_id: Uuid = row.get("corp_id");
+        if checkpoint_retention::review_ready_tx(tx, corp_id, run_id).await? {
+            // The verifier finished. Its durable human review does not require
+            // an active provider claim and must survive runner/server reconnect.
+            continue;
+        }
         let task_id: Uuid = row.get("task_id");
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
@@ -12381,6 +12401,10 @@ async fn source_workspace_checkpoint_tx(
         r#"
         SELECT run.status, run.execution_mode, run.verification_status,
                run.workspace_path, run.workspace_disposition, run.workspace_fingerprint,
+               run.deliverable_sha256,
+               COALESCE(task.contract#>>'{deliverable,form}'='commit_branch'
+                 OR task.contract#>>'{deliverable,commit_after_verification}'='true',false)
+                 AS expects_verification_commit,
                deliverable.head_commit, recovery.id AS recovery_id,
                recovery.status AS recovery_status, recovery.mode AS recovery_mode,
                recovery.request->>'expected_workspace_fingerprint' AS authorized_fingerprint,
@@ -12448,7 +12472,21 @@ async fn source_workspace_checkpoint_tx(
         // Native verifier cleanup emits this fingerprint only after checking both
         // assigned guards. Keep the authorized head even when a lost/cancelled
         // run never exported a deliverable; never weaken Some(head) to None.
-        head = checkpoint_head_commit(head, row.get("authorized_head"))?;
+        let exported_head = checkpoint_retention::exported_head_tx(tx, corp_id, run_id).await?;
+        if row.get::<Option<String>, _>("recovery_mode").as_deref()
+            == Some("checkpoint_verification")
+            && row.get::<bool, _>("expects_verification_commit")
+            && row.get::<Option<String>, _>("deliverable_sha256").is_some()
+            && exported_head.is_none()
+        {
+            return Err(anyhow!(
+                "checkpoint export head has no exact ready artifact binding"
+            ));
+        }
+        head = match exported_head {
+            Some(exported) if head.as_ref() == Some(&exported) => Some(exported),
+            _ => checkpoint_head_commit(head, row.get("authorized_head"))?,
+        };
         Some(fingerprint)
     } else {
         None

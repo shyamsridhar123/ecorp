@@ -1,5 +1,9 @@
 # Checkpoint recovery review fixes and native application probe
 
+**Subsequent update:** [the same native case now passes recovery, browser review and
+download acceptance](2026-09-08-checkpoint-retention-accepted.md). The failed observations
+below remain history; no replacement mission was used.
+
 Date: September 8, 2026. Parent: #148 / PR #195, above PR #194.
 Candidate base: `e291a6e19c0b5079ce7260a2fe05c4eb451165c4`.
 

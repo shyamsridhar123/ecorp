@@ -17,6 +17,8 @@
  * --missing-required-artifact, --review-via-browser, --continue.
  * Review is ALWAYS external/browser-only. The driver returns the exact pending
  * review IDs without a decision POST; --continue observes Bob's native decision.
+ * --server-upgrade-receipt <owned JSON> is --continue-only. It attests a server
+ * replacement, never restarts anything, and retains the original report/binding.
  *
  * --continue is OBSERVATION ONLY. It never repeats a CLI/decision mutation or
  * creates a replacement. Lost responses are reconciled only to the unique,
@@ -88,6 +90,7 @@ export function parseArgs(argv) {
   const names = {
     '--receipt': 'receiptPath', '--output-dir': 'outputDir', '--cli': 'cli',
     '--cli-sha256': 'cliSha256',
+    '--server-upgrade-receipt': 'serverUpgradeReceipt',
     '--fixture-sha256': 'fixtureSha256', '--reviewer-actor-id': 'reviewer',
     '--tokens': 'tokens', '--timeout-ms': 'timeoutMs', '--poll-ms': 'pollMs',
     '--settle-ms': 'settleMs',
@@ -109,6 +112,7 @@ export function parseArgs(argv) {
   for (const name of ['receiptPath', 'outputDir', 'cli', 'fixtureSha256', 'reviewer']) {
     ensure(options[name] !== undefined, 'explicit_receipt_output_cli_fixture_reviewer_required')
   }
+  ensure(!options.serverUpgradeReceipt || options.continuation === true, 'server_upgrade_requires_continue')
   return options
 }
 
@@ -166,7 +170,9 @@ export function captureBaseline(state, replay, config) {
   baseline.extra = Object.fromEntries(EXTRA_HISTORY.map((table) => {
     const rows = state.snapshot[table]
     ensure(Array.isArray(rows) && rows.length <= LIMITS.snapshot_rows, 'history_table_missing_or_bounded')
-    return [table, rows.map((row) => ({ id: uuid(row.id ?? row.run_id), sha256: digest(row) }))]
+    return [table, rows.map((row) => ({
+      id: uuid(table === 'verification_requests' ? row.run_id : row.id), sha256: digest(row),
+    }))]
   }))
   return baseline
 }
@@ -175,7 +181,9 @@ export function assertBaseline(baseline, state, replay, config) {
   assertHistory(baseline, state, replay, config)
   for (const [table, rows] of Object.entries(baseline.extra)) {
     ensure(Array.isArray(state.snapshot[table]), 'history_table_missing')
-    const current = new Map(state.snapshot[table].map((row) => [row.id ?? row.run_id, digest(row)]))
+    const current = new Map(state.snapshot[table].map((row) => [
+      table === 'verification_requests' ? row.run_id : row.id, digest(row),
+    ]))
     ensure(rows.every((row) => current.get(row.id) === row.sha256), 'prior_evidence_or_factory_history_changed')
   }
 }
@@ -577,6 +585,40 @@ export function assessRecovery(state, replay, context, config, plan, original, i
     event.payload.runner_id === config.runner_id)
   ensure(ack.length === 1 && UUID.test(ack[0].payload.command_id) &&
     ack[0].seq > requested.seq, 'native_verify_run_command_not_acknowledged')
+  // A parent-issued CheckpointWorkspace re-attests THIS run; it is not VerifyRun.
+  const checkpointAcks = events.filter((event) => event.type === 'runner.command_acknowledged' &&
+    event.payload.command_kind === 'factory_workspace_checkpoint')
+  const checkpointRequests = replay.events.filter((event) => event.type === 'factory.workspace_checkpoint_requested' &&
+    (event.aggregate_id === rows.item.id || event.payload.source_run_id === run.id))
+  let reattestation = null
+  ensure(events.filter((event) => event.type === 'runner.command_acknowledged').length ===
+    ack.length + checkpointAcks.length, 'unexpected_verifier_command_ack')
+  if (checkpointAcks.length || checkpointRequests.length) {
+    ensure(checkpointAcks.length === 1 && checkpointRequests.length === 1, 'checkpoint_reattest_not_exactly_once')
+    const request = checkpointRequests[0]
+    const checkpointAck = checkpointAcks[0]
+    const preserved = events.filter((event) => event.type === 'run.workspace_preserved' &&
+      event.seq > request.seq && event.seq < checkpointAck.seq)
+    const delivered = state.snapshot.source_deliverables.find((row) => row.run_id === run.id)
+    ensure(request.aggregate_id === rows.item.id && request.actor_id === config.actor_id &&
+      request.corp_id === config.corp_id && request.room_id === rows.mission.room_id &&
+      request.correlation_id === rows.mission.id && request.causation_id === run.id &&
+      request.payload.source_run_id === run.id && request.payload.review_re_attestation === true &&
+      UUID.test(request.payload.command_id) && request.payload.command_id !== ack[0].payload.command_id &&
+      request.payload.command_id === checkpointAck.payload.command_id &&
+      checkpointAck.payload.runner_id === config.runner_id &&
+      request.seq > oneEvent(events, 'run.verification_waiting').seq && preserved.length === 1 &&
+      request.payload.expected_head_commit === delivered?.head_commit,
+    'checkpoint_reattest_authority_mismatch')
+    const proof = preserved[0].payload
+    ensure(samePath(proof.workspace, run.workspace_path) && proof.workspace_branch === run.workspace_branch &&
+      proof.workspace_base_ref === 'HEAD' && proof.workspace_base_commit === PIN.source_commit &&
+      proof.workspace_fingerprint === original.source_checkpoint.workspace_fingerprint &&
+      proof.head_commit === request.payload.expected_head_commit && proof.branch_deleted === false &&
+      proof.workspace_quarantined === false, 'checkpoint_reattest_source_changed')
+    reattestation = { run_id: run.id, command_id: request.payload.command_id,
+      requested: request.seq, preserved: preserved[0].seq, acknowledged: checkpointAck.seq }
+  }
   const evidence = state.snapshot.verification_evidence.filter((row) => row.run_id === run.id)
     .sort((a, b) => a.check_index - b.check_index)
   const evidenceEvents = events.filter((event) => event.type === 'run.verification_evidence')
@@ -592,6 +634,7 @@ export function assessRecovery(state, replay, context, config, plan, original, i
     new_provider_sessions: 0, new_provider_outputs: 0, new_provider_usage_events: 0,
     model_token_allocation: 0, model_cost_allocation: 0, input_tokens: 0, output_tokens: 0, cost_microusd: 0,
     provider_artifact_bytes_claimed: false, command_id: ack[0].payload.command_id,
+    checkpoint_re_attestation: reattestation,
     policy_sha256: checkpointPolicyDigests(plan.policy).verification_policy_sha256,
     checks: evidence.map((row) => ({ id: uuid(row.id), check_index: row.check_index,
       kind: row.kind, status: row.status, payload_sha256: digest(row.payload) })),
@@ -631,6 +674,8 @@ export function assessRecovery(state, replay, context, config, plan, original, i
   ensure(deliverables.length === 1 && gates.length === 1, 'one_deliverable_and_independent_gate_required')
   const deliverable = deliverables[0]
   const gate = gates[0]
+  ensure(gate.run_id === run.id && gate.corp_id === config.corp_id && gate.task_id === rows.task.id,
+    'verification_request_run_identity_mismatch')
   equal(gate.gate, plan.policy.manual_gate, 'persisted_independent_gate_changed')
   ensure(deliverable.corp_id === config.corp_id && deliverable.task_id === rows.task.id &&
     deliverable.form === 'commit_branch' && deliverable.bytes > 0 &&
@@ -722,11 +767,15 @@ export function newReport(config, driverId = randomUUID()) {
   }
 }
 
-export function validateSavedReport(report, config) {
+export function validateSavedReport(report, config, serverUpgrade = null) {
+  const upgraded = serverUpgrade && canonical(report?.server_upgrade) === canonical(serverUpgrade) &&
+    serverUpgrade.old_binding_sha256 === report?.binding_sha256 &&
+    serverUpgrade.new_binding_sha256 === receiptIdentity(config)
   ensure(report?.schema_version === 1 && report.suite === SUITE &&
-    report.binding_sha256 === receiptIdentity(config), 'saved_report_binding_mismatch')
+    (report.binding_sha256 === receiptIdentity(config) || upgraded), 'saved_report_binding_mismatch')
   uuid(report.driver_id)
-  equal(Object.keys(report).sort(), Object.keys(newReport(config, report.driver_id)).sort(),
+  equal(Object.keys(report).filter((key) => !(upgraded && key === 'server_upgrade')).sort(),
+    Object.keys(newReport(config, report.driver_id)).sort(),
     'saved_report_shape_mismatch')
   equal(Object.keys(report.identity).sort(), Object.keys(newReport(config).identity).sort(), 'saved_identity_shape')
   for (const value of Object.values(report.identity)) if (value !== null) uuid(value)
@@ -745,6 +794,76 @@ export function validateSavedReport(report, config) {
       report.pending_review.reviewer_actor_id === config.reviewer, 'saved_browser_review_identity_changed')
   }
   return report
+}
+
+/** Parent's public stop/start attestation; no process inspection or mutations. */
+export function validateServerUpgrade(upgrade, currentRuntime, config, options, report, api = path) {
+  ensure(options.continuation === true && options.serverUpgradeReceipt, 'server_upgrade_requires_continue')
+  containedPath(PIN.runtime, options.serverUpgradeReceipt, api)
+  ensure(upgrade?.schema_version === 1 && upgrade.phase === 'ready' &&
+    typeof upgrade.ready_at === 'string' && Number.isFinite(Date.parse(upgrade.ready_at)) &&
+    upgrade.old_server_stopped_verified === true &&
+    upgrade.database_unchanged === true && upgrade.runner_unchanged === true, 'server_upgrade_attestation_required')
+  const old = upgrade.old_runtime
+  const next = upgrade.new_runtime
+  ensure(uuid(upgrade.owner_task) === old?.owner_task && upgrade.owner_task === next?.owner_task &&
+    upgrade.owner_task === config.receipt_id, 'server_upgrade_owner_mismatch')
+  const identity = (runtime, withoutServer = false) => {
+    const value = { ...runtime, processes: { ...runtime.processes }, binaries: { ...runtime.binaries } }
+    // Observer metadata carries no authority; full before/after hashes are retained.
+    for (const key of ['observed_at', 'ready_at', 'history']) delete value[key]
+    if (withoutServer) { delete value.processes.server; delete value.binaries.server }
+    return value
+  }
+  equal(identity(next), identity(currentRuntime), 'server_upgrade_current_runtime_mismatch')
+  equal(identity(old, true), identity(next, true), 'server_upgrade_changed_nonserver_runtime')
+  ensure(old.processes.runner.pid === 14532 && old.processes.web?.pid === 47032 &&
+    upgrade.old_server_pid === old.processes.server.pid && upgrade.new_server_pid === next.processes.server.pid &&
+    Number.isSafeInteger(upgrade.new_server_pid) && upgrade.new_server_pid > 0 &&
+    ![upgrade.old_server_pid, 14532, 47032].includes(upgrade.new_server_pid), 'server_upgrade_process_identity_mismatch')
+  ensure(/^[0-9a-f]{40}$/u.test(upgrade.new_server_source_base_head) &&
+    next.processes.server.source_base_head === upgrade.new_server_source_base_head &&
+    next.binaries.server.source_base_head === upgrade.new_server_source_base_head, 'new_server_build_base_mismatch')
+  const manifest = upgrade.product_source_sha256
+  ensure(Array.isArray(manifest?.paths) && Array.isArray(manifest.sha256) &&
+    manifest.paths.length > 0 && manifest.paths.length <= 64 &&
+    manifest.paths.length === manifest.sha256.length && new Set(manifest.paths).size === manifest.paths.length &&
+    manifest.paths.every((file) => typeof file === 'string' &&
+      /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/u.test(file.replaceAll('\\', '/')) &&
+      !file.replaceAll('\\', '/').split('/').some((part) => part === '.' || part === '..')) &&
+    manifest.sha256.every((value) => typeof value === 'string' && SHA.test(value.toLowerCase())),
+  'product_source_digest_manifest_required')
+  const oldConfig = configuration(old, options, api)
+  // These are freshly checked local input digests, not values trusted from the receipt.
+  for (const key of ['application_fixture_sha256', 'fake_github_sha256', 'git_sha256']) {
+    if (config[key] !== undefined) oldConfig[key] = config[key]
+  }
+  const { server_upgrade: previousUpgrade, ...oldReport } = report
+  validateSavedReport(oldReport, oldConfig)
+  ensure(report.identity.original_run_id && report.identity.replacement_run_id &&
+    report.identity.original_run_id !== report.identity.replacement_run_id &&
+    report.intents.create && report.intents.recovery && report.original?.admission,
+  'server_upgrade_requires_existing_two_run_acceptance')
+  const evidence = {
+    schema_version: 1, receipt_sha256: digest(upgrade), owner_task: upgrade.owner_task,
+    old_runtime_sha256: digest(old), new_runtime_sha256: digest(next),
+    old_binding_sha256: report.binding_sha256, new_binding_sha256: receiptIdentity(config),
+    old_server_pid: upgrade.old_server_pid, new_server_pid: upgrade.new_server_pid,
+    old_server_sha256: oldConfig.runtime_binaries.server.sha256,
+    new_server_sha256: config.runtime_binaries.server.sha256,
+    runtime_launch_source_commit: old.source_commit,
+    new_server_source_base_head: upgrade.new_server_source_base_head,
+    product_source_sha256: { paths: [...manifest.paths], sha256: manifest.sha256.map((value) => value.toLowerCase()) },
+    old_server_stopped_verified: true, database_unchanged: true, runner_unchanged: true,
+  }
+  if (previousUpgrade) {
+    const { retained_report_path, retained_report_sha256, ...previousEvidence } = previousUpgrade
+    equal(previousEvidence, evidence, 'recorded_server_upgrade_changed')
+    containedPath(config.output_dir, retained_report_path, api)
+    sha(retained_report_sha256)
+    return { ...evidence, retained_report_path, retained_report_sha256 }
+  }
+  return evidence
 }
 
 async function canonicalDirectory(directory) {
@@ -870,8 +989,9 @@ function admissionView(context, report) {
 }
 
 /** All effects are injectable. Tests use ONLY memory, never a fake service. */
-export async function executeSuite(config, report, io, { continuation = false } = {}) {
-  validateSavedReport(report, config)
+export async function executeSuite(config, report, io, { continuation = false, serverUpgrade = null } = {}) {
+  ensure(!serverUpgrade || continuation, 'server_upgrade_requires_continue')
+  validateSavedReport(report, config, serverUpgrade)
   const plan = buildPlan(config, report.driver_id)
   const deadline = io.now() + config.timeout_ms
   let phase = 'preflight'
@@ -1148,12 +1268,13 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     const options = parseArgs(argv)
     if (options.help) {
-      console.log('Required: --receipt <absolute issue195 runtime.json> --output-dir <existing owned runtime subdirectory> --cli <absolute candidate.exe> --fixture-sha256 <current SHA256> --reviewer-actor-id <independent human UUID>. Optional: --cli-sha256 <explicit rebuilt candidate SHA256>, --tokens 5000|6000, --timeout-ms, --poll-ms, --settle-ms, --missing-required-artifact, --review-via-browser, --continue (observation only). Review always pauses for the parent browser, never a decision POST. Never start or reset the runtime with this driver.')
+      console.log('Required: --receipt <absolute issue195 runtime.json> --output-dir <existing owned runtime subdirectory> --cli <absolute candidate.exe> --fixture-sha256 <current SHA256> --reviewer-actor-id <independent human UUID>. Optional: --cli-sha256 <explicit rebuilt candidate SHA256>, --tokens 5000|6000, --timeout-ms, --poll-ms, --settle-ms, --missing-required-artifact, --review-via-browser, --continue (observation only), --server-upgrade-receipt <owned JSON, continue-only>. Review always pauses for the parent browser, never a decision POST. Never start or reset the runtime with this driver.')
       return 0
     }
     ensure(process.platform === 'win32', 'this_driver_targets_the_explicit_windows_qa_only')
-    const config = configuration(JSON.parse((await readBounded(localAbsolute(options.receiptPath),
-      LIMITS.receipt_bytes)).toString('utf8')), options)
+    const runtime = JSON.parse((await readBounded(localAbsolute(options.receiptPath),
+      LIMITS.receipt_bytes)).toString('utf8'))
+    const config = configuration(runtime, options)
     await verifyInputs(config)
     reportPath = config.report_path
     const lockPath = `${reportPath}.lock`
@@ -1164,11 +1285,27 @@ export async function main(argv = process.argv.slice(2)) {
     ensure(priorExists === (options.continuation === true),
       priorExists ? 'existing_report_requires_explicit_continue' : 'continuation_report_missing')
     let report
+    let serverUpgrade = null
     if (priorExists) {
       const bytes = await readBounded(reportPath, LIMITS.report_bytes)
-      report = validateSavedReport(JSON.parse(bytes.toString('utf8')), config)
+      report = JSON.parse(bytes.toString('utf8'))
+      if (options.serverUpgradeReceipt) {
+        const upgradePath = containedPath(PIN.runtime, options.serverUpgradeReceipt)
+        const upgrade = JSON.parse((await readBounded(upgradePath, 2 * LIMITS.receipt_bytes)).toString('utf8'))
+        serverUpgrade = validateServerUpgrade(upgrade, runtime, config, options, report)
+        if (serverUpgrade.retained_report_path) {
+          ensure(hashBytes(await readBounded(serverUpgrade.retained_report_path, LIMITS.report_bytes)) ===
+            serverUpgrade.retained_report_sha256, 'retained_preupgrade_report_changed')
+        }
+      } else validateSavedReport(report, config)
       // Preserve failed/successful prior reports before ANY observation refresh.
-      await writeNew(`${reportPath}.previous-${randomUUID()}.json`, bytes)
+      const retainedPath = `${reportPath}.previous-${randomUUID()}.json`
+      await writeNew(retainedPath, bytes)
+      if (serverUpgrade) {
+        serverUpgrade = { retained_report_path: retainedPath, retained_report_sha256: hashBytes(bytes), ...serverUpgrade }
+        report.server_upgrade = serverUpgrade // Keep binding_sha256 and original inputs unchanged.
+        validateSavedReport(report, config, serverUpgrade)
+      }
     } else report = newReport(config)
     async function save(value) {
       const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`)
@@ -1198,7 +1335,7 @@ export async function main(argv = process.argv.slice(2)) {
             'retained_download_changed_do_not_overwrite')
         } else await writeNew(target, bytes)
       },
-    }, { continuation: options.continuation === true })
+    }, { continuation: options.continuation === true, serverUpgrade })
     console.log(JSON.stringify({ suite: SUITE, passed: report.passed, report_path: reportPath,
       status: report.status, identity: report.identity, pending_review: report.pending_review }))
     return 0

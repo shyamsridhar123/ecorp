@@ -1798,8 +1798,49 @@ async fn decode_recovery_runner_command(
                 }
             }
         }
+        "factory_workspace_checkpoint"
+            if command
+                .payload
+                .get("review_re_attestation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            if !checkpoint_dispatch_allowed(
+                state.store.checkpoint_review_command_authorized(command),
+                async {
+                    if let Some(event) = state
+                        .store
+                        .fail_runner_command(
+                            command.id,
+                            &command.runner_id,
+                            "checkpoint re-attestation authorization is no longer current",
+                        )
+                        .await?
+                    {
+                        publish(state, event);
+                    }
+                    Ok(())
+                },
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            decode_runner_command(command, control_lease_token, durable_control).map(Some)
+        }
         _ => decode_runner_command(command, control_lease_token, durable_control).map(Some),
     }
+}
+
+async fn checkpoint_dispatch_allowed(
+    authorization: impl std::future::Future<Output = anyhow::Result<bool>>,
+    retire_denied_command: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<bool> {
+    if authorization.await? {
+        return Ok(true);
+    }
+    retire_denied_command.await?;
+    Ok(false)
 }
 
 fn supports_checkpoint_verification(capabilities: &[crony_protocol::RunnerCapability]) -> bool {
@@ -6348,6 +6389,35 @@ mod tests {
         schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
         validate_verification_artifact_reference,
     };
+
+    #[tokio::test]
+    async fn checkpoint_denial_retires_only_the_command_and_store_errors_remain_retryable() {
+        use std::cell::Cell;
+        for allowed in [true, false] {
+            let retired = Cell::new(false);
+            let result = super::checkpoint_dispatch_allowed(async { Ok(allowed) }, async {
+                retired.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, allowed);
+            assert_eq!(retired.get(), !allowed);
+        }
+        let retired = Cell::new(false);
+        assert!(
+            super::checkpoint_dispatch_allowed(
+                async { Err(anyhow::anyhow!("transient database failure")) },
+                async {
+                    retired.set(true);
+                    Ok(())
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(!retired.get());
+    }
 
     #[test]
     fn checkpoint_verification_requires_explicit_runner_support() {

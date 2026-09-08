@@ -286,6 +286,14 @@ Explicit stop, loop and quarantine checks, current room/role authority, independ
 the separate publication/merge/deployment boundaries remain. Missing artifact evidence cannot be
 manufactured or dropped from the persisted verifier policy.
 
+Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
+verification commit. Ready-artifact joins bind the new head to its run, producer, source,
+policy and verification digest; these relational checks are not fresh signature/byte validation.
+Same-run checkpoint re-attestation rechecks current role/room and source authority and cannot
+start a provider, alter budgets, or overwrite another assignment. Definite authorization denial
+retires only its command; database failures remain retryable. Outcome review and publication
+retain their separate authorization and integrity checks.
+
 Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
 declared media type in memory, then performs authoritative assignment, task, budget, and breaker
 checks while reserving the event-specific staging key in Postgres. No object bytes are written

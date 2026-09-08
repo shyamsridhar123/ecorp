@@ -1496,3 +1496,145 @@ test('runtime factory adapter never retries an ambiguous injected CLI call', asy
   await assert.rejects(async () => io.factory(true, 1000), { code: 'native_cli_not_retried' })
   assert.equal(calls, 2)
 })
+
+// Focused rolling-upgrade regressions: all receipts, archives and runtime I/O
+// below remain in memory; no process, file, service or browser is operated.
+async function serverUpgradeFixture() {
+  const old = receipt()
+  old.processes.server.pid = 36944
+  old.processes.runner.pid = 14532
+  old.processes.web = { role: 'web', pid: 47032, executable: 'C:\\Program Files\\nodejs\\node.exe',
+    workspace: EXPECTED.workspace, started_utc: '2026-09-08T16:00:00Z' }
+  const args = options({ continuation: true,
+    serverUpgradeReceipt: WIN.join(EXPECTED.runtime, 'server-upgrade.json') })
+  const h = memoryHarness(driver.configuration(old, args, WIN))
+  await driver.executeSuite(h.c, h.report, h.io)
+  h.report.status = 'failed'
+  h.report.failures.push({ at: 1, code: 'not_exact_provider_free_workspace_lineage' })
+  const next = clone(old)
+  const build = { source_base_head: '4992e2cdbb9c3d5ed116ca2cb19174f1d77ec800' }
+  next.binaries.server = { path: WIN.join(EXPECTED.runtime, 'bin', 'crony-server-upgraded.exe'),
+    sha256: 'a'.repeat(64), ...build }
+  next.processes.server = { ...old.processes.server, pid: 36945,
+    executable: next.binaries.server.path, started_utc: '2026-09-08T18:00:00Z', ...build }
+  const upgrade = { schema_version: 1, owner_task: old.owner_task, old_runtime: old, new_runtime: next,
+    phase: 'ready', ready_at: '2026-09-08T18:01:00Z',
+    old_server_stopped_verified: true, old_server_pid: 36944, new_server_pid: 36945,
+    database_unchanged: true, runner_unchanged: true, new_server_source_base_head: build.source_base_head,
+    product_source_sha256: {
+      paths: ['crates/crony-store/src/checkpoint_retention.rs', 'Cargo.lock'],
+      sha256: ['c'.repeat(64), 'd'.repeat(64)],
+    } }
+  return { h, args, old, next, upgrade, current: driver.configuration(next, args, WIN) }
+}
+
+test('server-upgrade option is explicit, continue-only, and confined to the owned runtime directory', async () => {
+  const argv = [...requiredPairs().flat(), '--server-upgrade-receipt', WIN.join(EXPECTED.runtime, 'upgrade.json')]
+  assert.throws(() => driver.parseArgs(argv), { code: 'server_upgrade_requires_continue' })
+  assert.equal(driver.parseArgs([...argv, '--continue']).continuation, true)
+  const f = await serverUpgradeFixture()
+  assert.throws(() => driver.validateServerUpgrade(f.upgrade, f.next, f.current,
+    { ...f.args, serverUpgradeReceipt: 'C:\\elsewhere\\upgrade.json' }, f.h.report, WIN),
+  { code: 'path_outside_owned_root' })
+  f.upgrade.database_unchanged = false
+  assert.throws(() => driver.validateServerUpgrade(f.upgrade, f.next, f.current, f.args, f.h.report, WIN),
+    { code: 'server_upgrade_attestation_required' })
+  f.upgrade.database_unchanged = true
+  f.upgrade.phase = 'new_server_started'
+  assert.throws(() => driver.validateServerUpgrade(f.upgrade, f.next, f.current, f.args, f.h.report, WIN),
+    { code: 'server_upgrade_attestation_required' })
+})
+
+test('server-only upgrade retains the original binding/failure and separately records server provenance read-only', async () => {
+  const f = await serverUpgradeFixture()
+  const retained = JSON.stringify(f.h.report)
+  const evidence = driver.validateServerUpgrade(f.upgrade, f.next, f.current, f.args, f.h.report, WIN)
+  assert.equal(JSON.stringify(f.h.report), retained, 'upgrade validation must not alter the old report')
+  assert.equal(evidence.old_binding_sha256, f.h.report.binding_sha256)
+  assert.notEqual(evidence.new_binding_sha256, evidence.old_binding_sha256)
+  assert.equal(evidence.runtime_launch_source_commit, EXPECTED.code_commit)
+  assert.equal(evidence.new_server_source_base_head, f.upgrade.new_server_source_base_head)
+  assert.deepEqual(evidence.product_source_sha256, f.upgrade.product_source_sha256)
+  assert.ok(!JSON.stringify(evidence).includes(SENTINEL))
+  const recorded = { ...evidence, retained_report_path: `${f.current.report_path}.previous-${id(910)}.json`,
+    retained_report_sha256: sha(retained) }
+  f.h.report.server_upgrade = recorded
+  assert.throws(() => driver.validateSavedReport(f.h.report, f.current), { code: 'saved_report_binding_mismatch' })
+  const before = clone(f.h.mutations)
+  await driver.executeSuite(f.current, f.h.report, f.h.io, { continuation: true, serverUpgrade: recorded })
+  assert.deepEqual(f.h.mutations, before)
+  assert.equal(f.h.report.binding_sha256, evidence.old_binding_sha256)
+  assert.equal(f.h.report.status, 'awaiting_browser_review')
+  assert.equal(f.h.report.failures.at(-1).code, 'not_exact_provider_free_workspace_lineage')
+  assert.equal(f.h.report.server_upgrade.retained_report_sha256, sha(retained))
+  assert.deepEqual(driver.validateServerUpgrade(f.upgrade, f.next, f.current, f.args, f.h.report, WIN), recorded)
+})
+
+test('upgrade rejects runner/web/CLI changes, a mismatched old binding, and conflicting server provenance', async () => {
+  const f = await serverUpgradeFixture()
+  for (const role of ['runner', 'web']) {
+    const upgrade = clone(f.upgrade)
+    upgrade.new_runtime.processes[role].pid += 1
+    assert.throws(() => driver.validateServerUpgrade(upgrade, upgrade.new_runtime, f.current, f.args, f.h.report, WIN),
+      { code: 'server_upgrade_changed_nonserver_runtime' })
+  }
+  assert.throws(() => driver.validateServerUpgrade(f.upgrade, f.next, f.current,
+    { ...f.args, cli: WIN.join(EXPECTED.runtime, 'bin', 'different-cli.exe') }, f.h.report, WIN),
+  { code: 'saved_report_binding_mismatch' })
+  const wrongReport = { ...f.h.report, binding_sha256: 'e'.repeat(64) }
+  assert.throws(() => driver.validateServerUpgrade(f.upgrade, f.next, f.current, f.args, wrongReport, WIN),
+    { code: 'saved_report_binding_mismatch' })
+  const wrongBuild = clone(f.upgrade)
+  wrongBuild.new_runtime.processes.server.source_base_head = EXPECTED.code_commit
+  assert.throws(() => driver.validateServerUpgrade(wrongBuild, wrongBuild.new_runtime, f.current, f.args, f.h.report, WIN),
+    { code: 'new_server_build_base_mismatch' })
+})
+
+function appendCheckpointReattestation(f) {
+  const commandId = id(930)
+  f.append('factory.workspace_checkpoint_requested', {
+    source_run_id: f.replacement.id, command_id: commandId, expected_head_commit: f.deliverable.head_commit,
+    review_re_attestation: true,
+  }, { aggregate_id: f.item.id, aggregate_type: 'factory_work_item',
+    actor_id: f.c.actor_id, causation_id: f.replacement.id })
+  f.append('run.workspace_preserved', {
+    workspace: f.run.workspace_path, workspace_branch: f.run.workspace_branch, workspace_base_ref: 'HEAD',
+    workspace_base_commit: EXPECTED.source_commit, workspace_fingerprint: f.proof.workspace_fingerprint,
+    head_commit: f.deliverable.head_commit, branch_deleted: false, workspace_quarantined: false,
+  })
+  f.append('runner.command_acknowledged', {
+    command_id: commandId, runner_id: f.c.runner_id, command_kind: 'factory_workspace_checkpoint',
+  })
+}
+
+test('same-verifier native checkpoint re-attestation accepts a real run_id-only VerificationRequest', () => {
+  const f = recoveryFixture()
+  assert.equal(Object.hasOwn(f.state.snapshot.verification_requests[0], 'id'), false)
+  appendCheckpointReattestation(f)
+  const result = driver.assessRecovery(f.state, f.replay, f.context, f.c, f.plan, f.original, f.identity)
+  assert.equal(result.checkpoint_re_attestation.run_id, f.replacement.id)
+  assert.equal(result.checkpoint_re_attestation.command_id, id(930))
+  assert.equal(result.new_provider_sessions, 0)
+  assert.equal(f.state.snapshot.runs.length, 2)
+  assert.equal(result.verified, false)
+})
+
+test('checkpoint re-attestation cannot target another run, duplicate an ACK, or permit provider usage', () => {
+  const f = recoveryFixture()
+  appendCheckpointReattestation(f)
+  const request = f.replay.events.find((entry) => entry.type === 'factory.workspace_checkpoint_requested')
+  request.payload.source_run_id = f.run.id
+  assert.throws(() => driver.assessRecovery(f.state, f.replay, f.context, f.c, f.plan, f.original, f.identity),
+    { code: 'checkpoint_reattest_authority_mismatch' })
+  request.payload.source_run_id = f.replacement.id
+  f.append('runner.command_acknowledged', {
+    command_id: id(931), runner_id: f.c.runner_id, command_kind: 'factory_workspace_checkpoint',
+  })
+  assert.throws(() => driver.assessRecovery(f.state, f.replay, f.context, f.c, f.plan, f.original, f.identity),
+    { code: 'checkpoint_reattest_not_exactly_once' })
+  f.replay.events.pop()
+  f.replay.through -= 1
+  f.append('run.usage', { input_tokens: 1, output_tokens: 0, cost_microusd: 0 })
+  assert.throws(() => driver.assessRecovery(f.state, f.replay, f.context, f.c, f.plan, f.original, f.identity),
+    { code: 'replacement_provider_events_or_unsafe_cleanup' })
+})

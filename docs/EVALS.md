@@ -23,6 +23,12 @@ store metadata tests, not proof of physical files, signed artifact bytes, a brow
 real application delivered after a stop. See
 [the scoped report](evidence/2026-09-08-checkpoint-verification-admission.md).
 
+The separate [native same-lineage acceptance](evidence/2026-09-08-checkpoint-retention-accepted.md)
+records a budget-stopped application, provider-free verification, a server-only upgrade,
+same-run native re-attestation, Bob's actual browser review and an identical downloaded bundle.
+It preserves the earlier failure and distinguishes deterministic protocol evidence from
+real-vendor inference, publication and production identity.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

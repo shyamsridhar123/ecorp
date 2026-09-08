@@ -1,7 +1,7 @@
 //! Actual-store metadata tests in SQLx-owned disposable databases, not provider
 //! execution, physical source verification, or signed-object acceptance.
 use super::*;
-use crony_domain::StoppedSourceCheckpoint;
+use crony_domain::{DeliverableForm, DeliverableSpec, StoppedSourceCheckpoint};
 
 const CORP: Uuid = Uuid::from_u128(1);
 const MISSION: Uuid = Uuid::from_u128(2);
@@ -47,6 +47,15 @@ async fn fixture_with_stop_request(
     needs_artifact: bool,
     explicit_stop: bool,
 ) -> PgStore {
+    fixture_with_deliverable(pool, needs_artifact, explicit_stop, None).await
+}
+
+async fn fixture_with_deliverable(
+    pool: PgPool,
+    needs_artifact: bool,
+    explicit_stop: bool,
+    deliverable: Option<DeliverableSpec>,
+) -> PgStore {
     sqlx::raw_sql(
         r#"
         INSERT INTO corps(id,slug,name) VALUES
@@ -71,7 +80,7 @@ async fn fixture_with_stop_request(
            'Preserve completed source','running',5000,5000,5000000);
         "#,
     ).execute(&pool).await.unwrap();
-    let contract: TaskContract = serde_json::from_value(json!({
+    let mut contract: TaskContract = serde_json::from_value(json!({
         "objective":"verify result.md", "expected_output":"result.md",
         "source_repository":"fixture/source", "source_base_ref":"main",
         "source_base_commit":"a".repeat(40), "acceptance_tests":["result.md is present"],
@@ -81,6 +90,7 @@ async fn fixture_with_stop_request(
         "model":"fixture-model", "reasoning_effort":"medium"
     }))
     .unwrap();
+    contract.deliverable = deliverable;
     let mut checks = vec![json!({"type":"file","path":"result.md","min_bytes":1})];
     if needs_artifact {
         checks.push(json!({"type":"artifact","min_bytes":1}));
@@ -119,11 +129,14 @@ async fn fixture_with_stop_request(
     .execute(&pool)
     .await
     .unwrap();
-    let factory_policy = json!({
+    let mut factory_policy = json!({
         "source_base_ref":"main", "source_base_commit":"a".repeat(40),
         "repository_allowlist":["fixture/source"], "write_scope":["result.md"],
         "allowed_tools":["filesystem"], "prohibited_actions":["no external effects"]
     });
+    if let Some(deliverable) = &contract.deliverable {
+        factory_policy["deliverable_form"] = json!(deliverable.form.as_str());
+    }
     sqlx::query(
         "INSERT INTO factory_work_items(id,corp_id,source_kind,source_project_owner,
           source_project_number,source_project_item_id,source_repository_owner,source_repository_name,
@@ -235,12 +248,19 @@ async fn state(store: &PgStore) -> Value {
           'runs',(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM runs r),
           'task',(SELECT to_jsonb(t) FROM tasks t WHERE id=$2),
           'mission',(SELECT to_jsonb(m) FROM missions m WHERE id=$3),
+          'tasks',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM tasks t),
+          'missions',(SELECT jsonb_agg(to_jsonb(m) ORDER BY id) FROM missions m),
           'item',(SELECT to_jsonb(f) FROM factory_work_items f WHERE id=$4),
           'agents',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM agents a),
           'actors',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM actors a),
           'memberships',(SELECT coalesce(jsonb_agg(to_jsonb(m) ORDER BY room_id,actor_id),'[]') FROM room_memberships m),
           'recoveries',(SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY id),'[]') FROM factory_verification_recoveries v),
           'commands',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY id),'[]') FROM runner_commands c),
+          'artifacts',(SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY id),'[]') FROM artifacts a),
+          'deliverables',(SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM source_deliverables d),
+          'verification_evidence',(SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY id),'[]') FROM verification_evidence v),
+          'verification_requests',(SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY run_id),'[]') FROM verification_requests v),
+          'operations',(SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY corp_id,idempotency_key),'[]') FROM factory_operations o),
           'events',(SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY seq),'[]') FROM events e))",
     ).bind(SOURCE).bind(TASK).bind(MISSION).bind(ITEM)
         .fetch_one(&store.pool).await.unwrap()
@@ -1062,4 +1082,503 @@ async fn issue148_checkpoint_unrelated_stop_events_do_not_revoke_budget_recovery
             .unwrap()
     );
     tx.rollback().await.unwrap();
+}
+
+fn retained_run(snapshot: &Value, run_id: Uuid) -> &Value {
+    snapshot["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["id"] == json!(run_id))
+        .expect("retained verifier run")
+}
+
+fn retention_event(command: &PendingRunnerCommand) -> RunnerEventInput {
+    event(
+        command.run_id,
+        Uuid::parse_str(command.payload["assignment_token"].as_str().unwrap()).unwrap(),
+        "run.workspace_preserved",
+        json!({
+            "workspace":"fixture-worktree","workspace_branch":"crony/fixture",
+            "workspace_base_ref":"main","workspace_base_commit":"a".repeat(40),
+            "workspace_fingerprint":"b".repeat(64),"workspace_quarantined":false,
+            "detail":"Native verifier retained its checked source",
+        }),
+    )
+}
+
+async fn waiting_export_fixture(pool: PgPool) -> (PgStore, PendingRunnerCommand, Uuid) {
+    let store = fixture_with_deliverable(
+        pool,
+        false,
+        false,
+        Some(DeliverableSpec {
+            form: DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: vec!["result.md".to_owned()],
+        }),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO runner_nodes(id,corp_id,hostname,os,connection_epoch,status)
+         VALUES($1,$2,'sqlx-retention-fixture','fixture',$3,'connected')",
+    )
+    .bind(RUNNER)
+    .bind(CORP)
+    .bind(Uuid::from_u128(20))
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let command = checkpoint_command(&store).await;
+    let token = retention_event(&command).assignment_token;
+    for (kind, payload) in [
+        (
+            "run.started",
+            json!({"workspace":"fixture-worktree","workspace_branch":"crony/fixture",
+            "workspace_base_ref":"main","workspace_base_commit":"a".repeat(40),
+            "execution_mode":"verification_only"}),
+        ),
+        ("run.verification_started", json!({})),
+        (
+            "run.verification_evidence",
+            json!({"evidence_id":Uuid::new_v4(),"check_index":0,
+            "kind":"file","status":"passed","summary":"Fixture file verified","payload":{}}),
+        ),
+    ] {
+        store
+            .apply_runner_event(event(command.run_id, token, kind, payload))
+            .await
+            .unwrap();
+    }
+    // Exercise native store reservation/finalization and verification linkage.
+    // These are synthetic metadata, not real Git bundle, signature, or object-store acceptance.
+    let content = br#"{"fixture":"SQLx-only source bundle metadata"}"#;
+    let sha256 = hex::encode(Sha256::digest(content));
+    let upload = event(command.run_id, token, "run.deliverable_upload", json!({}));
+    let artifact_id = upload.event_id;
+    let artifact = StoredArtifact {
+        id: artifact_id,
+        corp_id: CORP,
+        task_id: TASK,
+        run_id: command.run_id,
+        producer_agent_id: AGENT,
+        producer_runner_id: RUNNER.to_owned(),
+        verifier: "crony-server:artifact-ingest-v1".to_owned(),
+        object_key: format!("corps/{CORP}/sha256/{}/{sha256}", &sha256[..2]),
+        uri: format!("/api/corps/{CORP}/artifacts/{artifact_id}"),
+        sha256: sha256.clone(),
+        media_type: "application/vnd.ecorp.deliverable+json".to_owned(),
+        bytes: i64::try_from(content.len()).unwrap(),
+        artifact_role: "source_deliverable".to_owned(),
+        file_name: "ecorp-commit-branch.json".to_owned(),
+        metadata: json!({
+            "form":"commit_branch","verification_sha256":"c".repeat(64),
+            "base_commit":"a".repeat(40),"head_commit":"d".repeat(40),
+            "branch":"crony/fixture","integration_state":"ready_for_review",
+            "git_bundle_sha256":hex::encode(Sha256::digest(b"SQLx bundle metadata")),
+            "publication_ready":true,
+        }),
+        provenance_signature: "0".repeat(64),
+        retention_until: Utc::now() + chrono::Duration::hours(1),
+    };
+    store
+        .prepare_artifact_upload(
+            upload,
+            artifact,
+            &format!("staging/corps/{CORP}/{artifact_id}"),
+        )
+        .await
+        .unwrap();
+    store
+        .finalize_artifact_upload(CORP, artifact_id)
+        .await
+        .unwrap();
+    for (kind, payload) in [
+        (
+            "run.verification_passed",
+            json!({"summary":"Fixture checks passed",
+            "verification_sha256":"c".repeat(64),"deliverable_sha256":sha256}),
+        ),
+        (
+            "run.verification_waiting",
+            json!({"gate":gate(),"gate_type":"independent_review"}),
+        ),
+    ] {
+        store
+            .apply_runner_event(event(command.run_id, token, kind, payload))
+            .await
+            .unwrap();
+    }
+    store
+        .acknowledge_runner_command(command.id, RUNNER)
+        .await
+        .unwrap();
+    let snapshot = state(&store).await;
+    let run = retained_run(&snapshot, command.run_id);
+    assert_eq!(run["status"], "waiting_for_approval");
+    assert_eq!(run["verification_status"], "waiting_for_approval");
+    assert_eq!(run["workspace_disposition"], "active");
+    assert!(run["workspace_fingerprint"].is_null());
+    (store, command, artifact_id)
+}
+
+async fn retention_request(
+    store: &PgStore,
+    command: &PendingRunnerCommand,
+) -> CheckpointFactoryWorkspaceInput {
+    CheckpointFactoryWorkspaceInput {
+        corp_id: CORP,
+        work_item_id: ITEM,
+        actor_id: OWNER,
+        claim_token: CLAIM,
+        expected_version: state(store).await["item"]["version"].as_i64().unwrap(),
+        idempotency_key: Uuid::new_v4().to_string(),
+        source_run_id: command.run_id,
+        expected_head_commit: "d".repeat(40),
+    }
+}
+
+async fn reject_retention_event(store: &PgStore, input: RunnerEventInput) {
+    let before = state(store).await;
+    assert!(store.apply_runner_event(input).await.is_err());
+    assert_eq!(state(store).await, before);
+}
+
+async fn reject_retention_request(store: &PgStore, input: CheckpointFactoryWorkspaceInput) {
+    let before = state(store).await;
+    assert!(store.checkpoint_factory_workspace(input).await.is_err());
+    assert_eq!(state(store).await, before);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_binds_export_head_by_mode_without_rewriting_origin(
+    pool: PgPool,
+) {
+    let (store, command, _) = waiting_export_fixture(pool).await;
+    let before = state(&store).await;
+    store
+        .apply_runner_event(retention_event(&command))
+        .await
+        .unwrap();
+    let after = state(&store).await;
+    for key in [
+        "source",
+        "task",
+        "mission",
+        "recoveries",
+        "artifacts",
+        "deliverables",
+    ] {
+        assert_eq!(after[key], before[key], "{key}");
+    }
+    let run = retained_run(&after, command.run_id);
+    assert_eq!(run["status"], "waiting_for_approval");
+    assert_eq!(run["workspace_disposition"], "preserved");
+    assert_eq!(run["workspace_fingerprint"], "b".repeat(64));
+    assert_eq!(
+        after["recoveries"][0]["request"]["expected_head_commit"],
+        "a".repeat(40)
+    );
+    assert_eq!(
+        after["recoveries"][0]["checkpoint_authority"]["checkpoint"]["head_commit"],
+        "a".repeat(40)
+    );
+    assert_eq!(after["deliverables"][0]["head_commit"], "d".repeat(40));
+    // Ordinary-mode metadata variant, not a claim that ordinary admission can waive the budget stop.
+    sqlx::query(
+        "UPDATE factory_verification_recoveries SET mode='verifier_only',checkpoint_authority=NULL,
+         request=jsonb_set(request,'{mode}','\"verifier_only\"') WHERE replacement_run_id=$1",
+    )
+    .bind(command.run_id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE runner_commands SET payload=jsonb_set(payload,'{mode}','\"verifier_only\"')
+         WHERE id=$1",
+    )
+    .bind(command.id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    reject_retention_event(&store, retention_event(&command)).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_rejects_unbound_export(pool: PgPool) {
+    let (store, command, artifact_id) = waiting_export_fixture(pool).await;
+    let mut wrong_report = retention_event(&command);
+    wrong_report.payload["head_commit"] = json!("e".repeat(40));
+    reject_retention_event(&store, wrong_report).await;
+    let finalized_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT finalized_at FROM artifacts WHERE id=$1")
+            .bind(artifact_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE artifacts SET status='staged',finalized_at=NULL WHERE id=$1")
+        .bind(artifact_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_retention_event(&store, retention_event(&command)).await;
+    sqlx::query("UPDATE artifacts SET status='ready',finalized_at=$2 WHERE id=$1")
+        .bind(artifact_id)
+        .bind(finalized_at)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    // Corrupt one binding at a time only inside this disposable metadata fixture.
+    for (corrupt, restore) in [
+        (
+            "UPDATE artifacts SET artifact_role='provider_evidence' WHERE id=$1",
+            "UPDATE artifacts SET artifact_role='source_deliverable' WHERE id=$1",
+        ),
+        (
+            "UPDATE artifacts SET run_id='00000000-0000-0000-0000-000000000004' WHERE id=$1",
+            "UPDATE artifacts a SET run_id=d.run_id FROM source_deliverables d WHERE d.artifact_id=a.id AND a.id=$1",
+        ),
+        (
+            "UPDATE artifacts SET sha256=repeat('e',64) WHERE id=$1",
+            "UPDATE artifacts a SET sha256=r.deliverable_sha256 FROM runs r WHERE a.run_id=r.id AND a.id=$1",
+        ),
+        (
+            "UPDATE source_deliverables SET base_commit=repeat('e',40) WHERE artifact_id=$1",
+            "UPDATE source_deliverables d SET base_commit=r.workspace_base_commit FROM runs r WHERE d.run_id=r.id AND d.artifact_id=$1",
+        ),
+        (
+            "UPDATE source_deliverables SET verification_sha256=repeat('e',64) WHERE artifact_id=$1",
+            "UPDATE source_deliverables d SET verification_sha256=r.verification_sha256 FROM runs r WHERE d.run_id=r.id AND d.artifact_id=$1",
+        ),
+        (
+            "UPDATE source_deliverables SET head_commit=repeat('e',40) WHERE artifact_id=$1",
+            "UPDATE source_deliverables d SET head_commit=a.metadata->>'head_commit' FROM artifacts a WHERE d.artifact_id=a.id AND a.id=$1",
+        ),
+    ] {
+        sqlx::query(corrupt)
+            .bind(artifact_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        reject_retention_event(&store, retention_event(&command)).await;
+        sqlx::query(restore)
+            .bind(artifact_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    // Removing the ready artifact also cascades its deliverable row. Already
+    // verified export digests must not fall back to A for a fingerprint-only report.
+    sqlx::query("DELETE FROM artifacts WHERE id=$1")
+        .bind(artifact_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_retention_event(&store, retention_event(&command)).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_reattests_waiting_run_with_one_replayable_command(
+    pool: PgPool,
+) {
+    let (store, command, _) = waiting_export_fixture(pool).await;
+    let input = retention_request(&store, &command).await;
+    let before = state(&store).await;
+    let outcome = store
+        .checkpoint_factory_workspace(input.clone())
+        .await
+        .unwrap();
+    assert!(!outcome.replayed);
+    assert_eq!(outcome.source_run_id, command.run_id);
+    assert!(
+        outcome.workspace_fingerprint.is_none(),
+        "request is not a runner attestation"
+    );
+    let command_id = outcome.command_id.expect("native checkpoint command");
+    let after = state(&store).await;
+    for key in [
+        "source",
+        "runs",
+        "tasks",
+        "missions",
+        "task",
+        "mission",
+        "agents",
+        "recoveries",
+        "artifacts",
+        "deliverables",
+        "verification_evidence",
+        "verification_requests",
+    ] {
+        assert_eq!(after[key], before[key], "{key}");
+    }
+    assert_eq!(
+        after["commands"].as_array().unwrap().len(),
+        before["commands"].as_array().unwrap().len() + 1
+    );
+    let pending = store.pending_runner_commands(RUNNER).await.unwrap();
+    let checkpoint = pending.iter().find(|entry| entry.id == command_id).unwrap();
+    assert_eq!(checkpoint.command_kind, "factory_workspace_checkpoint");
+    assert_eq!(checkpoint.run_id, command.run_id);
+    assert_eq!(checkpoint.payload["workspace_run_id"], json!(SOURCE));
+    assert_eq!(checkpoint.payload["expected_head_commit"], "d".repeat(40));
+    assert_eq!(checkpoint.payload["source_base_commit"], "a".repeat(40));
+    assert_eq!(
+        checkpoint.payload["assignment_token"],
+        command.payload["assignment_token"]
+    );
+    let replay = store.checkpoint_factory_workspace(input).await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.command_id, Some(command_id));
+    assert_eq!(state(&store).await, after);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_reattest_rechecks_role_room_and_claim(pool: PgPool) {
+    let (store, command, _) = waiting_export_fixture(pool).await;
+    let input = retention_request(&store, &command).await;
+    store
+        .checkpoint_factory_workspace(input.clone())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE actors SET role='member' WHERE id=$1")
+        .bind(OWNER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_retention_request(&store, input.clone()).await;
+    sqlx::query("UPDATE actors SET role='owner' WHERE id=$1")
+        .bind(OWNER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM room_memberships WHERE room_id=$1 AND actor_id=$2")
+        .bind(ROOM)
+        .bind(OWNER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_retention_request(&store, input.clone()).await;
+    sqlx::query("INSERT INTO room_memberships(room_id,actor_id) VALUES($1,$2)")
+        .bind(ROOM)
+        .bind(OWNER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let mut stale = input.clone();
+    stale.claim_token = Uuid::new_v4();
+    reject_retention_request(&store, stale).await;
+    let mut stale = input.clone();
+    stale.expected_version += 1;
+    reject_retention_request(&store, stale).await;
+    assert!(
+        store
+            .checkpoint_factory_workspace(input)
+            .await
+            .unwrap()
+            .replayed
+    );
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_reattest_rejects_stop_quarantine_and_active_lineage(
+    pool: PgPool,
+) {
+    let (store, command, _) = waiting_export_fixture(pool).await;
+    let input = retention_request(&store, &command).await;
+    let other = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO runs(id,corp_id,task_id,agent_id,runner_id,assignment_token,status,workspace_run_id)
+         VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
+    ).bind(other).bind(CORP).bind(TASK).bind(AGENT).bind(RUNNER).bind(Uuid::new_v4())
+        .bind(SOURCE).execute(&store.pool).await.unwrap();
+    reject_retention_request(&store, input.clone()).await;
+    // Restore only injected fixture state between independent negative cases.
+    sqlx::query("DELETE FROM runs WHERE id=$1")
+        .bind(other)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runs SET workspace_disposition='quarantined' WHERE id=$1")
+        .bind(command.run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    reject_retention_request(&store, input.clone()).await;
+    sqlx::query("UPDATE runs SET workspace_disposition='active' WHERE id=$1")
+        .bind(command.run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let stopped = store
+        .request_emergency_stop(CORP, AGENT, OWNER, "Stop retained verification")
+        .await
+        .unwrap();
+    assert_eq!(stopped.run_id, command.run_id);
+    reject_retention_request(&store, input).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_retention_unclaimed_reconnect_preserves_only_bound_review(
+    pool: PgPool,
+) {
+    let (store, command, artifact_id) = waiting_export_fixture(pool).await;
+    let before = state(&store).await;
+    let mut tx = store.pool.begin().await.unwrap();
+    let events = mark_runner_runs_lost_tx(
+        &mut tx,
+        RUNNER,
+        &[],
+        None,
+        "fixture reconnect without a provider process claim",
+    )
+    .await
+    .unwrap();
+    assert!(
+        events.is_empty(),
+        "evidence-complete review must remain waiting"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(state(&store).await, before);
+
+    for corrupt in [
+        "UPDATE artifacts SET run_id='00000000-0000-0000-0000-000000000004' WHERE id=$1",
+        "DELETE FROM artifacts WHERE id=$1",
+    ] {
+        // The private native method shares this test transaction. Rollback keeps
+        // negative metadata variants isolated without resetting any lifecycle.
+        let mut tx = store.pool.begin().await.unwrap();
+        sqlx::query(corrupt)
+            .bind(artifact_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let events = mark_runner_runs_lost_tx(
+            &mut tx,
+            RUNNER,
+            &[],
+            None,
+            "fixture reconnect with unbound review evidence",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !events.is_empty(),
+            "unbound review must take the normal loss path"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=$1")
+            .bind(command.run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(status, "lost");
+        tx.rollback().await.unwrap();
+        assert_eq!(state(&store).await, before);
+    }
 }

@@ -578,6 +578,15 @@ existing `VerifyRun` command, with no model, provider session, provider secrets,
 allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
 unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
 
+The original checkpoint HEAD still guards admission, while the native exporter may create a
+first verification commit. Retention accepts that new HEAD only through the exact verifier's
+ready source artifact and source/policy/verification bindings. A missing or mismatched commit
+artifact never silently falls back to the old HEAD. A finished checkpoint verifier awaiting
+human review can request the existing `CheckpointWorkspace` operation to repair a missing
+retention receipt on the same run; the runner checks the physical HEAD and fingerprint again.
+Such an evidence-complete review needs no live provider claim and survives runner reconnect.
+See [the same-lineage native acceptance](evidence/2026-09-08-checkpoint-retention-accepted.md).
+
 Only that exactly bound recovery can proceed despite exhausted model-usage budgets. A zero limit
 or a generic `verification_only` flag is insufficient. Explicit stops, loop breakers, quarantine,
 other active assignments, and unrelated Factory blocks remain effective. The checkpoint operation
