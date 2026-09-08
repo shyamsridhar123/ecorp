@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
+import { writeCheckpointApplication } from './checkpoint-application-fixture.mjs'
 
 if (process.argv.includes('--version')) {
   process.stdout.write('codex-cli fake-app-server\n')
@@ -170,6 +171,10 @@ function startTurn(message) {
     },
     completedAtMs: Date.now(),
   })
+
+  if (prompt.includes('[checkpoint-app]')) {
+    writeCheckpointApplication(workspace)
+  }
 
   if (prompt.includes('[budget-queued-completion]')) {
     // Isolated #193 race candidate: base.txt already exists. Emit both usage
