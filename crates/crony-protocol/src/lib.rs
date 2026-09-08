@@ -168,6 +168,10 @@ pub enum ServerToRunner {
         workspace_base_commit: String,
         expected_workspace_fingerprint: String,
         expected_head_commit: Option<String>,
+        /// A separately authorized stopped-source checkpoint may create its first
+        /// verification commit. The expected HEAD still fences source admission.
+        #[serde(default)]
+        checkpoint_verification: bool,
         verification_policy: VerificationPolicy,
         #[serde(default)]
         write_scope: Vec<String>,
@@ -642,6 +646,8 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub remaining_mission_cost_microusd: i64,
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
+    #[serde(default)]
+    pub checkpoint_verification: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

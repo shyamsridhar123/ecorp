@@ -1739,11 +1739,24 @@ async fn decode_recovery_runner_command(
                         secrets,
                     }))
                 }
-                FactoryVerificationRecoveryMode::VerifierOnly => {
+                FactoryVerificationRecoveryMode::VerifierOnly
+                | FactoryVerificationRecoveryMode::CheckpointVerification => {
+                    if payload.mode == FactoryVerificationRecoveryMode::CheckpointVerification
+                        && !state.runners.get(&command.runner_id).is_some_and(|runner| {
+                            supports_checkpoint_verification(&runner.capabilities)
+                        })
+                    {
+                        return Err(anyhow::anyhow!(
+                            "runner does not support stopped-checkpoint verification; update the runner before recovery"
+                        ));
+                    }
                     if !payload.secret_refs.is_empty() {
                         return Err(anyhow::anyhow!(
                             "verifier-only recovery cannot receive provider secrets"
                         ));
+                    }
+                    if !verification_recovery_authority_is_current(state, command).await? {
+                        return Ok(None);
                     }
                     if let Some(reference) = payload.provider_artifact.as_mut()
                         && !hydrate_verification_artifact(
@@ -1756,7 +1769,7 @@ async fn decode_recovery_runner_command(
                     {
                         return Ok(None);
                     }
-                    if !recovery_command_can_dispatch(state, command).await? {
+                    if !verification_recovery_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::VerifyRun {
@@ -1775,6 +1788,8 @@ async fn decode_recovery_runner_command(
                         workspace_base_commit: payload.workspace_base_commit,
                         expected_workspace_fingerprint: payload.expected_workspace_fingerprint,
                         expected_head_commit: payload.expected_head_commit,
+                        checkpoint_verification: payload.mode
+                            == FactoryVerificationRecoveryMode::CheckpointVerification,
                         verification_policy: payload.verification_policy,
                         write_scope: payload.write_scope,
                         deliverable: payload.deliverable,
@@ -1783,8 +1798,74 @@ async fn decode_recovery_runner_command(
                 }
             }
         }
+        "factory_workspace_checkpoint"
+            if command
+                .payload
+                .get("review_re_attestation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            if !checkpoint_dispatch_allowed(
+                state.store.checkpoint_review_command_authorized(command),
+                async {
+                    if let Some(event) = state
+                        .store
+                        .fail_runner_command(
+                            command.id,
+                            &command.runner_id,
+                            "checkpoint re-attestation authorization is no longer current",
+                        )
+                        .await?
+                    {
+                        publish(state, event);
+                    }
+                    Ok(())
+                },
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            decode_runner_command(command, control_lease_token, durable_control).map(Some)
+        }
         _ => decode_runner_command(command, control_lease_token, durable_control).map(Some),
     }
+}
+
+async fn checkpoint_dispatch_allowed(
+    authorization: impl std::future::Future<Output = anyhow::Result<bool>>,
+    retire_denied_command: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<bool> {
+    if authorization.await? {
+        return Ok(true);
+    }
+    retire_denied_command.await?;
+    Ok(false)
+}
+
+fn supports_checkpoint_verification(capabilities: &[crony_protocol::RunnerCapability]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.name == "checkpoint-verification-v1" && capability.available)
+}
+
+async fn verification_recovery_authority_is_current(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<bool> {
+    if state
+        .store
+        .verification_recovery_dispatch_authorized(command)
+        .await?
+    {
+        return Ok(true);
+    }
+    if !recovery_command_can_dispatch(state, command).await? {
+        return Ok(false);
+    }
+    Err(anyhow::anyhow!(
+        "current recovery authorization is unavailable; no verifier command was dispatched"
+    ))
 }
 
 async fn recovery_command_can_dispatch(
@@ -3058,6 +3139,7 @@ async fn get_factory_verification_recovery_context(
         remaining_mission_cost_microusd: context.remaining_mission_cost_microusd,
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
+        checkpoint_verification: context.checkpoint_verification,
     }))
 }
 
@@ -6307,6 +6389,59 @@ mod tests {
         schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
         validate_verification_artifact_reference,
     };
+
+    #[tokio::test]
+    async fn checkpoint_denial_retires_only_the_command_and_store_errors_remain_retryable() {
+        use std::cell::Cell;
+        for allowed in [true, false] {
+            let retired = Cell::new(false);
+            let result = super::checkpoint_dispatch_allowed(async { Ok(allowed) }, async {
+                retired.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, allowed);
+            assert_eq!(retired.get(), !allowed);
+        }
+        let retired = Cell::new(false);
+        assert!(
+            super::checkpoint_dispatch_allowed(
+                async { Err(anyhow::anyhow!("transient database failure")) },
+                async {
+                    retired.set(true);
+                    Ok(())
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(!retired.get());
+    }
+
+    #[test]
+    fn checkpoint_verification_requires_explicit_runner_support() {
+        let mut capability = RunnerCapability {
+            name: "verification-artifact-transfer-v1".to_owned(),
+            available: true,
+            detail: None,
+            models: Vec::new(),
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        };
+        assert!(!super::supports_checkpoint_verification(&[]));
+        assert!(!super::supports_checkpoint_verification(&[
+            capability.clone()
+        ]));
+        capability.name = "checkpoint-verification-v1".to_owned();
+        capability.available = false;
+        assert!(!super::supports_checkpoint_verification(&[
+            capability.clone()
+        ]));
+        capability.available = true;
+        assert!(super::supports_checkpoint_verification(&[capability]));
+    }
 
     fn mission_preview_test_request() -> CreateMissionRequest {
         serde_json::from_value(json!({

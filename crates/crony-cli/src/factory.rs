@@ -151,6 +151,7 @@ pub struct FactoryWatchArgs {
 pub enum VerificationRecoveryModeArg {
     SourceCorrection,
     VerifierOnly,
+    CheckpointVerification,
 }
 
 impl From<VerificationRecoveryModeArg> for FactoryVerificationRecoveryMode {
@@ -158,6 +159,7 @@ impl From<VerificationRecoveryModeArg> for FactoryVerificationRecoveryMode {
         match value {
             VerificationRecoveryModeArg::SourceCorrection => Self::SourceCorrection,
             VerificationRecoveryModeArg::VerifierOnly => Self::VerifierOnly,
+            VerificationRecoveryModeArg::CheckpointVerification => Self::CheckpointVerification,
         }
     }
 }
@@ -878,7 +880,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     let launch = match launch_result {
         Ok(launch) => launch,
         Err(error) => {
-            if work_item_state != "blocked" {
+            if work_item_state != "blocked"
+                && args.verification_recovery
+                    != Some(VerificationRecoveryModeArg::CheckpointVerification)
+            {
                 transition_factory_state(
                     client,
                     server,
@@ -2973,6 +2978,11 @@ async fn recover_factory_verification(
         )?;
     }
     let legacy_workspace_checkpointed = snapshot.workspace_fingerprint.is_none();
+    if mode == FactoryVerificationRecoveryMode::CheckpointVerification
+        && (legacy_workspace_checkpointed || snapshot.expected_head_commit.is_none())
+    {
+        bail!("checkpoint verification requires a native stopped-source fingerprint and head");
+    }
     if legacy_workspace_checkpointed {
         let expected_head_commit = snapshot
             .expected_head_commit
@@ -3032,6 +3042,13 @@ async fn recover_factory_verification(
         .unwrap_or_else(|| snapshot.verification_policy.clone());
     let source_changed = selected.issue.updated_at != persisted.source_revision;
     let policy_changed = replacement_policy != snapshot.verification_policy;
+    if mode == FactoryVerificationRecoveryMode::CheckpointVerification
+        && (source_changed || policy_changed)
+    {
+        bail!(
+            "checkpoint verification cannot change the source revision or persisted verification policy"
+        );
+    }
     let reason_digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
     let contract_revision_id = if let Some(active) = snapshot.active_recovery.as_ref() {
         active_recovery_contract_revision(
@@ -3040,7 +3057,9 @@ async fn recover_factory_verification(
             &reviewed_source_snapshot,
             &replacement_policy,
         )?
-    } else if recovery_revision_required(mode, source_changed, policy_changed, &snapshot) {
+    } else if mode != FactoryVerificationRecoveryMode::CheckpointVerification
+        && recovery_revision_required(mode, source_changed, policy_changed, &snapshot)
+    {
         let mut request = recovery_contract_request(
             args,
             &snapshot,

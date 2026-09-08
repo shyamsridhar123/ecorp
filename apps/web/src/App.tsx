@@ -2536,6 +2536,8 @@ function BudgetRevisionPanel({
   const remainingCostMicrousd =
     mission.budget_cost_microusd - consumedCostMicrousd
   const budgetExhausted = remainingTokens <= 0 || remainingCostMicrousd <= 0
+  const completedMission = mission.status === 'completed'
+  const budgetNeedsAction = budgetExhausted && !completedMission
   const activeRun = runs.some((run) => !terminalRun(run.status))
   const orderedRevisions = revisions.toSorted(
     (left, right) =>
@@ -2762,7 +2764,7 @@ function BudgetRevisionPanel({
 
   return (
     <section
-      className={`budget-ledger${budgetExhausted ? ' budget-ledger-exhausted' : ''}`}
+      className={`budget-ledger${budgetNeedsAction ? ' budget-ledger-exhausted' : ''}`}
       data-testid="mission-budget-ledger"
       data-budget-exhausted={budgetExhausted}
     >
@@ -2770,7 +2772,9 @@ function BudgetRevisionPanel({
         <div>
           <span>Mission budget authority</span>
           <strong>
-            {budgetExhausted
+            {completedMission
+              ? 'Completed · recorded spend'
+              : budgetExhausted
               ? 'Recovery authorization required'
               : pendingRevision
                 ? 'Revision awaiting decision'
@@ -2778,7 +2782,7 @@ function BudgetRevisionPanel({
           </strong>
         </div>
         <span className={`budget-state budget-state-${budgetExhausted ? 'exhausted' : 'available'}`}>
-          {budgetExhausted ? 'Exhausted' : 'Available'}
+          {completedMission ? 'Recorded' : budgetExhausted ? 'Exhausted' : 'Available'}
         </span>
       </div>
 
@@ -2901,7 +2905,7 @@ function BudgetRevisionPanel({
         </div>
       ) : null}
 
-      {budgetExhausted && !pendingRevision && canManageBudget && canReviseNow ? (
+      {budgetNeedsAction && !pendingRevision && canManageBudget && canReviseNow ? (
         proposalOpen ? (
           <form
             className="budget-proposal"
@@ -3099,17 +3103,22 @@ function BudgetRevisionPanel({
         )
       ) : null}
 
-      {budgetExhausted && !canManageBudget ? (
+      {completedMission ? (
+        <p className="budget-guidance">
+          This mission is complete. Usage remains recorded; no budget revision or replacement mission is needed for this result.
+        </p>
+      ) : null}
+      {budgetNeedsAction && !canManageBudget ? (
         <p className="budget-guidance">
           {resumableRun?.breaker_stage === 'stop'
-            ? 'A stop-stage breaker is terminal and cannot be overridden. Create a new bounded mission from the preserved evidence.'
+            ? 'This provider session cannot restart after a stop. Inspect its preserved work and evidence instead of discarding it.'
             : 'Resume is locked. An owner or admin must approve a higher mission ceiling before another provider session starts.'}
         </p>
       ) : null}
-      {budgetExhausted && canManageBudget && !canReviseNow && !pendingRevision ? (
+      {budgetNeedsAction && canManageBudget && !canReviseNow && !pendingRevision ? (
         <p className="budget-guidance">
           {resumableRun?.breaker_stage === 'stop'
-            ? 'A stop-stage breaker is terminal and cannot be overridden. Create a new bounded mission from the preserved evidence.'
+            ? 'This provider session cannot restart after a stop. Inspect its preserved work and evidence instead of discarding it.'
             : 'Recovery becomes available after the active run stops at a resumable budget suspension.'}
         </p>
       ) : null}
@@ -3614,10 +3623,10 @@ function MissionCard({
       </dl>
       <details
         className="mission-dossier"
-        open={resumeBudgetBlocked || Boolean(pendingBudgetRevision)}
+        open={mission.status !== 'completed' && (resumeBudgetBlocked || Boolean(pendingBudgetRevision))}
       >
         <summary>
-          <span>Budget authority</span>
+          <span>{mission.status === 'completed' ? 'Recorded spend' : 'Budget authority'}</span>
           <small>
             {consumedTokens.toLocaleString()} of {mission.budget_tokens.toLocaleString()} tokens
           </small>

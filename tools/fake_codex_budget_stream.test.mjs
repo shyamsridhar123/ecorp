@@ -119,13 +119,16 @@ test('actual queued fixture writes base then emits both usages and finish synchr
   const source = readFileSync(script, 'utf8')
   const imports = source.match(/^import .+ from 'node:[^']+'\r?$/gmu)
   assert.equal(imports?.length, 3, 'review the sandbox when fixture imports change')
+  const applicationImport = "import { writeCheckpointApplication } from './checkpoint-application-fixture.mjs'"
+  assert.equal(source.split(applicationImport).length, 2, 'review the application-fixture import')
   const timeline = []
   const timers = []
   let onLine
   let nextId = 0
-  runInNewContext(source.replace(/^import .+ from 'node:[^']+'\r?$/gmu, ''), {
+  runInNewContext(source.replace(/^import .+ from 'node:[^']+'\r?$/gmu, '').replace(applicationImport, ''), {
     randomUUID: () => `fixture-${++nextId}`,
     writeFileSync: (file, bytes) => timeline.push({ file, bytes }),
+    writeCheckpointApplication: () => assert.fail('the disjoint application marker was not requested'),
     createInterface: () => ({ on: (type, callback) => {
       assert.equal(type, 'line')
       onLine = callback

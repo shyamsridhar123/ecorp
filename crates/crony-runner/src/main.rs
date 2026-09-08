@@ -179,6 +179,7 @@ struct Assignment {
     expected_workspace_fingerprint: Option<String>,
     expected_head_commit: Option<String>,
     provider_artifact: Option<VerificationArtifactReference>,
+    checkpoint_verification: bool,
     hard_boundary_checkpoint: Arc<HardBoundaryControl>,
 }
 
@@ -623,6 +624,18 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        name: "checkpoint-verification-v1".to_owned(),
+        available: true,
+        detail: Some(
+            "exact stopped-source admission and runner-owned verification commit without a provider"
+                .to_owned(),
+        ),
+        models: Vec::new(),
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    });
+    capabilities.push(RunnerCapability {
         name: "secret-delivery".to_owned(),
         available: true,
         detail: Some(
@@ -765,6 +778,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: None,
                     provider_artifact: None,
+                    checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
@@ -911,6 +925,7 @@ async fn run_connection(
                     expected_workspace_fingerprint,
                     expected_head_commit,
                     provider_artifact: None,
+                    checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
@@ -1060,6 +1075,7 @@ async fn run_connection(
                 workspace_base_commit,
                 expected_workspace_fingerprint,
                 expected_head_commit,
+                checkpoint_verification,
                 verification_policy,
                 write_scope,
                 deliverable,
@@ -1101,6 +1117,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: Some(expected_workspace_fingerprint),
                     expected_head_commit,
                     provider_artifact,
+                    checkpoint_verification,
                     hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
@@ -1237,6 +1254,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: Some(expected_head_commit),
                     provider_artifact: None,
+                    checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
                 match checkpoint_preserved_workspace(
@@ -1862,6 +1880,7 @@ async fn execute_assignment(
                     &summary,
                     None,
                     None,
+                    None,
                     Some(&mut cancellation),
                 )
                 .await;
@@ -2033,6 +2052,7 @@ async fn execute_verification_assignment(
     let mut artifact_snapshot = None;
     let mut checkpoint_admitted = false;
     let mut workspace_quarantined = false;
+    let mut cleanup_head_commit = assignment.expected_head_commit.clone();
     let result = async {
         let expected_fingerprint = assignment
             .expected_workspace_fingerprint
@@ -2099,7 +2119,12 @@ async fn execute_verification_assignment(
             &mut artifact_acks,
             "Verifier-only recovery completed without starting a provider.",
             Some(expected_fingerprint),
-            assignment.expected_head_commit.as_deref(),
+            if assignment.checkpoint_verification {
+                None
+            } else {
+                assignment.expected_head_commit.as_deref()
+            },
+            Some(&mut cleanup_head_commit),
             Some(&mut cancellation_rx),
         );
         tokio::pin!(verification);
@@ -2150,8 +2175,13 @@ async fn execute_verification_assignment(
         {
             failures.push(format!("verifier-only snapshot cleanup failed: {error:#}"));
         }
-        if let Err(error) =
-            verify_prepared_recovery_workspace(&workspaces, &workspace, &assignment).await
+        if let Err(error) = verify_preserved_workspace_checkpoint(
+            &workspaces,
+            &workspace,
+            assignment.expected_workspace_fingerprint.as_deref(),
+            cleanup_head_commit.as_deref(),
+        )
+        .await
         {
             workspace_quarantined = true;
             failures.push(format!("verifier-only source is quarantined: {error:#}"));
@@ -2618,6 +2648,7 @@ async fn send_verification_events(
     completion_summary: &str,
     expected_workspace_fingerprint: Option<&str>,
     preserve_head_commit: Option<&str>,
+    mut cleanup_head_commit: Option<&mut Option<String>>,
     mut cancellation: Option<&mut watch::Receiver<bool>>,
 ) -> VerificationRunOutcome {
     send_run_event(
@@ -2629,7 +2660,11 @@ async fn send_verification_events(
             "check_count": assignment.verification_policy.checks.len(),
         }),
     );
-    let mut completion_head_commit = preserve_head_commit.map(str::to_owned);
+    // Admission still binds the original checkpoint HEAD. Only the exporter may
+    // replace it with the exact runner-owned verification commit after checks.
+    let mut completion_head_commit = preserve_head_commit
+        .or(expected_workspace_fingerprint.and(assignment.expected_head_commit.as_deref()))
+        .map(str::to_owned);
     if expected_workspace_fingerprint.is_some() && completion_head_commit.is_none() {
         match workspaces.head_commit(workspace).await {
             Ok(head) => completion_head_commit = Some(head),
@@ -2821,6 +2856,11 @@ async fn send_verification_events(
             // A first authorized commit may be created by export. Bind that exact produced head
             // for the upload wait, without ever replacing an explicitly preserved head.
             completion_head_commit = Some(head.clone());
+            // ACK failure or cancellation must retain this exact runner-owned head,
+            // not mistake it for source tampering. Never read/adopt a cleanup-time HEAD.
+            if let Some(cleanup_guard) = cleanup_head_commit.as_mut() {
+                **cleanup_guard = completion_head_commit.clone();
+            }
         }
         if cancellation
             .as_ref()
@@ -3341,6 +3381,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         }
     }
@@ -3901,6 +3942,250 @@ mod tests {
         AckClosed,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CheckpointAck {
+        Immediate,
+        Closed,
+        Cancelled,
+    }
+
+    async fn checkpoint_commit_case(
+        checkpoint_mode: bool,
+        change_head: bool,
+        acknowledgment: CheckpointAck,
+    ) {
+        let (root, workspaces, workspace, mut assignment) = prepared_verification_fixture().await;
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(canonical_root != temporary && canonical_root.starts_with(&temporary));
+        std::fs::write(workspace.path.join("checkpoint.txt"), b"completed source\n").unwrap();
+        let original_head = assignment.expected_head_commit.clone().unwrap();
+        let fingerprint = workspaces.fingerprint(&workspace).await.unwrap();
+        assignment.expected_workspace_fingerprint = Some(fingerprint.clone());
+        assignment.checkpoint_verification = checkpoint_mode;
+        assignment.verification_policy = VerificationPolicy {
+            checks: vec![crony_domain::VerifierCheck::File {
+                path: "checkpoint.txt".to_owned(),
+                min_bytes: 1,
+            }],
+            manual_gate: None,
+        };
+        assignment.write_scope = vec!["checkpoint.txt".to_owned()];
+        assignment.deliverable = Some(DeliverableSpec {
+            form: crony_domain::DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: vec!["checkpoint.txt".to_owned()],
+        });
+        let outbound = OutboundBus::default();
+        let (connection, mut received) = mpsc::unbounded_channel();
+        outbound.attach(connection, assignment.connection_epoch);
+        let (control_tx, controls) = mpsc::unbounded_channel();
+        let (ack_tx, artifact_acks) = mpsc::unbounded_channel();
+        let mut ack_tx = Some(ack_tx);
+        let task_assignment = assignment.clone();
+        let task_workspaces = workspaces.clone();
+        let execution = tokio::spawn(async move {
+            execute_verification_assignment(
+                task_workspaces,
+                "runner-test".to_owned(),
+                task_assignment,
+                outbound,
+                AssignmentChannels {
+                    controls,
+                    artifact_acks,
+                },
+            )
+            .await
+        });
+        let mut uploaded = false;
+        let mut final_head = None;
+        let mut events = Vec::new();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while let Some(message) = received.recv().await {
+                if let RunnerToServer::RunEvent {
+                    event_type,
+                    payload,
+                    ..
+                } = message
+                {
+                    if event_type == "run.deliverable_upload" {
+                        assert!(
+                            checkpoint_mode,
+                            "ordinary verifier must preserve its existing commit"
+                        );
+                        assert!(!uploaded, "one native upload with an immediate ACK");
+                        uploaded = true;
+                        let bytes = BASE64
+                            .decode(payload["content_base64"].as_str().unwrap())
+                            .unwrap();
+                        let document: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(document["base_commit"], workspace.base_commit);
+                        assert_eq!(document["changes"][0]["path"], "checkpoint.txt");
+                        assert_eq!(
+                            BASE64
+                                .decode(document["changes"][0]["content_base64"].as_str().unwrap())
+                                .unwrap(),
+                            b"completed source\n"
+                        );
+                        let bundle = BASE64
+                            .decode(document["git_bundle_base64"].as_str().unwrap())
+                            .unwrap();
+                        assert!(!bundle.is_empty());
+                        assert_eq!(
+                            hex::encode(sha2::Sha256::digest(&bundle)),
+                            document["git_bundle_sha256"]
+                        );
+                        assert_ne!(payload["head_commit"], original_head);
+                        assert_eq!(payload["publication_ready"], true);
+                        final_head = Some(payload["head_commit"].as_str().unwrap().to_owned());
+                        if change_head {
+                            git(
+                                &workspace.path,
+                                &[
+                                    "-c",
+                                    "user.name=ECorp Test",
+                                    "-c",
+                                    "user.email=test@example.invalid",
+                                    "commit",
+                                    "--allow-empty",
+                                    "--no-gpg-sign",
+                                    "-m",
+                                    "unauthorized head drift",
+                                ],
+                            );
+                        }
+                        if acknowledgment == CheckpointAck::Cancelled {
+                            control_tx
+                                .send(AdapterControl::Interrupt {
+                                    reason: "cancel after the runner-owned verification commit"
+                                        .to_owned(),
+                                })
+                                .unwrap();
+                        }
+                        if acknowledgment == CheckpointAck::Closed {
+                            drop(ack_tx.take());
+                        } else {
+                            ack_tx
+                                .as_ref()
+                                .unwrap()
+                                .send(ArtifactAck {
+                                    artifact_id: Uuid::new_v4(),
+                                    artifact_role: "source_deliverable".to_owned(),
+                                    sha256: payload["sha256"].as_str().unwrap().to_owned(),
+                                })
+                                .unwrap();
+                        }
+                    }
+                    let finished = event_type == "run.workspace_preserved";
+                    events.push((event_type, payload));
+                    if finished {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("native verifier and upload ACK settle");
+        execution.await.unwrap().unwrap();
+        let completed = events.iter().any(|(kind, _)| kind == "run.completed");
+        assert_eq!(
+            completed,
+            checkpoint_mode && !change_head && acknowledgment == CheckpointAck::Immediate,
+            "{events:?}"
+        );
+        assert_eq!(uploaded, checkpoint_mode, "{events:?}");
+        let retained = events
+            .iter()
+            .find(|(kind, _)| kind == "run.workspace_preserved")
+            .unwrap();
+        assert_eq!(
+            retained.1["workspace_quarantined"], change_head,
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|(kind, _)| matches!(
+            kind.as_str(),
+            "run.session" | "run.session_terminated" | "run.output" | "run.usage"
+        )));
+        assert_eq!(
+            workspaces.fingerprint(&workspace).await.unwrap(),
+            fingerprint
+        );
+        assert_eq!(
+            std::fs::read(workspace.path.join("checkpoint.txt")).unwrap(),
+            b"completed source\n"
+        );
+        if checkpoint_mode && !change_head {
+            assert_eq!(
+                workspaces.head_commit(&workspace).await.unwrap(),
+                final_head.unwrap()
+            );
+            assert_eq!(
+                git(&workspace.path, &["rev-parse", "HEAD^"]),
+                workspace.base_commit
+            );
+            if acknowledgment == CheckpointAck::Cancelled {
+                assert!(
+                    events.iter().any(|(kind, _)| kind == "run.cancelled"),
+                    "{events:?}"
+                );
+                assert!(
+                    !events.iter().any(|(kind, _)| kind == "run.failed"),
+                    "{events:?}"
+                );
+            } else if acknowledgment == CheckpointAck::Closed {
+                assert!(
+                    events.iter().any(|(kind, _)| kind == "run.failed"),
+                    "{events:?}"
+                );
+            }
+        } else {
+            let error = events
+                .iter()
+                .find(|(kind, _)| kind == "run.failed")
+                .unwrap();
+            assert!(
+                error.1["error"].as_str().unwrap().contains(if change_head {
+                    "head mismatch"
+                } else {
+                    "tree changed from preserved head"
+                }),
+                "{error:?}"
+            );
+        }
+        assert_no_verification_snapshots(assignment.run_id);
+        std::fs::remove_dir_all(canonical_root).expect("remove exact owned checkpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_exports_uncommitted_source_without_a_provider() {
+        checkpoint_commit_case(true, false, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_verifier_still_rejects_an_uncommitted_replacement_tree() {
+        checkpoint_commit_case(false, false, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_rejects_head_drift_after_its_owned_commit() {
+        checkpoint_commit_case(true, true, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_retains_own_commit_after_ack_failure() {
+        checkpoint_commit_case(true, false, CheckpointAck::Closed).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_cancellation_does_not_quarantine_own_commit() {
+        checkpoint_commit_case(true, false, CheckpointAck::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_cancellation_still_quarantines_unexpected_head() {
+        checkpoint_commit_case(true, true, CheckpointAck::Cancelled).await;
+    }
+
     async fn held_upload_checkpoint_case(change: HeldUploadChange, manual_gate: bool) {
         let (root, workspaces, workspace, mut assignment) = prepared_verification_fixture().await;
         let resolved = std::fs::canonicalize(&root).unwrap();
@@ -4304,6 +4589,7 @@ mod tests {
             "cleanup fixture",
             Some(&fingerprint),
             None,
+            None,
             Some(&mut cancellation),
         )
         .await;
@@ -4433,6 +4719,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };
         let workspace = WorkspaceLease {
@@ -4551,6 +4838,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };
         let uncertain = Arc::new(Notify::new());

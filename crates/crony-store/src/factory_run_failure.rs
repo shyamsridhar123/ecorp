@@ -173,6 +173,17 @@ struct FailureOrigin {
     version: i64,
 }
 
+pub(super) async fn owns_block_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    item: &FactoryWorkItem,
+    claim_token: Uuid,
+    source_run_id: Uuid,
+) -> Result<bool> {
+    Ok(failure_origin_tx(tx, item, claim_token)
+        .await?
+        .is_some_and(|origin| origin.run_id == source_run_id))
+}
+
 fn failure_authority_sha256(item: &FactoryWorkItem) -> Result<String> {
     // Lease-only metadata is intentionally excluded; source and policy are not.
     let authority = json!({

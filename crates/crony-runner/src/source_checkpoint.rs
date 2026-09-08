@@ -4,30 +4,9 @@
 //! still revalidate current authority, exact source bytes and persisted policy.
 
 use super::*;
+use crony_domain::StoppedSourceCheckpoint as SourceCheckpoint;
 
 const CHECKPOINT_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Serialize)]
-struct SourceCheckpoint {
-    schema_version: u32,
-    corp_id: Uuid,
-    mission_id: Uuid,
-    task_id: Uuid,
-    run_id: Uuid,
-    workspace_run_id: Uuid,
-    agent_id: Uuid,
-    runner_id: String,
-    source_repository: String,
-    source_base_ref: String,
-    source_base_commit: String,
-    workspace_base_commit: String,
-    branch: String,
-    head_commit: String,
-    workspace_fingerprint: String,
-    verification_policy_sha256: String,
-    write_scope_sha256: String,
-    deliverable_policy_sha256: String,
-}
 
 fn policy_digest(value: &impl Serialize) -> Result<String> {
     Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(
@@ -229,6 +208,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };
         (root, workspaces, workspace, assignment)
