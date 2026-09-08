@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFICATION_SNAPSHOT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CHECKPOINT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const CHECKPOINT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -424,6 +426,38 @@ impl WorkspaceManager {
         .map(|value| value.trim().to_ascii_lowercase())
     }
 
+    pub async fn checkpoint(&self, workspace: &WorkspaceLease) -> Result<(String, String)> {
+        self.verify_existing(
+            workspace.path.clone(),
+            workspace.branch.clone(),
+            Some(&workspace.base_commit),
+        )
+        .await?;
+        let head = self.head_commit(workspace).await?;
+        let fingerprint = fingerprint_checkpoint_path(
+            &workspace.path,
+            CHECKPOINT_MAX_BYTES,
+            CHECKPOINT_READ_TIMEOUT,
+        )
+        .await?;
+        // Repeat the existing root/branch/base checks after reading the bytes.
+        self.verify_existing(
+            workspace.path.clone(),
+            workspace.branch.clone(),
+            Some(&workspace.base_commit),
+        )
+        .await?;
+        if self.head_commit(workspace).await? != head {
+            return Err(anyhow!("workspace HEAD changed during checkpoint"));
+        }
+        Ok((head, fingerprint))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn hold_operations_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.git_lock.clone().lock_owned().await
+    }
+
     async fn verify_existing(
         &self,
         path: PathBuf,
@@ -614,6 +648,20 @@ pub async fn fingerprint_path(root: &Path) -> Result<String> {
     tokio::task::spawn_blocking(move || fingerprint_workspace(&root))
         .await
         .context("join workspace fingerprint task")?
+}
+
+pub(super) async fn fingerprint_checkpoint_path(
+    root: &Path,
+    max_bytes: u64,
+    timeout: Duration,
+) -> Result<String> {
+    let root = root.to_owned();
+    let deadline = std::time::Instant::now() + timeout;
+    tokio::task::spawn_blocking(move || {
+        fingerprint_workspace_with_limits(&root, Some(max_bytes), Some(deadline))
+    })
+    .await
+    .context("join bounded workspace checkpoint task")?
 }
 
 pub async fn find_file_by_digest(
@@ -1060,10 +1108,21 @@ fn find_workspace_file_by_digest(
 }
 
 fn fingerprint_workspace(root: &Path) -> Result<String> {
+    fingerprint_workspace_with_limits(root, None, None)
+}
+
+fn fingerprint_workspace_with_limits(
+    root: &Path,
+    max_bytes: Option<u64>,
+    deadline: Option<std::time::Instant>,
+) -> Result<String> {
     let root = fs::canonicalize(root).context("resolve workspace fingerprint root")?;
     let mut digest = Sha256::new();
+    let mut declared_bytes = 0_u64;
+    let mut read_bytes = 0_u64;
     // Root permissions intentionally differ for private snapshots. Bind every copied entry.
     for (relative, path) in fingerprint_entries(&root)? {
+        ensure_checkpoint_deadline(deadline)?;
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("inspect workspace fingerprint path {}", path.display()))?;
         if snapshot_entry_is_link(&metadata) {
@@ -1079,6 +1138,12 @@ fn fingerprint_workspace(root: &Path) -> Result<String> {
             digest.update(b"\0");
             digest.update(fingerprint_mode(&metadata).to_le_bytes());
         } else if metadata.is_file() {
+            declared_bytes = declared_bytes
+                .checked_add(metadata.len())
+                .context("workspace fingerprint byte count overflow")?;
+            if max_bytes.is_some_and(|maximum| declared_bytes > maximum) {
+                return Err(anyhow!("workspace checkpoint exceeds its byte limit"));
+            }
             digest.update(b"F\0");
             digest.update(relative.as_bytes());
             digest.update(b"\0");
@@ -1088,11 +1153,18 @@ fn fingerprint_workspace(root: &Path) -> Result<String> {
                 .with_context(|| format!("open workspace fingerprint path {}", path.display()))?;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
+                ensure_checkpoint_deadline(deadline)?;
                 let read = file.read(&mut buffer).with_context(|| {
                     format!("read workspace fingerprint path {}", path.display())
                 })?;
                 if read == 0 {
                     break;
+                }
+                read_bytes = read_bytes
+                    .checked_add(read as u64)
+                    .context("workspace fingerprint read count overflow")?;
+                if max_bytes.is_some_and(|maximum| read_bytes > maximum) {
+                    return Err(anyhow!("workspace checkpoint exceeds its byte limit"));
                 }
                 digest.update(&buffer[..read]);
             }
@@ -1105,6 +1177,13 @@ fn fingerprint_workspace(root: &Path) -> Result<String> {
         }
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+fn ensure_checkpoint_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(anyhow!("workspace checkpoint exceeded its read deadline"));
+    }
+    Ok(())
 }
 
 fn fingerprint_mode(metadata: &fs::Metadata) -> u32 {

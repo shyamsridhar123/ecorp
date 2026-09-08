@@ -1,5 +1,6 @@
 mod adapter;
 mod deliverable;
+mod source_checkpoint;
 mod verifier;
 mod workspace;
 
@@ -8,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -178,6 +179,64 @@ struct Assignment {
     expected_workspace_fingerprint: Option<String>,
     expected_head_commit: Option<String>,
     provider_artifact: Option<VerificationArtifactReference>,
+    hard_boundary_checkpoint: Arc<HardBoundaryControl>,
+}
+
+impl Assignment {
+    fn hard_boundary_requested(&self) -> bool {
+        self.hard_boundary_checkpoint.requested()
+    }
+}
+
+#[derive(Debug)]
+struct HardBoundaryControl {
+    phase: AtomicU8,
+    cancellation: watch::Sender<bool>,
+}
+
+impl Default for HardBoundaryControl {
+    fn default() -> Self {
+        Self {
+            phase: AtomicU8::new(Self::OPEN),
+            cancellation: watch::channel(false).0,
+        }
+    }
+}
+
+impl HardBoundaryControl {
+    const OPEN: u8 = 0;
+    const REQUESTED: u8 = 1;
+    const FINALIZING: u8 = 2;
+
+    fn request(&self) -> bool {
+        match self.phase.compare_exchange(
+            Self::OPEN,
+            Self::REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(Self::REQUESTED) => {
+                self.cancellation.send_replace(true);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn requested(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == Self::REQUESTED
+    }
+
+    fn begin_finalization(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                Self::OPEN,
+                Self::FINALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -193,6 +252,29 @@ struct ActiveRunControl {
     assignment_token: Uuid,
     control: mpsc::UnboundedSender<AdapterControl>,
     artifact_ack: mpsc::UnboundedSender<ArtifactAck>,
+    hard_boundary_checkpoint: Arc<HardBoundaryControl>,
+}
+
+impl ActiveRunControl {
+    fn apply_circuit_breaker(&self, stage: String, reason: String) -> bool {
+        let hard = matches!(stage.as_str(), "suspend" | "stop");
+        if hard {
+            // Remember native stop authority before handing it to the adapter.
+            // This is retention intent, never authority to resume or complete.
+            if !self.hard_boundary_checkpoint.request() {
+                // Finalization won the boundary. Never acknowledge retention
+                // after cleanup has committed to its native removal decision.
+                return false;
+            }
+        }
+        let delivered = self
+            .control
+            .send(AdapterControl::CircuitBreaker { stage, reason })
+            .is_ok();
+        // The assignment can still own cancellable verification after the
+        // provider's control receiver closes. The hard directive applies there too.
+        delivered || hard
+    }
 }
 
 #[derive(Debug)]
@@ -208,6 +290,25 @@ struct AssignmentChannels {
 }
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
+
+fn apply_circuit_breaker_command(
+    seen_commands: &DashMap<Uuid, ()>,
+    active_runs: &ActiveRuns,
+    command_id: Uuid,
+    run_id: Uuid,
+    stage: String,
+    reason: String,
+) -> (bool, bool) {
+    let duplicate = seen_commands.contains_key(&command_id);
+    let applied = duplicate
+        || active_runs
+            .get(&run_id)
+            .is_some_and(|active| active.apply_circuit_breaker(stage, reason));
+    if applied {
+        seen_commands.insert(command_id, ());
+    }
+    (applied, duplicate)
+}
 
 fn default_codex_command() -> PathBuf {
     if cfg!(windows) {
@@ -664,6 +765,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: None,
                     provider_artifact: None,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
                     send_run_event(
@@ -713,6 +815,7 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
@@ -808,6 +911,7 @@ async fn run_connection(
                     expected_workspace_fingerprint,
                     expected_head_commit,
                     provider_artifact: None,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
                     if let Some(command_id) = command_id {
@@ -898,6 +1002,7 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
@@ -996,6 +1101,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: Some(expected_workspace_fingerprint),
                     expected_head_commit,
                     provider_artifact,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
                 if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
                     seen_commands.remove(&command_id);
@@ -1036,6 +1142,7 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
@@ -1130,6 +1237,7 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: Some(expected_head_commit),
                     provider_artifact: None,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
                 match checkpoint_preserved_workspace(
                     workspaces.clone(),
@@ -1272,14 +1380,14 @@ async fn run_connection(
                 stage,
                 reason,
             } => {
-                let duplicate = seen_commands.insert(command_id, ()).is_some();
-                let applied = duplicate
-                    || active_runs.get(&run_id).is_some_and(|active| {
-                        active
-                            .control
-                            .send(AdapterControl::CircuitBreaker { stage, reason })
-                            .is_ok()
-                    });
+                let (applied, duplicate) = apply_circuit_breaker_command(
+                    &seen_commands,
+                    &active_runs,
+                    command_id,
+                    run_id,
+                    stage,
+                    reason,
+                );
                 outbound.send(RunnerToServer::CommandAck {
                     runner_id: args.runner_id.clone(),
                     connection_epoch,
@@ -1290,7 +1398,8 @@ async fn run_connection(
                     } else if applied {
                         "circuit-breaker command delivered to the active provider".to_owned()
                     } else {
-                        "circuit-breaker command had no active provider".to_owned()
+                        "circuit-breaker command had no active provider or cancellable verification"
+                            .to_owned()
                     },
                 });
             }
@@ -1672,6 +1781,8 @@ async fn execute_assignment(
     let mut preserve_workspace =
         execution.is_err() || assignment.resume_workspace_base_commit.is_some();
     let mut workspace_quarantined = false;
+    let mut checkpoint_reported = false;
+    let mut verification_started = false;
     let provider_outcome = match &execution {
         Ok(AdapterExit::Completed) => "completed",
         Ok(AdapterExit::Failed) => "failed",
@@ -1692,7 +1803,7 @@ async fn execute_assignment(
     );
     if execution.is_ok() {
         let buffered = terminal.lock().ok().and_then(|mut value| value.take());
-        let terminal =
+        let mut terminal =
             buffered.unwrap_or_else(|| match execution.as_ref().expect("checked above") {
                 AdapterExit::Completed => {
                     BufferedTerminal::Completed("Agent completed without a summary.".to_owned())
@@ -1704,8 +1815,32 @@ async fn execute_assignment(
                     BufferedTerminal::Cancelled("Agent cancelled without a reason.".to_owned())
                 }
             });
+        if assignment.hard_boundary_requested() {
+            source_checkpoint::report(
+                &outbound,
+                &runner_id,
+                &assignment,
+                &workspace,
+                &workspaces,
+                !teardown_uncertain.load(Ordering::Acquire),
+                false,
+            )
+            .await;
+            checkpoint_reported = true;
+            preserve_workspace = true;
+            if matches!(terminal, BufferedTerminal::Completed(_)) {
+                // A delivered hard stop wins over a late provider completion.
+                // Verification requires a separately authorized recovery.
+                terminal = BufferedTerminal::Cancelled(
+                    "Hard circuit-breaker boundary reached; source retained for explicit recovery."
+                        .to_owned(),
+                );
+            }
+        }
         match terminal {
             BufferedTerminal::Completed(summary) => {
+                verification_started = true;
+                let mut cancellation = assignment.hard_boundary_checkpoint.cancellation.subscribe();
                 let verification = send_verification_events(
                     &outbound,
                     &runner_id,
@@ -1721,11 +1856,20 @@ async fn execute_assignment(
                     &summary,
                     None,
                     None,
-                    None,
+                    Some(&mut cancellation),
                 )
                 .await;
                 preserve_workspace |= verification != VerificationRunOutcome::Finished;
                 workspace_quarantined |= verification == VerificationRunOutcome::IntegrityFailed;
+                if verification == VerificationRunOutcome::Cancelled {
+                    send_run_event(
+                        &outbound,
+                        &runner_id,
+                        &assignment,
+                        "run.cancelled",
+                        json!({"reason": "Hard circuit breaker cancelled verification; source retained without a pre-verification checkpoint."}),
+                    );
+                }
             }
             BufferedTerminal::Failed(error) => {
                 preserve_workspace = true;
@@ -1747,6 +1891,28 @@ async fn execute_assignment(
                 );
             }
         }
+    }
+    if !checkpoint_reported && !assignment.hard_boundary_checkpoint.begin_finalization() {
+        // Atomically choose retention or ordinary finalization before either
+        // path awaits. A subsequently delivered hard directive cannot race removal.
+        source_checkpoint::report(
+            &outbound,
+            &runner_id,
+            &assignment,
+            &workspace,
+            &workspaces,
+            execution.is_ok()
+                && !teardown_uncertain.load(Ordering::Acquire)
+                && !verification_started,
+            workspace_quarantined,
+        )
+        .await;
+        checkpoint_reported = true;
+    }
+    if checkpoint_reported {
+        // No finalize, second seal, or source deletion after a hard-boundary report.
+        execution?;
+        return Ok(());
     }
     if teardown_uncertain.load(Ordering::Acquire) || preserve_workspace {
         let fingerprint = workspaces.fingerprint(&workspace).await.ok();
@@ -2526,7 +2692,21 @@ async fn send_verification_events(
             }
         }
         (None, None, None) => {
-            verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await
+            if let Some(cancellation) = cancellation.as_deref_mut() {
+                match verifier::verify_cancellable(
+                    &assignment.verification_policy,
+                    &workspace.path,
+                    &artifacts,
+                    cancellation,
+                )
+                .await
+                {
+                    Some(report) => report,
+                    None => return VerificationRunOutcome::Cancelled,
+                }
+            } else {
+                verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await
+            }
         }
         _ => {
             send_run_event(
@@ -2595,6 +2775,12 @@ async fn send_verification_events(
         } else {
             VerificationRunOutcome::Failed
         };
+    }
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return VerificationRunOutcome::Cancelled;
     }
     let deliverable_linkage = if let Some(spec) = &assignment.deliverable {
         let exported = match deliverable::export(
@@ -2691,7 +2877,17 @@ async fn send_verification_events(
             );
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let attempt = tokio::time::timeout_at(deadline, artifact_acks.recv()).await;
+                let attempt = if let Some(cancellation) = cancellation.as_deref_mut() {
+                    tokio::select! {
+                        biased;
+                        () = verifier::wait_for_verifier_cancellation(cancellation) => {
+                            return VerificationRunOutcome::Cancelled;
+                        }
+                        attempt = tokio::time::timeout_at(deadline, artifact_acks.recv()) => attempt,
+                    }
+                } else {
+                    tokio::time::timeout_at(deadline, artifact_acks.recv()).await
+                };
                 // Every ACK (including an unrelated one) is an asynchronous boundary, not an
                 // integrity receipt. Keep this check outside the upload-wait timeout itself.
                 if let Err(error) = verify_preserved_workspace_checkpoint(
@@ -3139,6 +3335,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            hard_boundary_checkpoint: Arc::default(),
         }
     }
 
@@ -4230,6 +4427,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            hard_boundary_checkpoint: Arc::default(),
         };
         let workspace = WorkspaceLease {
             path: PathBuf::from("worktrees/exact-run"),
@@ -4347,6 +4545,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            hard_boundary_checkpoint: Arc::default(),
         };
         let uncertain = Arc::new(Notify::new());
         let verified = Arc::new(Notify::new());
