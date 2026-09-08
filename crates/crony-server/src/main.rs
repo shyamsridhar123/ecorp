@@ -1739,7 +1739,8 @@ async fn decode_recovery_runner_command(
                         secrets,
                     }))
                 }
-                FactoryVerificationRecoveryMode::VerifierOnly => {
+                FactoryVerificationRecoveryMode::VerifierOnly
+                | FactoryVerificationRecoveryMode::CheckpointVerification => {
                     if !payload.secret_refs.is_empty() {
                         return Err(anyhow::anyhow!(
                             "verifier-only recovery cannot receive provider secrets"
@@ -3058,6 +3059,7 @@ async fn get_factory_verification_recovery_context(
         remaining_mission_cost_microusd: context.remaining_mission_cost_microusd,
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
+        checkpoint_verification: context.checkpoint_verification,
     }))
 }
 

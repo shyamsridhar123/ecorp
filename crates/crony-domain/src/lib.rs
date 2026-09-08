@@ -164,6 +164,8 @@ impl FactoryWorkItemState {
 pub enum FactoryVerificationRecoveryMode {
     SourceCorrection,
     VerifierOnly,
+    /// Verify a sealed budget-boundary checkpoint with no provider allocation.
+    CheckpointVerification,
 }
 
 impl FactoryVerificationRecoveryMode {
@@ -171,8 +173,39 @@ impl FactoryVerificationRecoveryMode {
         match self {
             Self::SourceCorrection => "source_correction",
             Self::VerifierOnly => "verifier_only",
+            Self::CheckpointVerification => "checkpoint_verification",
         }
     }
+
+    pub const fn is_verifier_only(self) -> bool {
+        matches!(self, Self::VerifierOnly | Self::CheckpointVerification)
+    }
+}
+
+/// Evidence emitted by the native runner after provider termination.
+/// This is not recovery authority: admission must bind every field to the
+/// persisted assignment, policy and latest preserved workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoppedSourceCheckpoint {
+    pub schema_version: u32,
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub workspace_run_id: Uuid,
+    pub agent_id: Uuid,
+    pub runner_id: String,
+    pub source_repository: String,
+    pub source_base_ref: String,
+    pub source_base_commit: String,
+    pub workspace_base_commit: String,
+    pub branch: String,
+    pub head_commit: String,
+    pub workspace_fingerprint: String,
+    pub verification_policy_sha256: String,
+    pub write_scope_sha256: String,
+    pub deliverable_policy_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

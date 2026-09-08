@@ -642,6 +642,8 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub remaining_mission_cost_microusd: i64,
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
+    #[serde(default)]
+    pub checkpoint_verification: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

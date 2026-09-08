@@ -14,6 +14,15 @@ An implementation claim needs evidence at the same scope:
 - Postgres records state and events
 - the browser receives the final state
 
+The opt-in `issue148_checkpoint_` store family applies the real migrations in SQLx-owned disposable
+databases. It covers zero-provider checkpoint admission after exhausted budget/attempt history,
+unchanged original records, exact retry/replay, native independent review, missing/tampered
+evidence, wrong modes/source/actors, quarantine and loop guards, other active assignments, and
+transaction rollback. A generic zero-limit verifier receives no model-budget exemption. These are
+store metadata tests, not proof of physical files, signed artifact bytes, a browser recovery, or a
+real application delivered after a stop. See
+[the scoped report](evidence/2026-09-08-checkpoint-verification-admission.md).
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.
