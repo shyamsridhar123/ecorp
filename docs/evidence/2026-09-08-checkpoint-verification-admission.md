@@ -1,5 +1,9 @@
 # Provider-free stopped-checkpoint admission
 
+For the subsequent 17-case store gate, independent review fixes, and the retained
+native application probe, see [the review/runtime follow-up](2026-09-08-checkpoint-recovery-review-followup.md).
+That probe exposed an unresolved exported-HEAD retention mismatch; it is not a full recovery pass.
+
 - Issue: #148; full dark-factory outcome #63.
 - Base: `8317851b1c5733dc30f41eb29d9ff1e1b4ffa7a8` (draft #194), on merged checkpoint layer #192.
 - Date: September 8, 2026.

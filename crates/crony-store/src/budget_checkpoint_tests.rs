@@ -39,6 +39,14 @@ fn gate() -> Value {
 }
 
 async fn fixture(pool: PgPool, needs_artifact: bool) -> PgStore {
+    fixture_with_stop_request(pool, needs_artifact, false).await
+}
+
+async fn fixture_with_stop_request(
+    pool: PgPool,
+    needs_artifact: bool,
+    explicit_stop: bool,
+) -> PgStore {
     sqlx::raw_sql(
         r#"
         INSERT INTO corps(id,slug,name) VALUES
@@ -138,6 +146,14 @@ async fn fixture(pool: PgPool, needs_artifact: bool) -> PgStore {
         .unwrap();
     let breaker = store.evaluate_circuit_breaker(CORP, SOURCE).await.unwrap();
     assert_eq!(breaker.event.unwrap().payload["stage"], "stop");
+    if explicit_stop {
+        let stopped = store
+            .request_emergency_stop(CORP, AGENT, OWNER, "Stop this assignment explicitly")
+            .await
+            .unwrap();
+        assert_eq!(stopped.run_id, SOURCE);
+        assert_eq!(stopped.event.event_type, "run.stop_requested");
+    }
     store
         .apply_runner_event(event(
             SOURCE,
@@ -221,6 +237,8 @@ async fn state(store: &PgStore) -> Value {
           'mission',(SELECT to_jsonb(m) FROM missions m WHERE id=$3),
           'item',(SELECT to_jsonb(f) FROM factory_work_items f WHERE id=$4),
           'agents',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM agents a),
+          'actors',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM actors a),
+          'memberships',(SELECT coalesce(jsonb_agg(to_jsonb(m) ORDER BY room_id,actor_id),'[]') FROM room_memberships m),
           'recoveries',(SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY id),'[]') FROM factory_verification_recoveries v),
           'commands',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY id),'[]') FROM runner_commands c),
           'events',(SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY seq),'[]') FROM events e))",
@@ -681,4 +699,367 @@ async fn issue148_checkpoint_preserves_another_active_agent_assignment(pool: PgP
         .await
         .unwrap();
     rejected_without_changes(&store, request()).await;
+}
+
+async fn checkpoint_command(store: &PgStore) -> PendingRunnerCommand {
+    let recovery = store
+        .create_factory_verification_recovery(request())
+        .await
+        .unwrap();
+    let replacement_run_id = recovery
+        .recovery
+        .replacement_run_id
+        .expect("native checkpoint replacement run");
+    store
+        .pending_runner_commands(RUNNER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|command| {
+            command.command_kind == "factory_verification_recovery"
+                && command.run_id == replacement_run_id
+        })
+        .expect("native checkpoint recovery command")
+}
+
+async fn assert_dispatch_read(store: &PgStore, command: &PendingRunnerCommand, expected: bool) {
+    let before = state(store).await;
+    let payload = command.payload.clone();
+    assert_eq!(
+        store
+            .verification_recovery_dispatch_authorized(command)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(command.payload, payload);
+    assert_eq!(state(store).await, before);
+}
+
+async fn assert_explicit_stop_rejected(
+    store: &PgStore,
+    input: CreateFactoryVerificationRecoveryInput,
+) {
+    let before = state(store).await;
+    let error = store
+        .create_factory_verification_recovery(input)
+        .await
+        .expect_err("explicit stop must reject checkpoint authorization");
+    assert!(
+        error.to_string().contains("explicit stop request"),
+        "wrong rejection: {error:#}"
+    );
+    assert_eq!(state(store).await, before);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_dispatch_rechecks_artifact_free_author_role(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    assert!(command.payload["provider_artifact"].is_null());
+    for role in ["owner", "admin", "manager", "member", "guest"] {
+        sqlx::query("UPDATE actors SET role=$1 WHERE id=$2 AND corp_id=$3")
+            .bind(role)
+            .bind(OWNER)
+            .bind(CORP)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_dispatch_read(
+            &store,
+            &command,
+            matches!(role, "owner" | "admin" | "manager"),
+        )
+        .await;
+    }
+    sqlx::query("UPDATE actors SET role='owner',kind='service' WHERE id=$1 AND corp_id=$2")
+        .bind(OWNER)
+        .bind(CORP)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert_dispatch_read(&store, &command, false).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_dispatch_rechecks_artifact_free_room_membership(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    assert_dispatch_read(&store, &command, true).await;
+    sqlx::query("DELETE FROM room_memberships WHERE room_id=$1 AND actor_id=$2")
+        .bind(ROOM)
+        .bind(OWNER)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert_dispatch_read(&store, &command, false).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_dispatch_rejects_foreign_and_stale_commands(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    let mut foreign = command.clone();
+    foreign.id = Uuid::new_v4();
+    assert_dispatch_read(&store, &foreign, false).await;
+    let mut foreign = command.clone();
+    foreign.corp_id = Uuid::new_v4();
+    foreign.payload["corp_id"] = json!(foreign.corp_id);
+    assert_dispatch_read(&store, &foreign, false).await;
+    let mut foreign = command.clone();
+    foreign.run_id = Uuid::new_v4();
+    foreign.payload["run_id"] = json!(foreign.run_id);
+    assert_dispatch_read(&store, &foreign, false).await;
+    let mut foreign = command.clone();
+    foreign.runner_id = "foreign-runner".to_owned();
+    assert_dispatch_read(&store, &foreign, false).await;
+    let mut foreign = command.clone();
+    foreign.command_kind = "circuit_breaker".to_owned();
+    assert_dispatch_read(&store, &foreign, false).await;
+
+    for field in [
+        "source_run_id",
+        "workspace_run_id",
+        "agent_id",
+        "assignment_token",
+        "task_id",
+        "mission_id",
+        "room_id",
+    ] {
+        let mut altered = command.clone();
+        altered.payload[field] = json!(Uuid::new_v4());
+        assert_dispatch_read(&store, &altered, false).await;
+    }
+    let mut altered = command.clone();
+    altered.payload["mode"] = json!("source_correction");
+    assert_dispatch_read(&store, &altered, false).await;
+
+    let mut replacement = command.payload.clone();
+    replacement["prompt"] = json!("Changed durable metadata after the pending read");
+    sqlx::query("UPDATE runner_commands SET payload=$1 WHERE id=$2")
+        .bind(replacement)
+        .bind(command.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert_dispatch_read(&store, &command, false).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_dispatch_rejects_settled_and_inactive_recoveries(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    for status in ["completed", "failed", "cancelled", "lost"] {
+        sqlx::query("UPDATE runs SET status=$1 WHERE id=$2")
+            .bind(status)
+            .bind(command.run_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_dispatch_read(&store, &command, false).await;
+    }
+    sqlx::query("UPDATE runs SET status='starting' WHERE id=$1")
+        .bind(command.run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    for status in ["completed", "failed"] {
+        sqlx::query(
+            "UPDATE factory_verification_recoveries SET status=$1 WHERE replacement_run_id=$2",
+        )
+        .bind(status)
+        .bind(command.run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_dispatch_read(&store, &command, false).await;
+    }
+    sqlx::query(
+        "UPDATE factory_verification_recoveries SET status='running' WHERE replacement_run_id=$1",
+    )
+    .bind(command.run_id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    assert_dispatch_read(&store, &command, true).await;
+    store
+        .acknowledge_runner_command(command.id, RUNNER)
+        .await
+        .unwrap()
+        .expect("native command acknowledgment");
+    assert_dispatch_read(&store, &command, false).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_dispatch_binds_current_command_source_and_policy(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    for (field, value) in [
+        ("assignment_token", json!(Uuid::new_v4())),
+        ("source_run_id", json!(Uuid::new_v4())),
+        ("workspace_run_id", json!(Uuid::new_v4())),
+        ("room_id", json!(Uuid::new_v4())),
+        ("source_repository", json!("foreign/source")),
+        ("source_base_ref", json!("foreign-ref")),
+        ("source_base_commit", json!("c".repeat(40))),
+        ("expected_workspace_fingerprint", json!("c".repeat(64))),
+        ("expected_head_commit", json!("c".repeat(40))),
+        ("verification_policy", json!({"checks":[]})),
+        ("write_scope", json!(["foreign/**"])),
+        ("mode", json!("verifier_only")),
+        ("secret_refs", json!([{"fixture":"not a provider grant"}])),
+    ] {
+        // Supply the changed stored payload too: denial must come from native
+        // assignment/recovery/source binding, not just stale-input comparison.
+        let mut altered = command.clone();
+        altered.payload[field] = value;
+        sqlx::query("UPDATE runner_commands SET payload=$1 WHERE id=$2")
+            .bind(&altered.payload)
+            .bind(command.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_dispatch_read(&store, &altered, false).await;
+    }
+    sqlx::query("UPDATE runner_commands SET payload=$1 WHERE id=$2")
+        .bind(&command.payload)
+        .bind(command.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert_dispatch_read(&store, &command, true).await;
+    sqlx::query("UPDATE runs SET source_base_commit=$1 WHERE id=$2")
+        .bind("c".repeat(40))
+        .bind(SOURCE)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert_dispatch_read(&store, &command, false).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_budget_incident_cannot_override_native_explicit_stop(pool: PgPool) {
+    let store = fixture_with_stop_request(pool, false, true).await;
+    assert_explicit_stop_rejected(&store, request()).await;
+    let before = state(&store).await;
+    let error = store
+        .factory_verification_recovery_context(CORP, OWNER, ITEM)
+        .await
+        .expect_err("explicitly stopped checkpoint cannot be offered for recovery");
+    assert!(error.to_string().contains("explicit stop request"));
+    assert_eq!(state(&store).await, before);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_explicit_stop_fences_dispatch_budget_exemption_and_retry(
+    pool: PgPool,
+) {
+    let store = fixture(pool, false).await;
+    let command = checkpoint_command(&store).await;
+    let token = Uuid::parse_str(command.payload["assignment_token"].as_str().unwrap()).unwrap();
+    assert_dispatch_read(&store, &command, true).await;
+    store
+        .apply_runner_event(event(
+            command.run_id,
+            token,
+            "run.started",
+            json!({"workspace":"fixture-worktree","workspace_branch":"crony/fixture",
+                "workspace_base_ref":"main","workspace_base_commit":"a".repeat(40),
+                "execution_mode":"verification_only"}),
+        ))
+        .await
+        .unwrap();
+    let stopped = store
+        .request_emergency_stop(CORP, AGENT, OWNER, "Stop this verifier explicitly")
+        .await
+        .unwrap();
+    assert_eq!(stopped.run_id, command.run_id);
+    assert_dispatch_read(&store, &command, false).await;
+    let before = state(&store).await;
+    let mut tx = store.pool.begin().await.unwrap();
+    assert!(
+        !budget_checkpoint::zero_provider_allocation_tx(&mut tx, CORP, command.run_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        hard_breaker_reached_tx(&mut tx, CORP, command.run_id)
+            .await
+            .unwrap()
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(state(&store).await, before);
+    store
+        .apply_runner_event(event(
+            command.run_id,
+            token,
+            "run.cancelled",
+            json!({"reason":"Explicit operator stop"}),
+        ))
+        .await
+        .unwrap();
+    store
+        .apply_runner_event(event(
+            command.run_id,
+            token,
+            "run.workspace_preserved",
+            json!({"workspace_fingerprint":"b".repeat(64),"head_commit":"a".repeat(40),
+                "detail":"Native verifier preserved original source"}),
+        ))
+        .await
+        .unwrap();
+    let mut retry = request();
+    retry.source_run_id = command.run_id;
+    retry.expected_factory_version = state(&store).await["item"]["version"].as_i64().unwrap();
+    assert_explicit_stop_rejected(&store, retry).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_unrelated_stop_events_do_not_revoke_budget_recovery(pool: PgPool) {
+    let store = fixture(pool, false).await;
+    let other_corp = Uuid::new_v4();
+    sqlx::query("INSERT INTO corps(id,slug,name) VALUES($1,'foreign-stop','Foreign stop fixture')")
+        .bind(other_corp)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let mut tx = store.pool.begin().await.unwrap();
+    for (corp_id, aggregate_type, run_id) in [
+        (CORP, "run", Uuid::new_v4()),
+        (other_corp, "run", SOURCE),
+        (CORP, "task", SOURCE),
+    ] {
+        append_event_tx(
+            &mut tx,
+            NewEvent::new(
+                corp_id,
+                None,
+                "run.stop_requested",
+                aggregate_type,
+                run_id,
+                Uuid::new_v4().to_string(),
+                json!({"reason":"Unrelated stop metadata fixture"}),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let command = checkpoint_command(&store).await;
+    assert_dispatch_read(&store, &command, true).await;
+    let mut tx = store.pool.begin().await.unwrap();
+    assert!(
+        budget_checkpoint::zero_provider_allocation_tx(&mut tx, CORP, command.run_id)
+            .await
+            .unwrap()
+    );
+    tx.rollback().await.unwrap();
 }

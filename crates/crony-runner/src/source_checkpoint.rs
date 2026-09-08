@@ -208,6 +208,7 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };
         (root, workspaces, workspace, assignment)

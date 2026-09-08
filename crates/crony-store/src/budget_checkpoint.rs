@@ -30,6 +30,36 @@ fn budget_metric(metric: &str) -> bool {
     )
 }
 
+async fn ensure_no_explicit_stop_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    workspace_run_id: Uuid,
+) -> Result<()> {
+    // A measured budget boundary does not supersede an operator's stop. Check
+    // the complete preserved lineage, including earlier failed verifier retries.
+    let stopped: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM runs lineage
+            JOIN events stop_event
+              ON stop_event.corp_id=lineage.corp_id AND stop_event.aggregate_id=lineage.id
+             AND stop_event.aggregate_type='run' AND stop_event.type='run.stop_requested'
+            WHERE lineage.corp_id=$1 AND lineage.workspace_run_id=$2
+        )
+        "#,
+    )
+    .bind(corp_id)
+    .bind(workspace_run_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if stopped {
+        return Err(anyhow!(
+            "checkpoint verification cannot bypass an explicit stop request"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn source_authority_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -82,6 +112,7 @@ pub(super) async fn source_authority_tx(
             "checkpoint verification requires a terminal preserved source"
         ));
     }
+    ensure_no_explicit_stop_tx(tx, corp_id, source.get("workspace_run_id")).await?;
     let inherited = if source_mode == "verification_only" {
         if source.get::<Option<Uuid>, _>("parent_id")
             != source.get::<Option<Uuid>, _>("resumed_from_run_id")
@@ -316,6 +347,7 @@ pub(super) async fn validate_lineage_tx(
     workspace_run_id: Uuid,
     authority: &Authority,
 ) -> Result<()> {
+    ensure_no_explicit_stop_tx(tx, corp_id, workspace_run_id).await?;
     let rows = sqlx::query(
         r#"
         SELECT run.id, run.task_id, run.agent_id, run.runner_id, run.status,
@@ -440,6 +472,14 @@ pub(super) async fn zero_provider_allocation_tx(
             AND origin.workspace_disposition='preserved'
             AND origin.execution_mode='provider' AND origin.breaker_stage IN ('suspend','stop')
             AND run.workspace_disposition IS DISTINCT FROM 'quarantined'
+            AND NOT EXISTS (
+                SELECT 1 FROM runs lineage
+                JOIN events stop_event
+                  ON stop_event.corp_id=lineage.corp_id AND stop_event.aggregate_id=lineage.id
+                 AND stop_event.aggregate_type='run' AND stop_event.type='run.stop_requested'
+                WHERE lineage.corp_id=run.corp_id
+                  AND lineage.workspace_run_id=run.workspace_run_id
+            )
         )
         "#,
     )

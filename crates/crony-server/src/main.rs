@@ -1741,10 +1741,22 @@ async fn decode_recovery_runner_command(
                 }
                 FactoryVerificationRecoveryMode::VerifierOnly
                 | FactoryVerificationRecoveryMode::CheckpointVerification => {
+                    if payload.mode == FactoryVerificationRecoveryMode::CheckpointVerification
+                        && !state.runners.get(&command.runner_id).is_some_and(|runner| {
+                            supports_checkpoint_verification(&runner.capabilities)
+                        })
+                    {
+                        return Err(anyhow::anyhow!(
+                            "runner does not support stopped-checkpoint verification; update the runner before recovery"
+                        ));
+                    }
                     if !payload.secret_refs.is_empty() {
                         return Err(anyhow::anyhow!(
                             "verifier-only recovery cannot receive provider secrets"
                         ));
+                    }
+                    if !verification_recovery_authority_is_current(state, command).await? {
+                        return Ok(None);
                     }
                     if let Some(reference) = payload.provider_artifact.as_mut()
                         && !hydrate_verification_artifact(
@@ -1757,7 +1769,7 @@ async fn decode_recovery_runner_command(
                     {
                         return Ok(None);
                     }
-                    if !recovery_command_can_dispatch(state, command).await? {
+                    if !verification_recovery_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::VerifyRun {
@@ -1776,6 +1788,8 @@ async fn decode_recovery_runner_command(
                         workspace_base_commit: payload.workspace_base_commit,
                         expected_workspace_fingerprint: payload.expected_workspace_fingerprint,
                         expected_head_commit: payload.expected_head_commit,
+                        checkpoint_verification: payload.mode
+                            == FactoryVerificationRecoveryMode::CheckpointVerification,
                         verification_policy: payload.verification_policy,
                         write_scope: payload.write_scope,
                         deliverable: payload.deliverable,
@@ -1786,6 +1800,31 @@ async fn decode_recovery_runner_command(
         }
         _ => decode_runner_command(command, control_lease_token, durable_control).map(Some),
     }
+}
+
+fn supports_checkpoint_verification(capabilities: &[crony_protocol::RunnerCapability]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.name == "checkpoint-verification-v1" && capability.available)
+}
+
+async fn verification_recovery_authority_is_current(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<bool> {
+    if state
+        .store
+        .verification_recovery_dispatch_authorized(command)
+        .await?
+    {
+        return Ok(true);
+    }
+    if !recovery_command_can_dispatch(state, command).await? {
+        return Ok(false);
+    }
+    Err(anyhow::anyhow!(
+        "current recovery authorization is unavailable; no verifier command was dispatched"
+    ))
 }
 
 async fn recovery_command_can_dispatch(
@@ -6309,6 +6348,30 @@ mod tests {
         schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
         validate_verification_artifact_reference,
     };
+
+    #[test]
+    fn checkpoint_verification_requires_explicit_runner_support() {
+        let mut capability = RunnerCapability {
+            name: "verification-artifact-transfer-v1".to_owned(),
+            available: true,
+            detail: None,
+            models: Vec::new(),
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        };
+        assert!(!super::supports_checkpoint_verification(&[]));
+        assert!(!super::supports_checkpoint_verification(&[
+            capability.clone()
+        ]));
+        capability.name = "checkpoint-verification-v1".to_owned();
+        capability.available = false;
+        assert!(!super::supports_checkpoint_verification(&[
+            capability.clone()
+        ]));
+        capability.available = true;
+        assert!(super::supports_checkpoint_verification(&[capability]));
+    }
 
     fn mission_preview_test_request() -> CreateMissionRequest {
         serde_json::from_value(json!({

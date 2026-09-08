@@ -27,6 +27,7 @@ mod factory_run_failure;
 mod publication;
 mod staffing;
 mod terminal_accounting;
+mod verification_dispatch;
 
 #[cfg(test)]
 mod budget_checkpoint_tests;
