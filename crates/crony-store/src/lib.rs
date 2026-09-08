@@ -5,9 +5,10 @@ use chrono::{Duration, Utc};
 use crony_domain::{
     ActionApproval, Actor, ActorKind, Agent, AgentStatus, CircuitBreakerIncident, ControlLease,
     Corp, CorpSnapshot, DeliverableForm, DeliverableSpec, DomainEvent, EntityLink,
-    FactoryController, FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, Mission,
-    MissionBudgetRevision, MissionContractRevision, MissionContractRevisionAction, MissionStatus,
-    NewEvent, PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
+    FactoryController, FactoryVerificationRecovery, FactoryVerificationRecoveryMode,
+    FactoryWorkItem, FactoryWorkItemState, ManualVerificationGate, Mission, MissionBudgetRevision,
+    MissionContractRevision, MissionContractRevisionAction, MissionStatus, NewEvent,
+    PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
     VerificationRequest, VerifierCheck, repository_relative_path_is_valid, write_scope_allows_path,
@@ -23,6 +24,9 @@ mod contract_revision;
 mod factory_controller;
 mod publication;
 mod staffing;
+
+#[cfg(test)]
+mod factory_recovery_loss_tests;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
@@ -181,6 +185,18 @@ pub struct UpgradeFactorySourceCommitInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct CheckpointFactoryWorkspaceInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_run_id: Uuid,
+    pub expected_head_commit: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct TransitionFactoryWorkItemInput {
     pub corp_id: Uuid,
     pub work_item_id: Uuid,
@@ -229,11 +245,61 @@ pub struct RejectFactoryMaterializationInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct CreateFactoryVerificationRecoveryInput {
+    pub corp_id: Uuid,
+    pub work_item_id: Uuid,
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_factory_version: i64,
+    pub idempotency_key: Uuid,
+    pub source_run_id: Uuid,
+    pub mode: FactoryVerificationRecoveryMode,
+    pub reason: String,
+    pub observed_source_revision: String,
+    pub reviewed_source_snapshot: Value,
+    pub contract_revision_id: Option<Uuid>,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FactoryWorkItemOutcome {
     pub work_item: FactoryWorkItem,
     pub claim_token: Option<Uuid>,
     pub event: Option<DomainEvent>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryWorkspaceCheckpointOutcome {
+    pub work_item: FactoryWorkItem,
+    pub claim_token: Option<Uuid>,
+    pub source_run_id: Uuid,
+    pub runner_id: String,
+    pub command_id: Option<Uuid>,
+    pub workspace_fingerprint: Option<String>,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryVerificationRecoveryContext {
+    pub work_item: FactoryWorkItem,
+    pub recoveries: Vec<FactoryVerificationRecovery>,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub source_run_id: Uuid,
+    pub remaining_attempts: i32,
+    pub remaining_mission_tokens: i64,
+    pub remaining_mission_cost_microusd: i64,
+    pub workspace_fingerprint: Option<String>,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerEventOutcome {
+    pub event: Option<DomainEvent>,
+    pub related_events: Vec<DomainEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,7 +556,8 @@ pub struct VerificationDecisionOutcome {
     pub corp_id: Uuid,
     pub mission_id: Uuid,
     pub status: String,
-    pub event: DomainEvent,
+    pub events: Vec<DomainEvent>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +669,37 @@ pub struct PendingRunnerCommand {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerCommandDispatchState {
+    Pending,
+    Settled,
+    Obsolete,
+}
+
+fn runner_command_dispatch_state(
+    command_status: &str,
+    run_status: Option<&str>,
+) -> RunnerCommandDispatchState {
+    if command_status != "pending" {
+        return RunnerCommandDispatchState::Settled;
+    }
+    if matches!(
+        run_status,
+        Some(
+            "provisioning"
+                | "starting"
+                | "running"
+                | "waiting_for_input"
+                | "waiting_for_approval"
+                | "verifying"
+        )
+    ) {
+        RunnerCommandDispatchState::Pending
+    } else {
+        RunnerCommandDispatchState::Obsolete
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerOutcome {
     pub command: Option<PendingRunnerCommand>,
@@ -647,6 +745,7 @@ pub struct PreparedArtifactUpload {
 #[derive(Debug, Clone)]
 pub struct DependencyArtifactContext {
     pub task_id: Uuid,
+    pub verification_run_id: Uuid,
     pub plan_key: String,
     pub task_title: String,
     pub run_summary: Option<String>,
@@ -1313,6 +1412,17 @@ impl PgStore {
             .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+        // Only the explicit development reset removes mission history. Its
+        // mission-owned crew must be removed after run/task references and
+        // before their owning missions; normal retirement never deletes it.
+        sqlx::query(
+            "DELETE FROM agents agent USING missions mission
+             WHERE agent.mission_id = mission.id
+               AND agent.corp_id = $1 AND mission.corp_id = $1",
+        )
+        .bind(corp_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM missions WHERE corp_id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
@@ -1529,6 +1639,7 @@ impl PgStore {
                    r.source_repository, r.source_base_ref, r.source_base_commit,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
+                   r.workspace_fingerprint, r.execution_mode,
                    r.verification_status, r.verification_summary,
                    r.verification_sha256, r.deliverable_sha256, r.status,
                    r.summary, r.artifact_id, r.artifact_uri, r.artifact_media_type,
@@ -1885,6 +1996,32 @@ impl PgStore {
         .map(factory_controller::map_factory_controller)
         .collect::<Result<Vec<_>>>()?;
 
+        let factory_verification_recoveries = sqlx::query(
+            r#"
+            SELECT recovery.id, recovery.corp_id, recovery.factory_work_item_id,
+                   recovery.mission_id, recovery.task_id, recovery.source_run_id,
+                   recovery.replacement_run_id, recovery.mode, recovery.status,
+                   recovery.authorized_by, recovery.reason,
+                   recovery.observed_source_revision, recovery.reviewed_source_snapshot,
+                   recovery.contract_revision_id, recovery.previous_verification_policy,
+                   recovery.replacement_verification_policy,
+                   recovery.created_at, recovery.updated_at
+            FROM factory_verification_recoveries recovery
+            JOIN missions mission ON mission.id = recovery.mission_id
+            JOIN room_memberships membership ON membership.room_id = mission.room_id
+            WHERE recovery.corp_id = $1 AND membership.actor_id = $2
+            ORDER BY recovery.created_at DESC
+            LIMIT 100
+            "#,
+        )
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_factory_verification_recovery)
+        .collect::<Result<Vec<_>>>()?;
+
         let mut events = sqlx::query(
             r#"
             SELECT seq, id, schema_version, corp_id, room_id, actor_id, type,
@@ -1934,6 +2071,7 @@ impl PgStore {
             circuit_breaker_incidents,
             factory_work_items,
             factory_controllers,
+            factory_verification_recoveries,
             events,
         };
         tx.commit().await?;
@@ -3534,6 +3672,356 @@ impl PgStore {
         })
     }
 
+    pub async fn checkpoint_factory_workspace(
+        &self,
+        input: CheckpointFactoryWorkspaceInput,
+    ) -> Result<FactoryWorkspaceCheckpointOutcome> {
+        if input.expected_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let expected_head_commit = input.expected_head_commit.trim().to_ascii_lowercase();
+        validate_factory_base_commit(&expected_head_commit)?;
+        let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
+        let command_idempotency_key = format!("factory-workspace-checkpoint:{idempotency_key}");
+        let operation_request = json!({
+            "work_item_id": input.work_item_id,
+            "expected_version": input.expected_version,
+            "source_run_id": input.source_run_id,
+            "expected_head_commit": expected_head_commit,
+        });
+        let workspace_run_id: Uuid =
+            sqlx::query_scalar("SELECT workspace_run_id FROM runs WHERE id = $1 AND corp_id = $2")
+                .bind(input.source_run_id)
+                .bind(input.corp_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .context("factory workspace checkpoint source run was not found")?;
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(
+            &mut tx,
+            &[
+                format!("factory:idempotency:{}:{idempotency_key}", input.corp_id),
+                format!("factory:item:{}:{}", input.corp_id, input.work_item_id),
+                format!("resume:workspace:{}:{}", input.corp_id, workspace_run_id),
+            ],
+        )
+        .await?;
+
+        let existing_command = sqlx::query(
+            r#"
+            SELECT id, runner_id, run_id, payload
+            FROM runner_commands
+            WHERE corp_id = $1 AND idempotency_key = $2
+            "#,
+        )
+        .bind(input.corp_id)
+        .bind(&command_idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(command) = existing_command {
+            let (work_item, current_token) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                    .await?
+                    .context("idempotent workspace checkpoint references a missing work item")?;
+            ensure_active_factory_control(
+                &work_item,
+                current_token,
+                input.actor_id,
+                input.claim_token,
+                input.expected_version,
+                Utc::now(),
+            )?;
+            if !matches!(
+                work_item.state,
+                FactoryWorkItemState::VerificationFailed | FactoryWorkItemState::Blocked
+            ) {
+                return Err(anyhow!(
+                    "factory workspace checkpoint replay requires verification-failed or blocked state"
+                ));
+            }
+            let mission_id = work_item
+                .mission_id
+                .context("idempotent workspace checkpoint references no mission")?;
+            ensure_factory_recovery_authorizer_tx(
+                &mut tx,
+                input.corp_id,
+                mission_id,
+                input.actor_id,
+            )
+            .await?;
+            let command_run_id: Uuid = command.get("run_id");
+            let command_payload: Value = command.get("payload");
+            if command_run_id != input.source_run_id
+                || command_payload.get("run_id").and_then(Value::as_str)
+                    != Some(input.source_run_id.to_string().as_str())
+                || command_payload.get("mission_id").and_then(Value::as_str)
+                    != Some(mission_id.to_string().as_str())
+                || command_payload
+                    .get("expected_head_commit")
+                    .and_then(Value::as_str)
+                    != Some(expected_head_commit.as_str())
+            {
+                return Err(anyhow!(
+                    "factory workspace checkpoint idempotency key was reused with a different request"
+                ));
+            }
+            let workspace_fingerprint: Option<String> = sqlx::query_scalar(
+                r#"
+                SELECT run.workspace_fingerprint
+                FROM runs run
+                JOIN tasks task ON task.id = run.task_id
+                WHERE run.id = $1 AND run.corp_id = $2 AND task.mission_id = $3
+                "#,
+            )
+            .bind(input.source_run_id)
+            .bind(input.corp_id)
+            .bind(mission_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            tx.commit().await?;
+            return Ok(FactoryWorkspaceCheckpointOutcome {
+                work_item,
+                claim_token: Some(input.claim_token),
+                source_run_id: command_run_id,
+                runner_id: command.get("runner_id"),
+                command_id: Some(command.get("id")),
+                workspace_fingerprint,
+                event: None,
+                replayed: true,
+            });
+        }
+        if factory_operation_tx(&mut tx, input.corp_id, &idempotency_key)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow!(
+                "factory workspace checkpoint audit operation exists without its runner command"
+            ));
+        }
+
+        let (work_item, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_active_factory_control(
+            &work_item,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_version,
+            Utc::now(),
+        )?;
+        if !matches!(
+            work_item.state,
+            FactoryWorkItemState::VerificationFailed | FactoryWorkItemState::Blocked
+        ) {
+            return Err(anyhow!(
+                "factory workspace checkpoint requires verification-failed or blocked state"
+            ));
+        }
+        let mission_id = work_item
+            .mission_id
+            .context("factory workspace checkpoint requires a linked mission")?;
+        ensure_factory_recovery_authorizer_tx(&mut tx, input.corp_id, mission_id, input.actor_id)
+            .await?;
+        let row = sqlx::query(
+            r#"
+            SELECT mission.room_id, mission.status AS mission_status,
+                   task.id AS task_id, task.status AS task_status,
+                   task.verification_status AS task_verification_status,
+                   run.runner_id, run.agent_id, run.assignment_token,
+                   run.workspace_run_id, run.workspace_path,
+                   run.workspace_disposition,
+                   run.workspace_base_commit, run.breaker_stage,
+                   run.verification_status AS source_verification_status,
+                   run.source_repository, run.source_base_ref, run.source_base_commit
+            FROM missions mission
+            JOIN tasks task ON task.mission_id = mission.id
+            JOIN runs run ON run.task_id = task.id
+            WHERE mission.id = $1 AND mission.corp_id = $2 AND run.id = $3
+            FOR UPDATE OF mission, task, run
+            "#,
+        )
+        .bind(mission_id)
+        .bind(input.corp_id)
+        .bind(input.source_run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("factory workspace checkpoint source context was not found")?;
+        let checkpoint =
+            source_workspace_checkpoint_tx(&mut tx, input.corp_id, input.source_run_id).await?;
+        checkpoint.ensure_factory_terminal()?;
+        if row.get::<Uuid, _>("workspace_run_id") != workspace_run_id
+            || row.get::<String, _>("mission_status") != "failed"
+            || row.get::<String, _>("task_status") != "verification_failed"
+            || row.get::<String, _>("task_verification_status") != "failed"
+            || row.get::<String, _>("source_verification_status") != "failed"
+        {
+            return Err(anyhow!(
+                "factory workspace checkpoint requires failed verification, task, and mission state"
+            ));
+        }
+        if row
+            .get::<Option<String>, _>("workspace_disposition")
+            .as_deref()
+            != Some("preserved")
+            || row.get::<Option<String>, _>("workspace_path").is_none()
+        {
+            return Err(anyhow!(
+                "factory workspace checkpoint requires a preserved workspace"
+            ));
+        }
+        if checkpoint.expected_head_commit.as_deref() != Some(expected_head_commit.as_str()) {
+            return Err(anyhow!("factory workspace checkpoint head commit mismatch"));
+        }
+        let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
+        if lineage.iter().any(|candidate| {
+            matches!(
+                candidate.get::<String, _>("breaker_stage").as_str(),
+                "suspend" | "stop"
+            ) || candidate
+                .get::<Option<String>, _>("workspace_disposition")
+                .as_deref()
+                == Some("quarantined")
+        }) {
+            return Err(anyhow!(
+                "factory workspace checkpoint cannot bypass a suspended, stopped, or quarantined lineage"
+            ));
+        }
+        let latest_lineage_run_id = latest_workspace_source_id(&lineage)?;
+        if latest_lineage_run_id != input.source_run_id {
+            return Err(anyhow!(
+                "factory workspace checkpoint source run is not the latest workspace checkpoint"
+            ));
+        }
+        let workspace_fingerprint = checkpoint.fingerprint.clone();
+        if workspace_fingerprint.is_some() {
+            checkpoint.ensure_preserved()?;
+            tx.commit().await?;
+            return Ok(FactoryWorkspaceCheckpointOutcome {
+                work_item,
+                claim_token: Some(input.claim_token),
+                source_run_id: input.source_run_id,
+                runner_id: row.get("runner_id"),
+                command_id: None,
+                workspace_fingerprint,
+                event: None,
+                replayed: true,
+            });
+        }
+        let active_run: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM runs
+                WHERE task_id = $1
+                  AND status IN ('provisioning', 'starting', 'running',
+                                 'waiting_for_input', 'waiting_for_approval', 'verifying')
+            )
+            "#,
+        )
+        .bind(row.get::<Uuid, _>("task_id"))
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_run {
+            return Err(anyhow!(
+                "factory workspace checkpoint task already has an active run"
+            ));
+        }
+        let workspace_base_commit: String =
+            row.get::<Option<String>, _>("workspace_base_commit")
+                .context("factory workspace checkpoint source run has no workspace base commit")?;
+        let command_id = Uuid::new_v4();
+        let command_payload = json!({
+            "corp_id": input.corp_id,
+            "room_id": row.get::<Uuid, _>("room_id"),
+            "mission_id": mission_id,
+            "task_id": row.get::<Uuid, _>("task_id"),
+            "run_id": input.source_run_id,
+            "workspace_run_id": workspace_run_id,
+            "agent_id": row.get::<Uuid, _>("agent_id"),
+            "assignment_token": row.get::<Uuid, _>("assignment_token"),
+            "source_repository": row.get::<Option<String>, _>("source_repository"),
+            "source_base_ref": row.get::<Option<String>, _>("source_base_ref"),
+            "source_base_commit": row.get::<Option<String>, _>("source_base_commit"),
+            "workspace_base_commit": workspace_base_commit,
+            "expected_head_commit": expected_head_commit,
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO runner_commands
+                (id, corp_id, runner_id, run_id, command_kind, payload, idempotency_key)
+            VALUES ($1, $2, $3, $4, 'factory_workspace_checkpoint', $5, $6)
+            "#,
+        )
+        .bind(command_id)
+        .bind(input.corp_id)
+        .bind(row.get::<String, _>("runner_id"))
+        .bind(input.source_run_id)
+        .bind(&command_payload)
+        .bind(&command_idempotency_key)
+        .execute(&mut *tx)
+        .await?;
+        record_factory_operation_tx(
+            &mut tx,
+            NewFactoryOperation {
+                corp_id: input.corp_id,
+                idempotency_key: &idempotency_key,
+                work_item_id: work_item.id,
+                actor_id: input.actor_id,
+                operation: "checkpoint_workspace",
+                resulting_version: work_item.version,
+                claim_token: Some(input.claim_token),
+                request: &operation_request,
+            },
+        )
+        .await?;
+        let event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(row.get("room_id")),
+                aggregate_version: work_item.version,
+                correlation_id: Some(mission_id),
+                causation_id: Some(input.source_run_id),
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.workspace_checkpoint_requested",
+                    "factory_work_item",
+                    work_item.id,
+                    format!(
+                        "factory:{}:workspace-checkpoint:{}",
+                        work_item.id, input.source_run_id
+                    ),
+                    json!({
+                        "state": work_item.state.as_str(),
+                        "source_run_id": input.source_run_id,
+                        "command_id": command_id,
+                        "expected_head_commit": expected_head_commit,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory workspace checkpoint event unexpectedly existed")?;
+        let runner_id = row.get("runner_id");
+        tx.commit().await?;
+        Ok(FactoryWorkspaceCheckpointOutcome {
+            work_item,
+            claim_token: Some(input.claim_token),
+            source_run_id: input.source_run_id,
+            runner_id,
+            command_id: Some(command_id),
+            workspace_fingerprint: None,
+            event: Some(event),
+            replayed: false,
+        })
+    }
+
     pub async fn transition_factory_work_item(
         &self,
         input: TransitionFactoryWorkItemInput,
@@ -3735,6 +4223,1009 @@ impl PgStore {
             event: Some(event),
             replayed: false,
         })
+    }
+
+    pub async fn factory_verification_recovery_context(
+        &self,
+        corp_id: Uuid,
+        viewer_actor_id: Uuid,
+        work_item_id: Uuid,
+    ) -> Result<Option<FactoryVerificationRecoveryContext>> {
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, corp_id, viewer_actor_id).await?;
+        let work_item = sqlx::query(
+            r#"
+            SELECT item.id, item.corp_id, item.source_kind, item.source_project_owner,
+                   item.source_project_number, item.source_project_item_id,
+                   item.source_repository_owner, item.source_repository_name,
+                   item.source_issue_number, item.source_issue_node_id, item.source_issue_url,
+                   item.source_title, item.source_revision, item.state, item.version,
+                   item.claim_owner_id, item.lease_expires_at, item.policy, item.mission_id,
+                   item.failure_detail, item.created_at, item.updated_at
+            FROM factory_work_items item
+            WHERE item.id = $1
+              AND item.corp_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM missions mission
+                  JOIN room_memberships membership ON membership.room_id = mission.room_id
+                  WHERE mission.id = item.mission_id
+                    AND mission.corp_id = item.corp_id
+                    AND membership.actor_id = $3
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM actors viewer
+                  WHERE viewer.id = $3
+                    AND viewer.corp_id = item.corp_id
+                    AND viewer.kind = 'human'
+                    AND viewer.role IN ('owner', 'admin', 'manager', 'member')
+              )
+            "#,
+        )
+        .bind(work_item_id)
+        .bind(corp_id)
+        .bind(viewer_actor_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_factory_work_item)
+        .transpose()?;
+        let Some(work_item) = work_item else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mission_id = work_item
+            .mission_id
+            .context("factory recovery context requires a linked mission")?;
+        let recoveries = sqlx::query(
+            r#"
+            SELECT id, corp_id, factory_work_item_id, mission_id, task_id,
+                   source_run_id, replacement_run_id, mode, status, authorized_by,
+                   reason, observed_source_revision, reviewed_source_snapshot,
+                   contract_revision_id, previous_verification_policy,
+                   replacement_verification_policy, created_at, updated_at
+            FROM factory_verification_recoveries
+            WHERE corp_id = $1 AND factory_work_item_id = $2
+            ORDER BY CASE WHEN status IN ('authorized', 'running') THEN 0 ELSE 1 END,
+                     created_at DESC, id DESC
+            LIMIT 100
+            "#,
+        )
+        .bind(corp_id)
+        .bind(work_item_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_factory_verification_recovery)
+        .collect::<Result<Vec<_>>>()?;
+        let active_recoveries = recoveries
+            .iter()
+            .filter(|recovery| matches!(recovery.status.as_str(), "authorized" | "running"))
+            .collect::<Vec<_>>();
+        if active_recoveries.len() > 1 {
+            return Err(anyhow!(
+                "factory recovery context found multiple active recoveries"
+            ));
+        }
+        let (task_id, source_run_id) = if let Some(recovery) = active_recoveries.first() {
+            (recovery.task_id, recovery.source_run_id)
+        } else {
+            let candidates = sqlx::query(
+                r#"
+                SELECT task.id AS task_id, source.workspace_run_id
+                FROM tasks task
+                JOIN LATERAL (
+                    SELECT run.workspace_run_id
+                    FROM runs run
+                    WHERE run.corp_id = task.corp_id
+                      AND run.task_id = task.id
+                    ORDER BY run.created_at DESC, run.id DESC
+                    LIMIT 1
+                ) source ON TRUE
+                WHERE task.corp_id = $1
+                  AND task.mission_id = $2
+                  AND task.status = 'verification_failed'
+                  AND task.verification_status IN ('failed', 'pending')
+                ORDER BY task.created_at, task.id
+                "#,
+            )
+            .bind(corp_id)
+            .bind(mission_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            if candidates.len() != 1 {
+                return Err(anyhow!(
+                    "factory recovery context requires exactly one failed task; found {}",
+                    candidates.len()
+                ));
+            }
+            let lineage =
+                workspace_lineage_tx(&mut tx, corp_id, candidates[0].get("workspace_run_id"))
+                    .await?;
+            (
+                candidates[0].get::<Uuid, _>("task_id"),
+                latest_workspace_source_id(&lineage)?,
+            )
+        };
+        let row = sqlx::query(
+            r#"
+            SELECT task.attempt_count, task.max_attempts,
+                   mission.budget_tokens, mission.budget_cost_microusd,
+                   source.id
+            FROM tasks task
+            JOIN missions mission
+              ON mission.id = task.mission_id AND mission.corp_id = task.corp_id
+            JOIN runs source
+              ON source.id = $4 AND source.task_id = task.id AND source.corp_id = task.corp_id
+            WHERE task.id = $1 AND task.corp_id = $2 AND mission.id = $3
+            "#,
+        )
+        .bind(task_id)
+        .bind(corp_id)
+        .bind(mission_id)
+        .bind(source_run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("factory recovery context source run was not found")?;
+        let checkpoint = source_workspace_checkpoint_tx(&mut tx, corp_id, source_run_id).await?;
+        checkpoint.ensure_factory_terminal()?;
+        checkpoint.ensure_preserved()?;
+        let (mission_tokens_used, mission_cost_used) =
+            budget_revision::mission_usage_tx(&mut tx, corp_id, mission_id).await?;
+        let context = FactoryVerificationRecoveryContext {
+            work_item,
+            recoveries,
+            mission_id,
+            task_id,
+            source_run_id,
+            remaining_attempts: (row.get::<i32, _>("max_attempts")
+                - row.get::<i32, _>("attempt_count"))
+            .max(0),
+            remaining_mission_tokens: (row.get::<i64, _>("budget_tokens") - mission_tokens_used)
+                .max(0),
+            remaining_mission_cost_microusd: (row.get::<i64, _>("budget_cost_microusd")
+                - mission_cost_used)
+                .max(0),
+            workspace_fingerprint: checkpoint.fingerprint,
+            expected_head_commit: checkpoint.expected_head_commit,
+        };
+        tx.commit().await?;
+        Ok(Some(context))
+    }
+
+    pub async fn create_factory_verification_recovery(
+        &self,
+        input: CreateFactoryVerificationRecoveryInput,
+    ) -> Result<FactoryVerificationRecoveryOutcome> {
+        if input.expected_factory_version <= 0 {
+            return Err(anyhow!(
+                "expected factory work-item version must be positive"
+            ));
+        }
+        let reason =
+            normalize_factory_text(&input.reason, "factory verification recovery reason", 4_000)?;
+        let observed_source_revision = normalize_factory_text(
+            &input.observed_source_revision,
+            "observed source revision",
+            200,
+        )?;
+        if !valid_sha256(&input.expected_workspace_fingerprint) {
+            return Err(anyhow!(
+                "expected workspace fingerprint must be a lowercase SHA-256 digest"
+            ));
+        }
+        if let Some(expected_head_commit) = input.expected_head_commit.as_deref() {
+            validate_factory_base_commit(expected_head_commit)?;
+        }
+        let reviewed_source_snapshot = match input.reviewed_source_snapshot {
+            Value::Object(snapshot) => Value::Object(snapshot),
+            _ => {
+                return Err(anyhow!("reviewed source snapshot must be a JSON object"));
+            }
+        };
+        if serde_json::to_vec(&reviewed_source_snapshot)?.len() > 65_536 {
+            return Err(anyhow!(
+                "reviewed source snapshot cannot exceed 65,536 bytes"
+            ));
+        }
+        if reviewed_source_snapshot
+            .get("source_revision")
+            .and_then(Value::as_str)
+            != Some(observed_source_revision.as_str())
+        {
+            return Err(anyhow!(
+                "reviewed source snapshot does not match the observed source revision"
+            ));
+        }
+        let request = json!({
+            "work_item_id": input.work_item_id,
+            "source_run_id": input.source_run_id,
+            "mode": input.mode,
+            "reason": reason,
+            "observed_source_revision": observed_source_revision,
+            "reviewed_source_snapshot": reviewed_source_snapshot,
+            "contract_revision_id": input.contract_revision_id,
+            "expected_workspace_fingerprint": input.expected_workspace_fingerprint,
+            "expected_head_commit": input.expected_head_commit,
+        });
+
+        let source_scope = sqlx::query(
+            r#"
+            SELECT run.workspace_run_id, mission.requested_by
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            "#,
+        )
+        .bind(input.source_run_id)
+        .bind(input.corp_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("factory verification recovery source run was not found")?;
+        let workspace_run_id: Uuid = source_scope.get("workspace_run_id");
+        let requester: Uuid = source_scope.get("requested_by");
+        let mut lock_keys = budget_scope_lock_keys(input.corp_id, requester);
+        lock_keys.push(format!(
+            "factory:verification-recovery:{}:{}",
+            input.corp_id, input.idempotency_key
+        ));
+        lock_keys.push(format!(
+            "factory:item:{}:{}",
+            input.corp_id, input.work_item_id
+        ));
+        lock_keys.push(format!(
+            "resume:workspace:{}:{}",
+            input.corp_id, workspace_run_id
+        ));
+
+        let mut tx = self.pool.begin().await?;
+        assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        lock_factory_keys_tx(&mut tx, &lock_keys).await?;
+
+        if let Some((recovery, stored_request)) =
+            factory_verification_recovery_by_key_tx(&mut tx, input.corp_id, input.idempotency_key)
+                .await?
+        {
+            ensure_factory_recovery_authorizer_tx(
+                &mut tx,
+                input.corp_id,
+                recovery.mission_id,
+                input.actor_id,
+            )
+            .await?;
+            if recovery.factory_work_item_id != input.work_item_id
+                || recovery.authorized_by != input.actor_id
+                || stored_request != request
+            {
+                return Err(anyhow!(
+                    "factory verification recovery idempotency key was reused with a different request"
+                ));
+            }
+            let (work_item, _) =
+                factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
+                    .await?
+                    .context("idempotent factory recovery references a missing work item")?;
+            let launch =
+                factory_verification_recovery_launch_tx(&mut tx, &recovery, &reason).await?;
+            tx.commit().await?;
+            return Ok(FactoryVerificationRecoveryOutcome {
+                recovery,
+                work_item,
+                launch,
+                events: Vec::new(),
+                replayed: true,
+            });
+        }
+
+        let (mut work_item, current_token) =
+            factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, true)
+                .await?
+                .context("factory work item not found")?;
+        ensure_active_factory_control(
+            &work_item,
+            current_token,
+            input.actor_id,
+            input.claim_token,
+            input.expected_factory_version,
+            Utc::now(),
+        )?;
+        let mission_id = work_item
+            .mission_id
+            .context("factory verification recovery requires a linked mission")?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT mission.room_id, mission.requested_by,
+                   mission.status AS mission_status, mission.title AS mission_title,
+                   mission.budget_tokens AS mission_budget_tokens,
+                   mission.budget_cost_microusd AS mission_budget_cost_microusd,
+                   task.id AS task_id, task.title AS task_title,
+                   task.status AS task_status,
+                   task.verification_status AS task_verification_status,
+                   task.contract, task.contract_version, task.verification_policy,
+                   task.attempt_count, task.max_attempts,
+                   task.assigned_agent_id,
+                   COALESCE(task.required_adapter, agent.adapter) AS required_adapter,
+                   agent.adapter, agent.retired_at AS agent_retired_at,
+                   run.id AS source_run_id, run.agent_id, run.runner_id,
+                   COALESCE(run.provider_session_id, provider_lineage.provider_session_id)
+                       AS provider_session_id,
+                   run.workspace_run_id,
+                   run.workspace_disposition, run.workspace_base_commit,
+                   run.breaker_stage,
+                   run.verification_status AS source_verification_status,
+                   run.source_repository, run.source_base_ref, run.source_base_commit,
+                   run.artifact_id, run.artifact_uri, run.artifact_signature,
+                   run.artifact_path, run.artifact_sha256, run.artifact_media_type,
+                   artifact.bytes AS artifact_bytes,
+                   artifact.file_name AS artifact_file_name,
+                   artifact.metadata->>'workspace_relative_path' AS artifact_relative_path
+            FROM missions mission
+            JOIN tasks task ON task.mission_id = mission.id
+            JOIN runs run ON run.task_id = task.id
+            JOIN agents agent ON agent.id = run.agent_id
+            LEFT JOIN LATERAL (
+                WITH RECURSIVE lineage AS (
+                    SELECT ancestor.id, ancestor.resumed_from_run_id,
+                           ancestor.provider_session_id, 0 AS depth,
+                           ARRAY[ancestor.id] AS visited
+                    FROM runs ancestor
+                    WHERE ancestor.id = run.id AND ancestor.corp_id = run.corp_id
+                      AND run.execution_mode = 'verification_only'
+                    UNION ALL
+                    SELECT parent.id, parent.resumed_from_run_id,
+                           parent.provider_session_id, lineage.depth + 1,
+                           lineage.visited || parent.id
+                    FROM runs parent
+                    JOIN lineage ON lineage.resumed_from_run_id = parent.id
+                    WHERE parent.corp_id = run.corp_id
+                      AND parent.task_id = run.task_id AND parent.agent_id = run.agent_id
+                      AND parent.runner_id = run.runner_id
+                      AND parent.workspace_run_id = run.workspace_run_id
+                      AND parent.source_repository IS NOT DISTINCT FROM run.source_repository
+                      AND parent.source_base_ref IS NOT DISTINCT FROM run.source_base_ref
+                      AND parent.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
+                      AND NOT parent.id = ANY(lineage.visited)
+                      AND lineage.depth < 64
+                )
+                SELECT provider_session_id
+                FROM lineage
+                WHERE provider_session_id IS NOT NULL
+                ORDER BY depth
+                LIMIT 1
+            ) provider_lineage ON TRUE
+            LEFT JOIN artifacts artifact ON artifact.id = run.artifact_id
+            WHERE mission.id = $1 AND mission.corp_id = $2 AND run.id = $3
+            FOR UPDATE OF mission, task, run, agent
+            "#,
+        )
+        .bind(mission_id)
+        .bind(input.corp_id)
+        .bind(input.source_run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("factory verification recovery source context was not found")?;
+        let room_id: Uuid = row.get("room_id");
+        ensure_factory_recovery_authorizer_tx(&mut tx, input.corp_id, mission_id, input.actor_id)
+            .await?;
+        if row.get::<Uuid, _>("workspace_run_id") != workspace_run_id
+            || row.get::<Uuid, _>("requested_by") != requester
+        {
+            return Err(anyhow!(
+                "factory verification recovery source lineage changed during authorization"
+            ));
+        }
+        let task_id: Uuid = row.get("task_id");
+        let task_status: String = row.get("task_status");
+        let task_verification_status: String = row.get("task_verification_status");
+        let mission_status: String = row.get("mission_status");
+        let revised_verification_pending =
+            input.contract_revision_id.is_some() && task_verification_status == "pending";
+        let checkpoint =
+            source_workspace_checkpoint_tx(&mut tx, input.corp_id, input.source_run_id).await?;
+        checkpoint.ensure_factory_terminal()?;
+        checkpoint.ensure_preserved()?;
+        let mut events = Vec::new();
+        if work_item.state != FactoryWorkItemState::VerificationFailed {
+            if task_status != "verification_failed"
+                || (task_verification_status != "failed" && !revised_verification_pending)
+                || mission_status != "failed"
+            {
+                return Err(anyhow!(
+                    "factory work item is not in a recoverable verification-failed state"
+                ));
+            }
+            let failure_detail = work_item
+                .failure_detail
+                .clone()
+                .unwrap_or_else(|| "reconciled persisted verification failure".to_owned());
+            let (reconciled, event) = reconcile_factory_verification_failure_tx(
+                &mut tx,
+                input.corp_id,
+                mission_id,
+                room_id,
+                input.source_run_id,
+                Some(input.actor_id),
+                &failure_detail,
+                "recovery_admission",
+            )
+            .await?
+            .context("factory recovery could not reconcile the stale work item")?;
+            work_item = reconciled;
+            events.push(event);
+        }
+        if task_status != "verification_failed"
+            || (task_verification_status != "failed" && !revised_verification_pending)
+            || mission_status != "failed"
+            || row.get::<String, _>("source_verification_status") != "failed"
+        {
+            return Err(anyhow!(
+                "factory verification recovery requires failed verification, task, and mission state"
+            ));
+        }
+        let workspace_disposition: Option<String> = row.get("workspace_disposition");
+        if workspace_disposition.as_deref() != Some("preserved") {
+            return Err(anyhow!(
+                "factory verification recovery requires a preserved workspace"
+            ));
+        }
+        if checkpoint.fingerprint.as_deref() != Some(input.expected_workspace_fingerprint.as_str())
+        {
+            return Err(anyhow!(
+                "factory verification recovery workspace fingerprint mismatch"
+            ));
+        }
+        if checkpoint.expected_head_commit != input.expected_head_commit {
+            return Err(anyhow!(
+                "factory verification recovery head commit mismatch"
+            ));
+        }
+        let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
+        if lineage.iter().any(|candidate| {
+            matches!(
+                candidate.get::<String, _>("breaker_stage").as_str(),
+                "suspend" | "stop"
+            ) || candidate
+                .get::<Option<String>, _>("workspace_disposition")
+                .as_deref()
+                == Some("quarantined")
+        }) {
+            return Err(anyhow!(
+                "factory verification recovery cannot bypass a suspended, stopped, or quarantined lineage"
+            ));
+        }
+        let latest_lineage_run_id = latest_workspace_source_id(&lineage)?;
+        if latest_lineage_run_id != input.source_run_id {
+            return Err(anyhow!(
+                "factory verification recovery source run is not the latest workspace checkpoint"
+            ));
+        }
+        let active_run: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM runs
+                WHERE (task_id = $1 OR agent_id = $2)
+                  AND corp_id = $3
+                  AND status IN ('provisioning', 'starting', 'running',
+                                 'waiting_for_input', 'waiting_for_approval', 'verifying')
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(row.get::<Uuid, _>("agent_id"))
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_run {
+            return Err(anyhow!(
+                "factory verification recovery task or assigned agent already has an active run"
+            ));
+        }
+        let attempt_count: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
+        if attempt_count >= max_attempts {
+            return Err(anyhow!(
+                "factory verification recovery task exhausted its attempt limit"
+            ));
+        }
+        let attempt = attempt_count + 1;
+        let contract: TaskContract =
+            serde_json::from_value(row.get("contract")).context("decode recovery task contract")?;
+        let current_verification_policy: VerificationPolicy =
+            serde_json::from_value(row.get("verification_policy"))
+                .context("decode recovery verification policy")?;
+        let (previous_verification_policy, replacement_verification_policy) =
+            validate_factory_recovery_contract_revision_tx(
+                &mut tx,
+                input.corp_id,
+                mission_id,
+                task_id,
+                input.source_run_id,
+                input.actor_id,
+                input.mode,
+                input.contract_revision_id,
+                row.get("contract_version"),
+                &current_verification_policy,
+            )
+            .await?;
+        if observed_source_revision != work_item.source_revision
+            && input.contract_revision_id.is_none()
+        {
+            return Err(anyhow!(
+                "changed source revision requires an explicit audited contract revision"
+            ));
+        }
+        if reviewed_source_snapshot
+            .get("issue_number")
+            .and_then(Value::as_i64)
+            != Some(work_item.source_issue_number)
+        {
+            return Err(anyhow!(
+                "reviewed source snapshot does not match the factory issue"
+            ));
+        }
+        ensure_factory_recovery_policy(&work_item, &contract, &replacement_verification_policy)?;
+
+        let workspace_base_commit: String =
+            row.get::<Option<String>, _>("workspace_base_commit")
+                .context("factory verification recovery source run has no workspace base commit")?;
+        let (mission_tokens_used, mission_cost_used) =
+            budget_revision::mission_usage_tx(&mut tx, input.corp_id, mission_id).await?;
+        let mission_budget_tokens: i64 = row.get("mission_budget_tokens");
+        let mission_budget_cost_microusd: i64 = row.get("mission_budget_cost_microusd");
+        let remaining_mission_tokens = mission_budget_tokens - mission_tokens_used;
+        let remaining_mission_cost_microusd = mission_budget_cost_microusd - mission_cost_used;
+        if remaining_mission_tokens <= 0 || remaining_mission_cost_microusd <= 0 {
+            return Err(anyhow!(
+                "factory verification recovery has no remaining mission budget"
+            ));
+        }
+        let rolling = rolling_budget_remaining_tx(&mut tx, input.corp_id, requester).await?;
+        if rolling.actor_tokens <= 0
+            || rolling.actor_cost_microusd <= 0
+            || rolling.corp_tokens <= 0
+            || rolling.corp_cost_microusd <= 0
+        {
+            return Err(anyhow!(
+                "factory verification recovery has no remaining requester or Corp budget"
+            ));
+        }
+        let run_budget_tokens = contract
+            .budget_tokens
+            .min(remaining_mission_tokens)
+            .min(rolling.actor_tokens)
+            .min(rolling.corp_tokens);
+        let run_budget_cost_microusd = contract
+            .budget_cost_microusd
+            .min(remaining_mission_cost_microusd)
+            .min(rolling.actor_cost_microusd)
+            .min(rolling.corp_cost_microusd);
+        let required_adapter: String = row.get("required_adapter");
+        let adapter: String = row.get("adapter");
+        if required_adapter != adapter {
+            return Err(anyhow!(
+                "factory verification recovery assigned adapter no longer satisfies the task"
+            ));
+        }
+        if input.mode == FactoryVerificationRecoveryMode::SourceCorrection
+            && row
+                .get::<Option<String>, _>("provider_session_id")
+                .is_none()
+        {
+            return Err(anyhow!(
+                "source-correction recovery requires a preserved provider session"
+            ));
+        }
+        let run_id = Uuid::new_v4();
+        let recovery_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let assignment_token = Uuid::new_v4();
+        let execution_mode = if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+            "verification_only"
+        } else {
+            "provider"
+        };
+        let model = (input.mode == FactoryVerificationRecoveryMode::SourceCorrection)
+            .then(|| contract.model.clone())
+            .flatten();
+        let reasoning_effort = (input.mode == FactoryVerificationRecoveryMode::SourceCorrection)
+            .then(|| contract.reasoning_effort.clone())
+            .flatten();
+        let provider_session_id = (input.mode == FactoryVerificationRecoveryMode::SourceCorrection)
+            .then(|| row.get::<Option<String>, _>("provider_session_id"))
+            .flatten();
+        let reused_artifact_id = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<Uuid>, _>("artifact_id"))
+            .flatten();
+        let reused_artifact_uri = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<String>, _>("artifact_uri"))
+            .flatten();
+        let reused_artifact_signature = (input.mode
+            == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<String>, _>("artifact_signature"))
+            .flatten();
+        let reused_artifact_path = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<String>, _>("artifact_path"))
+            .flatten();
+        let reused_artifact_sha256 = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<String>, _>("artifact_sha256"))
+            .flatten();
+        let reused_artifact_media_type = (input.mode
+            == FactoryVerificationRecoveryMode::VerifierOnly)
+            .then(|| row.get::<Option<String>, _>("artifact_media_type"))
+            .flatten();
+        sqlx::query(
+            r#"
+            INSERT INTO runs
+                (id, corp_id, task_id, agent_id, runner_id, assignment_token, status,
+                 provider_session_id, resumed_from_run_id, workspace_run_id,
+                 budget_tokens_limit, budget_cost_microusd_limit, model, reasoning_effort,
+                 source_repository, source_base_ref, source_base_commit, execution_mode,
+                 artifact_id, artifact_uri, artifact_signature, artifact_path,
+                 artifact_sha256, artifact_media_type)
+            VALUES ($1, $2, $3, $4, $5, $6, 'starting', $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+            "#,
+        )
+        .bind(run_id)
+        .bind(input.corp_id)
+        .bind(task_id)
+        .bind(row.get::<Uuid, _>("agent_id"))
+        .bind(row.get::<String, _>("runner_id"))
+        .bind(assignment_token)
+        .bind(&provider_session_id)
+        .bind(input.source_run_id)
+        .bind(workspace_run_id)
+        .bind(run_budget_tokens)
+        .bind(run_budget_cost_microusd)
+        .bind(&model)
+        .bind(&reasoning_effort)
+        .bind(&contract.source_repository)
+        .bind(&contract.source_base_ref)
+        .bind(&contract.source_base_commit)
+        .bind(execution_mode)
+        .bind(reused_artifact_id)
+        .bind(&reused_artifact_uri)
+        .bind(&reused_artifact_signature)
+        .bind(&reused_artifact_path)
+        .bind(&reused_artifact_sha256)
+        .bind(&reused_artifact_media_type)
+        .execute(&mut *tx)
+        .await?;
+        let queued_messages = if input.mode == FactoryVerificationRecoveryMode::SourceCorrection {
+            reserve_queued_messages_tx(&mut tx, input.corp_id, row.get("agent_id"), run_id).await?
+        } else {
+            Vec::new()
+        };
+        sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
+            .bind(mission_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET status = 'claimed', attempt_count = $1,
+                verification_status = 'pending', updated_at = now()
+            WHERE id = $2
+            "#,
+        )
+        .bind(attempt)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agents SET status = 'starting', station = $1, current_run_id = $2, retired_at = NULL WHERE id = $3",
+        )
+        .bind(if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+            "review"
+        } else {
+            "dispatch"
+        })
+        .bind(run_id)
+        .bind(row.get::<Uuid, _>("agent_id"))
+        .execute(&mut *tx)
+        .await?;
+        let work_item_row = sqlx::query(
+            r#"
+            UPDATE factory_work_items
+            SET state = 'running', version = version + 1,
+                failure_detail = NULL, updated_at = now()
+            WHERE id = $1 AND corp_id = $2
+            RETURNING id, corp_id, source_kind, source_project_owner,
+                      source_project_number, source_project_item_id,
+                      source_repository_owner, source_repository_name,
+                      source_issue_number, source_issue_node_id, source_issue_url,
+                      source_title, source_revision, state, version, claim_owner_id,
+                      lease_expires_at, policy, mission_id, failure_detail,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(work_item.id)
+        .bind(input.corp_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        work_item = map_factory_work_item(work_item_row)?;
+        sqlx::query(
+            r#"
+            INSERT INTO factory_verification_recoveries (
+                id, corp_id, factory_work_item_id, mission_id, task_id,
+                source_run_id, replacement_run_id, mode, status, authorized_by,
+                reason, idempotency_key, observed_source_revision,
+                reviewed_source_snapshot, contract_revision_id,
+                previous_verification_policy, replacement_verification_policy, request
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, $11,
+                $12, $13, $14, $15, $16, $17
+            )
+            "#,
+        )
+        .bind(recovery_id)
+        .bind(input.corp_id)
+        .bind(work_item.id)
+        .bind(mission_id)
+        .bind(task_id)
+        .bind(input.source_run_id)
+        .bind(run_id)
+        .bind(input.mode.as_str())
+        .bind(input.actor_id)
+        .bind(&reason)
+        .bind(input.idempotency_key)
+        .bind(&observed_source_revision)
+        .bind(&reviewed_source_snapshot)
+        .bind(input.contract_revision_id)
+        .bind(serde_json::to_value(&previous_verification_policy)?)
+        .bind(serde_json::to_value(&replacement_verification_policy)?)
+        .bind(&request)
+        .execute(&mut *tx)
+        .await?;
+
+        let mut task_prompt = format_task_prompt(
+            &row.get::<String, _>("mission_title"),
+            &row.get::<String, _>("task_title"),
+            &contract,
+            attempt,
+        );
+        task_prompt.push_str("\n\nFACTORY RECOVERY AUTHORIZATION:\n");
+        task_prompt.push_str(&reason);
+        append_queued_messages(&mut task_prompt, &queued_messages);
+        let provider_artifact_path: Option<String> = row
+            .get::<Option<String>, _>("artifact_relative_path")
+            .or_else(|| row.get("artifact_path"))
+            .or_else(|| row.get("artifact_file_name"));
+        let provider_artifact_sha256: Option<String> = row.get("artifact_sha256");
+        let provider_artifact_media_type: Option<String> = row.get("artifact_media_type");
+        let provider_artifact_bytes = row
+            .get::<Option<i64>, _>("artifact_bytes")
+            .map(usize::try_from)
+            .transpose()
+            .context("provider artifact size is out of range")?;
+        let provider_artifact = if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+            match (
+                provider_artifact_path.as_ref(),
+                provider_artifact_sha256.as_ref(),
+                provider_artifact_bytes,
+                provider_artifact_media_type.as_ref(),
+            ) {
+                (Some(path), Some(sha256), Some(bytes), Some(media_type)) => Some(json!({
+                    "path": path,
+                    "sha256": sha256,
+                    "bytes": bytes,
+                    "media_type": media_type,
+                })),
+                (None, None, None, None) => None,
+                _ => {
+                    return Err(anyhow!(
+                        "source run provider artifact metadata is incomplete"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let command_secret_refs = if input.mode == FactoryVerificationRecoveryMode::SourceCorrection
+        {
+            contract.secret_refs.clone()
+        } else {
+            Vec::new()
+        };
+        let command_payload = json!({
+            "mode": input.mode,
+            "corp_id": input.corp_id,
+            "room_id": room_id,
+            "mission_id": mission_id,
+            "task_id": task_id,
+            "run_id": run_id,
+            "source_run_id": input.source_run_id,
+            "workspace_run_id": workspace_run_id,
+            "agent_id": row.get::<Uuid, _>("agent_id"),
+            "assignment_token": assignment_token,
+            "adapter": adapter,
+            "provider_session_id": provider_session_id,
+            "prompt": task_prompt,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "source_repository": contract.source_repository,
+            "source_base_ref": contract.source_base_ref,
+            "source_base_commit": contract.source_base_commit,
+            "workspace_base_commit": workspace_base_commit,
+            "expected_workspace_fingerprint": input.expected_workspace_fingerprint,
+            "expected_head_commit": input.expected_head_commit,
+            "verification_policy": replacement_verification_policy,
+            "write_scope": contract.write_scope,
+            "deliverable": contract.deliverable,
+            "secret_refs": command_secret_refs,
+            "provider_artifact": provider_artifact,
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO runner_commands
+                (id, corp_id, runner_id, run_id, command_kind, payload, idempotency_key)
+            VALUES ($1, $2, $3, $4, 'factory_verification_recovery', $5, $6)
+            "#,
+        )
+        .bind(command_id)
+        .bind(input.corp_id)
+        .bind(row.get::<String, _>("runner_id"))
+        .bind(run_id)
+        .bind(&command_payload)
+        .bind(format!("factory-verification-recovery:{recovery_id}"))
+        .execute(&mut *tx)
+        .await?;
+
+        let recovery_event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                causation_id: Some(input.source_run_id),
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.verification_recovery_authorized",
+                    "factory_verification_recovery",
+                    recovery_id,
+                    format!("factory-verification-recovery:{recovery_id}:authorized"),
+                    json!({
+                        "factory_work_item_id": work_item.id,
+                        "mission_id": mission_id,
+                        "task_id": task_id,
+                        "source_run_id": input.source_run_id,
+                        "replacement_run_id": run_id,
+                        "mode": input.mode,
+                        "observed_source_revision": observed_source_revision,
+                        "contract_revision_id": input.contract_revision_id,
+                        "reason": reason,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory verification recovery event unexpectedly existed")?;
+        let run_event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                correlation_id: Some(mission_id),
+                causation_id: Some(input.source_run_id),
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+                        "run.verification_requested"
+                    } else {
+                        "run.resume_requested"
+                    },
+                    "run",
+                    run_id,
+                    format!("factory-verification-recovery:{recovery_id}:run"),
+                    json!({
+                        "recovery_id": recovery_id,
+                        "source_run_id": input.source_run_id,
+                        "mission_worker_reactivated": row.get::<Option<chrono::DateTime<Utc>>, _>("agent_retired_at").is_some(),
+                        "workspace_run_id": workspace_run_id,
+                        "task_id": task_id,
+                        "agent_id": row.get::<Uuid, _>("agent_id"),
+                        "runner_id": row.get::<String, _>("runner_id"),
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "execution_mode": execution_mode,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory recovery run event unexpectedly existed")?;
+        let factory_event = append_event_tx(
+            &mut tx,
+            NewEvent {
+                room_id: Some(room_id),
+                aggregate_version: work_item.version,
+                correlation_id: Some(mission_id),
+                causation_id: Some(run_id),
+                ..NewEvent::new(
+                    input.corp_id,
+                    Some(input.actor_id),
+                    "factory.verification_recovery_started",
+                    "factory_work_item",
+                    work_item.id,
+                    format!("factory-verification-recovery:{recovery_id}:factory"),
+                    json!({
+                        "previous_state": FactoryWorkItemState::VerificationFailed.as_str(),
+                        "state": work_item.state.as_str(),
+                        "mission_id": mission_id,
+                        "run_id": run_id,
+                        "recovery_id": recovery_id,
+                        "mode": input.mode,
+                    }),
+                )
+            },
+        )
+        .await?
+        .context("factory recovery state event unexpectedly existed")?;
+        events.extend([recovery_event, run_event, factory_event]);
+        let recovery = factory_verification_recovery_by_id_tx(&mut tx, input.corp_id, recovery_id)
+            .await?
+            .context("inserted factory verification recovery disappeared")?;
+        let launch = factory_verification_recovery_launch_from_parts(
+            input.mode,
+            input.corp_id,
+            room_id,
+            mission_id,
+            task_id,
+            run_id,
+            input.source_run_id,
+            workspace_run_id,
+            row.get("agent_id"),
+            row.get("runner_id"),
+            assignment_token,
+            adapter,
+            provider_session_id,
+            task_prompt,
+            model,
+            reasoning_effort,
+            contract.source_repository.clone(),
+            contract.source_base_ref.clone(),
+            contract.source_base_commit.clone(),
+            workspace_base_commit,
+            input.expected_workspace_fingerprint,
+            input.expected_head_commit,
+            replacement_verification_policy.clone(),
+            contract.write_scope.clone(),
+            contract.deliverable.clone(),
+            contract.secret_refs.clone(),
+            queued_messages,
+            provider_artifact_path,
+            provider_artifact_sha256,
+            provider_artifact_bytes,
+            provider_artifact_media_type,
+        )?;
+        tx.commit().await?;
+        Ok(FactoryVerificationRecoveryOutcome {
+            recovery,
+            work_item,
+            launch,
+            events,
+            replayed: false,
+        })
+    }
+
+    pub async fn factory_verification_recovery_status(
+        &self,
+        corp_id: Uuid,
+        recovery_id: Uuid,
+    ) -> Result<(FactoryVerificationRecovery, FactoryWorkItem)> {
+        let mut tx = self.pool.begin().await?;
+        let recovery = factory_verification_recovery_by_id_tx(&mut tx, corp_id, recovery_id)
+            .await?
+            .context("factory verification recovery was not found")?;
+        let (work_item, _) =
+            factory_work_item_tx(&mut tx, corp_id, recovery.factory_work_item_id, false)
+                .await?
+                .context("factory verification recovery references a missing work item")?;
+        tx.commit().await?;
+        Ok((recovery, work_item))
     }
 
     pub async fn reject_factory_materialization(
@@ -4113,6 +5604,23 @@ impl PgStore {
             events,
             replayed: false,
         })
+    }
+
+    /// Checks the same admission as creation using only reads and row locks.
+    /// No staffing, graph, event, or identifier reservation is persisted.
+    pub async fn validate_mission_creation(
+        &self,
+        corp_id: Uuid,
+        requested_by: Uuid,
+        title: &str,
+        description: &str,
+        plan: &TaskGraphPlan,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        mission_creation_admission_tx(&mut tx, corp_id, requested_by, title, description, plan)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn create_mission(
@@ -4569,6 +6077,12 @@ impl PgStore {
             SELECT r.task_id, r.agent_id, r.runner_id, r.provider_session_id,
                    r.workspace_run_id, r.workspace_disposition, r.workspace_base_commit,
                    r.breaker_stage AS source_breaker_stage,
+                   r.verification_status AS source_verification_status,
+                   t.status AS task_status,
+                   EXISTS (
+                       SELECT 1 FROM factory_work_items item
+                       WHERE item.corp_id = r.corp_id AND item.mission_id = t.mission_id
+                   ) AS factory_linked,
                    t.mission_id, t.title AS task_title, t.attempt_count,
                    t.contract, t.verification_policy, m.room_id,
                    m.requested_by, m.title AS mission_title,
@@ -4588,6 +6102,13 @@ impl PgStore {
         .fetch_one(&mut *tx)
         .await
         .context("source run not found")?;
+        let room_id: Uuid = row.get("room_id");
+        assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
+        ensure_generic_resume_is_not_factory_recovery(
+            row.get("factory_linked"),
+            &row.get::<String, _>("task_status"),
+            &row.get::<String, _>("source_verification_status"),
+        )?;
         let task_id: Uuid = row.get("task_id");
         let agent_id: Uuid = row.get("agent_id");
         let runner_id: String = row.get("runner_id");
@@ -4627,7 +6148,6 @@ impl PgStore {
             ));
         }
         let mission_id: Uuid = row.get("mission_id");
-        let room_id: Uuid = row.get("room_id");
         let requester: Uuid = row.get("requested_by");
         if requester != expected_requester {
             return Err(anyhow!(
@@ -4637,22 +6157,8 @@ impl PgStore {
         let adapter: String = row.get("adapter");
         let model = contract.model.clone();
         let reasoning_effort = contract.reasoning_effort.clone();
-        assert_room_membership_tx(&mut tx, corp_id, room_id, requested_by).await?;
 
-        let lineage = sqlx::query(
-            r#"
-            SELECT id, breaker_stage, status, workspace_path,
-                   workspace_disposition, workspace_detail
-            FROM runs
-            WHERE corp_id = $1 AND workspace_run_id = $2
-            ORDER BY created_at DESC, id DESC
-            FOR UPDATE
-            "#,
-        )
-        .bind(corp_id)
-        .bind(workspace_run_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let lineage = workspace_lineage_tx(&mut tx, corp_id, workspace_run_id).await?;
         if lineage
             .iter()
             .any(|candidate| candidate.get::<String, _>("breaker_stage") == "stop")
@@ -4661,24 +6167,7 @@ impl PgStore {
                 "provider workspace lineage reached a stop-stage breaker and cannot be resumed"
             ));
         }
-        let latest_lineage_run_id = lineage
-            .iter()
-            .find(|candidate| {
-                !lineage_run_is_pre_dispatch_failure(
-                    candidate.get::<String, _>("status").as_str(),
-                    candidate
-                        .get::<Option<String>, _>("workspace_path")
-                        .as_deref(),
-                    candidate
-                        .get::<Option<String>, _>("workspace_disposition")
-                        .as_deref(),
-                    candidate
-                        .get::<Option<String>, _>("workspace_detail")
-                        .as_deref(),
-                )
-            })
-            .map(|candidate| candidate.get::<Uuid, _>("id"))
-            .context("source run workspace lineage is empty")?;
+        let latest_lineage_run_id = latest_workspace_source_id(&lineage)?;
         if latest_lineage_run_id != source_run_id {
             return Err(anyhow!(
                 "source run is not the latest run in its provider workspace lineage"
@@ -4860,14 +6349,45 @@ impl PgStore {
         corp_id: Uuid,
         run_id: Uuid,
         reason: &str,
-    ) -> Result<DomainEvent> {
+    ) -> Result<Vec<DomainEvent>> {
         let mut tx = self.pool.begin().await?;
+        let scope = sqlx::query(
+            "SELECT task.mission_id, item.id AS factory_id
+             FROM runs run
+             JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
+             JOIN missions mission ON mission.id = task.mission_id AND mission.corp_id = task.corp_id
+             LEFT JOIN factory_work_items item ON item.mission_id = mission.id AND item.corp_id = mission.corp_id
+             WHERE run.id = $1 AND run.corp_id = $2",
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("run not found for dispatch failure")?;
+        let expected_mission_id: Uuid = scope.get("mission_id");
+        let expected_factory_id: Option<Uuid> = scope.get("factory_id");
+        if let Some(factory_id) = expected_factory_id {
+            // Recovery and publication already take these gates before their
+            // row locks. Join that ordering before locking run/task/mission.
+            lock_factory_keys_tx(
+                &mut tx,
+                &[
+                    format!("factory:item:{corp_id}:{factory_id}"),
+                    format!("publication:factory:{corp_id}:{factory_id}"),
+                ],
+            )
+            .await?;
+        }
         let row = sqlx::query(
             r#"
-            SELECT run.task_id, run.agent_id, task.mission_id, mission.room_id
+            SELECT run.task_id, run.agent_id, run.status AS run_status,
+                   run.summary, run.workspace_detail,
+                   task.mission_id, task.status AS task_status,
+                   mission.room_id, mission.status AS mission_status
             FROM runs run
-            JOIN tasks task ON task.id = run.task_id
+            JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
             JOIN missions mission ON mission.id = task.mission_id
+                                 AND mission.corp_id = task.corp_id
             WHERE run.id = $1 AND run.corp_id = $2
             FOR UPDATE OF run, task, mission
             "#,
@@ -4881,36 +6401,320 @@ impl PgStore {
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
-        sqlx::query(
-            "UPDATE runs SET status = 'failed', summary = $1,
-             workspace_detail = 'dispatch_not_started', updated_at = now() WHERE id = $2",
+        if mission_id != expected_mission_id {
+            return Err(anyhow!("dispatch failure mission scope changed"));
+        }
+        let run_status: String = row.get("run_status");
+        let task_status: String = row.get("task_status");
+        let mission_status: String = row.get("mission_status");
+        let replay = run_status == "failed"
+            && row.get::<Option<String>, _>("workspace_detail").as_deref()
+                == Some("dispatch_not_started")
+            && task_status == "failed"
+            && mission_status == "failed";
+        // Read again after taking the task/mission locks so a newer accepted
+        // attempt cannot be failed by an old dispatch callback.
+        let latest_run: Uuid = sqlx::query_scalar(
+            "SELECT id FROM runs WHERE task_id = $1 AND corp_id = $2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
-        .bind(reason)
-        .bind(run_id)
-        .execute(&mut *tx)
+        .bind(task_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE queued_messages SET status = 'queued', run_id = NULL WHERE run_id = $1 AND status = 'reserved'",
+        let started: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE corp_id = $1
+             AND aggregate_type = 'run' AND aggregate_id = $2
+             AND type IN ('run.started', 'run.session'))",
         )
+        .bind(corp_id)
         .bind(run_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1")
-            .bind(task_id)
+        if latest_run != run_id
+            || started
+            || task_status == "completed"
+            || matches!(mission_status.as_str(), "completed" | "cancelled")
+            || (!replay && !matches!(run_status.as_str(), "provisioning" | "starting"))
+        {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let factory = sqlx::query(
+            "SELECT id, state, version FROM factory_work_items
+             WHERE corp_id = $1 AND mission_id = $2 FOR UPDATE",
+        )
+        .bind(corp_id)
+        .bind(mission_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if factory.as_ref().map(|item| item.get::<Uuid, _>("id")) != expected_factory_id {
+            return Err(anyhow!("dispatch failure factory scope changed"));
+        }
+        let factory = factory.filter(|item| {
+            matches!(
+                item.get::<String, _>("state").as_str(),
+                "claimed"
+                    | "mission_created"
+                    | "running"
+                    | "blocked"
+                    | "awaiting_approval"
+                    | "verification_failed"
+            )
+        });
+        // A fresh generic resume can belong to a previously verified/final
+        // factory. Clean up its failed allocation without downgrading that item.
+        // Replay uses the persisted diagnostic, not new caller text. This also
+        // repairs a legacy failed dispatch's stale factory projection.
+        let original = row.get::<Option<String>, _>("summary");
+        let reason = normalize_bounded_failure_reason(
+            if replay {
+                original.as_deref().unwrap_or(reason)
+            } else {
+                reason
+            },
+            "run dispatch failed before provider start",
+        );
+        let mut events = Vec::new();
+        if !replay {
+            sqlx::query(
+                "UPDATE runs SET status = 'failed', summary = $1,
+                 workspace_detail = 'dispatch_not_started', updated_at = now()
+                 WHERE id = $2 AND corp_id = $3",
+            )
+            .bind(&reason)
+            .bind(run_id)
+            .bind(corp_id)
             .execute(&mut *tx)
             .await?;
+            sqlx::query(
+                "UPDATE queued_messages SET status = 'queued', run_id = NULL
+                 WHERE run_id = $1 AND corp_id = $2 AND status = 'reserved'",
+            )
+            .bind(run_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE tasks SET status = 'failed', updated_at = now() WHERE id = $1 AND corp_id = $2",
+            )
+            .bind(task_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND corp_id = $2",
+            )
+            .bind(mission_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL
+                 WHERE id = $1 AND current_run_id = $2 AND corp_id = $3",
+            )
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(corp_id)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(event) = append_event_tx(
+                &mut tx,
+                NewEvent {
+                    room_id: Some(room_id),
+                    correlation_id: Some(mission_id),
+                    ..NewEvent::new(
+                        corp_id,
+                        None,
+                        "run.failed",
+                        "run",
+                        run_id,
+                        format!("run:{run_id}:dispatch-failed"),
+                        json!({"error": reason, "dispatch_not_started": true}),
+                    )
+                },
+            )
+            .await?
+            {
+                events.push(event);
+            }
+        }
+        if let Some(factory) = factory {
+            let factory_id: Uuid = factory.get("id");
+            let key = format!("factory:{factory_id}:dispatch-failed:{run_id}");
+            let recorded: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE corp_id = $1 AND idempotency_key = $2)",
+            )
+            .bind(corp_id)
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !recorded {
+                let version: i64 = sqlx::query_scalar(
+                    "UPDATE factory_work_items SET state = 'blocked', version = version + 1,
+                     failure_detail = $1, updated_at = now()
+                     WHERE id = $2 AND corp_id = $3 RETURNING version",
+                )
+                .bind(&reason)
+                .bind(factory_id)
+                .bind(corp_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if let Some(event) = append_event_tx(
+                    &mut tx,
+                    NewEvent {
+                        room_id: Some(room_id),
+                        aggregate_version: version,
+                        correlation_id: Some(mission_id),
+                        ..NewEvent::new(
+                            corp_id,
+                            None,
+                            "factory.blocked",
+                            "factory_work_item",
+                            factory_id,
+                            key,
+                            json!({
+                                "previous_state": factory.get::<String, _>("state"),
+                                "state": "blocked",
+                                "mission_id": mission_id,
+                                "run_id": run_id,
+                                "failure_detail": reason,
+                                "dispatch_not_started": true,
+                            }),
+                        )
+                    },
+                )
+                .await?
+                {
+                    events.push(event);
+                }
+            }
+        }
+        events.sort_by_key(|event| event.seq);
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn fail_factory_recovery_before_dispatch(
+        &self,
+        corp_id: Uuid,
+        run_id: Uuid,
+        reason: &str,
+    ) -> Result<Vec<DomainEvent>> {
+        let reason = normalize_factory_text(reason, "factory recovery dispatch failure", 2_000)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT run.task_id, run.agent_id, run.status AS run_status,
+                   task.mission_id, mission.room_id,
+                   recovery.id AS recovery_id, recovery.status AS recovery_status
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id
+            JOIN missions mission ON mission.id = task.mission_id
+            JOIN factory_verification_recoveries recovery
+              ON recovery.replacement_run_id = run.id
+             AND recovery.corp_id = run.corp_id
+            WHERE run.id = $1 AND run.corp_id = $2
+            FOR UPDATE OF run, task, mission, recovery
+            "#,
+        )
+        .bind(run_id)
+        .bind(corp_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("factory recovery run not found for dispatch failure")?;
+        let recovery_status: String = row.get("recovery_status");
+        let run_status: String = row.get("run_status");
+        if recovery_status == "failed" && run_status == "failed" {
+            sqlx::query(
+                "UPDATE runner_commands
+                 SET status = 'dispatched', dispatched_at = COALESCE(dispatched_at, now())
+                 WHERE corp_id = $1 AND run_id = $2
+                   AND command_kind = 'factory_verification_recovery'",
+            )
+            .bind(corp_id)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        if !matches!(run_status.as_str(), "provisioning" | "starting") {
+            return Err(anyhow!(
+                "factory recovery dispatch failure cannot terminalize run state {run_status}"
+            ));
+        }
+        let task_id: Uuid = row.get("task_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let mission_id: Uuid = row.get("mission_id");
+        let room_id: Uuid = row.get("room_id");
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET status = 'failed',
+                verification_status = 'failed',
+                verification_summary = $1,
+                summary = $1,
+                workspace_detail = 'dispatch_not_started',
+                updated_at = now()
+            WHERE id = $2
+            "#,
+        )
+        .bind(&reason)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE queued_messages
+             SET status = 'queued', run_id = NULL
+             WHERE run_id = $1 AND status = 'reserved'",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE tasks
+             SET status = 'verification_failed',
+                 verification_status = 'failed',
+                 updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1")
             .bind(mission_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1 AND current_run_id = $2",
+            "UPDATE agents
+             SET status = 'idle', station = NULL, current_run_id = NULL
+             WHERE id = $1 AND current_run_id = $2",
         )
         .bind(agent_id)
         .bind(run_id)
         .execute(&mut *tx)
         .await?;
-        let event = append_event_tx(
+        sqlx::query(
+            "UPDATE factory_verification_recoveries
+             SET status = 'failed', updated_at = now()
+             WHERE id = $1 AND corp_id = $2",
+        )
+        .bind(row.get::<Uuid, _>("recovery_id"))
+        .bind(corp_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE runner_commands
+             SET status = 'dispatched', dispatched_at = COALESCE(dispatched_at, now())
+             WHERE corp_id = $1 AND run_id = $2
+               AND command_kind = 'factory_verification_recovery'",
+        )
+        .bind(corp_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        let run_event = append_event_tx(
             &mut tx,
             NewEvent {
                 room_id: Some(room_id),
@@ -4921,15 +6725,33 @@ impl PgStore {
                     "run.failed",
                     "run",
                     run_id,
-                    format!("run:{run_id}:dispatch-failed"),
-                    json!({"error": reason}),
+                    format!("run:{run_id}:factory-recovery-dispatch-failed"),
+                    json!({
+                        "error": reason,
+                        "dispatch_not_started": true,
+                    }),
                 )
             },
         )
         .await?
-        .context("dispatch failure event unexpectedly existed")?;
+        .context("factory recovery dispatch-failure event unexpectedly existed")?;
+        let mut events = vec![run_event];
+        if let Some((_, factory_event)) = reconcile_factory_verification_failure_tx(
+            &mut tx,
+            corp_id,
+            mission_id,
+            room_id,
+            run_id,
+            None,
+            &reason,
+            "recovery_dispatch",
+        )
+        .await?
+        {
+            events.push(factory_event);
+        }
         tx.commit().await?;
-        Ok(event)
+        Ok(events)
     }
 
     pub async fn artifact_context(
@@ -5477,6 +7299,66 @@ impl PgStore {
         Ok(row.map(map_stored_artifact))
     }
 
+    pub async fn verification_artifact_for_recovery(
+        &self,
+        command_id: Uuid,
+        corp_id: Uuid,
+        run_id: Uuid,
+        runner_id: &str,
+    ) -> Result<Option<StoredArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact.id, artifact.corp_id, artifact.task_id, artifact.run_id,
+                   artifact.producer_agent_id, artifact.producer_runner_id,
+                   artifact.verifier, artifact.object_key, artifact.uri,
+                   artifact.sha256, artifact.media_type, artifact.bytes,
+                   artifact.artifact_role, artifact.file_name, artifact.metadata,
+                   artifact.provenance_signature, artifact.retention_until
+            FROM runner_commands command
+            JOIN runs run
+              ON run.id = command.run_id AND run.corp_id = command.corp_id
+             AND run.runner_id = command.runner_id
+            JOIN factory_verification_recoveries recovery
+              ON recovery.replacement_run_id = run.id AND recovery.corp_id = run.corp_id
+             AND recovery.task_id = run.task_id
+            JOIN runs source
+              ON source.id = recovery.source_run_id AND source.corp_id = run.corp_id
+             AND source.task_id = run.task_id
+            JOIN tasks task
+              ON task.id = run.task_id AND task.corp_id = run.corp_id
+             AND task.mission_id = recovery.mission_id
+            JOIN missions mission
+              ON mission.id = task.mission_id AND mission.corp_id = run.corp_id
+            JOIN actors author
+              ON author.id = recovery.authorized_by AND author.corp_id = run.corp_id
+             AND author.kind = 'human' AND author.role IN ('owner', 'admin', 'manager')
+            JOIN room_memberships membership
+              ON membership.room_id = mission.room_id AND membership.actor_id = author.id
+            JOIN artifacts artifact
+              ON artifact.id = run.artifact_id AND artifact.id = source.artifact_id
+             AND artifact.corp_id = run.corp_id AND artifact.task_id = run.task_id
+            WHERE command.id = $1 AND command.corp_id = $2
+              AND command.run_id = $3 AND command.runner_id = $4
+              AND command.command_kind = 'factory_verification_recovery'
+              AND command.status = 'pending'
+              AND run.execution_mode = 'verification_only'
+              AND run.status IN ('provisioning', 'starting', 'running', 'verifying',
+                                 'waiting_for_input', 'waiting_for_approval')
+              AND recovery.mode = 'verifier_only'
+              AND recovery.status IN ('authorized', 'running')
+              AND artifact.artifact_role = 'provider_evidence'
+              AND artifact.status = 'ready'
+            "#,
+        )
+        .bind(command_id)
+        .bind(corp_id)
+        .bind(run_id)
+        .bind(runner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(map_stored_artifact))
+    }
+
     pub async fn ready_artifact_for_run_role_digest(
         &self,
         corp_id: Uuid,
@@ -5522,6 +7404,7 @@ impl PgStore {
         let rows = sqlx::query(
             r#"
                 SELECT parent.id AS dependency_task_id,
+                       run.id AS verification_run_id,
                        parent.plan_key,
                        parent.title AS task_title,
                        parent.contract AS dependency_contract,
@@ -5553,9 +7436,8 @@ impl PgStore {
                 JOIN LATERAL (
                     SELECT r.* FROM runs r
                     WHERE r.task_id = parent.id AND r.corp_id = parent.corp_id
-                      AND r.status = 'completed'
                     ORDER BY r.created_at DESC, r.id DESC LIMIT 1
-                ) run ON run.verification_status = 'passed'
+                ) run ON run.status = 'completed' AND run.verification_status = 'passed'
                 LEFT JOIN source_deliverables deliverable
                   ON deliverable.run_id = run.id AND deliverable.task_id = parent.id
                  AND deliverable.corp_id = parent.corp_id
@@ -5563,17 +7445,71 @@ impl PgStore {
                   ON artifact.id = CASE
                     WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
                       THEN deliverable.artifact_id ELSE run.artifact_id END
-                 AND artifact.run_id = run.id AND artifact.task_id = parent.id
+                 AND artifact.task_id = parent.id
                  AND artifact.corp_id = parent.corp_id
+                 AND artifact.producer_agent_id = run.agent_id
+                 AND artifact.producer_runner_id = run.runner_id
                  AND artifact.status = 'ready'
                  AND CASE
                     WHEN parent.contract #>> '{deliverable,form}' = 'typed_artifact_set'
                     THEN artifact.artifact_role = 'source_deliverable'
+                      AND artifact.run_id = run.id
                       AND deliverable.form = 'typed_artifact_set'
                       AND deliverable.verification_sha256 = run.verification_sha256
                       AND deliverable.base_commit = run.workspace_base_commit
                       AND artifact.sha256 = run.deliverable_sha256
-                    ELSE artifact.artifact_role = 'provider_evidence' END
+                    ELSE artifact.artifact_role = 'provider_evidence'
+                      AND artifact.sha256 = run.artifact_sha256
+                      AND artifact.media_type = run.artifact_media_type
+                      AND artifact.provenance_signature = run.artifact_signature
+                      AND EXISTS (
+                        -- Verifier-only runs reuse, never re-sign or reproduce, the
+                        -- exact provider artifact inherited through governed recovery.
+                        WITH RECURSIVE evidence_lineage AS (
+                            SELECT run.id, run.resumed_from_run_id, run.execution_mode,
+                                   0 AS depth, ARRAY[run.id] AS visited
+                            UNION ALL
+                            SELECT source.id, source.resumed_from_run_id,
+                                   source.execution_mode, lineage.depth + 1,
+                                   lineage.visited || source.id
+                            FROM evidence_lineage lineage
+                            JOIN factory_verification_recoveries recovery
+                              ON recovery.replacement_run_id = lineage.id
+                             AND recovery.source_run_id = lineage.resumed_from_run_id
+                             AND recovery.corp_id = parent.corp_id
+                             AND recovery.task_id = parent.id
+                             AND recovery.mission_id = parent.mission_id
+                             AND recovery.mode = 'verifier_only'
+                             AND (
+                                 (lineage.depth = 0 AND recovery.status = 'completed')
+                                 OR (lineage.depth > 0
+                                     AND recovery.status IN ('completed', 'failed'))
+                             )
+                            JOIN factory_work_items item
+                              ON item.id = recovery.factory_work_item_id
+                             AND item.corp_id = parent.corp_id
+                             AND item.mission_id = parent.mission_id
+                            JOIN runs source
+                              ON source.id = recovery.source_run_id
+                             AND source.corp_id = run.corp_id
+                             AND source.task_id = run.task_id
+                             AND source.agent_id = run.agent_id
+                             AND source.runner_id = run.runner_id
+                             AND source.workspace_run_id = run.workspace_run_id
+                             AND source.source_repository IS NOT DISTINCT FROM run.source_repository
+                             AND source.source_base_ref IS NOT DISTINCT FROM run.source_base_ref
+                             AND source.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
+                             AND source.artifact_id = run.artifact_id
+                             AND source.artifact_sha256 = artifact.sha256
+                             AND source.artifact_media_type = artifact.media_type
+                             AND source.artifact_signature = artifact.provenance_signature
+                            WHERE lineage.execution_mode = 'verification_only'
+                              AND NOT source.id = ANY(lineage.visited)
+                              AND lineage.depth < 64
+                        )
+                        SELECT 1 FROM evidence_lineage
+                        WHERE id = artifact.run_id AND execution_mode = 'provider'
+                      ) END
                 WHERE child.id = $1 AND child.corp_id = $2
                 ORDER BY parent.plan_key
             "#,
@@ -5591,6 +7527,7 @@ impl PgStore {
         rows.into_iter()
             .map(|row| {
                 let dependency_task_id = row.get("dependency_task_id");
+                let verification_run_id = row.get("verification_run_id");
                 let plan_key = row.get("plan_key");
                 let task_title = row.get("task_title");
                 let run_summary = row.get("run_summary");
@@ -5600,6 +7537,7 @@ impl PgStore {
                 let artifact = map_stored_artifact(row);
                 Ok(DependencyArtifactContext {
                     task_id: dependency_task_id,
+                    verification_run_id,
                     plan_key,
                     task_title,
                     run_summary,
@@ -5612,7 +7550,7 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<Option<DomainEvent>> {
+    pub async fn apply_runner_event(&self, input: RunnerEventInput) -> Result<RunnerEventOutcome> {
         let RunnerEventInput {
             event_id,
             runner_id,
@@ -5653,7 +7591,9 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.verification_status AS run_verification_status,
-                   r.breaker_stage,
+                   r.breaker_stage, r.workspace_fingerprint AS existing_workspace_fingerprint,
+                   r.workspace_disposition AS existing_workspace_disposition,
+                   r.execution_mode, r.status AS run_status,
                    t.mission_id, t.contract, t.verification_policy, m.room_id,
                    t.attempt_count, t.max_attempts
             FROM runs r
@@ -5687,6 +7627,10 @@ impl PgStore {
         let attempt_count: i32 = row.get("attempt_count");
         let max_attempts: i32 = row.get("max_attempts");
         let run_verification_status: String = row.get("run_verification_status");
+        let existing_workspace_fingerprint: Option<String> =
+            row.get("existing_workspace_fingerprint");
+        let existing_workspace_disposition: Option<String> =
+            row.get("existing_workspace_disposition");
         let breaker_stage: String = row.get("breaker_stage");
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
@@ -5699,6 +7643,9 @@ impl PgStore {
             ));
         }
         if runner_event_advances_run(&event_type) {
+            if existing_workspace_disposition.as_deref() == Some("quarantined") {
+                return Err(anyhow!("quarantined workspace cannot accept run progress"));
+            }
             ensure_run_not_hard_blocked_tx(
                 &mut tx,
                 corp_id,
@@ -5732,8 +7679,12 @@ impl PgStore {
         .await?;
         let Some(event) = event else {
             tx.rollback().await?;
-            return Ok(None);
+            return Ok(RunnerEventOutcome {
+                event: None,
+                related_events: Vec::new(),
+            });
         };
+        let mut related_events = Vec::new();
 
         match event_type.as_str() {
             "run.session" => {
@@ -6286,6 +8237,13 @@ impl PgStore {
                 .bind(agent_id)
                 .execute(&mut *tx)
                 .await?;
+                if let Some((_, factory_event)) = reconcile_factory_awaiting_approval_tx(
+                    &mut tx, corp_id, mission_id, room_id, run_id,
+                )
+                .await?
+                {
+                    related_events.push(factory_event);
+                }
             }
             "run.verification_failed" => {
                 let evidence_statuses: Vec<String> = sqlx::query_scalar(
@@ -6330,6 +8288,20 @@ impl PgStore {
                 .bind(agent_id)
                 .execute(&mut *tx)
                 .await?;
+                if let Some((_, factory_event)) = reconcile_factory_verification_failure_tx(
+                    &mut tx,
+                    corp_id,
+                    mission_id,
+                    room_id,
+                    run_id,
+                    None,
+                    summary,
+                    "automated_verification",
+                )
+                .await?
+                {
+                    related_events.push(factory_event);
+                }
             }
             "run.teardown_uncertain" => {
                 let process_state = payload
@@ -6345,7 +8317,7 @@ impl PgStore {
                     .and_then(Value::as_str)
                     .context("teardown uncertainty omitted detail")?;
                 sqlx::query(
-                    "UPDATE runs SET workspace_disposition = 'preserved', workspace_detail = $1, updated_at = now() WHERE id = $2",
+                    "UPDATE runs SET workspace_disposition = CASE WHEN workspace_disposition = 'quarantined' THEN 'quarantined' ELSE 'preserved' END, workspace_detail = $1, updated_at = now() WHERE id = $2",
                 )
                 .bind(detail)
                 .bind(run_id)
@@ -6353,29 +8325,112 @@ impl PgStore {
                 .await?;
             }
             "run.workspace_preserved" | "run.workspace_removed" => {
-                let disposition = if event_type == "run.workspace_removed" {
-                    "removed"
-                } else {
-                    "preserved"
-                };
+                let disposition = retained_workspace_disposition(
+                    existing_workspace_disposition.as_deref(),
+                    &event_type,
+                    &payload,
+                )?;
                 let detail = payload
                     .get("detail")
                     .and_then(Value::as_str)
                     .unwrap_or("runner did not provide cleanup detail");
+                let workspace_fingerprint = if disposition == "quarantined" {
+                    None
+                } else {
+                    payload.get("workspace_fingerprint").and_then(Value::as_str)
+                };
+                if let Some(fingerprint) = workspace_fingerprint
+                    && !valid_sha256(fingerprint)
+                {
+                    return Err(anyhow!("workspace fingerprint is invalid"));
+                }
+                if row.get::<String, _>("execution_mode") == "verification_only"
+                    && disposition == "preserved"
+                    && let Some(fingerprint) = workspace_fingerprint
+                {
+                    let checkpoint =
+                        source_workspace_checkpoint_tx(&mut tx, corp_id, run_id).await?;
+                    let reported_head = payload
+                        .get("head_commit")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .context("workspace checkpoint head must be a string")
+                        })
+                        .transpose()?;
+                    checkpoint.validate_report(fingerprint, reported_head)?;
+                }
+                if let (Some(existing), Some(incoming)) = (
+                    existing_workspace_fingerprint.as_deref(),
+                    workspace_fingerprint,
+                ) && existing != incoming
+                {
+                    return Err(anyhow!(
+                        "workspace fingerprint cannot change after it is recorded"
+                    ));
+                }
                 sqlx::query(
                     r#"
                     UPDATE runs
                     SET workspace_disposition = $1,
                         workspace_detail = $2,
+                        workspace_fingerprint = COALESCE($3, workspace_fingerprint),
                         updated_at = now()
-                    WHERE id = $3
+                    WHERE id = $4
                     "#,
                 )
                 .bind(disposition)
                 .bind(detail)
+                .bind(workspace_fingerprint)
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
+                if row.get::<String, _>("run_status") == "lost"
+                    && row.get::<String, _>("execution_mode") == "provider"
+                    && disposition == "preserved"
+                    && workspace_fingerprint.is_some()
+                {
+                    let checkpoint =
+                        source_workspace_checkpoint_tx(&mut tx, corp_id, run_id).await?;
+                    if checkpoint.source_correction_recovery {
+                        // ACK may arrive before run.started. Native cleanup is
+                        // the first proof that this exact assignment survived;
+                        // recover only its missing, already-authorized metadata,
+                        // never a path supplied by the cleanup event or an old
+                        // fingerprint in place of the newly confirmed bytes.
+                        sqlx::query(
+                            r#"
+                            UPDATE runs current
+                            SET workspace_path = COALESCE(current.workspace_path, previous.workspace_path),
+                                workspace_branch = COALESCE(current.workspace_branch, previous.workspace_branch),
+                                workspace_base_ref = COALESCE(current.workspace_base_ref, previous.workspace_base_ref),
+                                workspace_base_commit = COALESCE(current.workspace_base_commit, previous.workspace_base_commit)
+                            FROM factory_verification_recoveries recovery
+                            JOIN runs previous
+                              ON previous.id = recovery.source_run_id AND previous.corp_id = recovery.corp_id
+                            WHERE current.id = $1 AND current.corp_id = $2 AND current.status = 'lost'
+                              AND current.execution_mode = 'provider'
+                              AND recovery.replacement_run_id = current.id AND recovery.corp_id = current.corp_id
+                              AND recovery.mode = 'source_correction' AND recovery.status = 'failed'
+                              AND previous.id = current.resumed_from_run_id
+                              AND previous.task_id = current.task_id AND previous.agent_id = current.agent_id
+                              AND previous.runner_id = current.runner_id
+                              AND previous.workspace_run_id = current.workspace_run_id
+                              AND previous.source_repository IS NOT DISTINCT FROM current.source_repository
+                              AND previous.source_base_ref IS NOT DISTINCT FROM current.source_base_ref
+                              AND previous.source_base_commit IS NOT DISTINCT FROM current.source_base_commit
+                              AND previous.workspace_fingerprint = recovery.request->>'expected_workspace_fingerprint'
+                              AND previous.workspace_disposition = 'preserved'
+                              AND previous.workspace_path IS NOT NULL AND previous.workspace_path <> ''
+                            "#,
+                        )
+                        .bind(run_id)
+                        .bind(corp_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
             }
             "run.completed" => {
                 if run_verification_status != "passed" {
@@ -6403,6 +8458,7 @@ impl PgStore {
                 .bind(task_id)
                 .execute(&mut *tx)
                 .await?;
+                settle_successful_factory_recoveries_tx(&mut tx, corp_id, run_id).await?;
                 sqlx::query(
                     r#"
                     UPDATE tasks child
@@ -6440,6 +8496,14 @@ impl PgStore {
                 .bind(mission_id)
                 .execute(&mut *tx)
                 .await?;
+                if mission_complete
+                    && let Some((_, factory_event)) = reconcile_factory_verified_tx(
+                        &mut tx, corp_id, mission_id, room_id, run_id, None,
+                    )
+                    .await?
+                {
+                    related_events.push(factory_event);
+                }
                 sqlx::query(
                     "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
                 )
@@ -6452,27 +8516,58 @@ impl PgStore {
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("Runner reported failure");
-                sqlx::query(
-                    "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+                let recovery_id: Option<Uuid> = sqlx::query_scalar(
+                    r#"
+                    SELECT id
+                    FROM factory_verification_recoveries
+                    WHERE corp_id = $1 AND replacement_run_id = $2
+                    FOR UPDATE
+                    "#,
                 )
-                .bind(summary)
+                .bind(corp_id)
                 .bind(run_id)
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-                let retry =
-                    should_retry_runner_failure(&breaker_stage, attempt_count, max_attempts);
-                sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
-                    .bind(if retry { "ready" } else { "failed" })
-                    .bind(task_id)
+                if let Some(recovery_id) = recovery_id {
+                    if let Some(factory_event) = terminalize_factory_recovery_run_tx(
+                        &mut tx,
+                        corp_id,
+                        recovery_id,
+                        run_id,
+                        task_id,
+                        mission_id,
+                        room_id,
+                        summary,
+                        "failed",
+                        "recovery_run_failure",
+                    )
+                    .await?
+                    {
+                        related_events.push(factory_event);
+                    }
+                } else {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', summary = $1, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(summary)
+                    .bind(run_id)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query(
-                    "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
-                )
-                .bind(if retry { "running" } else { "failed" })
-                .bind(mission_id)
-                .execute(&mut *tx)
-                .await?;
+                    let retry =
+                        should_retry_runner_failure(&breaker_stage, attempt_count, max_attempts);
+                    sqlx::query("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2")
+                        .bind(if retry { "ready" } else { "failed" })
+                        .bind(task_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE missions SET status = $1, updated_at = now() WHERE id = $2 AND status IN ('ready', 'running')",
+                    )
+                    .bind(if retry { "running" } else { "failed" })
+                    .bind(mission_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
                     "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
                 )
@@ -6485,25 +8580,56 @@ impl PgStore {
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("Run cancelled by an authorized operator");
-                sqlx::query(
-                    "UPDATE runs SET status = 'cancelled', summary = $1, updated_at = now() WHERE id = $2",
+                let recovery_id: Option<Uuid> = sqlx::query_scalar(
+                    r#"
+                    SELECT id
+                    FROM factory_verification_recoveries
+                    WHERE corp_id = $1 AND replacement_run_id = $2
+                    FOR UPDATE
+                    "#,
                 )
-                .bind(summary)
+                .bind(corp_id)
                 .bind(run_id)
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-                sqlx::query(
-                    "UPDATE tasks SET status = 'cancelled', updated_at = now() WHERE id = $1",
-                )
-                .bind(task_id)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "UPDATE missions SET status = 'cancelled', updated_at = now() WHERE id = $1",
-                )
-                .bind(mission_id)
-                .execute(&mut *tx)
-                .await?;
+                if let Some(recovery_id) = recovery_id {
+                    if let Some(factory_event) = terminalize_factory_recovery_run_tx(
+                        &mut tx,
+                        corp_id,
+                        recovery_id,
+                        run_id,
+                        task_id,
+                        mission_id,
+                        room_id,
+                        summary,
+                        "cancelled",
+                        "recovery_run_cancelled",
+                    )
+                    .await?
+                    {
+                        related_events.push(factory_event);
+                    }
+                } else {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'cancelled', summary = $1, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(summary)
+                    .bind(run_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE tasks SET status = 'cancelled', updated_at = now() WHERE id = $1",
+                    )
+                    .bind(task_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE missions SET status = 'cancelled', updated_at = now() WHERE id = $1",
+                    )
+                    .bind(mission_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
                     "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
                 )
@@ -6515,7 +8641,10 @@ impl PgStore {
         }
 
         tx.commit().await?;
-        Ok(Some(event))
+        Ok(RunnerEventOutcome {
+            event: Some(event),
+            related_events,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6809,6 +8938,36 @@ impl PgStore {
             payload: row.get("payload"),
         })
         .collect())
+    }
+
+    pub async fn runner_command_dispatch_state(
+        &self,
+        command: &PendingRunnerCommand,
+    ) -> Result<RunnerCommandDispatchState> {
+        let row = sqlx::query(
+            r#"
+            SELECT command.status AS command_status, run.status AS run_status
+            FROM runner_commands command
+            LEFT JOIN runs run
+              ON run.id = command.run_id AND run.corp_id = command.corp_id
+             AND run.runner_id = command.runner_id
+            WHERE command.id = $1 AND command.corp_id = $2
+              AND command.run_id = $3 AND command.runner_id = $4
+            "#,
+        )
+        .bind(command.id)
+        .bind(command.corp_id)
+        .bind(command.run_id)
+        .bind(&command.runner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => runner_command_dispatch_state(
+                &row.get::<String, _>("command_status"),
+                row.get::<Option<String>, _>("run_status").as_deref(),
+            ),
+            None => RunnerCommandDispatchState::Settled,
+        })
     }
 
     pub async fn control_command_lease_token(
@@ -7418,6 +9577,7 @@ impl PgStore {
         actor_id: Uuid,
         approved: bool,
         note: &str,
+        decision_key: Option<Uuid>,
     ) -> Result<VerificationDecisionOutcome> {
         let note = note.trim();
         if note.len() > 1_000 {
@@ -7430,6 +9590,7 @@ impl PgStore {
             r#"
             SELECT request.task_id, request.gate_type, request.gate,
                    request.status AS request_status,
+                   request.decided_by, request.decision_note, request.decision_key,
                    task.mission_id, task.status AS task_status,
                    mission.room_id, mission.requested_by, mission.status AS mission_status,
                     run.status AS run_status, run.breaker_stage, run.agent_id,
@@ -7491,6 +9652,27 @@ impl PgStore {
         let request_status: String = row.get("request_status");
         let run_status: String = row.get("run_status");
         let task_status: String = row.get("task_status");
+        if request_status != "pending" {
+            let expected_status = if approved { "approved" } else { "rejected" };
+            let replayed = decision_key.is_some()
+                && row.get::<Option<Uuid>, _>("decision_key") == decision_key
+                && request_status == expected_status
+                && row.get::<Option<Uuid>, _>("decided_by") == Some(actor_id)
+                && row.get::<Option<String>, _>("decision_note").as_deref()
+                    == (!note.is_empty()).then_some(note);
+            if replayed {
+                tx.commit().await?;
+                return Ok(VerificationDecisionOutcome {
+                    run_id,
+                    corp_id,
+                    mission_id,
+                    status: request_status,
+                    events: Vec::new(),
+                    replayed: true,
+                });
+            }
+            return Err(anyhow!("verification request is no longer pending"));
+        }
         if request_status != "pending"
             || run_status != "waiting_for_approval"
             || task_status != "awaiting_approval"
@@ -7518,17 +9700,20 @@ impl PgStore {
         sqlx::query(
             r#"
             UPDATE verification_requests
-            SET status = $1, decided_by = $2, decision_note = $3, decided_at = now()
-            WHERE run_id = $4
+            SET status = $1, decided_by = $2, decision_note = $3,
+                decision_key = $4, decided_at = now()
+            WHERE run_id = $5
             "#,
         )
         .bind(decision_status)
         .bind(actor_id)
         .bind((!note.is_empty()).then_some(note))
+        .bind(decision_key)
         .bind(run_id)
         .execute(&mut *tx)
         .await?;
 
+        let mut related_events = Vec::new();
         if approved {
             sqlx::query(
                 "UPDATE runs SET status = 'completed', verification_status = 'passed', updated_at = now() WHERE id = $1",
@@ -7542,6 +9727,7 @@ impl PgStore {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
+            settle_successful_factory_recoveries_tx(&mut tx, corp_id, run_id).await?;
             sqlx::query(
                 r#"
                 UPDATE tasks child
@@ -7575,6 +9761,19 @@ impl PgStore {
             .bind(mission_id)
             .execute(&mut *tx)
             .await?;
+            if mission_complete
+                && let Some((_, factory_event)) = reconcile_factory_verified_tx(
+                    &mut tx,
+                    corp_id,
+                    mission_id,
+                    room_id,
+                    run_id,
+                    Some(actor_id),
+                )
+                .await?
+            {
+                related_events.push(factory_event);
+            }
         } else {
             let rejection = if note.is_empty() {
                 "verification rejected by an authorized reviewer"
@@ -7600,6 +9799,20 @@ impl PgStore {
             .bind(mission_id)
             .execute(&mut *tx)
             .await?;
+            if let Some((_, factory_event)) = reconcile_factory_verification_failure_tx(
+                &mut tx,
+                corp_id,
+                mission_id,
+                room_id,
+                run_id,
+                Some(actor_id),
+                rejection,
+                "manual_verification",
+            )
+            .await?
+            {
+                related_events.push(factory_event);
+            }
         }
         sqlx::query(
             "UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL WHERE id = $1",
@@ -7634,13 +9847,17 @@ impl PgStore {
         )
         .await?
         .context("verification decision event unexpectedly existed")?;
+        let mut events = vec![event];
+        events.extend(related_events);
+        let events = ordered_events(events);
         tx.commit().await?;
         Ok(VerificationDecisionOutcome {
             run_id,
             corp_id,
             mission_id,
             status: decision_status.to_owned(),
-            event,
+            events,
+            replayed: false,
         })
     }
 
@@ -8625,14 +10842,70 @@ async fn mark_runner_runs_lost_tx(
     created_before: Option<chrono::DateTime<Utc>>,
     reason: &str,
 ) -> Result<Vec<DomainEvent>> {
+    // Use the existing recovery/publication gates before taking lifecycle rows.
+    // Pin the candidate set so a newly allocated run cannot enter the locked
+    // query without its Factory gate; terminal/claimed candidates are rechecked.
+    let candidates = sqlx::query(
+        r#"
+        SELECT r.id, r.corp_id, item.id AS factory_id
+        FROM runs r
+        JOIN tasks t ON t.id = r.task_id AND t.corp_id = r.corp_id
+        JOIN missions m ON m.id = t.mission_id AND m.corp_id = t.corp_id
+        LEFT JOIN factory_work_items item ON item.mission_id = m.id AND item.corp_id = m.corp_id
+        WHERE r.runner_id = $1
+          AND r.status IN ('provisioning', 'starting', 'running',
+                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+          AND (cardinality($2::uuid[]) = 0 OR NOT (r.id = ANY($2::uuid[])))
+          AND ($3::timestamptz IS NULL OR r.created_at <= $3)
+        "#,
+    )
+    .bind(runner_id)
+    .bind(excluded_run_ids)
+    .bind(created_before)
+    .fetch_all(&mut **tx)
+    .await?;
+    let run_ids: Vec<Uuid> = candidates.iter().map(|row| row.get("id")).collect();
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let gate_keys = candidates
+        .iter()
+        .filter_map(|row| {
+            row.get::<Option<Uuid>, _>("factory_id")
+                .map(|item| (row.get::<Uuid, _>("corp_id"), item))
+        })
+        .flat_map(|(corp, item)| {
+            [
+                format!("factory:item:{corp}:{item}"),
+                format!("publication:factory:{corp}:{item}"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lock_factory_keys_tx(tx, &gate_keys).await?;
     let rows = sqlx::query(
         r#"
         SELECT r.id AS run_id, r.corp_id, r.task_id, r.agent_id,
-               t.mission_id, m.room_id
+               t.mission_id, m.room_id, recovery.id AS factory_recovery_id,
+               recovery.mode AS recovery_mode
         FROM runs r
         JOIN tasks t ON t.id = r.task_id
         JOIN missions m ON m.id = t.mission_id
+        LEFT JOIN factory_verification_recoveries recovery
+          ON recovery.replacement_run_id = r.id AND recovery.corp_id = r.corp_id
+         AND recovery.task_id = r.task_id AND recovery.mission_id = m.id
+         AND (
+             (recovery.mode = 'verifier_only' AND r.execution_mode = 'verification_only')
+             OR (recovery.mode = 'source_correction' AND r.execution_mode = 'provider')
+         )
+         AND recovery.status IN ('authorized', 'running')
+         AND recovery.source_run_id = r.resumed_from_run_id
+         AND EXISTS (
+             SELECT 1 FROM factory_work_items item
+             WHERE item.id = recovery.factory_work_item_id AND item.corp_id = r.corp_id
+               AND item.mission_id = m.id
+         )
         WHERE r.runner_id = $1
+          AND r.id = ANY($4::uuid[])
           AND r.status IN ('provisioning', 'starting', 'running',
                            'waiting_for_input', 'waiting_for_approval', 'verifying')
           AND (
@@ -8640,13 +10913,24 @@ async fn mark_runner_runs_lost_tx(
             OR NOT (r.id = ANY($2::uuid[]))
           )
           AND ($3::timestamptz IS NULL OR r.created_at <= $3)
-        ORDER BY r.created_at
+          AND NOT (
+            r.workspace_path IS NULL
+            AND EXISTS (
+              SELECT 1 FROM runner_commands command
+              WHERE command.run_id = r.id AND command.corp_id = r.corp_id
+                AND command.runner_id = r.runner_id
+                AND command.command_kind = 'factory_verification_recovery'
+                AND command.status = 'pending'
+            )
+          )
+        ORDER BY r.created_at, r.id
         FOR UPDATE OF r, t, m
         "#,
     )
     .bind(runner_id)
     .bind(excluded_run_ids)
     .bind(created_before)
+    .bind(&run_ids)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -8658,27 +10942,51 @@ async fn mark_runner_runs_lost_tx(
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
-        sqlx::query(
-            "UPDATE runs SET status = 'lost', summary = $1, updated_at = now() WHERE id = $2",
-        )
-        .bind(reason)
-        .bind(run_id)
-        .execute(&mut **tx)
-        .await?;
+        if let Some(recovery_id) = row.get::<Option<Uuid>, _>("factory_recovery_id") {
+            let cause = if row.get::<String, _>("recovery_mode") == "source_correction" {
+                "source_correction_runner_lost"
+            } else {
+                "verifier_runner_lost"
+            };
+            if let Some(event) = terminalize_factory_recovery_run_tx(
+                tx,
+                corp_id,
+                recovery_id,
+                run_id,
+                task_id,
+                mission_id,
+                room_id,
+                reason,
+                "lost",
+                cause,
+            )
+            .await?
+            {
+                events.push(event);
+            }
+        } else {
+            sqlx::query(
+                "UPDATE runs SET status = 'lost', summary = $1, updated_at = now() WHERE id = $2",
+            )
+            .bind(reason)
+            .bind(run_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query("UPDATE tasks SET status = 'blocked', updated_at = now() WHERE id = $1")
+                .bind(task_id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(
+                "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
+            )
+            .bind(mission_id)
+            .execute(&mut **tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE queued_messages SET status = 'queued', run_id = NULL WHERE run_id = $1 AND status = 'reserved'",
         )
         .bind(run_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query("UPDATE tasks SET status = 'blocked', updated_at = now() WHERE id = $1")
-            .bind(task_id)
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query(
-            "UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1 AND status IN ('ready', 'running')",
-        )
-        .bind(mission_id)
         .execute(&mut **tx)
         .await?;
         sqlx::query(
@@ -8711,6 +11019,22 @@ async fn mark_runner_runs_lost_tx(
     Ok(events)
 }
 
+async fn mission_creation_admission_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    requested_by: Uuid,
+    title: &str,
+    description: &str,
+    plan: &TaskGraphPlan,
+) -> Result<(String, String, Uuid)> {
+    let title = normalize_mission_title(title)?;
+    let description = normalize_mission_description(description)?;
+    assert_mission_operator_tx(tx, corp_id, requested_by).await?;
+    staffing::validate_staffing(plan)?;
+    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
+    Ok((title, description, room_id))
+}
+
 async fn create_mission_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
@@ -8719,13 +11043,8 @@ async fn create_mission_tx(
     description: &str,
     plan: &TaskGraphPlan,
 ) -> Result<(MissionPlanIds, Vec<DomainEvent>)> {
-    let title = normalize_mission_title(title)?;
-    let description = normalize_mission_description(description)?;
-    assert_mission_operator_tx(tx, corp_id, requested_by).await?;
-    staffing::validate_staffing(plan)?;
-
-    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
-
+    let (title, description, room_id) =
+        mission_creation_admission_tx(tx, corp_id, requested_by, title, description, plan).await?;
     let mission_id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -9717,6 +12036,744 @@ async fn factory_work_item_tx(
     .transpose()
 }
 
+async fn workspace_lineage_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    workspace_run_id: Uuid,
+) -> Result<Vec<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        r#"
+        SELECT run.id, run.breaker_stage, run.status, run.workspace_path,
+               run.workspace_disposition, run.workspace_detail
+        FROM runs run
+        WHERE run.corp_id = $1 AND run.workspace_run_id = $2
+        ORDER BY run.created_at DESC, run.id DESC
+        FOR UPDATE OF run
+        "#,
+    )
+    .bind(corp_id)
+    .bind(workspace_run_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("load workspace lineage")
+}
+
+fn latest_workspace_source_id(lineage: &[sqlx::postgres::PgRow]) -> Result<Uuid> {
+    // The native pre-dispatch exception is the only skip. In particular, a lost
+    // verifier remains the latest run while its cleanup is still unconfirmed.
+    lineage
+        .iter()
+        .find(|run| {
+            !lineage_run_is_pre_dispatch_failure(
+                &run.get::<String, _>("status"),
+                run.get::<Option<String>, _>("workspace_path").as_deref(),
+                run.get::<Option<String>, _>("workspace_disposition")
+                    .as_deref(),
+                run.get::<Option<String>, _>("workspace_detail").as_deref(),
+            )
+        })
+        .map(|run| run.get("id"))
+        .context("workspace lineage has no resumable source")
+}
+
+#[derive(Debug)]
+struct SourceWorkspaceCheckpoint {
+    status: String,
+    execution_mode: String,
+    source_correction_recovery: bool,
+    verification_status: String,
+    workspace_path: Option<String>,
+    disposition: Option<String>,
+    fingerprint: Option<String>,
+    expected_verifier_fingerprint: Option<String>,
+    expected_head_commit: Option<String>,
+}
+
+impl SourceWorkspaceCheckpoint {
+    fn ensure_factory_terminal(&self) -> Result<()> {
+        let terminal = factory_recovery_source_is_terminal(&self.status, &self.execution_mode)
+            || (self.status == "lost" && self.source_correction_recovery);
+        if !terminal || self.verification_status != "failed" {
+            return Err(anyhow!(
+                "factory recovery requires failed verification on a terminal source or an exactly bound lost recovery"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_preserved(&self) -> Result<()> {
+        if self.disposition.as_deref() != Some("preserved")
+            || self.workspace_path.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(anyhow!(
+                "source run has no confirmed preserved workspace checkpoint"
+            ));
+        }
+        if self.expected_verifier_fingerprint.is_some() {
+            let fingerprint = self
+                .fingerprint
+                .as_deref()
+                .context("verifier-only source has no confirmed workspace fingerprint")?;
+            self.validate_report(fingerprint, None)?;
+        }
+        if self.status == "lost" && self.source_correction_recovery && self.fingerprint.is_none() {
+            return Err(anyhow!(
+                "lost source-correction recovery requires a runner-confirmed workspace fingerprint"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_report(&self, fingerprint: &str, reported_head: Option<&str>) -> Result<()> {
+        if self
+            .expected_verifier_fingerprint
+            .as_deref()
+            .is_some_and(|expected| expected != fingerprint)
+        {
+            return Err(anyhow!(
+                "verifier workspace fingerprint does not match its authorization"
+            ));
+        }
+        if let Some(head) = reported_head {
+            validate_factory_base_commit(head)?;
+            if self
+                .expected_head_commit
+                .as_deref()
+                .is_some_and(|expected| expected != head)
+            {
+                return Err(anyhow!(
+                    "verifier workspace head does not match its authorization"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn factory_recovery_source_is_terminal(status: &str, execution_mode: &str) -> bool {
+    matches!(status, "failed" | "cancelled")
+        || (status == "lost" && execution_mode == "verification_only")
+}
+
+fn checkpoint_head_commit(
+    deliverable_head: Option<String>,
+    authorized_head: Option<String>,
+) -> Result<Option<String>> {
+    if let (Some(deliverable), Some(authorized)) = (&deliverable_head, &authorized_head)
+        && deliverable != authorized
+    {
+        return Err(anyhow!(
+            "verifier source head conflicts with its authorized checkpoint"
+        ));
+    }
+    Ok(authorized_head.or(deliverable_head))
+}
+
+async fn source_workspace_checkpoint_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+) -> Result<SourceWorkspaceCheckpoint> {
+    let row = sqlx::query(
+        r#"
+        SELECT run.status, run.execution_mode, run.verification_status,
+               run.workspace_path, run.workspace_disposition, run.workspace_fingerprint,
+               deliverable.head_commit, recovery.id AS recovery_id,
+               recovery.status AS recovery_status, recovery.mode AS recovery_mode,
+               recovery.request->>'expected_workspace_fingerprint' AS authorized_fingerprint,
+               recovery.request->>'expected_head_commit' AS authorized_head,
+               previous.id AS previous_run_id
+        FROM runs run
+        JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
+        LEFT JOIN source_deliverables deliverable
+          ON deliverable.run_id = run.id AND deliverable.task_id = run.task_id
+         AND deliverable.corp_id = run.corp_id
+        LEFT JOIN factory_verification_recoveries recovery
+          ON recovery.replacement_run_id = run.id AND recovery.corp_id = run.corp_id
+         AND recovery.task_id = run.task_id AND recovery.mission_id = task.mission_id
+         AND (
+             (recovery.mode = 'verifier_only' AND run.execution_mode = 'verification_only')
+             OR (recovery.mode = 'source_correction' AND run.execution_mode = 'provider')
+         )
+         AND EXISTS (
+             SELECT 1 FROM factory_work_items item
+             WHERE item.id = recovery.factory_work_item_id AND item.corp_id = run.corp_id
+               AND item.mission_id = task.mission_id
+         )
+        LEFT JOIN runs previous
+          ON previous.id = recovery.source_run_id AND run.resumed_from_run_id = previous.id
+         AND previous.corp_id = run.corp_id AND previous.task_id = run.task_id
+         AND previous.agent_id = run.agent_id AND previous.runner_id = run.runner_id
+         AND previous.workspace_run_id = run.workspace_run_id
+         AND previous.source_repository IS NOT DISTINCT FROM run.source_repository
+         AND previous.source_base_ref IS NOT DISTINCT FROM run.source_base_ref
+         AND previous.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
+         AND previous.workspace_fingerprint = recovery.request->>'expected_workspace_fingerprint'
+        WHERE run.id = $1 AND run.corp_id = $2
+        FOR UPDATE OF run
+        "#,
+    )
+    .bind(run_id)
+    .bind(corp_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("source workspace checkpoint was not found")?;
+    let execution_mode: String = row.get("execution_mode");
+    let status: String = row.get("status");
+    // A lost ordinary provider remains ineligible. Only this exact governed
+    // recovery, with its original assignment/source binding and failed receipt,
+    // may return after native cleanup confirms the actual preserved bytes.
+    let source_correction_recovery = execution_mode == "provider"
+        && row.get::<Option<String>, _>("recovery_mode").as_deref() == Some("source_correction")
+        && row.get::<Option<String>, _>("recovery_status").as_deref() == Some("failed")
+        && row.get::<Option<Uuid>, _>("previous_run_id").is_some();
+    let mut head: Option<String> = row.get("head_commit");
+    let expected_verifier_fingerprint = if execution_mode == "verification_only" {
+        if row.get::<Option<Uuid>, _>("recovery_id").is_none()
+            || row.get::<Option<Uuid>, _>("previous_run_id").is_none()
+            || (status == "lost"
+                && row.get::<Option<String>, _>("recovery_status").as_deref() != Some("failed"))
+        {
+            return Err(anyhow!(
+                "verifier source checkpoint has no matching recovery lineage"
+            ));
+        }
+        let fingerprint: String = row
+            .get::<Option<String>, _>("authorized_fingerprint")
+            .filter(|value| valid_sha256(value))
+            .context("verifier source checkpoint omitted its authorized fingerprint")?;
+        // Native verifier cleanup emits this fingerprint only after checking both
+        // assigned guards. Keep the authorized head even when a lost/cancelled
+        // run never exported a deliverable; never weaken Some(head) to None.
+        head = checkpoint_head_commit(head, row.get("authorized_head"))?;
+        Some(fingerprint)
+    } else {
+        None
+    };
+    if let Some(head) = head.as_deref() {
+        validate_factory_base_commit(head)?;
+    }
+    Ok(SourceWorkspaceCheckpoint {
+        status,
+        execution_mode,
+        source_correction_recovery,
+        verification_status: row.get("verification_status"),
+        workspace_path: row.get("workspace_path"),
+        disposition: row.get("workspace_disposition"),
+        fingerprint: row.get("workspace_fingerprint"),
+        expected_verifier_fingerprint,
+        expected_head_commit: head,
+    })
+}
+
+async fn ensure_factory_recovery_authorizer_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    actor_id: Uuid,
+) -> Result<()> {
+    let row = sqlx::query(
+        r#"
+        SELECT mission.room_id, actor.kind, actor.role
+        FROM missions mission
+        JOIN actors actor ON actor.id = $3 AND actor.corp_id = mission.corp_id
+        WHERE mission.id = $1 AND mission.corp_id = $2
+        "#,
+    )
+    .bind(mission_id)
+    .bind(corp_id)
+    .bind(actor_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("factory recovery mission or actor was not found")?;
+    let room_id: Uuid = row.get("room_id");
+    assert_room_membership_tx(tx, corp_id, room_id, actor_id).await?;
+    let kind: String = row.get("kind");
+    let role: String = row.get("role");
+    if kind != "human" || !matches!(role.as_str(), "owner" | "admin" | "manager") {
+        return Err(anyhow!(
+            "forbidden: factory verification recovery requires owner, admin, or manager authority"
+        ));
+    }
+    Ok(())
+}
+
+async fn factory_verification_recovery_by_key_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    idempotency_key: Uuid,
+) -> Result<Option<(FactoryVerificationRecovery, Value)>> {
+    sqlx::query(
+        r#"
+        SELECT id, corp_id, factory_work_item_id, mission_id, task_id,
+               source_run_id, replacement_run_id, mode, status, authorized_by,
+               reason, observed_source_revision, reviewed_source_snapshot,
+               contract_revision_id, previous_verification_policy,
+               replacement_verification_policy, request, created_at, updated_at
+        FROM factory_verification_recoveries
+        WHERE corp_id = $1 AND idempotency_key = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(corp_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|row| {
+        let request = row.get("request");
+        map_factory_verification_recovery(row).map(|recovery| (recovery, request))
+    })
+    .transpose()
+}
+
+async fn factory_verification_recovery_by_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    recovery_id: Uuid,
+) -> Result<Option<FactoryVerificationRecovery>> {
+    sqlx::query(
+        r#"
+        SELECT id, corp_id, factory_work_item_id, mission_id, task_id,
+               source_run_id, replacement_run_id, mode, status, authorized_by,
+               reason, observed_source_revision, reviewed_source_snapshot,
+               contract_revision_id, previous_verification_policy,
+               replacement_verification_policy, created_at, updated_at
+        FROM factory_verification_recoveries
+        WHERE corp_id = $1 AND id = $2
+        "#,
+    )
+    .bind(corp_id)
+    .bind(recovery_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(map_factory_verification_recovery)
+    .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn factory_verification_recovery_launch_from_parts(
+    mode: FactoryVerificationRecoveryMode,
+    corp_id: Uuid,
+    room_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    run_id: Uuid,
+    source_run_id: Uuid,
+    workspace_run_id: Uuid,
+    agent_id: Uuid,
+    runner_id: String,
+    assignment_token: Uuid,
+    adapter: String,
+    provider_session_id: Option<String>,
+    task_prompt: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    source_repository: Option<String>,
+    source_base_ref: Option<String>,
+    source_base_commit: Option<String>,
+    workspace_base_commit: String,
+    expected_workspace_fingerprint: String,
+    expected_head_commit: Option<String>,
+    verification_policy: VerificationPolicy,
+    write_scope: Vec<String>,
+    deliverable: Option<DeliverableSpec>,
+    secret_refs: Vec<TaskSecretReference>,
+    queued_messages: Vec<QueuedRunMessage>,
+    provider_artifact_path: Option<String>,
+    provider_artifact_sha256: Option<String>,
+    provider_artifact_bytes: Option<usize>,
+    provider_artifact_media_type: Option<String>,
+) -> Result<FactoryVerificationRecoveryLaunch> {
+    Ok(match mode {
+        FactoryVerificationRecoveryMode::SourceCorrection => {
+            FactoryVerificationRecoveryLaunch::SourceCorrection(ResumeLaunchRecord {
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                source_run_id,
+                workspace_run_id,
+                agent_id,
+                runner_id,
+                assignment_token,
+                adapter,
+                provider_session_id: provider_session_id
+                    .context("source-correction recovery omitted provider session")?,
+                task_prompt,
+                model,
+                reasoning_effort,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
+                workspace_base_commit,
+                verification_policy,
+                write_scope,
+                deliverable,
+                secret_refs,
+                queued_messages,
+            })
+        }
+        FactoryVerificationRecoveryMode::VerifierOnly => {
+            FactoryVerificationRecoveryLaunch::VerifierOnly(VerifyLaunchRecord {
+                corp_id,
+                room_id,
+                mission_id,
+                task_id,
+                run_id,
+                source_run_id,
+                workspace_run_id,
+                agent_id,
+                runner_id,
+                assignment_token,
+                source_repository,
+                source_base_ref,
+                source_base_commit,
+                workspace_base_commit,
+                expected_workspace_fingerprint,
+                expected_head_commit,
+                verification_policy,
+                write_scope,
+                deliverable,
+                provider_artifact_path,
+                provider_artifact_sha256,
+                provider_artifact_bytes,
+                provider_artifact_media_type,
+            })
+        }
+    })
+}
+
+async fn factory_verification_recovery_launch_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    recovery: &FactoryVerificationRecovery,
+    reason: &str,
+) -> Result<FactoryVerificationRecoveryLaunch> {
+    let run_id = recovery
+        .replacement_run_id
+        .context("factory verification recovery has no replacement run")?;
+    let row = sqlx::query(
+        r#"
+        SELECT mission.room_id, mission.title AS mission_title,
+               task.title AS task_title, task.contract, task.verification_policy,
+               task.attempt_count, agent.adapter,
+                run.agent_id, run.runner_id, run.assignment_token,
+                COALESCE(run.provider_session_id, provider_lineage.provider_session_id)
+                    AS provider_session_id,
+                run.workspace_run_id,
+               run.model, run.reasoning_effort, run.source_repository,
+               run.source_base_ref, run.source_base_commit,
+               source.workspace_base_commit,
+               authorized.request->>'expected_workspace_fingerprint' AS workspace_fingerprint,
+               source.artifact_path, source.artifact_sha256,
+               source.artifact_media_type, artifact.bytes AS artifact_bytes,
+               artifact.file_name AS artifact_file_name,
+               artifact.metadata->>'workspace_relative_path' AS artifact_relative_path,
+               authorized.request->>'expected_head_commit' AS checkpoint_head_commit
+        FROM runs run
+        JOIN tasks task ON task.id = run.task_id
+        JOIN missions mission ON mission.id = task.mission_id
+        JOIN agents agent ON agent.id = run.agent_id
+        JOIN runs source ON source.id = $3 AND source.corp_id = run.corp_id
+          AND source.task_id = run.task_id AND source.agent_id = run.agent_id
+          AND source.runner_id = run.runner_id AND source.workspace_run_id = run.workspace_run_id
+        JOIN factory_verification_recoveries authorized
+          ON authorized.id = $4 AND authorized.corp_id = run.corp_id
+         AND authorized.replacement_run_id = run.id AND authorized.source_run_id = source.id
+        LEFT JOIN LATERAL (
+            WITH RECURSIVE lineage AS (
+                SELECT ancestor.id, ancestor.resumed_from_run_id,
+                       ancestor.provider_session_id, 0 AS depth,
+                       ARRAY[ancestor.id] AS visited
+                FROM runs ancestor
+                WHERE ancestor.id = source.id AND ancestor.corp_id = source.corp_id
+                  AND source.execution_mode = 'verification_only'
+                UNION ALL
+                SELECT parent.id, parent.resumed_from_run_id,
+                       parent.provider_session_id, lineage.depth + 1,
+                       lineage.visited || parent.id
+                FROM runs parent
+                JOIN lineage ON lineage.resumed_from_run_id = parent.id
+                WHERE parent.corp_id = source.corp_id
+                  AND parent.task_id = source.task_id AND parent.agent_id = source.agent_id
+                  AND parent.runner_id = source.runner_id
+                  AND parent.workspace_run_id = source.workspace_run_id
+                  AND parent.source_repository IS NOT DISTINCT FROM source.source_repository
+                  AND parent.source_base_ref IS NOT DISTINCT FROM source.source_base_ref
+                  AND parent.source_base_commit IS NOT DISTINCT FROM source.source_base_commit
+                  AND NOT parent.id = ANY(lineage.visited)
+                  AND lineage.depth < 64
+            )
+            SELECT provider_session_id
+            FROM lineage
+            WHERE provider_session_id IS NOT NULL
+            ORDER BY depth
+            LIMIT 1
+        ) provider_lineage ON TRUE
+        LEFT JOIN artifacts artifact ON artifact.id = source.artifact_id
+        WHERE run.id = $1 AND run.corp_id = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(recovery.corp_id)
+    .bind(recovery.source_run_id)
+    .bind(recovery.id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("factory verification recovery replacement run was not found")?;
+    let contract: TaskContract =
+        serde_json::from_value(row.get("contract")).context("decode recovery replay contract")?;
+    let verification_policy: VerificationPolicy =
+        serde_json::from_value(row.get("verification_policy"))
+            .context("decode recovery replay verification policy")?;
+    let queued_messages = queued_run_messages_tx(tx, recovery.corp_id, run_id).await?;
+    let mut task_prompt = format_task_prompt(
+        &row.get::<String, _>("mission_title"),
+        &row.get::<String, _>("task_title"),
+        &contract,
+        row.get("attempt_count"),
+    );
+    task_prompt.push_str("\n\nFACTORY RECOVERY AUTHORIZATION:\n");
+    task_prompt.push_str(reason);
+    append_queued_messages(&mut task_prompt, &queued_messages);
+    let provider_artifact_bytes = row
+        .get::<Option<i64>, _>("artifact_bytes")
+        .map(usize::try_from)
+        .transpose()
+        .context("provider artifact size is out of range")?;
+    let provider_artifact_path = row
+        .get::<Option<String>, _>("artifact_relative_path")
+        .or_else(|| row.get("artifact_path"))
+        .or_else(|| row.get("artifact_file_name"));
+    factory_verification_recovery_launch_from_parts(
+        recovery.mode,
+        recovery.corp_id,
+        row.get("room_id"),
+        recovery.mission_id,
+        recovery.task_id,
+        run_id,
+        recovery.source_run_id,
+        row.get("workspace_run_id"),
+        row.get("agent_id"),
+        row.get("runner_id"),
+        row.get("assignment_token"),
+        row.get("adapter"),
+        row.get("provider_session_id"),
+        task_prompt,
+        row.get("model"),
+        row.get("reasoning_effort"),
+        row.get("source_repository"),
+        row.get("source_base_ref"),
+        row.get("source_base_commit"),
+        row.get::<Option<String>, _>("workspace_base_commit")
+            .context("factory recovery replay source omitted workspace base commit")?,
+        row.get::<Option<String>, _>("workspace_fingerprint")
+            .context("factory recovery replay source omitted workspace fingerprint")?,
+        row.get("checkpoint_head_commit"),
+        verification_policy,
+        contract.write_scope.clone(),
+        contract.deliverable.clone(),
+        contract.secret_refs.clone(),
+        queued_messages,
+        provider_artifact_path,
+        row.get("artifact_sha256"),
+        provider_artifact_bytes,
+        row.get("artifact_media_type"),
+    )
+}
+
+async fn queued_run_messages_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+) -> Result<Vec<QueuedRunMessage>> {
+    Ok(sqlx::query(
+        r#"
+        SELECT id, actor_id, text
+        FROM queued_messages
+        WHERE corp_id = $1 AND run_id = $2
+          AND status IN ('reserved', 'delivered')
+        ORDER BY created_at, id
+        "#,
+    )
+    .bind(corp_id)
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|row| QueuedRunMessage {
+        id: row.get("id"),
+        actor_id: row.get("actor_id"),
+        text: row.get("text"),
+    })
+    .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_factory_recovery_contract_revision_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    task_id: Uuid,
+    source_run_id: Uuid,
+    actor_id: Uuid,
+    mode: FactoryVerificationRecoveryMode,
+    contract_revision_id: Option<Uuid>,
+    current_contract_version: i64,
+    current_verification_policy: &VerificationPolicy,
+) -> Result<(VerificationPolicy, VerificationPolicy)> {
+    let Some(contract_revision_id) = contract_revision_id else {
+        if mode == FactoryVerificationRecoveryMode::SourceCorrection {
+            return Err(anyhow!(
+                "source-correction recovery requires an explicit contract revision"
+            ));
+        }
+        return Ok((
+            current_verification_policy.clone(),
+            current_verification_policy.clone(),
+        ));
+    };
+    let row = sqlx::query(
+        r#"
+        SELECT id, corp_id, mission_id, task_id, version, revised_by,
+               next_action, source_run_id, reason, previous_description,
+               replacement_description, previous_contract, replacement_contract,
+               previous_verification_policy, replacement_verification_policy,
+               created_at
+        FROM mission_contract_revisions
+        WHERE id = $1 AND corp_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(contract_revision_id)
+    .bind(corp_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context("factory recovery contract revision was not found")?;
+    let revision = map_mission_contract_revision(row)?;
+    if revision.mission_id != mission_id
+        || revision.task_id != task_id
+        || revision.source_run_id != Some(source_run_id)
+        || revision.revised_by != actor_id
+        || revision.version != current_contract_version
+        || revision.next_action != MissionContractRevisionAction::Resume
+        || &revision.replacement_verification_policy != current_verification_policy
+    {
+        return Err(anyhow!(
+            "factory recovery contract revision does not match the authoritative failed task"
+        ));
+    }
+    ensure_factory_recovery_verification_policy_not_weakened(
+        &revision.previous_verification_policy,
+        &revision.replacement_verification_policy,
+    )?;
+    Ok((
+        revision.previous_verification_policy,
+        revision.replacement_verification_policy,
+    ))
+}
+
+fn ensure_factory_recovery_verification_policy_not_weakened(
+    previous: &VerificationPolicy,
+    replacement: &VerificationPolicy,
+) -> Result<()> {
+    if previous.manual_gate != replacement.manual_gate {
+        return Err(anyhow!(
+            "factory recovery cannot remove or change the persisted manual verification gate"
+        ));
+    }
+    if previous.checks.len() != replacement.checks.len()
+        || previous
+            .checks
+            .iter()
+            .zip(&replacement.checks)
+            .any(|(left, right)| left.kind() != right.kind())
+    {
+        return Err(anyhow!(
+            "factory recovery verifier revisions must preserve check count and kinds"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_factory_recovery_policy(
+    work_item: &FactoryWorkItem,
+    contract: &TaskContract,
+    verification_policy: &VerificationPolicy,
+) -> Result<()> {
+    let policy = work_item
+        .policy
+        .as_object()
+        .context("factory recovery policy snapshot must be an object")?;
+    let expected_ref = factory_policy_required_string(policy, "source_base_ref", 240)?;
+    if contract.source_base_ref.as_deref() != Some(expected_ref.as_str()) {
+        return Err(anyhow!(
+            "factory recovery task source ref differs from the persisted policy"
+        ));
+    }
+    let expected_commit =
+        factory_policy_required_string(policy, "source_base_commit", 64)?.to_ascii_lowercase();
+    if contract
+        .source_base_commit
+        .as_deref()
+        .is_none_or(|commit| !commit.eq_ignore_ascii_case(&expected_commit))
+    {
+        return Err(anyhow!(
+            "factory recovery task source commit differs from the persisted policy"
+        ));
+    }
+    let repository = contract
+        .source_repository
+        .as_deref()
+        .context("factory recovery task omitted its source repository")?;
+    let repository_allowed = policy
+        .get("repository_allowlist")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|value| value.eq_ignore_ascii_case(repository))
+        });
+    if !repository_allowed {
+        return Err(anyhow!(
+            "factory recovery task source repository is outside the persisted allowlist"
+        ));
+    }
+    let policy_scope = factory_policy_string_array(policy, "write_scope")?;
+    if contract.write_scope.iter().any(|candidate| {
+        !policy_scope
+            .iter()
+            .any(|authorized| write_scope_allows_path(authorized, candidate))
+    }) {
+        return Err(anyhow!(
+            "factory recovery task write scope exceeds the persisted policy"
+        ));
+    }
+    let policy_tools = factory_policy_string_array(policy, "allowed_tools")?;
+    if contract
+        .allowed_tools
+        .iter()
+        .any(|tool| !policy_tools.contains(tool))
+    {
+        return Err(anyhow!(
+            "factory recovery task tools exceed the persisted policy"
+        ));
+    }
+    let policy_prohibitions = factory_policy_string_array(policy, "prohibited_actions")?;
+    if policy_prohibitions
+        .iter()
+        .any(|action| !contract.prohibited_actions.contains(action))
+    {
+        return Err(anyhow!(
+            "factory recovery task removed a persisted prohibition"
+        ));
+    }
+    contract_revision::validate_mission_verification_policy(verification_policy)
+        .context("factory recovery verification policy is invalid")?;
+    Ok(())
+}
+
 fn replayable_factory_claim_token(
     work_item: &FactoryWorkItem,
     current_token: Uuid,
@@ -9788,8 +12845,7 @@ fn factory_transition_allowed(from: FactoryWorkItemState, to: FactoryWorkItemSta
         ),
         FactoryWorkItemState::VerificationFailed => matches!(
             to,
-            FactoryWorkItemState::Running
-                | FactoryWorkItemState::Blocked
+            FactoryWorkItemState::Blocked
                 | FactoryWorkItemState::Failed
                 | FactoryWorkItemState::Cancelled
         ),
@@ -9983,6 +13039,508 @@ async fn ensure_factory_mission_verified_tx(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyLaunchRecord {
+    pub corp_id: Uuid,
+    pub room_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub source_run_id: Uuid,
+    pub workspace_run_id: Uuid,
+    pub agent_id: Uuid,
+    pub runner_id: String,
+    pub assignment_token: Uuid,
+    pub source_repository: Option<String>,
+    pub source_base_ref: Option<String>,
+    pub source_base_commit: Option<String>,
+    pub workspace_base_commit: String,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: Option<String>,
+    pub verification_policy: VerificationPolicy,
+    pub write_scope: Vec<String>,
+    pub deliverable: Option<DeliverableSpec>,
+    pub provider_artifact_path: Option<String>,
+    pub provider_artifact_sha256: Option<String>,
+    pub provider_artifact_bytes: Option<usize>,
+    pub provider_artifact_media_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FactoryVerificationRecoveryLaunch {
+    SourceCorrection(ResumeLaunchRecord),
+    VerifierOnly(VerifyLaunchRecord),
+}
+
+#[derive(Debug, Clone)]
+pub struct FactoryVerificationRecoveryOutcome {
+    pub recovery: FactoryVerificationRecovery,
+    pub work_item: FactoryWorkItem,
+    pub launch: FactoryVerificationRecoveryLaunch,
+    pub events: Vec<DomainEvent>,
+    pub replayed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminalize_factory_recovery_run_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    recovery_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+    mission_id: Uuid,
+    room_id: Uuid,
+    summary: &str,
+    run_status: &str,
+    cause: &str,
+) -> Result<Option<DomainEvent>> {
+    if !matches!(run_status, "failed" | "cancelled" | "lost") {
+        return Err(anyhow!(
+            "factory recovery terminal run status {run_status} is unsupported"
+        ));
+    }
+    sqlx::query(
+        r#"
+        UPDATE runs
+        SET status = $1,
+            verification_status = 'failed',
+            verification_summary = $2,
+            summary = $2,
+            workspace_detail = CASE
+                WHEN workspace_path IS NULL AND $1 <> 'lost' THEN 'dispatch_not_started'
+                ELSE workspace_detail
+            END,
+            updated_at = now()
+        WHERE id = $3
+        "#,
+    )
+    .bind(run_status)
+    .bind(summary)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE tasks
+        SET status = 'verification_failed',
+            verification_status = 'failed',
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(task_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE missions SET status = 'failed', updated_at = now() WHERE id = $1")
+        .bind(mission_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        r#"
+        UPDATE verification_requests
+        SET status = 'rejected',
+            decision_note = LEFT($1, 1000),
+            decided_at = now()
+        WHERE run_id = $2 AND corp_id = $3 AND status = 'pending'
+        "#,
+    )
+    .bind(format!(
+        "Recovery run terminated before approval: {summary}"
+    ))
+    .bind(run_id)
+    .bind(corp_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE factory_verification_recoveries
+        SET status = 'failed', updated_at = now()
+        WHERE id = $1 AND corp_id = $2
+        "#,
+    )
+    .bind(recovery_id)
+    .bind(corp_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE runner_commands
+        SET status = 'dispatched',
+            dispatched_at = COALESCE(dispatched_at, now())
+        WHERE corp_id = $1 AND run_id = $2
+          AND command_kind = 'factory_verification_recovery'
+        "#,
+    )
+    .bind(corp_id)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(reconcile_factory_verification_failure_tx(
+        tx, corp_id, mission_id, room_id, run_id, None, summary, cause,
+    )
+    .await?
+    .map(|(_, event)| event))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_factory_verification_failure_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    room_id: Uuid,
+    run_id: Uuid,
+    actor_id: Option<Uuid>,
+    failure_detail: &str,
+    cause: &str,
+) -> Result<Option<(FactoryWorkItem, DomainEvent)>> {
+    let failure_detail =
+        normalize_factory_text(failure_detail, "factory verification failure detail", 2_000)?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+               source_project_item_id, source_repository_owner, source_repository_name,
+               source_issue_number, source_issue_node_id, source_issue_url, source_title,
+               source_revision, state, version, claim_owner_id, claim_token,
+               lease_expires_at, policy, mission_id, failure_detail, created_at, updated_at
+        FROM factory_work_items
+        WHERE corp_id = $1 AND mission_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(corp_id)
+    .bind(mission_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let current = map_factory_work_item(row)?;
+    if current.state == FactoryWorkItemState::VerificationFailed {
+        return Ok(None);
+    }
+    if !matches!(
+        current.state,
+        FactoryWorkItemState::MissionCreated
+            | FactoryWorkItemState::Running
+            | FactoryWorkItemState::Blocked
+            | FactoryWorkItemState::AwaitingApproval
+    ) {
+        return Err(anyhow!(
+            "factory verification failure cannot reconcile state {}",
+            current.state.as_str()
+        ));
+    }
+    let row = sqlx::query(
+        r#"
+        UPDATE factory_work_items
+        SET state = 'verification_failed',
+            version = version + 1,
+            failure_detail = $1,
+            updated_at = now()
+        WHERE id = $2 AND corp_id = $3
+        RETURNING id, corp_id, source_kind, source_project_owner,
+                  source_project_number, source_project_item_id,
+                  source_repository_owner, source_repository_name,
+                  source_issue_number, source_issue_node_id, source_issue_url,
+                  source_title, source_revision, state, version, claim_owner_id,
+                  lease_expires_at, policy, mission_id, failure_detail,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(&failure_detail)
+    .bind(current.id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let work_item = map_factory_work_item(row)?;
+    sqlx::query(
+        r#"
+        WITH RECURSIVE lineage AS (
+            SELECT id, resumed_from_run_id
+            FROM runs
+            WHERE corp_id = $1 AND id = $2
+            UNION
+            SELECT parent.id, parent.resumed_from_run_id
+            FROM runs parent
+            JOIN lineage child ON child.resumed_from_run_id = parent.id
+            WHERE parent.corp_id = $1
+        )
+        UPDATE factory_verification_recoveries
+        SET status = 'failed', updated_at = now()
+        WHERE corp_id = $1
+          AND replacement_run_id IN (SELECT id FROM lineage)
+          AND status IN ('authorized', 'running')
+        "#,
+    )
+    .bind(corp_id)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    let event = append_event_tx(
+        tx,
+        NewEvent {
+            room_id: Some(room_id),
+            aggregate_version: work_item.version,
+            correlation_id: Some(mission_id),
+            causation_id: Some(run_id),
+            ..NewEvent::new(
+                corp_id,
+                actor_id,
+                "factory.verification_failed",
+                "factory_work_item",
+                work_item.id,
+                format!(
+                    "factory:{}:verification-failed:{run_id}:{cause}",
+                    work_item.id
+                ),
+                json!({
+                    "previous_state": current.state.as_str(),
+                    "state": work_item.state.as_str(),
+                    "mission_id": mission_id,
+                    "run_id": run_id,
+                    "cause": cause,
+                    "failure_detail": failure_detail,
+                }),
+            )
+        },
+    )
+    .await?
+    .context("factory verification-failure event unexpectedly existed")?;
+    Ok(Some((work_item, event)))
+}
+
+async fn reconcile_factory_verified_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    room_id: Uuid,
+    run_id: Uuid,
+    actor_id: Option<Uuid>,
+) -> Result<Option<(FactoryWorkItem, DomainEvent)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+               source_project_item_id, source_repository_owner, source_repository_name,
+               source_issue_number, source_issue_node_id, source_issue_url, source_title,
+               source_revision, state, version, claim_owner_id, claim_token,
+               lease_expires_at, policy, mission_id, failure_detail, created_at, updated_at
+        FROM factory_work_items
+        WHERE corp_id = $1 AND mission_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(corp_id)
+    .bind(mission_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let current = map_factory_work_item(row)?;
+    if current.state == FactoryWorkItemState::Verified {
+        return Ok(None);
+    }
+    if !matches!(
+        current.state,
+        FactoryWorkItemState::MissionCreated
+            | FactoryWorkItemState::Running
+            | FactoryWorkItemState::Blocked
+            | FactoryWorkItemState::AwaitingApproval
+    ) {
+        return Err(anyhow!(
+            "factory verification approval cannot reconcile state {}",
+            current.state.as_str()
+        ));
+    }
+    ensure_factory_mission_verified_tx(tx, corp_id, mission_id).await?;
+    let row = sqlx::query(
+        r#"
+        UPDATE factory_work_items
+        SET state = 'verified',
+            version = version + 1,
+            failure_detail = NULL,
+            updated_at = now()
+        WHERE id = $1 AND corp_id = $2
+        RETURNING id, corp_id, source_kind, source_project_owner,
+                  source_project_number, source_project_item_id,
+                  source_repository_owner, source_repository_name,
+                  source_issue_number, source_issue_node_id, source_issue_url,
+                  source_title, source_revision, state, version, claim_owner_id,
+                  lease_expires_at, policy, mission_id, failure_detail,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(current.id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let work_item = map_factory_work_item(row)?;
+    let event = append_event_tx(
+        tx,
+        NewEvent {
+            room_id: Some(room_id),
+            aggregate_version: work_item.version,
+            correlation_id: Some(mission_id),
+            causation_id: Some(run_id),
+            ..NewEvent::new(
+                corp_id,
+                actor_id,
+                "factory.verified",
+                "factory_work_item",
+                work_item.id,
+                format!("factory:{}:verified:{run_id}", work_item.id),
+                json!({
+                    "previous_state": current.state.as_str(),
+                    "state": work_item.state.as_str(),
+                    "mission_id": mission_id,
+                    "run_id": run_id,
+                }),
+            )
+        },
+    )
+    .await?
+    .context("factory verified event unexpectedly existed")?;
+    Ok(Some((work_item, event)))
+}
+
+async fn settle_successful_factory_recoveries_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+) -> Result<()> {
+    // Settle at the recovered task's boundary, including a native resume of that
+    // same task. A later task's completion is not part of this run's lineage.
+    sqlx::query(
+        r#"
+        WITH RECURSIVE lineage AS (
+            SELECT run.id, run.resumed_from_run_id, run.task_id, run.agent_id,
+                   run.workspace_run_id
+            FROM runs run
+            JOIN tasks task ON task.id = run.task_id AND task.corp_id = run.corp_id
+            WHERE run.corp_id = $1 AND run.id = $2
+              AND run.status = 'completed' AND run.verification_status = 'passed'
+              AND task.status = 'completed' AND task.verification_status = 'passed'
+            UNION
+            SELECT parent.id, parent.resumed_from_run_id, parent.task_id,
+                   parent.agent_id, parent.workspace_run_id
+            FROM runs parent
+            JOIN lineage child ON child.resumed_from_run_id = parent.id
+            WHERE parent.corp_id = $1
+              AND parent.task_id = child.task_id AND parent.agent_id = child.agent_id
+              AND parent.workspace_run_id = child.workspace_run_id
+        )
+        UPDATE factory_verification_recoveries
+        SET status = 'completed', updated_at = now()
+        WHERE corp_id = $1
+          AND replacement_run_id IN (SELECT id FROM lineage)
+          AND task_id IN (SELECT task_id FROM lineage)
+          AND status IN ('authorized', 'running')
+        "#,
+    )
+    .bind(corp_id)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn reconcile_factory_awaiting_approval_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    mission_id: Uuid,
+    room_id: Uuid,
+    run_id: Uuid,
+) -> Result<Option<(FactoryWorkItem, DomainEvent)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, corp_id, source_kind, source_project_owner, source_project_number,
+               source_project_item_id, source_repository_owner, source_repository_name,
+               source_issue_number, source_issue_node_id, source_issue_url, source_title,
+               source_revision, state, version, claim_owner_id, claim_token,
+               lease_expires_at, policy, mission_id, failure_detail, created_at, updated_at
+        FROM factory_work_items
+        WHERE corp_id = $1 AND mission_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(corp_id)
+    .bind(mission_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let current = map_factory_work_item(row)?;
+    if current.state == FactoryWorkItemState::AwaitingApproval {
+        return Ok(None);
+    }
+    if !matches!(
+        current.state,
+        FactoryWorkItemState::MissionCreated
+            | FactoryWorkItemState::Running
+            | FactoryWorkItemState::Blocked
+    ) {
+        return Err(anyhow!(
+            "factory verification waiting cannot reconcile state {}",
+            current.state.as_str()
+        ));
+    }
+    let row = sqlx::query(
+        r#"
+        UPDATE factory_work_items
+        SET state = 'awaiting_approval',
+            version = version + 1,
+            failure_detail = NULL,
+            updated_at = now()
+        WHERE id = $1 AND corp_id = $2
+        RETURNING id, corp_id, source_kind, source_project_owner,
+                  source_project_number, source_project_item_id,
+                  source_repository_owner, source_repository_name,
+                  source_issue_number, source_issue_node_id, source_issue_url,
+                  source_title, source_revision, state, version, claim_owner_id,
+                  lease_expires_at, policy, mission_id, failure_detail,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(current.id)
+    .bind(corp_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let work_item = map_factory_work_item(row)?;
+    let event = append_event_tx(
+        tx,
+        NewEvent {
+            room_id: Some(room_id),
+            aggregate_version: work_item.version,
+            correlation_id: Some(mission_id),
+            causation_id: Some(run_id),
+            ..NewEvent::new(
+                corp_id,
+                None,
+                "factory.awaiting_approval",
+                "factory_work_item",
+                work_item.id,
+                format!("factory:{}:awaiting-approval:{run_id}", work_item.id),
+                json!({
+                    "previous_state": current.state.as_str(),
+                    "state": work_item.state.as_str(),
+                    "mission_id": mission_id,
+                    "run_id": run_id,
+                }),
+            )
+        },
+    )
+    .await?
+    .context("factory awaiting-approval event unexpectedly existed")?;
+    Ok(Some((work_item, event)))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
 }
 
 async fn assert_actor_agent_scope_tx(
@@ -10216,14 +13774,41 @@ async fn sanitize_verification_evidence_tx(
         .context("artifact verification evidence omitted status")?;
     let artifact = sqlx::query(
         r#"
-        SELECT id, corp_id, task_id, run_id, producer_agent_id, producer_runner_id,
-               verifier, object_key, uri, sha256, media_type, bytes,
-               artifact_role, file_name, metadata, provenance_signature, retention_until
-        FROM artifacts
-        WHERE run_id = $1
-          AND status = 'ready'
-          AND artifact_role = 'provider_evidence'
-        ORDER BY created_at DESC
+        SELECT artifact.id, artifact.corp_id, artifact.task_id, artifact.run_id,
+               artifact.producer_agent_id, artifact.producer_runner_id,
+               artifact.verifier, artifact.object_key, artifact.uri, artifact.sha256,
+               artifact.media_type, artifact.bytes, artifact.artifact_role,
+               artifact.file_name, artifact.metadata, artifact.provenance_signature,
+               artifact.retention_until
+        FROM runs recovery_run
+        JOIN artifacts artifact
+          ON artifact.id = recovery_run.artifact_id
+         AND artifact.corp_id = recovery_run.corp_id
+         AND artifact.task_id = recovery_run.task_id
+        WHERE recovery_run.id = $1
+          AND artifact.status = 'ready'
+          AND artifact.artifact_role = 'provider_evidence'
+          AND (
+              artifact.run_id = recovery_run.id
+              OR (
+                  recovery_run.execution_mode = 'verification_only'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM factory_verification_recoveries recovery
+                      JOIN runs source
+                        ON source.id = recovery.source_run_id
+                       AND source.corp_id = recovery_run.corp_id
+                       AND source.task_id = recovery_run.task_id
+                       AND source.workspace_run_id = recovery_run.workspace_run_id
+                      WHERE recovery.replacement_run_id = recovery_run.id
+                        AND recovery.corp_id = recovery_run.corp_id
+                        AND recovery.task_id = recovery_run.task_id
+                        AND source.artifact_id = artifact.id
+                        AND recovery.status IN ('authorized', 'running')
+                  )
+              )
+          )
+        ORDER BY artifact.created_at DESC
         LIMIT 1
         "#,
     )
@@ -10680,6 +14265,8 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         workspace_base_commit: row.get("workspace_base_commit"),
         workspace_disposition: row.get("workspace_disposition"),
         workspace_detail: row.get("workspace_detail"),
+        workspace_fingerprint: row.get("workspace_fingerprint"),
+        execution_mode: row.get("execution_mode"),
         verification_status: row.get("verification_status"),
         verification_summary: row.get("verification_summary"),
         verification_sha256: row.get("verification_sha256"),
@@ -10692,6 +14279,46 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         artifact_signature: row.get("artifact_signature"),
         artifact_path: row.get("artifact_path"),
         artifact_sha256: row.get("artifact_sha256"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_factory_verification_recovery(
+    row: sqlx::postgres::PgRow,
+) -> Result<FactoryVerificationRecovery> {
+    let mode = match row.get::<String, _>("mode").as_str() {
+        "source_correction" => FactoryVerificationRecoveryMode::SourceCorrection,
+        "verifier_only" => FactoryVerificationRecoveryMode::VerifierOnly,
+        other => {
+            return Err(anyhow!(
+                "unknown factory verification recovery mode {other}"
+            ));
+        }
+    };
+    Ok(FactoryVerificationRecovery {
+        id: row.get("id"),
+        corp_id: row.get("corp_id"),
+        factory_work_item_id: row.get("factory_work_item_id"),
+        mission_id: row.get("mission_id"),
+        task_id: row.get("task_id"),
+        source_run_id: row.get("source_run_id"),
+        replacement_run_id: row.get("replacement_run_id"),
+        mode,
+        status: row.get("status"),
+        authorized_by: row.get("authorized_by"),
+        reason: row.get("reason"),
+        observed_source_revision: row.get("observed_source_revision"),
+        reviewed_source_snapshot: row.get("reviewed_source_snapshot"),
+        contract_revision_id: row.get("contract_revision_id"),
+        previous_verification_policy: serde_json::from_value(
+            row.get("previous_verification_policy"),
+        )
+        .context("decode previous factory recovery verification policy")?,
+        replacement_verification_policy: serde_json::from_value(
+            row.get("replacement_verification_policy"),
+        )
+        .context("decode replacement factory recovery verification policy")?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -10761,6 +14388,10 @@ fn ensure_artifact_upload_matches(
 }
 
 fn normalize_artifact_rejection_reason(reason: &str) -> String {
+    normalize_bounded_failure_reason(reason, "artifact finalization failed permanently")
+}
+
+fn normalize_bounded_failure_reason(reason: &str, fallback: &str) -> String {
     let normalized = reason
         .chars()
         .map(|character| {
@@ -10773,7 +14404,7 @@ fn normalize_artifact_rejection_reason(reason: &str) -> String {
         .collect::<String>();
     let mut normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        normalized = "artifact finalization failed permanently".to_owned();
+        normalized = fallback.to_owned();
     }
     if normalized.len() > 2_000 {
         let mut end = 2_000;
@@ -11349,6 +14980,50 @@ async fn hard_breaker_reached_tx(
     Ok(reached)
 }
 
+fn retained_workspace_disposition(
+    existing: Option<&str>,
+    event_type: &str,
+    payload: &Value,
+) -> Result<&'static str> {
+    let quarantined = payload
+        .get("workspace_quarantined")
+        .map(|value| {
+            value
+                .as_bool()
+                .context("workspace quarantine flag must be a boolean")
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if existing == Some("quarantined") || quarantined {
+        return Ok("quarantined");
+    }
+    Ok(if event_type == "run.workspace_removed" {
+        "removed"
+    } else {
+        "preserved"
+    })
+}
+
+fn ensure_generic_resume_is_not_factory_recovery(
+    factory_linked: bool,
+    task_status: &str,
+    source_verification_status: &str,
+) -> Result<()> {
+    if factory_linked
+        && (task_status == "verification_failed" || source_verification_status == "failed")
+    {
+        return Err(anyhow!(
+            "factory verification-failed lineage requires governed verification recovery"
+        ));
+    }
+    Ok(())
+}
+
+fn ordered_events(mut events: Vec<DomainEvent>) -> Vec<DomainEvent> {
+    events.sort_by_key(|event| event.seq);
+    events
+}
+
 fn runner_event_advances_run(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -11423,13 +15098,975 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        FactorySourceInput, breaker_blocks_runner_progress, ensure_active_factory_control,
-        ensure_breaker_allows_human_progress, ensure_new_factory_policy_is_pinned,
-        factory_transition_allowed, lineage_run_is_pre_dispatch_failure,
-        normalize_artifact_rejection_reason, normalize_factory_policy, normalize_factory_source,
+        FactorySourceInput, RunnerCommandDispatchState, breaker_blocks_runner_progress,
+        ensure_active_factory_control, ensure_breaker_allows_human_progress,
+        ensure_factory_recovery_verification_policy_not_weakened,
+        ensure_new_factory_policy_is_pinned, factory_transition_allowed,
+        lineage_run_is_pre_dispatch_failure, normalize_artifact_rejection_reason,
+        normalize_factory_policy, normalize_factory_source, runner_command_dispatch_state,
         should_retry_runner_failure, validate_factory_lease_seconds,
         validate_factory_plan_against_policy,
     };
+
+    async fn predispatch_failure_fixture(pool: sqlx::PgPool) -> super::PgStore {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE missions (id UUID PRIMARY KEY, corp_id UUID, room_id UUID,
+                status TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE tasks (id UUID PRIMARY KEY, corp_id UUID, mission_id UUID,
+                status TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE runs (id UUID PRIMARY KEY, corp_id UUID, task_id UUID, agent_id UUID,
+                status TEXT, summary TEXT, workspace_detail TEXT,
+                workspace_path TEXT DEFAULT 'preserved-source', budget_tokens_limit BIGINT DEFAULT 100,
+                input_tokens BIGINT DEFAULT 0, output_tokens BIGINT DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE agents (id UUID PRIMARY KEY, corp_id UUID, status TEXT,
+                station TEXT, current_run_id UUID);
+            CREATE TABLE queued_messages (id UUID PRIMARY KEY, corp_id UUID,
+                run_id UUID, status TEXT);
+            CREATE TABLE factory_work_items (id UUID PRIMARY KEY, corp_id UUID,
+                mission_id UUID UNIQUE, state TEXT, version BIGINT DEFAULT 1,
+                failure_detail TEXT, updated_at TIMESTAMPTZ DEFAULT now());
+            CREATE TABLE events (seq BIGSERIAL PRIMARY KEY, id UUID UNIQUE,
+                schema_version INTEGER DEFAULT 1, corp_id UUID, room_id UUID, actor_id UUID,
+                type TEXT, aggregate_type TEXT, aggregate_id UUID, aggregate_version BIGINT,
+                correlation_id UUID, causation_id UUID, idempotency_key TEXT,
+                visibility TEXT, payload JSONB, created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE(corp_id, idempotency_key));
+            INSERT INTO missions VALUES
+                ('00000000-0000-0000-0000-000000000002',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000006', 'running', now());
+            INSERT INTO tasks (id,corp_id,mission_id,status) VALUES
+                ('00000000-0000-0000-0000-000000000003',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000002', 'running');
+            INSERT INTO runs (id,corp_id,task_id,agent_id,status) VALUES
+                ('00000000-0000-0000-0000-000000000004',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000003',
+                 '00000000-0000-0000-0000-000000000005', 'provisioning');
+            INSERT INTO agents VALUES
+                ('00000000-0000-0000-0000-000000000005',
+                 '00000000-0000-0000-0000-000000000001', 'working', 'dispatch',
+                 '00000000-0000-0000-0000-000000000004');
+            INSERT INTO queued_messages VALUES
+                ('00000000-0000-0000-0000-000000000008',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000004', 'reserved');
+            INSERT INTO factory_work_items (id,corp_id,mission_id,state) VALUES
+                ('00000000-0000-0000-0000-000000000007',
+                 '00000000-0000-0000-0000-000000000001',
+                 '00000000-0000-0000-0000-000000000002', 'awaiting_approval');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("isolated pre-dispatch fixture");
+        super::PgStore { pool }
+    }
+
+    async fn predispatch_fixture_state(store: &super::PgStore) -> serde_json::Value {
+        sqlx::query_scalar(
+            r#"
+            SELECT jsonb_build_object(
+              'runs',(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM runs r),
+              'tasks',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM tasks t),
+              'missions',(SELECT jsonb_agg(to_jsonb(m) ORDER BY id) FROM missions m),
+              'agents',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM agents a),
+              'queued',(SELECT jsonb_agg(to_jsonb(q) ORDER BY id) FROM queued_messages q),
+              'factory',(SELECT jsonb_agg(to_jsonb(f) ORDER BY id) FROM factory_work_items f),
+              'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY seq) FROM events e))
+            "#,
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_blocks_factory_atomically_and_replays_without_effects(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        store
+            .fail_run_before_dispatch(
+                Uuid::from_u128(1),
+                Uuid::from_u128(4),
+                "dependency context could not be verified",
+            )
+            .await
+            .unwrap();
+        let state = predispatch_fixture_state(&store).await;
+        assert_eq!(state["runs"][0]["status"], "failed");
+        assert_eq!(state["tasks"][0]["status"], "failed");
+        assert_eq!(state["missions"][0]["status"], "failed");
+        assert_eq!(state["factory"][0]["state"], "blocked");
+        assert_eq!(state["factory"][0]["version"], 2);
+        assert_eq!(
+            state["factory"][0]["failure_detail"],
+            "dependency context could not be verified"
+        );
+        assert_eq!(state["runs"][0]["workspace_path"], "preserved-source");
+        assert_eq!(state["runs"][0]["budget_tokens_limit"], 100);
+        assert_eq!(state["runs"][0]["input_tokens"], 0);
+        assert_eq!(state["agents"][0]["status"], "idle");
+        assert!(state["agents"][0]["current_run_id"].is_null());
+        assert_eq!(state["queued"][0]["status"], "queued");
+        assert!(state["queued"][0]["run_id"].is_null());
+        let events = state["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "run.failed");
+        assert_eq!(events[1]["type"], "factory.blocked");
+        assert_eq!(events[1]["correlation_id"], Uuid::from_u128(2).to_string());
+        assert_eq!(events[1]["room_id"], Uuid::from_u128(6).to_string());
+        store
+            .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "late new reason")
+            .await
+            .unwrap();
+        assert_eq!(predispatch_fixture_state(&store).await, state);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_rolls_back_every_projection_when_factory_update_fails(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        sqlx::query(
+            "ALTER TABLE factory_work_items ADD CONSTRAINT injected_failure CHECK (state <> 'blocked')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(
+                    Uuid::from_u128(1),
+                    Uuid::from_u128(4),
+                    "unavailable handoff"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_fences_terminal_started_newer_and_foreign_work(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(Uuid::from_u128(99), run, "foreign call")
+                .await
+                .is_err()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+        for status in [
+            "running",
+            "waiting_for_approval",
+            "verifying",
+            "completed",
+            "cancelled",
+            "lost",
+            "failed",
+        ] {
+            sqlx::query("UPDATE runs SET status = $1")
+                .bind(status)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            assert!(
+                store
+                    .fail_run_before_dispatch(corp, run, "late callback")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(predispatch_fixture_state(&store).await, before, "{status}");
+        }
+        sqlx::query("UPDATE runs SET status = 'provisioning'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        for kind in ["run.started", "run.session"] {
+            sqlx::query(
+                "INSERT INTO events (id,corp_id,type,aggregate_type,aggregate_id)
+                 VALUES ($1,$2,$3,'run',$4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(corp)
+            .bind(kind)
+            .bind(run)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            assert!(
+                store
+                    .fail_run_before_dispatch(corp, run, "already started")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(predispatch_fixture_state(&store).await, before);
+            sqlx::query("DELETE FROM events")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO runs (id,corp_id,task_id,agent_id,status,created_at)
+             SELECT '00000000-0000-0000-0000-000000000009',corp_id,task_id,agent_id,
+                    'running',created_at + interval '1 second' FROM runs;
+             UPDATE agents SET current_run_id = '00000000-0000-0000-0000-000000000009';",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(corp, run, "obsolete attempt")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_cleans_new_resumes_without_downgrading_factory_outcomes(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        for state in ["verified", "publishing", "published", "failed", "cancelled"] {
+            sqlx::raw_sql(
+                "UPDATE runs SET status = 'starting', summary = NULL, workspace_detail = NULL;
+                 UPDATE tasks SET status = 'running';
+                 UPDATE missions SET status = 'running';
+                 UPDATE agents SET status = 'working', station = 'dispatch',
+                    current_run_id = '00000000-0000-0000-0000-000000000004';
+                 UPDATE queued_messages SET status = 'reserved',
+                    run_id = '00000000-0000-0000-0000-000000000004';
+                 DELETE FROM events;",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE factory_work_items SET state = $1")
+                .bind(state)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            let before = predispatch_fixture_state(&store).await;
+            let events = store
+                .fail_run_before_dispatch(
+                    Uuid::from_u128(1),
+                    Uuid::from_u128(4),
+                    "runner disconnected before accepting resume",
+                )
+                .await
+                .unwrap();
+            let after = predispatch_fixture_state(&store).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(after["runs"][0]["status"], "failed");
+            assert_eq!(after["agents"][0]["status"], "idle");
+            assert!(after["agents"][0]["current_run_id"].is_null());
+            assert_eq!(after["queued"][0]["status"], "queued");
+            assert_eq!(after["factory"], before["factory"], "{state}");
+        }
+        sqlx::raw_sql(
+            "UPDATE runs SET status = 'completed';
+             UPDATE tasks SET status = 'completed';
+             UPDATE missions SET status = 'completed';
+             UPDATE factory_work_items SET state = 'published';",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        assert!(
+            store
+                .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "late failure")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, before);
+    }
+
+    async fn predispatch_gate_precedes_row_locks(pool: sqlx::PgPool, prefix: &str) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        let factory = Uuid::from_u128(7);
+        let mut blocker = store.pool.begin().await.unwrap();
+        super::lock_factory_keys_tx(&mut blocker, &[format!("{prefix}:{corp}:{factory}")])
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM factory_work_items FOR UPDATE")
+            .fetch_all(&mut *blocker)
+            .await
+            .unwrap();
+        let mut failure = Box::pin(store.fail_run_before_dispatch(corp, run, "blocked handoff"));
+        let pool = store.pool.clone();
+        let mut probe = Box::pin(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let waiting: Option<String> = sqlx::query_scalar(
+                    "SELECT query FROM pg_stat_activity
+                     WHERE datname = current_database() AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock' ORDER BY query_start LIMIT 1",
+                )
+                .fetch_optional(&pool)
+                .await?;
+                if let Some(query) = waiting {
+                    if !query.contains("pg_advisory_xact_lock") {
+                        return Err(anyhow::anyhow!("dispatch took rows before its shared gate"));
+                    }
+                    // A recovery/publication owner must be able to take mission
+                    // rows while the dispatch failure waits at the existing gate.
+                    sqlx::query("SELECT id FROM missions FOR UPDATE NOWAIT")
+                        .fetch_all(&mut *blocker)
+                        .await?;
+                    blocker.commit().await?;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!("dispatch never reached its shared gate"));
+                }
+            }
+        });
+        let mut finished = None;
+        std::future::poll_fn(|context| {
+            if finished.is_none()
+                && let Poll::Ready(result) = failure.as_mut().poll(context)
+            {
+                finished = Some(result);
+            }
+            probe.as_mut().poll(context)
+        })
+        .await
+        .unwrap();
+        let events = match finished {
+            Some(result) => result,
+            None => failure.await,
+        }
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            predispatch_fixture_state(&store).await["factory"][0]["state"],
+            "blocked"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_takes_recovery_gate_before_row_locks(pool: sqlx::PgPool) {
+        predispatch_gate_precedes_row_locks(pool, "factory:item").await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_takes_publication_gate_before_row_locks(pool: sqlx::PgPool) {
+        predispatch_gate_precedes_row_locks(pool, "publication:factory").await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_repairs_legacy_state_without_rewriting_failure_history(
+        pool: sqlx::PgPool,
+    ) {
+        let store = predispatch_failure_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let run = Uuid::from_u128(4);
+        sqlx::raw_sql(
+            "UPDATE runs SET status = 'failed', workspace_detail = 'dispatch_not_started',
+                summary = E'Legacy\\n diagnostic';
+             UPDATE tasks SET status = 'failed';
+             UPDATE missions SET status = 'failed';
+             UPDATE agents SET status = 'idle', station = NULL, current_run_id = NULL;
+             UPDATE queued_messages SET status = 'queued', run_id = NULL;",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO events (id,corp_id,type,aggregate_type,aggregate_id,idempotency_key)
+             VALUES ($1,$2,'run.failed','run',$3,$4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(corp)
+        .bind(run)
+        .bind(format!("run:{run}:dispatch-failed"))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        let emitted = store
+            .fail_run_before_dispatch(corp, run, "new caller text")
+            .await
+            .unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].event_type, "factory.blocked");
+        let after = predispatch_fixture_state(&store).await;
+        for key in ["runs", "tasks", "missions", "agents", "queued"] {
+            assert_eq!(after[key], before[key], "{key}");
+        }
+        assert_eq!(after["factory"][0]["state"], "blocked");
+        assert_eq!(after["factory"][0]["failure_detail"], "Legacy diagnostic");
+        assert_eq!(after["events"].as_array().unwrap().len(), 2);
+        assert_eq!(after["events"][0], before["events"][0]);
+        assert!(
+            store
+                .fail_run_before_dispatch(corp, run, "another reason")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(predispatch_fixture_state(&store).await, after);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn predispatch_failure_never_mutates_another_corps_factory(pool: sqlx::PgPool) {
+        let store = predispatch_failure_fixture(pool).await;
+        sqlx::query("UPDATE factory_work_items SET corp_id = $1")
+            .bind(Uuid::from_u128(99))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let before = predispatch_fixture_state(&store).await;
+        let events = store
+            .fail_run_before_dispatch(Uuid::from_u128(1), Uuid::from_u128(4), "own run only")
+            .await
+            .unwrap();
+        let after = predispatch_fixture_state(&store).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(after["factory"], before["factory"]);
+        assert_eq!(after["runs"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn predispatch_diagnostic_is_nonempty_single_line_and_utf8_bounded() {
+        let normalize = |input| super::normalize_bounded_failure_reason(input, "dispatch failed");
+        assert_eq!(normalize(" \r\n\t "), "dispatch failed");
+        assert_eq!(
+            normalize("missing\n\t handoff\u{7}bytes"),
+            "missing handoff bytes"
+        );
+        let text = normalize(&"δ".repeat(3_000));
+        assert!(text.len() <= 2_000);
+        assert!(!text.chars().any(char::is_control));
+    }
+
+    // These opt-in SQL regressions use only SQLx's disposable test database and
+    // exercise the real selection method, not a second implementation of its query.
+    async fn dependency_artifact_fixture(pool: sqlx::PgPool) -> super::PgStore {
+        let corp = Uuid::from_u128(1);
+        let mission = Uuid::from_u128(2);
+        let parent = Uuid::from_u128(3);
+        let child = Uuid::from_u128(4);
+        let provider = Uuid::from_u128(5);
+        let recovered = Uuid::from_u128(6);
+        let artifact = Uuid::from_u128(7);
+        let agent = Uuid::from_u128(8);
+        let recovery = Uuid::from_u128(9);
+        let item = Uuid::from_u128(10);
+        let peer = Uuid::from_u128(11);
+        let peer_run = Uuid::from_u128(12);
+        let peer_artifact = Uuid::from_u128(13);
+        sqlx::raw_sql(&format!(
+            r#"
+            CREATE TABLE tasks (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}',
+                mission_id UUID DEFAULT '{mission}', plan_key TEXT, title TEXT DEFAULT 'handoff',
+                contract JSONB DEFAULT '{{}}', status TEXT DEFAULT 'completed',
+                verification_status TEXT DEFAULT 'passed'
+            );
+            CREATE TABLE task_dependencies (task_id UUID, depends_on_task_id UUID);
+            CREATE TABLE runs (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', task_id UUID,
+                agent_id UUID DEFAULT '{agent}', runner_id TEXT DEFAULT 'fixture-runner',
+                workspace_run_id UUID DEFAULT '{provider}', resumed_from_run_id UUID,
+                source_repository TEXT DEFAULT 'fixture/repo', source_base_ref TEXT DEFAULT 'main',
+                source_base_commit TEXT DEFAULT 'base', workspace_base_commit TEXT DEFAULT 'base',
+                status TEXT DEFAULT 'completed', verification_status TEXT DEFAULT 'passed',
+                execution_mode TEXT DEFAULT 'provider', summary TEXT,
+                artifact_id UUID, artifact_sha256 TEXT DEFAULT 'digest',
+                artifact_media_type TEXT DEFAULT 'text/plain',
+                artifact_signature TEXT DEFAULT 'fixture-signature',
+                verification_sha256 TEXT DEFAULT 'verification', deliverable_sha256 TEXT,
+                created_at TIMESTAMPTZ DEFAULT '2000-01-01 00:00:00+00'
+            );
+            CREATE TABLE artifacts (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', task_id UUID, run_id UUID,
+                producer_agent_id UUID DEFAULT '{agent}',
+                producer_runner_id TEXT DEFAULT 'fixture-runner', verifier TEXT DEFAULT 'runner',
+                object_key TEXT DEFAULT 'fixture', uri TEXT DEFAULT 'fixture',
+                sha256 TEXT DEFAULT 'digest', media_type TEXT DEFAULT 'text/plain',
+                bytes BIGINT DEFAULT 1, artifact_role TEXT DEFAULT 'provider_evidence',
+                file_name TEXT DEFAULT 'result.md', metadata JSONB DEFAULT '{{}}',
+                provenance_signature TEXT DEFAULT 'fixture-signature',
+                retention_until TIMESTAMPTZ DEFAULT (now() + interval '1 day'),
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE source_deliverables (
+                run_id UUID, task_id UUID, corp_id UUID, artifact_id UUID, form TEXT,
+                base_commit TEXT, verification_sha256 TEXT
+            );
+            CREATE TABLE factory_work_items (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}', mission_id UUID DEFAULT '{mission}'
+            );
+            CREATE TABLE factory_verification_recoveries (
+                id UUID PRIMARY KEY, corp_id UUID DEFAULT '{corp}',
+                mission_id UUID DEFAULT '{mission}', task_id UUID DEFAULT '{parent}',
+                factory_work_item_id UUID DEFAULT '{item}', source_run_id UUID,
+                replacement_run_id UUID, mode TEXT DEFAULT 'verifier_only',
+                status TEXT DEFAULT 'completed'
+            );
+            INSERT INTO tasks (id, plan_key) VALUES
+                ('{parent}', 'specialist-a'), ('{peer}', 'specialist-b'), ('{child}', 'synthesis');
+            INSERT INTO task_dependencies VALUES ('{child}', '{parent}'), ('{child}', '{peer}');
+            INSERT INTO runs (id, task_id, artifact_id, status, verification_status)
+                VALUES ('{provider}', '{parent}', '{artifact}', 'failed', 'failed');
+            INSERT INTO runs (id, task_id, artifact_id, execution_mode, resumed_from_run_id, created_at)
+                VALUES ('{recovered}', '{parent}', '{artifact}', 'verification_only',
+                        '{provider}', '2000-01-03 00:00:00+00');
+            INSERT INTO runs (id, task_id, artifact_id, workspace_run_id)
+                VALUES ('{peer_run}', '{peer}', '{peer_artifact}', '{peer_run}');
+            INSERT INTO artifacts (id, task_id, run_id)
+                VALUES ('{artifact}', '{parent}', '{provider}'), ('{peer_artifact}', '{peer}', '{peer_run}');
+            INSERT INTO factory_work_items (id) VALUES ('{item}');
+            INSERT INTO factory_verification_recoveries (id, source_run_id, replacement_run_id)
+                VALUES ('{recovery}', '{provider}', '{recovered}');
+            "#
+        ))
+        .execute(&pool)
+        .await
+        .expect("create isolated dependency metadata fixture");
+        sqlx::query("UPDATE tasks SET contract = $1")
+            .bind(json!({
+                "objective": "handoff", "expected_output": "result.md",
+                "acceptance_tests": ["verified artifact"], "allowed_tools": ["filesystem"],
+                "prohibited_actions": [], "references": [], "write_scope": ["result.md"],
+                "budget_tokens": 100, "deadline_at": null, "escalation": "stop"
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+        super::PgStore { pool }
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn dependency_artifacts_bind_recovered_parent_and_reject_invalid_metadata(
+        pool: sqlx::PgPool,
+    ) {
+        let store = dependency_artifact_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let child = Uuid::from_u128(4);
+        let handoffs = store.dependency_artifacts(corp, child).await.unwrap();
+        assert_eq!(handoffs.len(), 2);
+        assert_eq!(handoffs[0].verification_run_id, Uuid::from_u128(6));
+        assert_eq!(handoffs[0].artifact.id, Uuid::from_u128(7));
+        assert_eq!(handoffs[0].artifact.run_id, Uuid::from_u128(5));
+        assert_eq!(handoffs[1].artifact.run_id, Uuid::from_u128(12));
+        let foreign_id = "'00000000-0000-0000-0000-000000000063'";
+        let peer_task = "'00000000-0000-0000-0000-00000000000b'";
+        let peer_run = "'00000000-0000-0000-0000-00000000000c'";
+        let peer_artifact = "'00000000-0000-0000-0000-00000000000d'";
+
+        // Each edit is confined to the disposable fixture and restored before
+        // the next assertion. No missing edge may fall back to another artifact.
+        for (table, column, id, invalid) in [
+            ("artifacts", "status", 7, "'staged'"),
+            ("artifacts", "artifact_role", 7, "'source_deliverable'"),
+            ("artifacts", "corp_id", 7, foreign_id),
+            ("artifacts", "task_id", 7, peer_task),
+            ("artifacts", "run_id", 7, peer_run),
+            ("artifacts", "producer_agent_id", 7, foreign_id),
+            ("artifacts", "producer_runner_id", 7, "'other-runner'"),
+            ("artifacts", "sha256", 7, "'other-digest'"),
+            ("artifacts", "media_type", 7, "'application/json'"),
+            ("artifacts", "provenance_signature", 7, "'tampered'"),
+            ("runs", "artifact_id", 6, "NULL"),
+            ("runs", "artifact_id", 6, foreign_id),
+            ("runs", "artifact_id", 6, peer_artifact),
+            ("runs", "artifact_sha256", 6, "'other-digest'"),
+            ("runs", "artifact_media_type", 6, "'application/json'"),
+            ("runs", "artifact_signature", 6, "'other-signature'"),
+            ("runs", "execution_mode", 6, "'provider'"),
+            ("runs", "verification_status", 6, "'failed'"),
+            ("runs", "status", 6, "'waiting_for_approval'"),
+            ("runs", "resumed_from_run_id", 6, "NULL"),
+            ("runs", "corp_id", 5, foreign_id),
+            ("runs", "task_id", 5, peer_task),
+            ("runs", "agent_id", 5, foreign_id),
+            ("runs", "runner_id", 5, "'other-runner'"),
+            ("runs", "workspace_run_id", 5, foreign_id),
+            ("runs", "source_repository", 5, "'other/repo'"),
+            ("runs", "source_base_ref", 5, "'other-ref'"),
+            ("runs", "source_base_commit", 5, "'other-base'"),
+            ("runs", "artifact_id", 5, "NULL"),
+            ("runs", "artifact_signature", 5, "'other-signature'"),
+            (
+                "factory_verification_recoveries",
+                "source_run_id",
+                9,
+                "NULL",
+            ),
+            (
+                "factory_verification_recoveries",
+                "replacement_run_id",
+                9,
+                "NULL",
+            ),
+            ("factory_verification_recoveries", "corp_id", 9, foreign_id),
+            ("factory_verification_recoveries", "task_id", 9, peer_task),
+            (
+                "factory_verification_recoveries",
+                "mission_id",
+                9,
+                foreign_id,
+            ),
+            (
+                "factory_verification_recoveries",
+                "mode",
+                9,
+                "'source_correction'",
+            ),
+            ("factory_verification_recoveries", "status", 9, "'running'"),
+            ("factory_verification_recoveries", "status", 9, "'failed'"),
+            ("factory_work_items", "corp_id", 10, foreign_id),
+            ("factory_work_items", "mission_id", 10, foreign_id),
+            ("tasks", "verification_status", 3, "'failed'"),
+            ("tasks", "mission_id", 3, foreign_id),
+            (
+                "tasks",
+                "contract",
+                3,
+                r#"jsonb_set(contract, '{deliverable}', '{"form":"typed_artifact_set"}')"#,
+            ),
+        ] {
+            let id = Uuid::from_u128(id);
+            let original: String = sqlx::query_scalar(&format!(
+                "SELECT quote_nullable({column}) FROM {table} WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = {invalid} WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            let rejected = store.dependency_artifacts(corp, child).await;
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = {original} WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                rejected.unwrap_err().to_string(),
+                "dependency handoff is incomplete or unverified: expected 2, found 1",
+                "accepted {table}.{column} = {invalid}"
+            );
+        }
+        assert_eq!(
+            store.dependency_artifacts(corp, child).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an explicitly owned PostgreSQL test database"]
+    async fn dependency_artifacts_follow_multiple_recoveries_without_stale_or_cyclic_fallback(
+        pool: sqlx::PgPool,
+    ) {
+        let store = dependency_artifact_fixture(pool).await;
+        let corp = Uuid::from_u128(1);
+        let parent = Uuid::from_u128(3);
+        let child = Uuid::from_u128(4);
+        let provider = Uuid::from_u128(5);
+        let recovered = Uuid::from_u128(6);
+        let artifact = Uuid::from_u128(7);
+        let bridge = Uuid::from_u128(14);
+        let bridge_recovery = Uuid::from_u128(15);
+        sqlx::raw_sql(&format!(
+            r#"
+            INSERT INTO runs (id, task_id, artifact_id, execution_mode, resumed_from_run_id,
+                              status, verification_status, created_at)
+                VALUES ('{bridge}', '{parent}', '{artifact}', 'verification_only',
+                        '{provider}', 'failed', 'failed', '2000-01-02 00:00:00+00');
+            UPDATE runs SET resumed_from_run_id = '{bridge}' WHERE id = '{recovered}';
+            UPDATE factory_verification_recoveries SET source_run_id = '{bridge}'
+                WHERE replacement_run_id = '{recovered}';
+            INSERT INTO factory_verification_recoveries (id, source_run_id, replacement_run_id, status)
+                VALUES ('{bridge_recovery}', '{provider}', '{bridge}', 'failed');
+            "#
+        ))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let handoffs = store.dependency_artifacts(corp, child).await.unwrap();
+        assert_eq!(handoffs.len(), 2);
+        assert_eq!(handoffs[0].artifact.run_id, provider);
+        assert_eq!(handoffs[0].verification_run_id, recovered);
+
+        sqlx::query("UPDATE runs SET created_at = '2000-01-04 00:00:00+00' WHERE id = $1")
+            .bind(bridge)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.dependency_artifacts(corp, child).await.is_err());
+        sqlx::query("UPDATE runs SET created_at = '2000-01-02 00:00:00+00' WHERE id = $1")
+            .bind(bridge)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.dependency_artifacts(corp, child).await.unwrap().len(),
+            2
+        );
+
+        sqlx::raw_sql(&format!(
+            "UPDATE runs SET resumed_from_run_id = '{recovered}' WHERE id = '{bridge}'; \
+             UPDATE factory_verification_recoveries SET source_run_id = '{recovered}' \
+             WHERE id = '{bridge_recovery}';"
+        ))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.dependency_artifacts(corp, child).await.is_err());
+    }
+
+    #[test]
+    fn recovery_generic_resume_fences_failed_and_revised_factory_work() {
+        for (task_status, verification_status) in [
+            ("verification_failed", "failed"),
+            ("verification_failed", "pending"),
+            ("blocked", "failed"),
+        ] {
+            assert!(
+                super::ensure_generic_resume_is_not_factory_recovery(
+                    true,
+                    task_status,
+                    verification_status,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_generic_resume_preserves_non_factory_and_budget_resume() {
+        for (factory_linked, task_status, verification_status) in [
+            (false, "verification_failed", "failed"),
+            (false, "blocked", "failed"),
+            (true, "blocked", "pending"),
+            (true, "cancelled", "pending"),
+            (true, "blocked", "running"),
+        ] {
+            assert!(
+                super::ensure_generic_resume_is_not_factory_recovery(
+                    factory_linked,
+                    task_status,
+                    verification_status,
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    fn lost_verifier_checkpoint() -> super::SourceWorkspaceCheckpoint {
+        super::SourceWorkspaceCheckpoint {
+            status: "lost".to_owned(),
+            execution_mode: "verification_only".to_owned(),
+            source_correction_recovery: false,
+            verification_status: "failed".to_owned(),
+            workspace_path: Some("workspace".to_owned()),
+            disposition: Some("active".to_owned()),
+            fingerprint: None,
+            expected_verifier_fingerprint: Some("b".repeat(64)),
+            expected_head_commit: Some("a".repeat(40)),
+        }
+    }
+
+    #[test]
+    fn recovery_lost_source_requires_confirmed_native_cleanup() {
+        let mut checkpoint = lost_verifier_checkpoint();
+        assert!(checkpoint.ensure_factory_terminal().is_ok());
+        assert!(checkpoint.ensure_preserved().is_err());
+        checkpoint.disposition = Some("preserved".to_owned());
+        assert!(checkpoint.ensure_preserved().is_err());
+        checkpoint.fingerprint = Some("b".repeat(64));
+        assert!(checkpoint.ensure_preserved().is_ok());
+        // Loss never gets the native pre-dispatch skip, before or after cleanup.
+        for disposition in [None, Some("active"), Some("preserved")] {
+            assert!(!lineage_run_is_pre_dispatch_failure(
+                "lost",
+                Some("workspace"),
+                disposition,
+                None,
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_lost_checkpoint_rejects_tampered_fingerprint_head_and_quarantine() {
+        let mut checkpoint = lost_verifier_checkpoint();
+        checkpoint.disposition = Some("preserved".to_owned());
+        checkpoint.fingerprint = Some("c".repeat(64));
+        assert!(checkpoint.ensure_preserved().is_err());
+        assert!(checkpoint.validate_report(&"c".repeat(64), None).is_err());
+        assert!(
+            checkpoint
+                .validate_report(&"b".repeat(64), Some(&"c".repeat(40)))
+                .is_err()
+        );
+        assert!(
+            checkpoint
+                .validate_report(&"b".repeat(64), Some(&"a".repeat(40)))
+                .is_ok()
+        );
+        checkpoint.fingerprint = Some("b".repeat(64));
+        checkpoint.disposition = Some("quarantined".to_owned());
+        assert!(checkpoint.ensure_preserved().is_err());
+    }
+
+    #[test]
+    fn recovery_checkpoint_retains_authorized_head_without_a_deliverable() {
+        let head = "a".repeat(40);
+        assert_eq!(
+            super::checkpoint_head_commit(None, Some(head.clone())).unwrap(),
+            Some(head.clone())
+        );
+        assert_eq!(
+            super::checkpoint_head_commit(Some(head.clone()), Some(head.clone())).unwrap(),
+            Some(head.clone())
+        );
+        assert!(super::checkpoint_head_commit(Some("b".repeat(40)), Some(head.clone())).is_err());
+        assert_eq!(
+            super::checkpoint_head_commit(Some(head.clone()), None).unwrap(),
+            Some(head)
+        );
+        assert_eq!(super::checkpoint_head_commit(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_lost_admission_does_not_reclassify_provider_loss_or_weaken_legacy_resume() {
+        assert!(super::factory_recovery_source_is_terminal(
+            "lost",
+            "verification_only"
+        ));
+        assert!(!super::factory_recovery_source_is_terminal(
+            "lost", "provider"
+        ));
+        for status in ["starting", "running", "verifying", "completed"] {
+            assert!(!super::factory_recovery_source_is_terminal(
+                status,
+                "verification_only"
+            ));
+        }
+        for status in ["failed", "cancelled"] {
+            assert!(super::factory_recovery_source_is_terminal(
+                status, "provider"
+            ));
+        }
+        let mut checkpoint = lost_verifier_checkpoint();
+        checkpoint.execution_mode = "provider".to_owned();
+        checkpoint.expected_verifier_fingerprint = None;
+        checkpoint.disposition = Some("preserved".to_owned());
+        // Native provider/budget resume may still use a legacy preserved session.
+        assert!(checkpoint.ensure_preserved().is_ok());
+    }
+
+    #[test]
+    fn recovery_decision_events_follow_persisted_sequence_without_dropping_events() {
+        let event = |seq, event_type: &str| crony_domain::DomainEvent {
+            seq,
+            id: Uuid::new_v4(),
+            schema_version: 1,
+            corp_id: Uuid::new_v4(),
+            room_id: None,
+            actor_id: None,
+            event_type: event_type.to_owned(),
+            aggregate_type: "run".to_owned(),
+            aggregate_id: Uuid::new_v4(),
+            aggregate_version: 1,
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: Uuid::new_v4().to_string(),
+            visibility: "corp".to_owned(),
+            payload: json!({}),
+            created_at: Utc::now(),
+        };
+        for (decision, factory) in [
+            ("verification.approved", "factory.verified"),
+            ("verification.rejected", "factory.verification_failed"),
+        ] {
+            let events = super::ordered_events(vec![event(12, decision), event(11, factory)]);
+            assert_eq!(
+                events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+                [11, 12]
+            );
+            assert_eq!(events[0].event_type, factory);
+            assert_eq!(events[1].event_type, decision);
+        }
+    }
+
+    #[test]
+    fn recovery_dispatch_never_reexecutes_settled_or_terminal_work() {
+        for status in [
+            "provisioning",
+            "starting",
+            "running",
+            "verifying",
+            "waiting_for_input",
+            "waiting_for_approval",
+        ] {
+            assert_eq!(
+                runner_command_dispatch_state("pending", Some(status)),
+                RunnerCommandDispatchState::Pending
+            );
+        }
+        for status in ["completed", "failed", "cancelled", "lost", "unknown"] {
+            assert_eq!(
+                runner_command_dispatch_state("pending", Some(status)),
+                RunnerCommandDispatchState::Obsolete
+            );
+        }
+        assert_eq!(
+            runner_command_dispatch_state("pending", None),
+            RunnerCommandDispatchState::Obsolete
+        );
+        for status in ["dispatched", "failed"] {
+            assert_eq!(
+                runner_command_dispatch_state(status, Some("running")),
+                RunnerCommandDispatchState::Settled
+            );
+        }
+    }
 
     #[test]
     fn hard_breakers_fence_progress_but_allow_terminal_cleanup() {
@@ -11500,6 +16137,92 @@ mod tests {
             Some("preserved"),
             Some("dispatch_not_started")
         ));
+    }
+
+    #[test]
+    fn workspace_quarantine_is_structured_and_never_downgraded_by_cleanup() {
+        use super::retained_workspace_disposition;
+        assert_eq!(
+            retained_workspace_disposition(None, "run.workspace_preserved", &serde_json::json!({}))
+                .unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            retained_workspace_disposition(
+                Some("active"),
+                "run.workspace_preserved",
+                &serde_json::json!({"workspace_quarantined": true})
+            )
+            .unwrap(),
+            "quarantined"
+        );
+        for event in ["run.workspace_preserved", "run.workspace_removed"] {
+            assert_eq!(
+                retained_workspace_disposition(
+                    Some("quarantined"),
+                    event,
+                    &serde_json::json!({"workspace_quarantined": false})
+                )
+                .unwrap(),
+                "quarantined"
+            );
+        }
+        assert!(
+            retained_workspace_disposition(
+                None,
+                "run.workspace_preserved",
+                &serde_json::json!({"workspace_quarantined": "true"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verification_failed_requires_dedicated_factory_recovery() {
+        assert!(!factory_transition_allowed(
+            FactoryWorkItemState::VerificationFailed,
+            FactoryWorkItemState::Running,
+        ));
+        assert!(factory_transition_allowed(
+            FactoryWorkItemState::VerificationFailed,
+            FactoryWorkItemState::Blocked,
+        ));
+    }
+
+    #[test]
+    fn recovery_verifier_revision_preserves_gate_count_and_kinds() {
+        let previous = VerificationPolicy {
+            checks: vec![
+                VerifierCheck::Artifact { min_bytes: 1 },
+                VerifierCheck::File {
+                    path: "before.txt".to_owned(),
+                    min_bytes: 10,
+                },
+            ],
+            manual_gate: Some(ManualVerificationGate::IndependentReview {
+                roles: vec!["owner".to_owned(), "manager".to_owned()],
+                exclude_requester: true,
+            }),
+        };
+        let mut corrected = previous.clone();
+        corrected.checks[1] = VerifierCheck::File {
+            path: "after.txt".to_owned(),
+            min_bytes: 12,
+        };
+        assert!(
+            ensure_factory_recovery_verification_policy_not_weakened(&previous, &corrected).is_ok()
+        );
+        let mut no_gate = corrected.clone();
+        no_gate.manual_gate = None;
+        assert!(
+            ensure_factory_recovery_verification_policy_not_weakened(&previous, &no_gate).is_err()
+        );
+        let mut fewer_checks = corrected;
+        fewer_checks.checks.pop();
+        assert!(
+            ensure_factory_recovery_verification_policy_not_weakened(&previous, &fewer_checks)
+                .is_err()
+        );
     }
 
     fn factory_work_item(lease_expires_at: chrono::DateTime<Utc>) -> (FactoryWorkItem, Uuid) {

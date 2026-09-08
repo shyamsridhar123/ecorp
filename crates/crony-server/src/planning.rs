@@ -352,7 +352,16 @@ impl ManagerStrategy for StudioSwarmStrategy {
                 format!(
                     "Produce only the {focus} technical handoff for this mission: {}\n\
                      Write exactly one concise UTF-8 Markdown handoff at {path}, at most 12 KiB \
-                     (12288 bytes). Use only Copilot native file tools to read relevant files and \
+                     (12288 bytes). For a small mission, aim for 350-600 words of concrete \
+                     decisions, interfaces, edge cases, and acceptance checks. The size ceiling \
+                     is not a target: omit exhaustive background, duplicated requirements, and \
+                     implementation listings. Read only what is needed to make those decisions, \
+                     then write the handoff and finish. Do not repeatedly reread the whole \
+                     handoff merely to estimate its byte count. If a known problem needs a \
+                     correction, make a focused edit rather than restarting the design pass. \
+                     The runner checks UTF-8, byte length, and the artifact using the persisted \
+                     verifier after you finish; report those checks as delegated, not already \
+                     passed. Use only Copilot native file tools to read relevant files and \
                      create or edit the handoff, including scoped directory creation if needed. \
                      No shell commands are needed or allowed. Do not inspect unrelated repository \
                      files, implement the final product, modify other files, or create commits. \
@@ -1446,6 +1455,12 @@ mod tests {
                 [900_000, 900_000, 900_000, 3_300_000],
             ),
             (
+                Some(1_000_000),
+                Some(6_000_000),
+                [150_000, 150_000, 150_000, 550_000],
+                [900_000, 900_000, 900_000, 3_300_000],
+            ),
+            (
                 Some(100_003),
                 Some(1_000_003),
                 [15_000, 15_000, 15_000, 55_003],
@@ -1469,6 +1484,28 @@ mod tests {
                 assert_eq!(task.max_attempts, 2);
             }
         }
+    }
+
+    #[test]
+    fn studio_handoffs_prioritize_decisions_and_delegate_mechanical_checks() {
+        let plan = StrategyRegistry::new()
+            .plan("studio-swarm", &studio_request(), &copilot_workers())
+            .expect("studio plan");
+        for task in &plan.tasks[..3] {
+            let objective = &task.contract.objective;
+            assert!(
+                objective.contains("aim for 350-600 words"),
+                "give specialists a concise target below the hard byte ceiling"
+            );
+            assert!(objective.contains("The size ceiling is not a target"));
+            assert!(objective.contains("Do not repeatedly reread the whole handoff"));
+            assert!(objective.contains("The runner checks UTF-8, byte length, and the artifact"));
+            assert!(objective.contains("not already passed"));
+            assert_eq!(task.contract.allowed_tools, vec!["filesystem"]);
+            assert_eq!(task.verification_policy.checks.len(), 3);
+            assert!(task.verification_policy.manual_gate.is_none());
+        }
+        assert_eq!(plan.tasks[3].depends_on.len(), 3);
     }
 
     #[test]

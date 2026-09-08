@@ -1,12 +1,7 @@
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { execFile as execFileCallback, spawn } from 'node:child_process'
-import {
-  existsSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs'
+import { execFile as execFileCallback } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -284,57 +279,7 @@ async function runPublisher(
 }
 
 async function restartLocalServer() {
-  const pidPath = process.env.CRONY_TEST_SERVER_PID_FILE
-  if (!pidPath || !existsSync(pidPath)) {
-    throw new Error('CRONY_TEST_SERVER_PID_FILE must identify the test-owned server')
-  }
-  const pidState = JSON.parse(readFileSync(pidPath, 'utf8'))
-  const serverPid = Number(pidState.server)
-  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) {
-    throw new Error(`test-owned server PID is invalid: ${serverPid}`)
-  }
-  process.kill(serverPid, 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const logDir = path.dirname(path.resolve(pidPath))
-  const stdout = openSync(path.join(logDir, 'publication-restart.stdout.log'), 'a')
-  const stderr = openSync(path.join(logDir, 'publication-restart.stderr.log'), 'a')
-  const child = spawn(
-    serverBinary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout, stderr],
-    },
-  )
-  writeFileSync(
-    pidPath,
-    `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`,
-  )
-  child.unref()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return child.pid
-    } catch {
-      // Server and runner are reconnecting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  throw new Error('server and runner did not recover during publication')
+  return restartOwnedTestServer({ root, server, databaseUrl, binary: serverBinary, logPrefix: 'cockpit-publication-restart' })
 }
 
 const sourceBaseCommit = (

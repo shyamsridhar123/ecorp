@@ -4,7 +4,7 @@ mod copilot_fs;
 mod external;
 mod fake;
 mod permission;
-mod process_tree;
+pub(crate) mod process_tree;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 

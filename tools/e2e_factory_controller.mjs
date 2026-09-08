@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { once } from 'node:events'
@@ -9,6 +10,7 @@ import path from 'node:path'
 const execFile = promisify(execFileCallback)
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
+const sourceRoot = path.resolve(process.env.ECORP_TEST_SOURCE_REPOSITORY ?? root)
 const binary =
   process.env.CRONY_CLI_BINARY ??
   path.join(
@@ -20,13 +22,12 @@ const binary =
 const statePath = path.join(root, 'output', 'fake-github-factory-state.json')
 const fakeGithub = path.join(root, 'tools', 'fake_github_cli.mjs')
 const sourceBaseCommit = (
-  await execFile('git', ['rev-parse', 'HEAD'], { cwd: root, windowsHide: true })
+  await execFile('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot, windowsHide: true })
 ).stdout.trim()
 
 async function createSourceFixture(repository) {
-  const fixture = path.join(root, 'output', `factory-source-${repository.replace('/', '-')}`)
-  await rm(fixture, { recursive: true, force: true })
-  await execFile('git', ['clone', '--quiet', '--no-hardlinks', root, fixture], {
+  const fixture = path.join(root, 'output', `factory-source-${repository.replace('/', '-')}-${randomUUID()}`)
+  await execFile('git', ['clone', '--quiet', '--no-hardlinks', sourceRoot, fixture], {
     cwd: root,
     windowsHide: true,
   })
@@ -155,7 +156,7 @@ function controllerInvocation(
     repository = 'ShyamSridhar123/ECorp',
     strategy = 'single',
     githubTimeoutMs,
-    sourceRepositoryPath = root,
+    sourceRepositoryPath = sourceRoot,
     sourceBaseRef = 'HEAD',
     publicationBaseRef,
     adapter = 'fake-process',

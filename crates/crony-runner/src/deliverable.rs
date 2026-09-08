@@ -53,6 +53,7 @@ struct TemporaryExportPaths<'a> {
     bundle_ref: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn export(
     run_id: Uuid,
     spec: &DeliverableSpec,
@@ -60,6 +61,7 @@ pub async fn export(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
+    preserve_head_commit: Option<&str>,
 ) -> Result<ExportedDeliverable> {
     let workspace_root = tokio::fs::canonicalize(&workspace.path)
         .await
@@ -90,6 +92,7 @@ pub async fn export(
         report,
         provider_artifacts,
         write_scope,
+        preserve_head_commit,
         &temporary_paths,
     )
     .await;
@@ -98,6 +101,7 @@ pub async fn export(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn export_with_index(
     spec: &DeliverableSpec,
     workspace: &WorkspaceLease,
@@ -105,28 +109,69 @@ async fn export_with_index(
     report: &VerificationReport,
     provider_artifacts: &[AdapterArtifact],
     write_scope: &[String],
+    preserve_head_commit: Option<&str>,
     temporary_paths: &TemporaryExportPaths<'_>,
 ) -> Result<ExportedDeliverable> {
+    for path in &spec.paths {
+        validate_relative(path)?;
+    }
+    #[cfg(windows)]
+    let index_base = preserve_head_commit.unwrap_or(&workspace.base_commit);
+    #[cfg(not(windows))]
+    let index_base = &workspace.base_commit;
     git_success(
         workspace_root,
         temporary_paths.index,
-        &[
-            OsString::from("read-tree"),
-            OsString::from(&workspace.base_commit),
-        ],
+        &[OsString::from("read-tree"), OsString::from(index_base)],
     )
     .await?;
 
-    let mut add_args = vec![
+    #[cfg(windows)]
+    if preserve_head_commit.is_some() && !spec.paths.is_empty() {
+        // Windows cannot reconstruct executable bits from physical permissions. Seed them from
+        // the verification-linked head, but restore every unselected path to the immutable base.
+        let mut reset_args = vec![
+            OsString::from("reset"),
+            OsString::from("-q"),
+            OsString::from(&workspace.base_commit),
+            OsString::from("--"),
+        ];
+        for (_, path) in changed_paths(
+            workspace_root,
+            temporary_paths.index,
+            &workspace.base_commit,
+        )
+        .await?
+        {
+            if !spec
+                .paths
+                .iter()
+                .any(|selected| path == *selected || path.starts_with(&format!("{selected}/")))
+            {
+                reset_args.push(OsString::from(path));
+            }
+        }
+        if reset_args.len() > 4 {
+            git_success(workspace_root, temporary_paths.index, &reset_args).await?;
+        }
+    }
+
+    let mut add_args = Vec::new();
+    // Native executable-mode changes must not disappear behind repository core.filemode=false.
+    // This override applies only to the temporary export index, never to repository configuration.
+    #[cfg(unix)]
+    add_args.extend([OsString::from("-c"), OsString::from("core.filemode=true")]);
+    #[cfg(windows)]
+    add_args.extend([OsString::from("-c"), OsString::from("core.filemode=false")]);
+    add_args.extend([
         OsString::from("add"),
         OsString::from("-A"),
         OsString::from("--"),
-    ];
+    ]);
     if spec.paths.is_empty() {
         add_args.push(OsString::from("."));
     } else {
         for path in &spec.paths {
-            validate_relative(path)?;
             add_args.push(OsString::from(path));
         }
     }
@@ -175,6 +220,7 @@ async fn export_with_index(
             workspace,
             &verification_sha256,
             &changes,
+            preserve_head_commit,
         )
         .await?
     } else {
@@ -437,6 +483,24 @@ async fn reject_unsafe_changes(
         if mode == "160000" {
             return Err(anyhow!("deliverable cannot contain Git link {path}"));
         }
+        if !matches!(mode.as_str(), "100644" | "100755") {
+            return Err(anyhow!(
+                "deliverable contains unsupported file mode {mode}: {path}"
+            ));
+        }
+        // Git modes alone cannot identify every Windows reparse point or a linked ancestor.
+        let mut physical = workspace.to_owned();
+        for component in Path::new(path).components() {
+            physical.push(component.as_os_str());
+            let metadata = tokio::fs::symlink_metadata(&physical)
+                .await
+                .with_context(|| format!("inspect deliverable path {path}"))?;
+            if crate::workspace::snapshot_entry_is_link(&metadata) {
+                return Err(anyhow!(
+                    "deliverable cannot contain a symbolic link or reparse point: {path}"
+                ));
+            }
+        }
         let candidate = workspace.join(path);
         let canonical = tokio::fs::canonicalize(&candidate)
             .await
@@ -513,6 +577,7 @@ async fn commit_index(
     lease: &WorkspaceLease,
     verification_sha256: &str,
     changes: &[(String, String)],
+    preserve_head_commit: Option<&str>,
 ) -> Result<Option<String>> {
     let tree = git_text(workspace, index, &[OsString::from("write-tree")]).await?;
     let base_tree = git_text(
@@ -530,6 +595,28 @@ async fn commit_index(
         &[OsString::from("rev-parse"), OsString::from("HEAD^{commit}")],
     )
     .await?;
+    if let Some(expected_head) = preserve_head_commit {
+        if old_head != expected_head {
+            return Err(anyhow!(
+                "verifier-only deliverable expected head {expected_head}, found {old_head}"
+            ));
+        }
+        let expected_tree = git_text(
+            workspace,
+            index,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from(format!("{expected_head}^{{tree}}")),
+            ],
+        )
+        .await?;
+        if tree != expected_tree {
+            return Err(anyhow!(
+                "verifier-only deliverable tree changed from preserved head {expected_head}"
+            ));
+        }
+        return Ok(Some(expected_head.to_owned()));
+    }
     let commit = if tree == base_tree {
         lease.base_commit.clone()
     } else {
@@ -884,6 +971,9 @@ mod tests {
         fs::write(root.join("tracked.txt"), b"after\n").expect("modify tracked");
         fs::write(root.join("new.txt"), b"new\n").expect("write untracked");
         fs::write(root.join("provider.md"), b"provider\n").expect("write provider");
+        fs::write(root.join(".git/info/exclude"), b"ignored.log\n")
+            .expect("exclude ignored source");
+        fs::write(root.join("ignored.log"), b"ignored source\n").expect("write ignored source");
         let provider = AdapterArtifact {
             path: root.join("provider.md"),
             sha256: hex::encode(Sha256::digest(b"provider\n")),
@@ -902,6 +992,7 @@ mod tests {
             &report,
             std::slice::from_ref(&provider),
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("first export");
@@ -912,6 +1003,7 @@ mod tests {
             &report,
             &[provider],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("second export");
@@ -925,8 +1017,82 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["new.txt", "tracked.txt"]);
         assert_eq!(
+            fs::read(root.join("ignored.log")).unwrap(),
+            b"ignored source\n"
+        );
+        assert_eq!(
             document["verification_sha256"].as_str(),
             Some(first.verification_sha256.as_str())
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn scoped_archive_preserves_staged_and_unselected_source_exactly() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"selected staged\n").unwrap();
+        fs::write(root.join("other.txt"), b"unselected staged\n").unwrap();
+        git(&root, &["add", "tracked.txt", "other.txt"]);
+        fs::write(root.join("tracked.txt"), b"selected physical bytes\n").unwrap();
+        fs::write(root.join("other.txt"), b"unselected physical bytes\n").unwrap();
+        fs::write(root.join("unselected.txt"), b"untracked source\n").unwrap();
+        fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
+        fs::write(root.join("ignored.log"), b"ignored source\n").unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let paths = ["tracked.txt", "other.txt", "unselected.txt", "ignored.log"];
+        let modified = paths.map(|path| fs::metadata(root.join(path)).unwrap().modified().unwrap());
+        let spec = DeliverableSpec {
+            form: DeliverableForm::Archive,
+            commit_after_verification: false,
+            paths: vec!["tracked.txt".to_owned()],
+        };
+        let first = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+            None,
+        )
+        .await
+        .expect("scoped archive");
+        let second = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+            None,
+        )
+        .await
+        .expect("repeat scoped archive");
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
+        );
+        assert_eq!(
+            paths.map(|path| fs::metadata(root.join(path)).unwrap().modified().unwrap()),
+            modified
+        );
+        assert_eq!(git(&root, &["show", ":tracked.txt"]), "selected staged");
+        assert_eq!(git(&root, &["show", ":other.txt"]), "unselected staged");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), lease.base_commit);
+        assert_eq!(first.base_commit, lease.base_commit);
+        assert!(first.head_commit.is_none());
+        let document: Value = serde_json::from_slice(&first.bytes).unwrap();
+        let changes = document["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["path"], "tracked.txt");
+        assert_eq!(
+            BASE64
+                .decode(changes[0]["content_base64"].as_str().unwrap())
+                .unwrap(),
+            b"selected physical bytes\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -946,6 +1112,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("secret-like path must fail");
@@ -974,6 +1141,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("nested secret-like path must fail");
@@ -1022,6 +1190,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("Git pathspec magic must fail");
@@ -1047,6 +1216,7 @@ mod tests {
             &report,
             &[],
             &["src/**".to_owned()],
+            None,
         )
         .await
         .expect_err("out-of-scope source must fail");
@@ -1081,6 +1251,7 @@ mod tests {
             &report,
             &[provider],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("commit export");
@@ -1117,6 +1288,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verifier_only_export_preserves_the_existing_head_commit() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"verified once\n").expect("modify tracked");
+        let spec = DeliverableSpec {
+            form: DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: vec!["tracked.txt".to_owned()],
+        };
+        let first = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            None,
+        )
+        .await
+        .expect("initial committed export");
+        let head = first.head_commit.expect("initial head commit");
+        fs::write(root.join("tracked.txt"), b"selected staged only\n").unwrap();
+        fs::write(root.join("other.txt"), b"unselected staged only\n").unwrap();
+        git(&root, &["add", "tracked.txt", "other.txt"]);
+        fs::write(root.join("tracked.txt"), b"verified once\n").unwrap();
+        fs::write(root.join("other.txt"), b"unselected physical bytes\n").unwrap();
+        fs::write(root.join("unselected.txt"), b"untracked source\n").unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let second = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect("verifier-only committed export");
+        assert_eq!(second.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(second.base_commit, lease.base_commit);
+        assert_eq!(git(&root, &["rev-parse", "HEAD^"]), lease.base_commit);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
+        );
+        let wrong_head = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&lease.base_commit),
+        )
+        .await
+        .expect_err("a different verification-linked head must fail");
+        assert!(wrong_head.to_string().contains("expected head"));
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
+        );
+        fs::write(root.join("tracked.txt"), b"changed after checkpoint\n")
+            .expect("mutate checkpoint");
+        let changed_fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let mismatch = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect_err("changed verifier-only tree must fail");
+        assert!(mismatch.to_string().contains("tree changed"));
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            changed_fingerprint
+        );
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_binds_executable_mode_even_when_git_filemode_is_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, lease, report) = fixture();
+        git(&root, &["config", "core.filemode", "false"]);
+        fs::set_permissions(root.join("tracked.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = DeliverableSpec {
+            form: DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: vec!["tracked.txt".to_owned()],
+        };
+        let first = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+            None,
+        )
+        .await
+        .expect("commit physical executable mode");
+        let head = first.head_commit.unwrap();
+        assert_eq!(first.base_commit, lease.base_commit);
+        assert!(git(&root, &["ls-tree", &head, "--", "tracked.txt"]).starts_with("100755 "));
+        assert_eq!(git(&root, &["config", "core.filemode"]), "false");
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let bytes = fs::read(root.join("tracked.txt")).unwrap();
+        fs::set_permissions(root.join("tracked.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), bytes);
+        let changed_fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        assert_ne!(changed_fingerprint, fingerprint);
+        let error = export(
+            Uuid::new_v4(),
+            &spec,
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect_err("physical executable-mode drift must reject a preserved head");
+        assert!(error.to_string().contains("tree changed"));
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(git(&root, &["config", "core.filemode"]), "false");
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            changed_fingerprint
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn verifier_only_export_preserves_post_base_git_modes_and_readonly_source() {
+        let (root, lease, report) = fixture();
+        git(&root, &["config", "core.filemode", "false"]);
+        git(&root, &["update-index", "--chmod=+x", "--", "tracked.txt"]);
+        git(&root, &["commit", "-m", "verified executable mode"]);
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        assert!(git(&root, &["ls-tree", &head, "--", "tracked.txt"]).starts_with("100755 "));
+        assert!(
+            git(&root, &["ls-tree", &lease.base_commit, "--", "tracked.txt"])
+                .starts_with("100644 ")
+        );
+        git(&root, &["config", "core.filemode", "true"]);
+        let original_permissions = fs::metadata(root.join("tracked.txt"))
+            .unwrap()
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(root.join("tracked.txt"), readonly).unwrap();
+        fs::write(root.join("other.txt"), b"unselected staged\n").unwrap();
+        git(&root, &["add", "other.txt"]);
+        fs::write(root.join("other.txt"), b"unselected physical\n").unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let exported = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: vec!["tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["tracked.txt".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect("preserve committed executable bit without inferring it from Windows permissions");
+        assert_eq!(exported.base_commit, lease.base_commit);
+        assert_eq!(exported.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&root, &["config", "core.filemode"]), "true");
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
+        );
+        assert!(
+            fs::metadata(root.join("tracked.txt"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        let document: Value = serde_json::from_slice(&exported.bytes).unwrap();
+        let changes = document["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["path"], "tracked.txt");
+        assert_eq!(changes[0]["mode"], "100755");
+        fs::set_permissions(root.join("tracked.txt"), original_permissions).unwrap();
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn verifier_only_export_rejects_unselected_preserved_head_changes() {
+        let (root, lease, report) = fixture();
+        fs::write(root.join("tracked.txt"), b"selected committed\n").unwrap();
+        fs::write(root.join("other.txt"), b"unselected committed\n").unwrap();
+        git(&root, &["add", "tracked.txt", "other.txt"]);
+        git(
+            &root,
+            &["commit", "-m", "head contains an unselected change"],
+        );
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
+        let error = export(
+            Uuid::new_v4(),
+            &DeliverableSpec {
+                form: DeliverableForm::CommitBranch,
+                commit_after_verification: true,
+                paths: vec!["tracked.txt".to_owned()],
+            },
+            &lease,
+            &report,
+            &[],
+            &["**".to_owned()],
+            Some(&head),
+        )
+        .await
+        .expect_err("preserving a head must not widen the selected export");
+        assert!(error.to_string().contains("tree changed"));
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn commit_form_bundles_validated_branch_when_head_is_detached() {
         let (root, lease, report) = fixture();
         git(&root, &["checkout", "--detach", &lease.base_commit]);
@@ -1133,6 +1553,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("detached commit export");
@@ -1174,6 +1595,9 @@ mod tests {
         fs::write(root.join("tracked.txt"), b"selected\n").expect("modify selected");
         fs::write(root.join("other.txt"), b"other staged\n").expect("modify other");
         git(&root, &["add", "other.txt"]);
+        fs::write(root.join("other.txt"), b"other unstaged\n").expect("modify unselected source");
+        let staged_other = git(&root, &["ls-files", "--stage", "--", "other.txt"]);
+        let fingerprint = crate::workspace::fingerprint_path(&root).await.unwrap();
         let exported = export(
             Uuid::new_v4(),
             &DeliverableSpec {
@@ -1185,6 +1609,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("scoped commit export");
@@ -1196,6 +1621,14 @@ mod tests {
         assert_eq!(
             git(&root, &["show", "--format=", "--name-only", "HEAD"]),
             "tracked.txt"
+        );
+        assert_eq!(
+            git(&root, &["ls-files", "--stage", "--", "other.txt"]),
+            staged_other
+        );
+        assert_eq!(
+            crate::workspace::fingerprint_path(&root).await.unwrap(),
+            fingerprint
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -1223,6 +1656,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect("literal scoped commit export");
@@ -1259,6 +1693,7 @@ mod tests {
             &report,
             &[],
             &["tracked.txt".to_owned()],
+            None,
         )
         .await
         .expect("scoped commit export");
@@ -1315,6 +1750,7 @@ mod tests {
             &report,
             &[],
             &["**".to_owned()],
+            None,
         )
         .await
         .expect_err("symlink must fail");

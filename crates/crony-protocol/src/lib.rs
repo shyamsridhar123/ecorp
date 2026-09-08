@@ -1,5 +1,6 @@
 use crony_domain::{
-    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryController, FactoryWorkItem,
+    CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryController,
+    FactoryVerificationRecovery, FactoryVerificationRecoveryMode, FactoryWorkItem,
     FactoryWorkItemState, MissionBudgetRevision, MissionContractRevision,
     MissionContractRevisionAction, PullRequestPublication, SourceDeliverable, TaskContract,
     TaskSecretReference, VerificationPolicy,
@@ -122,6 +123,8 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ResumeRun {
+        #[serde(default)]
+        command_id: Option<Uuid>,
         corp_id: Uuid,
         room_id: Uuid,
         mission_id: Uuid,
@@ -139,11 +142,53 @@ pub enum ServerToRunner {
         source_base_ref: Option<String>,
         source_base_commit: Option<String>,
         workspace_base_commit: Option<String>,
+        #[serde(default)]
+        expected_workspace_fingerprint: Option<String>,
+        #[serde(default)]
+        expected_head_commit: Option<String>,
         verification_policy: VerificationPolicy,
         #[serde(default)]
         write_scope: Vec<String>,
         deliverable: Option<DeliverableSpec>,
         secrets: Vec<ResolvedSecret>,
+    },
+    VerifyRun {
+        command_id: Uuid,
+        corp_id: Uuid,
+        room_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        workspace_run_id: Uuid,
+        agent_id: Uuid,
+        assignment_token: Uuid,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
+        workspace_base_commit: String,
+        expected_workspace_fingerprint: String,
+        expected_head_commit: Option<String>,
+        verification_policy: VerificationPolicy,
+        #[serde(default)]
+        write_scope: Vec<String>,
+        deliverable: Option<DeliverableSpec>,
+        provider_artifact: Option<VerificationArtifactReference>,
+    },
+    CheckpointWorkspace {
+        command_id: Uuid,
+        corp_id: Uuid,
+        room_id: Uuid,
+        mission_id: Uuid,
+        task_id: Uuid,
+        run_id: Uuid,
+        workspace_run_id: Uuid,
+        agent_id: Uuid,
+        assignment_token: Uuid,
+        source_repository: Option<String>,
+        source_base_ref: Option<String>,
+        source_base_commit: Option<String>,
+        workspace_base_commit: String,
+        expected_head_commit: String,
     },
     ControlMessage {
         #[serde(default)]
@@ -182,6 +227,33 @@ pub enum ServerToRunner {
         reason: String,
         reconnect_delay_ms: u64,
     },
+}
+
+pub const MAX_VERIFICATION_ARTIFACT_BYTES: usize = 16_777_216;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VerificationArtifactReference {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: usize,
+    pub media_type: String,
+    /// Hydrated from verified object storage only for the authenticated runner
+    /// dispatch. Durable command records retain metadata, not artifact contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+}
+
+impl std::fmt::Debug for VerificationArtifactReference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerificationArtifactReference")
+            .field("path", &self.path)
+            .field("sha256", &self.sha256)
+            .field("bytes", &self.bytes)
+            .field("media_type", &self.media_type)
+            .field("has_inline_data", &self.data_base64.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +459,26 @@ pub struct CreateMissionResponse {
     pub strategy: String,
 }
 
+/// Informational only: creation replans and revalidates current authority.
+/// Provisional staffing identities and task contracts are deliberately omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewMissionResponse {
+    pub strategy: String,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub tasks: Vec<PreviewMissionTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewMissionTask {
+    pub key: String,
+    pub title: String,
+    pub budget_tokens: i64,
+    pub budget_cost_microusd: i64,
+    pub depends_on: Vec<String>,
+    pub max_attempts: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimFactoryWorkItemRequest {
     pub actor_id: Uuid,
@@ -516,6 +608,65 @@ pub struct FactoryControllerResponse {
 
 const fn default_factory_controller_lease_seconds() -> i64 {
     30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFactoryWorkspaceRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub source_run_id: Uuid,
+    pub expected_head_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFactoryWorkspaceResponse {
+    pub work_item: FactoryWorkItem,
+    pub claim_token: Option<Uuid>,
+    pub source_run_id: Uuid,
+    pub command_id: Option<Uuid>,
+    pub workspace_fingerprint: Option<String>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryVerificationRecoveryContextResponse {
+    pub work_item: FactoryWorkItem,
+    pub recoveries: Vec<FactoryVerificationRecovery>,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub source_run_id: Uuid,
+    pub remaining_attempts: i32,
+    pub remaining_mission_tokens: i64,
+    pub remaining_mission_cost_microusd: i64,
+    pub workspace_fingerprint: Option<String>,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFactoryVerificationRecoveryRequest {
+    pub actor_id: Uuid,
+    pub claim_token: Uuid,
+    pub expected_factory_version: i64,
+    pub idempotency_key: Uuid,
+    pub source_run_id: Uuid,
+    pub mode: FactoryVerificationRecoveryMode,
+    pub reason: String,
+    pub observed_source_revision: String,
+    #[serde(default)]
+    pub reviewed_source_snapshot: Value,
+    pub contract_revision_id: Option<Uuid>,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateFactoryVerificationRecoveryResponse {
+    pub recovery: FactoryVerificationRecovery,
+    pub work_item: FactoryWorkItem,
+    pub run_id: Uuid,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,12 +1053,15 @@ pub struct VerificationDecisionRequest {
     pub actor_id: Uuid,
     pub approved: bool,
     pub note: String,
+    #[serde(default)]
+    pub decision_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationDecisionResponse {
     pub run_id: Uuid,
     pub status: String,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,6 +1093,65 @@ pub struct SetBudgetPolicyRequest {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn mission_preview_wire_shape_is_only_the_public_graph_summary() {
+        let response = super::PreviewMissionResponse {
+            strategy: "parallel-specialists".to_owned(),
+            budget_tokens: 10_001,
+            budget_cost_microusd: 20_003,
+            tasks: vec![
+                super::PreviewMissionTask {
+                    key: "prepare".to_owned(),
+                    title: "Prepare".to_owned(),
+                    budget_tokens: 4_000,
+                    budget_cost_microusd: 8_000,
+                    depends_on: Vec::new(),
+                    max_attempts: 2,
+                },
+                super::PreviewMissionTask {
+                    key: "deliver".to_owned(),
+                    title: "Deliver".to_owned(),
+                    budget_tokens: 6_001,
+                    budget_cost_microusd: 12_003,
+                    depends_on: vec!["prepare".to_owned()],
+                    max_attempts: 1,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&response).expect("serialize preview");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "strategy": "parallel-specialists",
+                "budget_tokens": 10_001,
+                "budget_cost_microusd": 20_003,
+                "tasks": [
+                    {
+                        "key": "prepare",
+                        "title": "Prepare",
+                        "budget_tokens": 4_000,
+                        "budget_cost_microusd": 8_000,
+                        "depends_on": [],
+                        "max_attempts": 2
+                    },
+                    {
+                        "key": "deliver",
+                        "title": "Deliver",
+                        "budget_tokens": 6_001,
+                        "budget_cost_microusd": 12_003,
+                        "depends_on": ["prepare"],
+                        "max_attempts": 1
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::PreviewMissionResponse>(wire)
+                .expect("deserialize preview"),
+            response
+        );
+    }
+
+    #[test]
     fn launch_replay_flag_is_backward_compatible_with_prior_responses() {
         let run_id = uuid::Uuid::new_v4();
         let response: super::LaunchMissionResponse = serde_json::from_value(serde_json::json!({
@@ -959,7 +1172,54 @@ mod tests {
         );
     }
 
-    use super::ServerToRunner;
+    use super::{ServerToRunner, VerificationArtifactReference};
+
+    #[test]
+    fn verifier_artifact_reference_preserves_metadata_only_wire_compatibility() {
+        let metadata = serde_json::json!({
+            "path": "provider.json",
+            "sha256": "0".repeat(64),
+            "bytes": 2,
+            "media_type": "application/json",
+        });
+        let reference: VerificationArtifactReference =
+            serde_json::from_value(metadata.clone()).expect("legacy artifact reference");
+        assert!(reference.data_base64.is_none());
+        assert_eq!(
+            serde_json::to_value(reference).expect("metadata-only serialization"),
+            metadata
+        );
+    }
+
+    #[test]
+    fn verifier_artifact_transfer_is_explicit_in_the_runner_wire_shape() {
+        let reference = VerificationArtifactReference {
+            path: "provider.json".to_owned(),
+            sha256: "0".repeat(64),
+            bytes: 2,
+            media_type: "application/json".to_owned(),
+            data_base64: Some("e30=".to_owned()),
+        };
+        let wire = serde_json::to_value(reference).expect("inline runner transfer");
+        assert_eq!(wire["data_base64"], "e30=");
+        let decoded: VerificationArtifactReference =
+            serde_json::from_value(wire).expect("inline runner transfer decode");
+        assert_eq!(decoded.data_base64.as_deref(), Some("e30="));
+    }
+
+    #[test]
+    fn verifier_artifact_debug_never_discloses_transferred_bytes() {
+        let reference = VerificationArtifactReference {
+            path: "provider.json".to_owned(),
+            sha256: "0".repeat(64),
+            bytes: 2,
+            media_type: "application/json".to_owned(),
+            data_base64: Some("PRIVATE_ARTIFACT_BYTES".to_owned()),
+        };
+        let debug = format!("{reference:?}");
+        assert!(debug.contains("has_inline_data: true"));
+        assert!(!debug.contains("PRIVATE_ARTIFACT_BYTES"));
+    }
 
     #[test]
     fn durable_control_message_accepts_the_legacy_wire_shape() {

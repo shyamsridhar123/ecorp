@@ -25,6 +25,21 @@ active work item in `BACKLOG.md`.
 Search the Project and repository issues before creating work. Add every live issue to Project #3,
 record explicit dependencies, and use one independently verifiable outcome per issue.
 
+## Reuse the harness before building
+
+ECorp coordinates existing agent harnesses; it should not rebuild their execution loops, tools,
+session persistence, or permission systems. For any proposed mechanism, record in the issue or PR:
+
+1. The selected harness and pinned version, plus the native capability you checked.
+2. The concrete requirement that capability does not satisfy.
+3. The smallest adapter or ECorp-level change needed, with verification evidence.
+
+Prefer the existing native session/resume and permission interfaces. Do not add another approval
+for the same currently authorized action and exact scope, or turn every artifact into a decision.
+ECorp still owns shared tenant authority, cross-agent coordination, budgets, durable audit, and
+outcome verification. A harness permission callback or configured sandbox is not, by itself, proof
+of those boundaries.
+
 ## Work safely
 
 - Never run write-capable work in the configured source checkout.
@@ -53,9 +68,11 @@ with the recorded parent branch only after coordinating the landing order.
 A contributor clone contains the ECorp dark-factory implementation. OpenAI Symphony inspired parts
 of the operating model, but Symphony is not an ECorp dependency and does not need to be installed.
 Contributors supply their own provider identity and private runner workspace. A local server is
-appropriate for isolated testing or a disjoint backlog. Factories consuming the same backlog must
-use the same authenticated control plane, Corp and claim namespace. A shared GitHub Project alone
-is not an execution lock.
+appropriate for solo testing or a disjoint backlog. Factories consuming the same backlog must use
+the **same authenticated server/control plane, the same Corp, and the same claim namespace**
+(the same canonical GitHub Project owner, Project number, and Project item identity).
+Database co-location, separate Corps on one server, or a shared GitHub Project alone do not unify
+claim authority.
 
 Prerequisites are Git, PowerShell 7.4+ on Windows, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
 Compose, GitHub CLI authenticated for the repository and Project #3, and any provider entitlement
@@ -81,9 +98,9 @@ pwsh -NoProfile -File ./tools/stop_local.ps1
 
 The server owns authoritative organizational state. The outbound runner owns provider processes and
 isolated worktrees. Closing a browser or desktop client must not terminate a run. Do not share the
-runner workspace, credential directory or provider state directory with another contributor.
-Shared operation uses the authenticated control plane, not shared database credentials.
-Contributors running on the same machine must also coordinate the stack's ports and
+runner workspace, credential directory, or provider state directory with another contributor.
+Shared deployments expose one authenticated ECorp authority, not shared database credentials.
+Contributors running local tests on the same machine must also coordinate the stack's ports and
 shared development Compose database.
 
 ### Local startup and recovery
@@ -167,8 +184,13 @@ Personal factory hosts do not create personal backlogs. Every contributor must u
 - require persisted verifier evidence and independent review before publication; and
 - never use `docs/BACKLOG.md` as a second queue.
 
-Separate local servers may race for the same issue. The GitHub Project transition and source
-revalidation are the cross-machine fence; never bypass them with a manually launched agent.
+Separate local servers can both observe an eligible issue before either changes its Project status.
+GitHub status and labels are not an atomic execution lock. Do not run unattended consumers of the
+same backlog against independent ECorp databases. Use the same server/control plane, same Corp,
+and same claim namespace with separately enrolled runners, or explicitly partition the eligible
+issue sets. Merely placing databases on one host is not coordination. Automatic enforcement and multi-host
+acceptance remain tracked in [#161](https://github.com/shyamsridhar123/ecorp/issues/161); this guidance
+does not claim that the gap is fixed.
 
 For a shared remote ECorp deployment instead of independent local factories, configure production
 OIDC, Corp membership, runner enrollment, private artifact storage, and the other production
@@ -178,6 +200,13 @@ boundaries in the architecture and security guides.
 
 Run targeted tests for the changed behavior. For user-visible behavior, exercise the complete
 browser-to-server-to-runner path; unit tests alone are insufficient.
+
+Keep local QA resource ownership explicit. Reuse an owned fixture instead of creating a new
+database container for every attempt. Never run destructive fixtures against a manual session's
+database or source checkout. Record process, port, and container identities before starting a
+test; on completion or failure, stop only those owned services and preserve their data and
+evidence. Do not leave parallel QA stacks running merely to retain their results, and do not
+prune unrelated containers, volumes, or worktrees as cleanup.
 
 The repository gate is:
 
@@ -209,6 +238,8 @@ quota/recovery section for the supported behavior.
 
 - Link the source issue.
 - State the source base, write scope, changed files, and exact local validation.
+- For orchestration or runtime mechanisms, include the native-capability check and the specific
+  ECorp gap rather than proposing a parallel harness.
 - Distinguish observed local evidence from unverified hosted or production claims.
 - Keep merge, auto-merge, and deployment disabled unless a separate current authorization permits
   them. Ordinary contribution and factory publication authorize review only.

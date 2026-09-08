@@ -5,6 +5,7 @@ import './Arcade.css'
 import './Cabinet.css'
 import './World.css'
 import './Accessible.css'
+import './OperationsUx.css'
 import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
 import { FactoryPollingNotice } from './FactoryPollingNotice'
@@ -17,6 +18,10 @@ import {
   STUDIO_STRATEGY, STUDIO_STRATEGY_LABEL, usesDeterministicHarness, workspaceCapability,
 } from './missionRuntime'
 import type { RepositoryTarget, RunnerCapability, RunnerNode } from './missionRuntime'
+import {
+  buildMissionRequest, currentMissionPreview, missionRequestScope, startMissionPreview,
+} from './missionPreview'
+import type { MissionPreviewLoad, MissionRequestScope } from './missionPreview'
 
 type Actor = {
   id: string
@@ -179,6 +184,8 @@ type Run = {
   workspace_base_commit: string | null
   workspace_disposition: string | null
   workspace_detail: string | null
+  workspace_fingerprint: string | null
+  execution_mode: 'provider' | 'verification_only'
   verification_status: string
   verification_summary: string | null
   verification_sha256: string | null
@@ -386,6 +393,7 @@ type MissionBudgetRevisionInput = {
 
 type FactoryWorkItem = {
   id: string
+  corp_id: string
   source_project_owner: string
   source_project_number: number
   source_project_item_id: string
@@ -435,6 +443,54 @@ type FactoryController = {
   last_reconciled_at: string | null
   last_reconcile_result: 'succeeded' | 'failed' | null
   last_error: string | null
+}
+
+type FactoryVerificationRecovery = {
+  id: string
+  factory_work_item_id: string
+  mission_id: string
+  task_id: string
+  source_run_id: string
+  replacement_run_id: string | null
+  mode: 'source_correction' | 'verifier_only'
+  status: 'authorized' | 'running' | 'completed' | 'failed'
+  authorized_by: string
+  reason: string
+  observed_source_revision: string
+  contract_revision_id: string | null
+  previous_verification_policy: VerificationPolicy
+  replacement_verification_policy: VerificationPolicy
+  created_at: string
+  updated_at: string
+}
+
+type FactoryVerificationRecoveryContextResponse = {
+  work_item: FactoryWorkItem
+  recoveries: FactoryVerificationRecovery[]
+  mission_id: string
+  task_id: string
+  source_run_id: string
+  remaining_attempts: number
+  remaining_mission_tokens: number
+  remaining_mission_cost_microusd: number
+  workspace_fingerprint: string | null
+  expected_head_commit: string | null
+}
+
+type FactoryRecoveryContextScope = {
+  corpId: string
+  actorId: string
+  missionId: string
+  itemId: string
+  version: number
+  reload: number
+}
+
+type FactoryRecoveryContextLoad = {
+  scopeKey: string
+  status: 'loading' | 'ready' | 'error'
+  data: FactoryVerificationRecoveryContextResponse | null
+  error: string | null
 }
 
 type DomainEvent = {
@@ -494,6 +550,7 @@ type SnapshotResponse = {
     circuit_breaker_incidents: CircuitBreakerIncident[]
     factory_work_items: FactoryWorkItem[]
     factory_controllers?: FactoryController[]
+    factory_verification_recoveries: FactoryVerificationRecovery[]
     events: DomainEvent[]
   }
   runners: RunnerNode[]
@@ -987,7 +1044,7 @@ function VerificationPolicyEditor({
     <div className="verification-policy-editor" data-testid={`${idPrefix}-verification-editor`}>
       <div className="contract-section-heading">
         <div>
-          <strong>Victory gate editor</strong>
+          <strong>Verification checks</strong>
           <span>Each check executes on the runner inside the assigned worktree.</span>
         </div>
         <button
@@ -3025,7 +3082,161 @@ function BudgetRevisionPanel({
   )
 }
 
+// Only exact run-bound receipts establish a total. Task policies can be revised
+// without starting a run, and the absence of older history in a snapshot proves nothing.
+function automatedVerificationPresentation(
+  run: Run | undefined,
+  evidence: VerificationEvidence[],
+  events: DomainEvent[],
+  recoveries: FactoryVerificationRecovery[],
+) {
+  const records = run
+    ? evidence.filter((item) => item.run_id === run.id && item.task_id === run.task_id)
+        .toSorted((left, right) => left.check_index - right.check_index)
+    : []
+  const receipts = run ? [
+    ...events.filter((event) =>
+      event.type === 'run.verification_started' &&
+      event.aggregate_type === 'run' && event.aggregate_id === run.id,
+    ).map((event) => event.payload.check_count),
+    ...recoveries.filter((recovery) =>
+      recovery.replacement_run_id === run.id && recovery.task_id === run.task_id,
+    ).map((recovery) => recovery.replacement_verification_policy?.checks?.length),
+  ] : []
+  const validReceipts = receipts.filter(
+    (count): count is number => typeof count === 'number' && Number.isSafeInteger(count) && count > 0,
+  )
+  const totals = new Set(validReceipts)
+  const conflicting = receipts.length !== validReceipts.length || totals.size > 1
+  const total = !conflicting && totals.size === 1 ? [...totals][0] : null
+  const inconsistent = new Set(records.map((item) => item.check_index)).size !== records.length ||
+    records.some((item) => !Number.isInteger(item.check_index) || item.check_index < 0 ||
+      !['passed', 'failed'].includes(item.status) ||
+      (total !== null && item.check_index >= total))
+  const passed = records.filter((item) => item.status === 'passed').length
+  const failed = records.filter((item) => item.status === 'failed').length
+  const missing = total !== null && !inconsistent ? total - records.length : null
+  const complete = missing === 0 && failed === 0
+  const status = failed > 0 ? 'failed' : complete ? 'passed' : 'pending'
+  const summary = inconsistent
+    ? 'Check records are inconsistent; inspect the recorded evidence.'
+    : conflicting
+      ? 'Run-bound check count is inconsistent; completeness is unknown.'
+      : total === null
+        ? 'Run-bound check total unavailable; recorded results only.'
+        : records.length === 0
+          ? 'No check results recorded'
+          : failed > 0
+            ? `${failed} check${failed === 1 ? '' : 's'} failed`
+            : complete ? 'All recorded checks passed' : 'Recorded checks passed; evidence is incomplete.'
+  const score = inconsistent
+    ? `${passed} passing records · completeness unknown`
+    : total === null ? `${passed} passed · total unknown` : `${passed}/${total} passed`
+  return { records, total, passed, failed, missing, status, summary, score }
+}
+
+function factoryRecoveryScopeKey(scope: FactoryRecoveryContextScope): string {
+  return JSON.stringify([
+    scope.corpId, scope.actorId, scope.missionId, scope.itemId, scope.version, scope.reload,
+  ])
+}
+
+function currentFactoryRecoveryLoad(
+  scope: FactoryRecoveryContextScope | null,
+  load: FactoryRecoveryContextLoad | null,
+) {
+  return scope && load?.scopeKey === factoryRecoveryScopeKey(scope) ? load : null
+}
+
+// Exact, authenticated, read-only context. A cleanup fences even a transport that
+// finishes after abort; the render-time scope check also hides old data immediately.
+function requestFactoryRecoveryContext(
+  scope: FactoryRecoveryContextScope,
+  publish: (load: FactoryRecoveryContextLoad) => void,
+) {
+  const controller = new AbortController()
+  const scopeKey = factoryRecoveryScopeKey(scope)
+  let current = true
+  publish({ scopeKey, status: 'loading', data: null, error: null })
+  const timeout = setTimeout(() => {
+    if (current && !controller.signal.aborted) {
+      publish({ scopeKey, status: 'error', data: null, error: 'Recovery context request timed out. Retry the read-only lookup.' })
+      controller.abort()
+    }
+  }, 15_000)
+  void api<FactoryVerificationRecoveryContextResponse>(
+    `/api/corps/${encodeURIComponent(scope.corpId)}/factory/work-items/${encodeURIComponent(scope.itemId)}/verification-recoveries?actor_id=${encodeURIComponent(scope.actorId)}`,
+    { method: 'GET', signal: controller.signal },
+  ).then((data) => {
+    if (!current || controller.signal.aborted) return
+    if (data.work_item?.id !== scope.itemId || data.work_item.corp_id !== scope.corpId ||
+      data.work_item.version !== scope.version || data.work_item.mission_id !== scope.missionId ||
+      data.mission_id !== scope.missionId) {
+      throw new Error('Recovery context does not match the current item/version. Wait for refreshed state or retry the lookup.')
+    }
+    if (typeof data.task_id !== 'string' || !data.task_id ||
+      typeof data.source_run_id !== 'string' || !data.source_run_id ||
+      !Array.isArray(data.recoveries) ||
+      !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+      ![data.remaining_attempts, data.remaining_mission_tokens, data.remaining_mission_cost_microusd].every(Number.isFinite)) {
+      throw new Error('Recovery context is missing required source, checkpoint or remaining-budget fields. No snapshot fallback is used.')
+    }
+    publish({ scopeKey, status: 'ready', data, error: null })
+  }).catch((error: unknown) => {
+    if (!current || controller.signal.aborted) return
+    publish({
+      scopeKey, status: 'error', data: null,
+      error: error instanceof Error ? error.message : 'Recovery context could not be loaded.',
+    })
+  }).finally(() => clearTimeout(timeout))
+  return () => {
+    current = false
+    clearTimeout(timeout)
+    controller.abort()
+  }
+}
+
+// Presentation only: selection, attempts and budgets belong to the exact endpoint.
+// Snapshot records add warnings/status labels, never eligibility or fallback sources.
+function factoryRecoveryPresentation(
+  context: FactoryVerificationRecoveryContextResponse | null,
+  runs: Run[],
+) {
+  if (!context) return null
+  const run = runs.find((candidate) =>
+    candidate.id === context.source_run_id && candidate.task_id === context.task_id,
+  )
+  const quarantined = runs.some((candidate) =>
+    candidate.workspace_disposition === 'quarantined' &&
+    (!run || candidate.workspace_run_id === run.workspace_run_id),
+  )
+  const active = context.recoveries.find((recovery) =>
+    recovery.status === 'authorized' || recovery.status === 'running',
+  )
+  const state = quarantined ? 'quarantined' : active ? 'active'
+    : context.workspace_fingerprint ? 'ready' : 'checkpoint_required'
+  return {
+    run,
+    state,
+    heading: quarantined ? 'Quarantine warning — inspect controller context'
+      : active ? 'Recovery already authorized'
+        : context.workspace_fingerprint ? 'Recover preserved work' : 'Checkpoint and recheck',
+    detail: quarantined
+      ? run
+        ? 'A visible record in the selected source lineage is quarantined. Its checkpoint hash is withheld. Inspect the native controller before executing a copied request; this lookup does not authorize recovery.'
+        : 'A visible mission workspace is quarantined, but this endpoint does not include source-workspace lineage details. The checkpoint hash is withheld until the native controller can resolve that warning.'
+      : active
+        ? 'An existing recovery is authorized or running. Inspect that operation through the controller; do not create a duplicate grant. Copied templates are not a new authorization.'
+        : context.workspace_fingerprint
+          ? 'Recheck saved work without a model call, or request a focused correction in the same session. The controller rechecks authorization before running.'
+          : 'The controller can ask the owning runner to seal this older workspace before rechecking it. The original work stays in place; copying a command executes nothing.',
+    checkpoint: quarantined || active ? null : context.workspace_fingerprint,
+    recoveryCount: context.recoveries.length,
+  }
+}
+
 function MissionCard({
+  corpId,
   mission,
   tasks,
   runs,
@@ -3037,6 +3248,9 @@ function MissionCard({
   actors,
   verificationRequests,
   actionApprovals,
+  factoryItem,
+  factoryRecoveries,
+  events,
   actorId,
   actorRole,
   busy,
@@ -3050,6 +3264,7 @@ function MissionCard({
   onVerificationDecision,
   onActionApprovalDecision,
 }: {
+  corpId: string
   mission: Mission
   tasks: Task[]
   runs: Run[]
@@ -3061,6 +3276,9 @@ function MissionCard({
   actors: Actor[]
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
+  factoryItem: FactoryWorkItem | undefined
+  factoryRecoveries: FactoryVerificationRecovery[]
+  events: DomainEvent[]
   actorId: string
   actorRole: string
   busy: boolean
@@ -3086,6 +3304,23 @@ function MissionCard({
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
 }) {
+  const [copiedRecoveryCommand, setCopiedRecoveryCommand] = useState<string | null>(null)
+  const [recoveryContextLoad, setRecoveryContextLoad] = useState<FactoryRecoveryContextLoad | null>(null)
+  const [recoveryReload, setRecoveryReload] = useState(0)
+  const recoveryItemId = factoryItem?.id
+  const recoveryItemVersion = factoryItem?.version
+  const recoveryItemState = factoryItem?.state
+  const recoveryScope = useMemo<FactoryRecoveryContextScope | null>(() =>
+    recoveryItemId && recoveryItemVersion !== undefined && recoveryItemState === 'verification_failed'
+      ? { corpId, actorId, missionId: mission.id, itemId: recoveryItemId, version: recoveryItemVersion, reload: recoveryReload }
+      : null,
+  [corpId, actorId, mission.id, recoveryItemId, recoveryItemVersion, recoveryItemState, recoveryReload])
+  useEffect(() => {
+    if (!recoveryScope) return
+    return requestFactoryRecoveryContext(recoveryScope, setRecoveryContextLoad)
+  }, [recoveryScope])
+  const scopedRecoveryLoad = currentFactoryRecoveryLoad(recoveryScope, recoveryContextLoad)
+  const recoveryContext = scopedRecoveryLoad?.status === 'ready' ? scopedRecoveryLoad.data : null
   const orderedTasks = tasks.toSorted((left, right) =>
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
@@ -3126,11 +3361,24 @@ function MissionCard({
   const pendingActionApprovals = actionApprovals.filter(
     (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
   )
-  const latestEvidence = latestRun
-    ? evidence
-        .filter((item) => item.run_id === latestRun.id)
-        .toSorted((left, right) => left.check_index - right.check_index)
-    : []
+  const automated = automatedVerificationPresentation(latestRun, evidence, events, factoryRecoveries)
+  const latestEvidence = automated.records
+  const latestVerificationRequest = latestRun
+    ? verificationRequests.find(
+        (request) => request.run_id === latestRun.id && request.task_id === latestRun.task_id,
+      )
+    : undefined
+  const reviewRejected = latestVerificationRequest?.status === 'rejected'
+  const reviewDecisionLabel = latestVerificationRequest?.gate_type === 'independent_review'
+    ? 'Independent review'
+    : 'Human approval'
+  const reviewer = actors.find((actor) => actor.id === latestVerificationRequest?.decided_by)
+  const reviewDecisionNote = latestVerificationRequest?.decision_note?.trim() ||
+    'No reason was recorded for this decision.'
+  const compactReviewNote = reviewDecisionNote.replace(/\s+/g, ' ')
+  const reviewDecisionSummary = compactReviewNote.length > 240
+    ? `${compactReviewNote.slice(0, 237).trimEnd()}…`
+    : compactReviewNote
   const latestDeliverable = latestRun
     ? deliverables.find((deliverable) => deliverable.run_id === latestRun.id)
     : undefined
@@ -3138,6 +3386,71 @@ function MissionCard({
     latestRun && terminalRun(latestRun.status)
       ? latestRun.summary ?? latestRun.verification_summary
       : null
+  const recovery = factoryRecoveryPresentation(recoveryContext, runs)
+  // The endpoint selects the task. This exact-ID lookup supplies command metadata
+  // only; absence is a field gap, never permission to pick a different task/source.
+  const recoveryTask = recoveryContext
+    ? tasks.find((task) => task.id === recoveryContext.task_id && task.mission_id === recoveryContext.mission_id)
+    : undefined
+  const recoveryItem = recoveryContext?.work_item
+  const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
+  const recoveryAgent = recoveryTask?.assigned_agent_id
+    ? agents.find((agent) => agent.id === recoveryTask.assigned_agent_id)
+    : undefined
+  const recoveryAdapter = recoveryTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
+  const recoverySourceBase = typeof recoveryItem?.policy.source_base_ref === 'string'
+    ? recoveryItem.policy.source_base_ref : recoveryTask?.contract.source_base_ref
+  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase)
+  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
+    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase) return ''
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+    const command = [
+      'crony factory',
+      quote(corpId),
+      quote(actorId),
+      '--owner',
+      quote(recoveryItem.source_project_owner),
+      '--project-number',
+      String(recoveryItem.source_project_number),
+      '--repository',
+      quote(`${recoveryItem.source_repository_owner}/${recoveryItem.source_repository_name}`),
+      '--source-base-ref',
+      quote(recoverySourceBase),
+      '--adapter',
+      quote(recoveryAdapter),
+      '--budget-tokens',
+      String(mission.budget_tokens),
+      '--budget-cost-microusd',
+      String(mission.budget_cost_microusd),
+      '--issue',
+      String(recoveryItem.source_issue_number),
+      '--verification-recovery',
+      mode,
+      '--verification-recovery-reason',
+      quote('Explain why this bounded recovery is authorized.'),
+    ]
+    if (recoveryTask.contract.model) {
+      command.push('--model', quote(recoveryTask.contract.model))
+    }
+    if (recoveryTask.contract.reasoning_effort) {
+      command.push('--reasoning-effort', quote(recoveryTask.contract.reasoning_effort))
+    }
+    return command.join(' ')
+  }
+  const recoveryCopyKey = (mode: 'verifier-only' | 'source-correction') =>
+    `${scopedRecoveryLoad?.scopeKey}:${recoveryContext?.source_run_id}:${recoveryCommand(mode)}`
+  const copyRecoveryCommand = async (
+    mode: 'verifier-only' | 'source-correction',
+  ) => {
+    const command = recoveryCommand(mode)
+    if (!command || !canAuthorizeRecovery) return
+    try {
+      await navigator.clipboard.writeText(command)
+      setCopiedRecoveryCommand(recoveryCopyKey(mode))
+    } catch {
+      setCopiedRecoveryCommand(null)
+    }
+  }
   return (
     <article
       className="mission-card"
@@ -3360,16 +3673,25 @@ function MissionCard({
       {latestRun &&
       (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
         <details
-          className={`verification-box verification-${latestRun.verification_status}`}
+          key={`verification-${latestRun.id}`}
+          className={`verification-box operations-verification verification-${automated.status}`}
           data-testid="verification-evidence"
-          open={latestRun.verification_status === 'failed'}
+          data-check-total={automated.total ?? 'unknown'}
         >
           <summary>
-            <strong>{statusLabel(latestRun.verification_status)}</strong>
-            <span>
-              {latestEvidence.filter((item) => item.status === 'passed').length}/
-              {latestEvidence.length} checks passed
+            <span className="operations-verification-copy">
+              <strong>Automated verification</strong>
+              <small>
+                {automated.summary}
+                {automated.missing !== null && automated.missing > 0
+                  ? ` · ${automated.missing} result${automated.missing === 1 ? '' : 's'} not recorded`
+                  : ''}
+              </small>
             </span>
+            <span className="operations-verification-score">
+              {automated.score}
+            </span>
+            <span className="operations-disclosure-mark" aria-hidden="true">+</span>
           </summary>
           {latestEvidence.length ? (
             <ol className="evidence-checks">
@@ -3384,34 +3706,205 @@ function MissionCard({
           ) : null}
         </details>
       ) : null}
-      {latestRun && terminalRun(latestRun.status) ? (
-        <div className={`terminal-summary terminal-${latestRun.status}`}>
-          <strong>{statusLabel(latestRun.status)}</strong>
-          <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+      {reviewRejected ? (
+        <section
+          className="operations-review-decision"
+          role="alert"
+          aria-labelledby={`review-decision-${mission.id}`}
+          data-testid="review-decision"
+        >
+          <span className="operations-review-label">{reviewDecisionLabel}</span>
+          <strong id={`review-decision-${mission.id}`}>Changes requested</strong>
           <small>
-            Worktree: {latestRun.workspace_disposition
-              ? statusLabel(latestRun.workspace_disposition)
-              : 'cleanup pending'}
-            {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            {reviewer
+              ? `Reviewed by ${reviewer.name}`
+              : latestVerificationRequest?.decided_by
+                ? `Reviewer ${shortId(latestVerificationRequest.decided_by)} (name unavailable)`
+                : 'Reviewer not recorded'}
           </small>
-        </div>
+          <p>{reviewDecisionSummary}</p>
+          {reviewDecisionSummary !== reviewDecisionNote ? (
+            <details className="operations-review-details" key={latestVerificationRequest?.run_id}>
+              <summary>Read full reviewer findings</summary>
+              <div
+                className="operations-review-full"
+                role="region"
+                aria-label="Full reviewer findings"
+                tabIndex={0}
+              >
+                <p>{reviewDecisionNote}</p>
+              </div>
+            </details>
+          ) : null}
+          <p className="operations-review-next">
+            <strong>Next step: </strong>
+            {recoveryScope
+              ? 'Inspect the governed recovery controls below with an authorized operator. The controller selects the source and revalidates the request; a new outcome review is still required.'
+                : 'Ask an authorized operator to resolve the findings and submit new evidence through the governed verification flow.'}
+          </p>
+        </section>
       ) : null}
-      {latestRun && (latestRun.input_tokens > 0 || latestRun.output_tokens > 0) ? (
-        <div className="usage-box">
-          {latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out
-        </div>
+      {factoryItem && recoveryScope ? (
+        <section
+          className="factory-recovery-callout"
+          aria-labelledby={`factory-recovery-${factoryItem.id}`}
+          data-testid="factory-verification-recovery"
+          data-recovery-state={recovery?.state ?? scopedRecoveryLoad?.status ?? 'loading'}
+          data-recovery-context-status={scopedRecoveryLoad?.status ?? 'loading'}
+          data-recovery-run-id={recoveryContext?.source_run_id}
+          data-recovery-task-id={recoveryContext?.task_id}
+          data-recovery-item-version={recoveryContext?.work_item.version}
+          aria-busy={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
+        >
+          <div className="factory-recovery-heading">
+            <div>
+              <span>Governed recovery</span>
+              <strong id={`factory-recovery-${factoryItem.id}`}>
+                {recovery?.heading ?? (scopedRecoveryLoad?.status === 'error'
+                  ? 'Recovery context unavailable' : 'Loading recovery context…')}
+              </strong>
+            </div>
+            <span className="status-chip status-chip-failed">
+              {recovery?.state === 'quarantined' ? 'Quarantine warning'
+                : recovery?.run ? `Source ${statusLabel(recovery.run.status)}` : 'Controller context'}
+            </span>
+          </div>
+          <p role={scopedRecoveryLoad?.status === 'error' ? 'alert' : 'status'}>
+            {recovery?.detail ?? scopedRecoveryLoad?.error ??
+              'Reading the exact work-item recovery context. No cached source or checkpoint is displayed.'}
+          </p>
+          {!recovery && runs.some((run) => run.workspace_disposition === 'quarantined') ? (
+            <p className="factory-recovery-role-note">
+              A visible mission workspace is quarantined. Preserve it; only the controller can resolve
+              the selected source context. No snapshot hash is substituted.
+            </p>
+          ) : null}
+          <button className="button button-secondary" type="button"
+            disabled={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
+            onClick={() => setRecoveryReload((value) => value + 1)}>
+            Refresh recovery context
+          </button>
+          {recoveryContext && recovery ? <>
+          <details className="factory-recovery-details">
+          <summary>Recovery details</summary>
+          <dl>
+            <div>
+              <dt>Attempts remaining</dt>
+              <dd>{recoveryContext.remaining_attempts}</dd>
+            </div>
+            <div>
+              <dt>Server-selected source</dt>
+              <dd title={recoveryContext.source_run_id}>{shortId(recoveryContext.source_run_id)}</dd>
+            </div>
+            <div>
+              <dt>Remaining mission tokens</dt>
+              <dd>{recoveryContext.remaining_mission_tokens.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Remaining mission budget</dt>
+              <dd>{formatUsd(recoveryContext.remaining_mission_cost_microusd)}</dd>
+            </div>
+            <div>
+              <dt>Recorded checkpoint</dt>
+              <dd>{recovery.checkpoint ? `${shortId(recovery.checkpoint)}…`
+                : recovery.state === 'checkpoint_required' ? 'Owning runner checkpoints through the controller' : 'Withheld; inspect controller context'}</dd>
+            </div>
+            <div>
+              <dt>Visible recovery records</dt>
+              <dd>{recovery.recoveryCount}</dd>
+            </div>
+          </dl>
+          </details>
+          <p className="factory-recovery-role-note">
+            Copying is not granting and executes nothing.
+          </p>
+          {recoveryCommandAvailable && canAuthorizeRecovery ? (
+            <div className="factory-recovery-actions">
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('verifier-only')}
+              >
+                {copiedRecoveryCommand === recoveryCopyKey('verifier-only')
+                  ? 'Verifier command copied'
+                  : 'Copy verifier-only command'}
+              </button>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void copyRecoveryCommand('source-correction')}
+              >
+                {copiedRecoveryCommand === recoveryCopyKey('source-correction')
+                  ? 'Correction command copied'
+                  : 'Copy source-correction command'}
+              </button>
+            </div>
+          ) : (
+            <p className="factory-recovery-role-note">
+              {canAuthorizeRecovery
+                ? 'The exact endpoint returns task/source IDs, not the task contract or adapter. Selected-task command metadata is missing in this snapshot; inspect the native controller. No substitute is inferred.'
+                : 'An owner, admin, or manager must authorize the recovery.'}
+            </p>
+          )}
+          {recoveryCommandAvailable && canAuthorizeRecovery ? <details>
+            <summary>Show trusted controller command</summary>
+            <code>{recoveryCommand('verifier-only')}</code>
+          </details> : null}
+          </> : null}
+        </section>
       ) : null}
-      {latestRun?.model ? (
-        <div className="usage-box">
-          {latestRun.model}
-          {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
-        </div>
+      {latestRun && terminalRun(latestRun.status) ? (
+        reviewRejected ? (
+          <details className="operations-run-outcome" key={`run-outcome-${latestRun.id}`}>
+            <summary>Run record · {statusLabel(latestRun.status)}</summary>
+            <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+            <small>
+              Worktree: {latestRun.workspace_disposition
+                ? statusLabel(latestRun.workspace_disposition)
+                : 'cleanup pending'}
+              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            </small>
+          </details>
+        ) : (
+          <div className={`terminal-summary terminal-${latestRun.status}`}>
+            <strong>{statusLabel(latestRun.status)}</strong>
+            <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
+            <small>
+              Worktree: {latestRun.workspace_disposition
+                ? statusLabel(latestRun.workspace_disposition)
+                : 'cleanup pending'}
+              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+            </small>
+          </div>
+        )
       ) : null}
-      {latestRun?.workspace_branch ? (
-        <div className="workspace-box" title={latestRun.workspace_detail ?? undefined}>
-          <span>{latestRun.workspace_disposition ?? 'active'} worktree</span>
-          <strong>{latestRun.workspace_branch}</strong>
-        </div>
+      {latestRun && (
+        latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ||
+        latestRun.model || latestRun.workspace_branch
+      ) ? (
+        <dl className="operations-run-metadata" aria-label="Run details">
+          {latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ? (
+            <div>
+              <dt>Usage</dt>
+              <dd>{latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out</dd>
+            </div>
+          ) : null}
+          {latestRun.model ? (
+            <div>
+              <dt>Model</dt>
+              <dd>
+                {latestRun.model}
+                {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
+              </dd>
+            </div>
+          ) : null}
+          {latestRun.workspace_branch ? (
+            <div title={latestRun.workspace_detail ?? undefined}>
+              <dt>{statusLabel(latestRun.workspace_disposition ?? 'active')} worktree</dt>
+              <dd>{latestRun.workspace_branch}</dd>
+            </div>
+          ) : null}
+        </dl>
       ) : null}
       {latestDeliverable ? (
         <div className="workspace-box integration-box" data-testid="integration-state">
@@ -3441,6 +3934,11 @@ function MissionCard({
               <div className="mission-approval-item" key={approval.id}>
                 <span>{approval.action}</span>
                 <small>{approval.risk} risk · {approval.rationale}</small>
+                <p className="operations-approval-note">
+                  Allowed tools make an action requestable, not pre-approved. This decision covers
+                  only the exact action and scope shown; it grants no blanket access. A current
+                  authorization for that same action and scope does not need a duplicate grant.
+                </p>
                 <div>
                   <button
                     className="button button-primary"
@@ -3464,7 +3962,7 @@ function MissionCard({
           })}
         </div>
       ) : null}
-      {resumableRun && activeRuns === 0 ? (
+      {resumableRun && activeRuns === 0 && factoryItem?.state !== 'verification_failed' ? (
         <>
           <button
             className="button button-secondary mission-launch"
@@ -3618,25 +4116,29 @@ function RoomPanel({
     )
   }
 
-  const linkedOptions = [
-    ...missions.slice(0, 2).map((mission) => ({
-      value: `mission:${mission.id}`,
-      label: `Mission · ${mission.title}`,
-    })),
-    ...tasks.slice(0, 2).map((task) => ({
-      value: `task:${task.id}`,
-      label: `Task · ${task.title}`,
-    })),
-    ...runs.slice(0, 2).flatMap((run) => [
-      { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
-      ...(run.artifact_sha256 && run.artifact_id
-        ? [{
-            value: `artifact:${run.artifact_id}`,
-            label: `Artifact · ${shortId(run.artifact_sha256)}`,
-          }]
-        : []),
-    ]),
-  ]
+  const linkedOptions = Array.from(
+    new Map(
+      [
+        ...missions.slice(0, 2).map((mission) => ({
+          value: `mission:${mission.id}`,
+          label: `Mission · ${mission.title}`,
+        })),
+        ...tasks.slice(0, 2).map((task) => ({
+          value: `task:${task.id}`,
+          label: `Task · ${task.title}`,
+        })),
+        ...runs.slice(0, 2).flatMap((run) => [
+          { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
+          ...(run.artifact_sha256 && run.artifact_id
+            ? [{
+                value: `artifact:${run.artifact_id}`,
+                label: `Artifact · ${shortId(run.artifact_sha256)}`,
+              }]
+            : []),
+        ]),
+      ].map((option) => [option.value, option] as const),
+    ).values(),
+  )
   const visibleMessages = messages.slice(-40)
   const replyTarget = replyToId
     ? messages.find((message) => message.id === replyToId)
@@ -3775,6 +4277,73 @@ function RoomPanel({
         </form>
       </div>
     </section>
+  )
+}
+
+function MissionAllocationPreview({
+  scope,
+}: {
+  scope: MissionRequestScope
+}) {
+  const [load, setLoad] = useState<MissionPreviewLoad | null>(null)
+  const [refresh, setRefresh] = useState(0)
+  const { key, corpId, actorId, body, strategy } = scope
+  useEffect(() => startMissionPreview({ key, corpId, actorId, body, strategy }, api, setLoad),
+    [key, corpId, actorId, body, strategy, refresh])
+  const current = currentMissionPreview(scope, load)
+  const quote = current?.status === 'ready' ? current.quote : null
+  return (
+    <div
+      data-testid="mission-allocation-preview"
+      data-preview-status={current?.status ?? 'pending'}
+      aria-busy={!current || current.status === 'pending'}
+    >
+      {quote ? (
+        <>
+          <p className="operations-approval-note" role="status">
+            Server-checked allocation · <strong>{quote.budget_tokens.toLocaleString()} total tokens</strong>
+          </p>
+          <ul className="evidence-checks" aria-label="Exact task token allocations">
+            {quote.tasks.map((task) => (
+              <li className="evidence-check" key={task.key} data-task-key={task.key}>
+                <strong title={task.title}>
+                  {statusLabel(task.key)}<span className="sr-only">: {task.title}</span>
+                </strong>
+                <span>{task.budget_tokens.toLocaleString()} tokens</span>
+              </li>
+            ))}
+          </ul>
+          <details className="mission-allocation-details">
+            <summary>Dependencies, retries and cost policy</summary>
+            <ul>
+              {quote.tasks.map((task) => (
+                <li key={task.key}>
+                  <strong>{statusLabel(task.key)}:</strong>{' '}
+                  {task.depends_on.length ? `after ${task.depends_on.map(statusLabel).join(', ')}` : 'no dependencies'}
+                  {' · '}{task.max_attempts} attempt{task.max_attempts === 1 ? '' : 's'} maximum.
+                </li>
+              ))}
+            </ul>
+            <p>Reported-cost limit: {formatUsd(quote.budget_cost_microusd)}. This is a policy on reported usage, not a provider billing estimate.</p>
+          </details>
+        </>
+      ) : (
+        <p className="operations-approval-note" role={current?.status === 'error' ? 'alert' : 'status'}>
+          {current?.error ?? 'Fetching exact allocation for these settings… No current task allocation is available yet.'}
+        </p>
+      )}
+      <p className="operations-approval-note">
+        Preview starts no work and grants no approval. Launch revalidates the current request on the server.
+      </p>
+      {current?.status === 'error' ? (
+        <button className="button button-secondary" type="button" onClick={() => {
+          setLoad(null)
+          setRefresh((value) => value + 1)
+        }}>
+          Retry preview
+        </button>
+      ) : null}
+    </div>
   )
 }
 
@@ -4153,6 +4722,32 @@ function App() {
   const missionVerifierErrors = customVerification && !deterministicHarness
     ? verificationPolicyErrors(missionVerificationPolicy)
     : []
+  const missionRequest = selectedActor && selectedMissionSource ? buildMissionRequest({
+    title: missionTitle,
+    description: missionDescription,
+    actorId: selectedActor.id,
+    strategy: missionStrategy,
+    adapter: effectiveMissionAdapter,
+    model: missionModel,
+    selectedModel,
+    reasoningEffort: missionReasoningEffort,
+    source: selectedMissionSource,
+    budgetTokens: missionBudgetTokens,
+    deliverableForm: missionDeliverable,
+    commitDeliverable,
+    contract: missionContractHasInput ? missionContract : null,
+    customVerification,
+    verificationPolicy: missionVerificationPolicy,
+  }) : null
+  const missionRequestBody = missionRequest ? JSON.stringify(missionRequest) : null
+  const missionCorpId = bootstrap?.corp_id
+  const missionActorId = selectedActor?.id
+  const currentMissionRequest = missionCorpId && missionActorId && missionRequestBody
+    ? missionRequestScope(missionCorpId, missionActorId, missionRequestBody) : null
+  const missionPreviewEnabled = !missionComposerCollapsed && activeWorkspaceView === 'missions' &&
+    Boolean(currentMissionRequest && selectedMissionSource && selectedActor && canOperate(selectedActor.role)) &&
+    Boolean(missionTitle.trim()) && missionSourceConfirmed && !busy &&
+    !runtimeError && missionVerifierErrors.length === 0
 
   const selectActor = (actor: Actor) => {
     setSelectedActorId(actor.id)
@@ -4172,6 +4767,7 @@ function App() {
     if (
       !bootstrap ||
       !selectedActor ||
+      !currentMissionRequest ||
       !missionTitle.trim() ||
       !selectedMissionSource ||
       !missionSourceConfirmed ||
@@ -4186,36 +4782,7 @@ function App() {
     try {
       const created = await api<CreateMissionResponse>(`/api/corps/${bootstrap.corp_id}/missions`, {
         method: 'POST',
-        body: JSON.stringify({
-          title: missionTitle,
-          description: missionDescription,
-          requested_by: selectedActor.id,
-          preferred_adapter: effectiveMissionAdapter,
-          preferred_model: !deterministicHarness && selectedModel ? missionModel : null,
-          reasoning_effort:
-            !deterministicHarness &&
-            selectedModel?.supported_reasoning_efforts.includes(missionReasoningEffort)
-              ? missionReasoningEffort
-              : null,
-          strategy: missionStrategy,
-          source: {
-            repository: selectedMissionSource.repository,
-            base_ref: selectedMissionSource.baseRef,
-            base_commit: selectedMissionSource.baseCommit,
-          },
-          budget_tokens: deterministicHarness ? null : missionBudgetTokens,
-          deliverable: {
-            form: missionDeliverable,
-            commit_after_verification:
-              commitDeliverable || missionDeliverable === 'commit_branch',
-            paths: [],
-          },
-          contract: missionContractHasInput ? missionContract : null,
-          verification_policy:
-            !deterministicHarness && customVerification
-              ? missionVerificationPolicy
-              : null,
-        }),
+        body: currentMissionRequest.body,
       })
       let launched: LaunchMissionResponse | null = null
       if (!pauseAfterPlanning) {
@@ -4988,19 +5555,32 @@ function App() {
           <div className={`runner-indicator ${connectedRunners.length ? 'runner-online' : ''}`}>
             {runnerLabel}
           </div>
-          <label title={productionAuthenticated ? 'Your authenticated identity; switching accounts is not allowed here.' : 'Local demo identities only. Alice, Bob and Eve are seeded test users, not GitHub sign-in.'}>
-            {productionAuthenticated ? 'Signed in as' : 'Demo operator'}
-            <select disabled={productionAuthenticated} value={selectedActor.id} onChange={(event) => {
-              const actor = humans.find((candidate) => candidate.id === event.target.value)
-              if (actor) selectActor(actor)
-            }}>
-              {humans.map((actor) => (
-                <option key={actor.id} value={actor.id}>
-                  {actor.name} · {actor.role}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="operations-identity">
+            <label htmlFor="operator-actor">
+              {productionAuthenticated ? 'Signed in as' : 'Demo operator'}
+              <select
+                id="operator-actor"
+                aria-describedby="operator-identity-help"
+                disabled={productionAuthenticated}
+                value={selectedActor.id}
+                onChange={(event) => {
+                  const actor = humans.find((candidate) => candidate.id === event.target.value)
+                  if (actor) selectActor(actor)
+                }}
+              >
+                {humans.map((actor) => (
+                  <option key={actor.id} value={actor.id}>
+                    {actor.name} · {actor.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <small id="operator-identity-help">
+              {productionAuthenticated
+                ? 'Locked to your authenticated OIDC account. Identity switching is disabled.'
+                : 'Alice, Bob and Eve are seeded local demo users. Switching changes demo permissions, not your GitHub sign-in.'}
+            </small>
+          </div>
         </div>
       </header>
 
@@ -5304,20 +5884,16 @@ function App() {
           hidden={activeWorkspaceView !== 'missions'}
           tabIndex={-1}
         >
-          <div className="panel-heading">
+          <div className="panel-heading operations-mission-toolbar">
             <div>
-              <span className="section-code">Missions</span>
-              <h2>Authorize work</h2>
-              <p>Describe the outcome. ECorp isolates the repo, dispatches agents, and verifies the result.</p>
+              <h2>Mission queue</h2>
+              <p>
+                {missionComposerCollapsed
+                  ? 'Track work, inspect evidence, and decide what happens next.'
+                  : 'Give ECorp a goal, then choose its runtime and completion evidence.'}
+              </p>
             </div>
-          </div>
-          {missionComposerCollapsed ? (
-            <div className="arcade-new-mission-bar">
-              <div>
-                <span>Ready for work</span>
-                <strong>Create another mission</strong>
-                <small>The active mission log stays below.</small>
-              </div>
+            {missionComposerCollapsed && (
               <button
                 className="button button-primary"
                 type="button"
@@ -5328,8 +5904,9 @@ function App() {
               >
                 New mission
               </button>
-            </div>
-          ) : (
+            )}
+          </div>
+          {!missionComposerCollapsed && (
           <form className="mission-form arcade-mission-form" onSubmit={createMission}>
             <div className="arcade-composer-header">
               <div>
@@ -5646,7 +6223,7 @@ function App() {
                       <select
                         id="mission-strategy"
                         value={missionStrategy}
-                        aria-describedby={studioTeam ? 'mission-strategy-help mission-strategy-policy' : 'mission-strategy-help'}
+                        aria-describedby="mission-strategy-help mission-strategy-policy"
                         onChange={(event) => {
                           const strategy = event.target.value
                           setMissionStrategy(strategy)
@@ -5680,13 +6257,19 @@ function App() {
                             ? 'One bounded worker owns the outcome.'
                             : 'A deterministic product-behavior fixture.'}
                       </small>
-                      {studioTeam ? (
-                        <small id="mission-strategy-policy">
-                          Native file work stays in isolated worktrees within the approved write scope.
-                          Configure persisted test commands and review gates under Verification.
-                          Shell, network, and other risky effects still require approval.
-                        </small>
-                      ) : null}
+                      <small id="mission-strategy-policy" className="operations-approval-note">
+                        {studioTeam
+                          ? 'Three workers hand off verified work to a later integration pass; this does not create a fourth concurrent worker or a grant per artifact.'
+                          : missionStrategy === 'parallel-specialists'
+                            ? 'Two specialists and synthesis can request different scoped actions; choosing parallel work does not pre-approve them.'
+                            : missionStrategy === 'single'
+                              ? 'One worker limits coordination, not authorization: a Solo run can still need decisions for risky actions.'
+                              : 'Fixture checks exercise recorded evidence and the configured review gate, not blanket permissions.'}
+                        {' '}Reuse the harness within current authorized scope. Shell, network and
+                        other risky effects need their existing scoped authorization, not duplicate
+                        grants for the same action. Persisted verifier checks and required outcome
+                        review remain separate.
+                      </small>
                     </div>
                   </div>
                   <div className="loadout-switches">
@@ -5893,6 +6476,26 @@ function App() {
               ) : null}
             </section>
 
+            <section className="mission-submit-note mission-plan-summary" aria-label="Mission settings and allocation">
+              <strong>Current settings · {missionStrategy === 'single' ? 'Solo run' : statusLabel(missionStrategy)}</strong>
+              <p className="operations-approval-note">
+                Strategy and budget stay selected between missions.
+                {!missionPreviewEnabled ? (deterministicHarness ? ' Fixture-owned budget.' : ` Requested limit: ${missionBudgetTokens.toLocaleString()} tokens.`) : ''}
+              </p>
+              {studioTeam ? (
+                <p className="operations-approval-note">
+                  Studio: 3 handoffs, then integration after all three complete.
+                </p>
+              ) : null}
+              {missionPreviewEnabled && currentMissionRequest ? (
+                <MissionAllocationPreview key={currentMissionRequest.key} scope={currentMissionRequest} />
+              ) : (
+                <p className="operations-approval-note" role="status">
+                  {busy ? 'Submission in progress; no preview is current.'
+                    : 'Select an authorized operator, complete valid inputs and confirm the source to preview exact task allocations.'}
+                </p>
+              )}
+            </section>
             <div className="arcade-form-controls">
               {missionComposerStep !== 'brief' ? (
                 <button
@@ -6004,6 +6607,7 @@ function App() {
               {selectedMission ? (
                 <MissionCard
                   key={selectedMission.id}
+                  corpId={bootstrap.corp_id}
                   mission={selectedMission}
                   tasks={selectedMissionTasks}
                   runs={selectedMissionRuns}
@@ -6019,6 +6623,13 @@ function App() {
                   actors={data.snapshot.actors}
                   verificationRequests={data.snapshot.verification_requests}
                   actionApprovals={data.snapshot.action_approvals}
+                  factoryItem={data.snapshot.factory_work_items.find(
+                    (item) => item.mission_id === selectedMission.id,
+                  )}
+                  factoryRecoveries={data.snapshot.factory_verification_recoveries.filter(
+                    (recovery) => recovery.mission_id === selectedMission.id,
+                  )}
+                  events={data.snapshot.events}
                   actorId={selectedActor.id}
                   actorRole={selectedActor.role}
                   busy={busy}

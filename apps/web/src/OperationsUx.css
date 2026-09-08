@@ -1,0 +1,286 @@
+/* Non-floor presentation only. Recovery controls and office styles stay intact. */
+.app-shell #missions > .operations-mission-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 0;
+  padding: 16px 20px;
+}
+
+.operations-mission-toolbar > div { flex: 1 1 240px; min-width: 0; }
+.app-shell .operations-mission-toolbar h2 { margin: 0; font-size: 20px; line-height: 1.3; }
+.app-shell .operations-mission-toolbar p { margin: 4px 0 0; color: #526058; font-size: 14px; line-height: 1.5; }
+.operations-mission-toolbar > button { flex: 0 0 auto; min-height: 44px; }
+.app-shell #missions .mission-card > h3 { margin-block: 10px; font-size: 24px; line-height: 1.35; overflow-wrap: anywhere; }
+
+.app-shell .operations-verification {
+  display: block;
+  min-width: 0;
+  margin-top: 8px;
+  padding: 0;
+  border: 1px solid #c8cec9;
+  border-left: 3px solid #667369;
+  border-radius: 3px;
+}
+
+.app-shell .operations-verification.verification-passed { border-left-color: #22633e; }
+.app-shell .operations-verification.verification-failed { border-left-color: #963047; }
+
+.app-shell .operations-verification > summary {
+  grid-template-columns: minmax(0, 1fr) auto 18px;
+  gap: 10px;
+  min-height: 48px;
+  padding: 10px 12px;
+  color: #202b36;
+  background: #f6f7f5;
+}
+
+.operations-verification-copy { display: grid; min-width: 0; gap: 3px; }
+.operations-verification-copy strong { font-size: 14px; }
+.operations-verification-copy small { color: #526058; font-size: 12px; line-height: 1.5; }
+.operations-verification-score { color: #202b36; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.operations-disclosure-mark { text-align: center; font-size: 20px; }
+.operations-verification[open] .operations-disclosure-mark { transform: rotate(45deg); }
+
+.app-shell .operations-verification > .evidence-checks {
+  gap: 0;
+  margin: 0;
+  padding: 0 12px 8px;
+}
+
+.app-shell .operations-verification .evidence-check {
+  gap: 3px 12px;
+  padding: 10px 0;
+  border: 0;
+  border-top: 1px solid #d4d9d4;
+  border-radius: 0;
+  box-shadow: none;
+  font-size: 13px;
+}
+
+.operations-verification .evidence-check p { color: #526058; overflow-wrap: anywhere; }
+.operations-verification .evidence-check-passed > span { color: #22633e; }
+.operations-verification .evidence-check-failed > span { color: #963047; }
+
+.app-shell .operations-review-decision {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 14px;
+  color: #35272a;
+  background: #fff7f4;
+  border: 1px solid #d9b8b7;
+  border-left: 4px solid #963047;
+  border-radius: 3px;
+}
+
+.operations-review-label { color: #7b263b; font-size: 12px; font-weight: 650; }
+.operations-review-decision > strong { font-size: 17px; }
+.operations-review-decision > small { color: #685357; font-size: 12px; }
+.operations-review-decision p { margin: 0; line-height: 1.55; overflow-wrap: anywhere; }
+.operations-review-decision > p { white-space: pre-wrap; }
+
+.operations-review-decision .operations-review-next {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid #e4cdca;
+  font-size: 13px;
+}
+
+.app-shell .operations-review-details > summary,
+.app-shell .operations-run-outcome > summary {
+  display: list-item;
+  min-height: 44px;
+  padding: 10px 4px;
+  color: #263f52;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: disclosure-closed inside;
+}
+
+.operations-review-details[open] > summary,
+.operations-run-outcome[open] > summary { list-style-type: disclosure-open; }
+
+.operations-review-full {
+  max-height: 18rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
+  color: #35272a;
+  background: #ffffff;
+  border: 1px solid #e4cdca;
+  white-space: pre-wrap;
+}
+
+.operations-run-outcome { min-width: 0; margin-top: 8px; }
+.operations-run-outcome > p,
+.operations-run-outcome > small { display: block; margin: 0 0 8px; overflow-wrap: anywhere; line-height: 1.5; }
+.operations-run-outcome > small { color: #526058; }
+
+.app-shell .operations-run-metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin: 10px 0 0;
+  padding: 10px 0;
+  color: #202b36;
+  border-block: 1px solid #d4d9d4;
+}
+
+.operations-run-metadata > div { flex: 1 1 150px; min-width: 0; }
+.operations-run-metadata dt { color: #526058; font-size: 12px; font-weight: 600; }
+.operations-run-metadata dd { margin: 3px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+
+.app-shell .operator-console .operations-identity {
+  display: grid;
+  flex: 0 1 24rem;
+  min-width: 0;
+  max-width: 100%;
+  gap: 5px;
+}
+
+.app-shell .operations-identity > label { display: grid; min-width: 0; gap: 4px; }
+.app-shell .operations-identity select { min-width: 0; width: 100%; max-width: 100%; min-height: 44px; }
+.operations-identity > small { color: #526058; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+
+.app-shell #missions .operations-approval-note {
+  display: block;
+  margin: 6px 0 0;
+  color: #526058;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.app-shell #missions .factory-recovery-details > summary {
+  min-height: 44px;
+  padding: 10px 0;
+  color: #4b3b25;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.app-shell #missions .factory-recovery-details > dl { margin: 8px 0 0; }
+
+/* The policy editor uses the same light, readable surface as run evidence. */
+#missions .verification-policy-editor {
+  color: #202b36;
+  background: #f6f7f5;
+  border: 1px solid #c8cec9;
+  border-radius: 3px;
+  box-shadow: none;
+}
+
+#missions .verification-policy-editor :is(label, legend, strong) { color: #202b36; font-size: 14px; line-height: 1.4; }
+#missions .verification-policy-editor :is(small, .contract-section-heading span) { color: #526058; font-size: 13px; line-height: 1.5; }
+#missions .verification-policy-editor fieldset { color: #202b36; background: #ffffff; border-color: #a8b3ae; }
+#missions .verification-policy-editor :is(input, select, textarea, pre) { color: #202b36; background: #ffffff; }
+#missions .verification-policy-editor [aria-pressed] {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 12px;
+  color: #293744;
+  background: #ffffff;
+  border: 1px solid #8c9992;
+  font-family: inherit;
+  font-size: 14px;
+}
+
+#missions .verification-policy-editor [aria-pressed="true"] {
+  color: #7b1430;
+  background: #fae8ec;
+  border: 2px solid #963047;
+}
+
+#missions .verification-policy-editor [aria-pressed] :is(span, strong, small) { color: inherit; background: transparent; font: inherit; font-weight: 600; text-transform: none; }
+#missions .verification-policy-editor [aria-pressed]:focus-visible { outline: 2px solid #7b1430; outline-offset: 3px; }
+#missions .mission-runtime-error { color: #86243a; background: #fff3f4; border-color: #d9b8b7; }
+#missions .field-warning { color: #86243a; background: #fff3f4; padding: 8px 12px; font-size: 13px; line-height: 1.5; }
+#missions .contract-error { color: #86243a; background: #fff3f4; padding: 10px 12px; font: inherit; line-height: 1.5; }
+#missions :is(.strategy-chip, .contract-version-chip) { color: #354650; background: #edf1ee; border: 1px solid #c8cec9; padding: 4px 7px; font-family: inherit; font-size: 12px; font-weight: 600; line-height: 1.4; }
+
+@media (max-width: 720px) {
+  .app-shell .operator-console .operations-identity { grid-column: 1 / -1; width: 100%; }
+}
+
+@media (max-width: 480px) {
+  .app-shell #missions > .operations-mission-toolbar { padding: 12px; }
+  .operations-mission-toolbar > div { flex-basis: 100%; }
+  .app-shell #missions .mission-card > h3 { font-size: 20px; }
+  .app-shell .operations-verification > summary { grid-template-columns: minmax(0, 1fr) 18px; gap: 5px 8px; }
+  .operations-verification-copy { grid-column: 1; }
+  .operations-verification-score { grid-column: 1; grid-row: 2; }
+  .operations-disclosure-mark { grid-column: 2; grid-row: 1 / 3; }
+  .app-shell .operations-review-decision { padding: 12px; }
+  .operations-run-metadata > div { flex-basis: 100%; }
+}
+.factory-dossier-stage .factory-facts > div {
+  background: #f2f5f7;
+  border-color: #c8d0d7;
+}
+
+.factory-dossier-stage .factory-facts dt {
+  color: #48515a;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.factory-dossier-stage .factory-facts dd {
+  color: #1c2630;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mission-submit-note.mission-plan-summary {
+  max-inline-size: 54rem;
+  text-align: left;
+  font-size: 0.94rem;
+}
+
+.mission-plan-summary .operations-approval-note {
+  margin-block: 0.35rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.mission-plan-summary .evidence-checks {
+  margin-block: 0.75rem;
+}
+
+.mission-plan-summary .evidence-check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  font-size: 0.875rem;
+}
+
+.mission-plan-summary .evidence-check strong {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mission-allocation-details {
+  margin-block: 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.mission-allocation-details summary {
+  min-block-size: 2.75rem;
+  display: list-item;
+  align-content: center;
+  cursor: pointer;
+}
+
+.mission-allocation-details ul {
+  margin-block: 0.5rem;
+  padding-inline-start: 1.25rem;
+}

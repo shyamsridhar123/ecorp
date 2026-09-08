@@ -407,7 +407,39 @@ After a process ends, cleanup checks the actual Git state. Dirty worktrees, igno
 with commits not integrated into the current base, and any state that cannot be verified are preserved.
 Automatic removal occurs only when the tree is clean and its branch is reachable from or
 tree-equivalent to the base. The runner emits `run.workspace_preserved` or
-`run.workspace_removed`, and Postgres stores the final disposition.
+`run.workspace_removed`, and Postgres stores the final disposition. Preserved worktrees also carry
+a deterministic SHA-256 fingerprint over tracked, untracked, ignored, directory, and symbolic-link
+entries while excluding only the worktree's `.git` control file. Recovery commands must present
+that fingerprint, and the runner rechecks it before provider resume or verifier-only execution.
+For a preserved run created before fingerprints existed, an authorized durable checkpoint command
+first asks the owning runner to verify the managed worktree and verification-linked head, compute
+the fingerprint without starting a provider, and persist it on the original run.
+
+Verifier-only recovery seals one bounded, ephemeral physical baseline of the admitted worktree.
+Read-only file, schema, and screenshot checks use that baseline; every command or test receives its
+own physical copy. The copies exclude the worktree's `.git` control file, reject symbolic links or
+Windows reparse points whose resolved target escapes the worktree, and enforce entry and byte
+ceilings. A check's side effects cannot manufacture a later check's evidence. Snapshot removal has
+a bounded explicit completion gate before accepted verification. The runner rechecks the source
+fingerprint and retains, rather than removes, a recovery workspace on every prepared-workspace
+exit. Integrity rejection quarantines the source without admitting a replacement fingerprint.
+
+Provider evidence is not assumed to be a worktree-local file. For a runner advertising
+`verification-artifact-transfer-v1`, the server resolves the exact ready provider artifact linked
+to the authorized recovery and its source run. It revalidates Corp, runner, task, author role and
+room membership, checks the stored signature, retention, digest, length and media type, and
+rechecks the binding after object-store I/O. The bounded bytes travel only in the authenticated
+runner dispatch; durable commands remain metadata-only. The runner bounds the encoded length and
+enforces the 16 MiB decoded-byte ceiling, byte count and digest before staging under a fresh name in a separate private
+artifact directory. That directory is never part of the source baseline or a command snapshot,
+and is cleaned before verification acceptance. A transferred artifact cannot create a missing
+source file. Contained legacy artifact lookup remains a compatibility path, not permission to
+read arbitrary external files.
+
+An already-consumed recovery command is a no-op. A late pending command targeting a terminal run
+is retired without starting another verifier or provider. Cancellation observed during deliverable
+upload prevents subsequent verification acceptance. These verification-failure recovery semantics
+do not authorize resuming a hard-stopped provider or implement budget-boundary checkpoint recovery.
 
 ## Planning and scheduling
 
@@ -448,6 +480,26 @@ The scheduler:
 - injects verified dependency artifacts into synthesis prompts
 - marks the mission complete only after every task completes
 
+Dependency handoffs distinguish the signed artifact's producer from the run that most
+recently verified the parent task. A completed verifier-only recovery may reuse the exact
+original provider artifact through a bounded, acyclic, governed recovery chain. Every edge
+retains the same Corp, mission, task, agent, runner, workspace and source identity; the
+current run's artifact metadata must still match the signed object. A newer unverified
+run cannot fall back to an older completed run. Typed source deliverables retain their
+existing verification-linked run binding. Artifact signature, retention, digest and byte
+checks still occur before dispatch. The prompt and `run.dependency_context` event record
+both producer `run_id` and `verification_run_id`; recovery does not forge a new producer.
+
+If dependency or assignment admission fails before a provider starts, the same transaction
+fails the run/task/mission, releases that run's agent and reserved messages, and blocks its
+eligible factory item with bounded failure detail. Ordered `run.failed` and `factory.blocked`
+events are published only after commit. Existing recovery/publication gates are acquired
+before row locks. Duplicate failures create no new work or events; a legacy failed dispatch
+can repair its stale factory projection using the original diagnostic. Started, terminal
+or superseded runs are not rewritten. A failed new generic-resume allocation is still
+released when its factory already has a verified/final outcome, without downgrading that
+outcome. No verifier failure, approval or workspace is invented for a never-started run.
+
 ## Mission specifications and contract revisions
 
 Mission titles remain bounded labels. The durable `missions.description` field carries the complete
@@ -485,10 +537,50 @@ The runner buffers an adapter's completion signal, emits one evidence record per
 `run.completed` only after every automated check passes. The server rejects completion events that
 arrive before complete passing evidence or while a manual gate is required.
 
-Failed verification sets the task to `verification_failed` and the mission to failed. A successful
-automated policy can instead enter `waiting_for_approval`. Human-approval gates enforce configured
-roles. Independent-review gates additionally reject the mission requester and producing agent.
-Decisions are durable, actor-attributed, and can release downstream scheduler work.
+Failed verification sets the run to failed, the task to `verification_failed`, and the mission to
+failed. When the mission belongs to a factory item, the same transaction also moves that item to
+`verification_failed`, stores bounded failure detail, and appends the factory event. A successful
+automated policy can instead enter `waiting_for_approval`; the linked factory item moves to
+`awaiting_approval` in that same durable event flow. Human-approval gates enforce configured roles.
+Independent-review gates additionally reject the mission requester and producing agent. Keyed
+decisions replay exactly, and an accepted final gate moves the completed mission and factory item
+to `verified` without requiring a controller polling race.
+
+Factory verification recovery is a dedicated aggregate, not a generic state transition. An owner,
+admin, or manager explicitly chooses `verifier_only` or `source_correction`, supplies a reason, and
+authorizes one new run against the exact failed run, preserved workspace fingerprint, source base,
+policy, attempt ceiling, and remaining budgets. `verification_failed -> running` is forbidden
+through the generic transition endpoint.
+
+- `verifier_only` creates a run with `execution_mode=verification_only`, reuses the stored provider
+  artifact, and starts no provider process. Each check receives a fresh bounded physical snapshot;
+  snapshot cleanup completes before accepted verification, and the preserved source worktree is
+  fingerprinted afterward. An existing commit is preserved when the source already has one. Legacy
+  provider artifacts without relative-path metadata are resolved only inside the preserved worktree
+  by file name, exact byte count, and SHA-256.
+- `source_correction` requires a versioned `resume` contract revision and resumes the exact provider
+  session, branch, and workspace lineage. The revision can update reviewed issue text and verifier
+  metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
+  deliverable authority, or widen tools and write scope.
+
+Recovery authorization and its runner command are idempotent and durable. The operation stores the
+reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and
+replacement run IDs, actor, reason, and contract revision. Runner command acknowledgment prevents
+duplicate provider or verifier execution after server reconnect. Command decode, secret-broker,
+source-validation, adapter, or other pre-start rejection terminalizes the replacement run and
+recovery, returns the factory item to `verification_failed`, consumes the failed command, and leaves
+the preserved source checkpoint eligible for a separately authorized retry.
+
+Runner loss terminalizes an exactly bound active recovery in either mode, including a
+source-correction command acknowledged before its start report arrives. The recovery slot is
+released and the Factory/task projections return to `verification_failed`; the run remains
+`lost`. A lost source-correction run becomes eligible for the existing recovery flow only after
+the assigned runner confirms preserved bytes with a fingerprint. If its start report was missing,
+that cleanup can restore missing assignment metadata from its exact authorized parent, never from
+a path supplied in the cleanup message. It cannot replace existing metadata or an earlier
+fingerprint, adopt an unrelated provider loss, bypass quarantine, or manufacture preservation.
+The next separately authorized native recovery retains the current checkpoint and immutable
+source, session, attempt and budget history. Recovery/publication gates precede loss row locks.
 
 ## Agent adapters
 
@@ -609,6 +701,13 @@ The deterministic `fake-process` harness remains gate-free so offline systems te
 without pretending to be production evidence.
 The generic transition endpoint cannot assert `publishing` or `published`; those states are
 reserved for the verifier-gated publication operation in #61.
+
+Verification-failed items are not restarted by ordinary queue polling. The CLI requires an exact
+`--issue`, an explicit `--verification-recovery` mode, and a non-empty recovery reason. A changed
+GitHub issue revision remains ineligible until the explicit recovery path stores the reviewed
+snapshot and, for source correction or verifier-policy change, links the versioned contract
+revision. GitHub Project status remains `In Progress`; only verified publication can move it to
+`In Review`.
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.
@@ -762,6 +861,16 @@ repository, base ref, branch, commit, pull-request title/body, source issue, exp
 authorization snapshot, and effect key. Attempts have independent publisher leases and fencing
 tokens; tokens never enter snapshots or events.
 
+When the selected verified run completed through factory verification recovery, publication
+provenance keeps the original claim and the reviewed recovery source distinct. The source issue's
+`claimed_revision` remains the revision captured by the factory claim, while `revision` records the
+effective reviewed revision observed by the completed recovery and `recovery_id` links that
+recovery. Recovery selection follows the selected deliverable run's persisted resume lineage rather
+than requiring the deliverable to belong directly to the first replacement run. New provenance is
+schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
+claimed revision so an in-flight publication can survive deployment. Without a completed recovery,
+both revisions are the claimed revision and `recovery_id` is null.
+
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
 expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
@@ -769,6 +878,12 @@ require both current human authority and the independently authenticated publish
 server derives the publisher ID from that workload credential and requires the request's publisher
 ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
 publication request header.
+
+Transaction-local publisher revalidation takes the update lock required by its
+`last_used_at` write at the first credential read. Two requests using one credential
+therefore wait before, rather than deadlock during, a shared-to-write lock upgrade.
+Corp, publisher, hash, revocation and expiry predicates are unchanged; this uses native
+PostgreSQL row locking rather than an application retry or additional approval.
 
 Publisher planning does not use the bounded browser snapshot as an index. An exact Corp-authorized
 publication-context read loads the requested work item, its durable publication, and every source

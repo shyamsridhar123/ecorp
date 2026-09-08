@@ -1,0 +1,169 @@
+{
+  "real_provider": false,
+  "hosted_actions": false,
+  "rust_regular_ignored": 10,
+  "gates": [
+    {
+      "exit_code": 0,
+      "seconds": 0.4868306,
+      "command": "node tools/check_migrations.mjs",
+      "name": "migrations"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 8.3515402,
+      "command": "cargo fmt --check",
+      "name": "format"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 95.9844489,
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "name": "clippy"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 547.854008,
+      "command": "cargo test --workspace",
+      "name": "rust-tests"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 203.1487439,
+      "command": "cargo build --workspace --bins",
+      "name": "binaries"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 38.3625151,
+      "command": "pnpm build:web",
+      "name": "web-build"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 11.7943085,
+      "command": "pnpm lint:web",
+      "name": "web-lint"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 2.6362037,
+      "command": "node --test C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\factoryPolling.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\missionPreview.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue148-governed-recovery\\apps\\web\\src\\missionRuntime.test.mjs tools/office_model.test.mjs tools/owned_test_stack.test.mjs",
+      "name": "frontend-tests"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 0.35858,
+      "command": "node --check tools/e2e_predispatch_failure.mjs",
+      "name": "predispatch-script"
+    },
+    {
+      "exit_code": 0,
+      "seconds": 0.6260528,
+      "command": "git diff --check",
+      "name": "diff-check"
+    }
+  ],
+  "test_runtime_supplement": {
+    "product_hashes_unchanged": true,
+    "exit_code": 0,
+    "command": "node --check tools/e2e_predispatch_failure.mjs",
+    "change": "Use PowerShell 7 for the test-only ownership probe; no product code, assertion, or deadline changed",
+    "checked_at": "2026-09-07T08:40:46.9903136Z"
+  },
+  "predispatch_store_checks_passed": 9,
+  "original_game_rerun": false,
+  "checked_at": "2026-09-07T08:43:39.399Z",
+  "source_base_commit": "fb19bf6d547db6e4c7ddf7a26b1edb9d5e55a04b",
+  "frontend_tests_passed": 104,
+  "rust_regular_passed": 335,
+  "resources": {
+    "containers_created": 0,
+    "existing_fixture_reused": true,
+    "manual_before": {
+      "status": "ok",
+      "service": "crony-server",
+      "runners": 1,
+      "mode": "development"
+    },
+    "historical_databases_reset": 0,
+    "manual_after": {
+      "status": "ok",
+      "service": "crony-server",
+      "runners": 1,
+      "mode": "development"
+    },
+    "cleanup_complete": true
+  },
+  "explicit_postgres_tests_passed": 10,
+  "observed": {
+    "mission_status": "failed",
+    "child_task_status": "failed",
+    "child_run_status": "failed",
+    "factory_state": "blocked",
+    "run_count": 3
+  },
+  "code_hashes": [
+    {
+      "path": "crates/crony-server/src/main.rs",
+      "sha256": "B620341494E4C2BDD2D3A9A7E435B3332F5B77859C0D5556D171C90A1917C455"
+    },
+    {
+      "path": "crates/crony-store/src/lib.rs",
+      "sha256": "D7150AF3CA42FACA724989A92C822D8273FDB81A519E1A2714E9EF1A7F7F842B"
+    },
+    {
+      "path": "tools/e2e_predispatch_failure.mjs",
+      "sha256": "CE4F6C9B137F7E48EE0A674CD08151A3D022368C4E35C61197C003A92C48C52C"
+    },
+    {
+      "path": "apps/web/src/OperationsUx.css",
+      "sha256": "1A76CD1A091FC5F4BDB5CB62F9094EDBE9074D39E34A40AA94E916E0159615EF"
+    }
+  ],
+  "runtime": [
+    "atomic_predispatch_failure",
+    "zero_child_execution_or_recovery",
+    "native_parent_replay_no_effects",
+    "owned_restart_and_replay_no_effects",
+    "original_fixtures_source_worktrees_preserved"
+  ],
+  "manual_instance_promoted": false,
+  "css_supplement": {
+    "change": "Restore readable factory metadata tiles; server and runner code unchanged",
+    "checked_at": "2026-09-07T09:02:58.0345519Z",
+    "web_lint_passed": true,
+    "frontend_tests_passed": 104,
+    "web_build_passed": true
+  },
+  "browser": {
+    "before": {
+      "sha256": "bf27b499e85b0c542af77c321ff6961a4ae08c15590da8eb66d8bb838ef8156d",
+      "state": "blocked",
+      "mission_status": "failed"
+    },
+    "blocked_requests": [],
+    "errors": [],
+    "viewports": [
+      {
+        "width": 1440,
+        "scroll": 1440,
+        "metadata_min_contrast": 7.37629545342715,
+        "metadata_min_font_px": 14
+      },
+      {
+        "width": 390,
+        "scroll": 390,
+        "metadata_min_contrast": 7.37629545342715,
+        "metadata_min_font_px": 14
+      }
+    ],
+    "after": {
+      "sha256": "bf27b499e85b0c542af77c321ff6961a4ae08c15590da8eb66d8bb838ef8156d",
+      "state": "blocked",
+      "mission_status": "failed"
+    },
+    "passed": true
+  },
+  "browser_qa_teardown": true
+}

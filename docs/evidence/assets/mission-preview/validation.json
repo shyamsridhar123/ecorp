@@ -1,0 +1,253 @@
+{
+  "observed_at": "2026-09-07T05:07:48.1722772Z",
+  "scope": "Manual mission preview and native directory-path consistency; not a new game build",
+  "hosted_actions": false,
+  "source_base_commit": "c33144be04fb8eb6d3eb1fbc4b9044f919a3991a",
+  "preview_unit_tests_passed": 18,
+  "api_coverage_limits": [
+    "No existing roomless operator; room-denial fixture not created",
+    "Development-principal RBAC only; production OIDC not exercised"
+  ],
+  "resources": {
+    "manual_health_before": {
+      "status": "ok",
+      "service": "crony-server",
+      "runners": 1,
+      "mode": "development"
+    },
+    "containers_created": 0,
+    "cleanup_complete": true,
+    "provider_runs_authorized": 0,
+    "databases_reset": 0,
+    "manual_health_after": {
+      "status": "ok",
+      "service": "crony-server",
+      "runners": 1,
+      "mode": "development"
+    }
+  },
+  "api_after": {
+    "rows": {
+      "actors": 10,
+      "agents": 7,
+      "rooms": 1,
+      "missions": 5,
+      "tasks": 5,
+      "runs": 10,
+      "mission_contract_revisions": 2,
+      "mission_budget_revisions": 0,
+      "verification_evidence": 45,
+      "verification_requests": 6,
+      "source_deliverables": 6,
+      "factory_work_items": 4,
+      "factory_verification_recoveries": 100,
+      "action_approvals": 0,
+      "events": 200
+    },
+    "active_runs": 0,
+    "event_watermark": 325,
+    "visible_state_sha256": "0d5918efaf83ab6d0e7d7aa2a7704cc5e3489c685e1112f0191ddd4fb13578f6"
+  },
+  "api_checks_passed": 29,
+  "code_hashes": [
+    {
+      "path": "apps/web/src/App.tsx",
+      "sha256": "51250E65C98901AA210D90FF9BA288390B579FAE95F2229D26462D98731E324D"
+    },
+    {
+      "path": "apps/web/src/missionPreview.test.mjs",
+      "sha256": "D78397784D3BCE5B284433FDD2319AF9E9744AAA75BC45A023DD2547DF03C700"
+    },
+    {
+      "path": "apps/web/src/missionPreview.ts",
+      "sha256": "14249895DB9AD18965307F564AAB9D701CF994563535EEDF306147F77948B09D"
+    },
+    {
+      "path": "apps/web/src/OperationsUx.css",
+      "sha256": "507C36F6B7BEE865C2B4445F5E1408F4D153D100B5D48C446269516A042DD50F"
+    },
+    {
+      "path": "crates/crony-protocol/src/lib.rs",
+      "sha256": "9923C8DF5FC938DFDCAE2E47E3321509AE058036147EFABAF006496D2B872302"
+    },
+    {
+      "path": "crates/crony-runner/src/adapter/copilot_fs.rs",
+      "sha256": "8FF2077A32F4392FBD2C351BEE944E12D1217CB9766FD3233EF69A73217365BD"
+    },
+    {
+      "path": "crates/crony-runner/src/adapter/copilot.rs",
+      "sha256": "C9E191C6A14FD55676C0019C53EA37B76FF9AFB9121076B4F8794F8FB58E3F47"
+    },
+    {
+      "path": "crates/crony-server/src/main.rs",
+      "sha256": "542937DF4A5CB722CF3CD804D951BE8605E1F3FA5302F45F58DFFB1EE85FF16A"
+    },
+    {
+      "path": "crates/crony-server/src/planning.rs",
+      "sha256": "735B85BD30E59F526915107CFDA445C15CEAC8CDB2D30C3A0B80C9C12EAAD85B"
+    },
+    {
+      "path": "crates/crony-store/src/lib.rs",
+      "sha256": "92F54CE29B49CA97BDC24A7EB55B937A14DB2B3467204426A066183215E7BD1D"
+    },
+    {
+      "path": "tools/e2e_mission_preview.mjs",
+      "sha256": "822CF5E834BF1E84A0EC8A34BC41C04960BDAFCF0D5FD042D209F4D48CE27229"
+    }
+  ],
+  "rust_tests_passed": 333.0,
+  "browser": {
+    "before": {
+      "counts": {
+        "actors": 10,
+        "agents": 7,
+        "missions": 5,
+        "tasks": 5,
+        "runs": 10,
+        "verification_evidence": 45,
+        "verification_requests": 6,
+        "action_approvals": 0
+      },
+      "sha256": "a8c6d3edad9dd44ef0aa31b0c660e63dca68be29f69355ddb4bc79ea57b05290"
+    },
+    "console_errors": [],
+    "actor_change_verified": true,
+    "after": {
+      "counts": {
+        "actors": 10,
+        "agents": 7,
+        "missions": 5,
+        "tasks": 5,
+        "runs": 10,
+        "verification_evidence": 45,
+        "verification_requests": 6,
+        "action_approvals": 0
+      },
+      "sha256": "a8c6d3edad9dd44ef0aa31b0c660e63dca68be29f69355ddb4bc79ea57b05290"
+    },
+    "viewports": [
+      {
+        "width": 1440,
+        "height": 1000,
+        "overflow": {
+          "width": 1440,
+          "scroll": 1440
+        },
+        "task_tokens": [
+          150000,
+          150000,
+          150000,
+          550000
+        ],
+        "launch_enabled": true,
+        "keyboard_disclosure": true
+      },
+      {
+        "width": 390,
+        "height": 900,
+        "overflow": {
+          "width": 390,
+          "scroll": 390
+        },
+        "task_tokens": [
+          150000,
+          150000,
+          150000,
+          550000
+        ],
+        "launch_enabled": true,
+        "keyboard_disclosure": true
+      }
+    ],
+    "launch_clicked": false,
+    "blocked_requests": []
+  },
+  "game_end_to_end_verified": false,
+  "gates": [
+    {
+      "seconds": 0.963848,
+      "exit_code": 0,
+      "command": "node tools/check_migrations.mjs",
+      "name": "migrations"
+    },
+    {
+      "seconds": 6.7823446,
+      "exit_code": 0,
+      "command": "cargo fmt --check",
+      "name": "format"
+    },
+    {
+      "seconds": 46.9052327,
+      "exit_code": 0,
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "name": "clippy"
+    },
+    {
+      "seconds": 313.9478284,
+      "exit_code": 0,
+      "command": "cargo test --workspace",
+      "name": "rust-tests"
+    },
+    {
+      "seconds": 18.979823,
+      "exit_code": 0,
+      "command": "cargo build --workspace --bins",
+      "name": "binaries"
+    },
+    {
+      "seconds": 42.8625111,
+      "exit_code": 0,
+      "command": "pnpm build:web",
+      "name": "web-build"
+    },
+    {
+      "seconds": 9.9028505,
+      "exit_code": 0,
+      "command": "pnpm lint:web",
+      "name": "web-lint"
+    },
+    {
+      "seconds": 0.9230198,
+      "exit_code": 0,
+      "command": "node --test apps/web/src/missionPreview.test.mjs",
+      "name": "preview-tests"
+    },
+    {
+      "seconds": 0.310872,
+      "exit_code": 0,
+      "command": "node --check tools/e2e_mission_preview.mjs",
+      "name": "preview-script-syntax"
+    },
+    {
+      "seconds": 0.6075243,
+      "exit_code": 0,
+      "command": "git diff --check",
+      "name": "diff-check"
+    }
+  ],
+  "api_before": {
+    "rows": {
+      "actors": 10,
+      "agents": 7,
+      "rooms": 1,
+      "missions": 5,
+      "tasks": 5,
+      "runs": 10,
+      "mission_contract_revisions": 2,
+      "mission_budget_revisions": 0,
+      "verification_evidence": 45,
+      "verification_requests": 6,
+      "source_deliverables": 6,
+      "factory_work_items": 4,
+      "factory_verification_recoveries": 100,
+      "action_approvals": 0,
+      "events": 200
+    },
+    "active_runs": 0,
+    "event_watermark": 325,
+    "visible_state_sha256": "0d5918efaf83ab6d0e7d7aa2a7704cc5e3489c685e1112f0191ddd4fb13578f6"
+  },
+  "manual_instance_promoted": false,
+  "frontend_regression_tests_passed": 104,
+  "frontend_regression_scope": "factoryPolling, missionPreview, missionRuntime, office_model, owned_test_stack; includes18 preview tests"
+}

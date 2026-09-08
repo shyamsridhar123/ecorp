@@ -180,6 +180,16 @@
       "version": 36,
       "file": "0036_factory_polling_backoff.sql",
       "sha384": "3880863a9e63c8817430b6345f070d21c7d204b3440431c725d0206ebbf16a046cad150b620f3f16ebb6ef54f1d7b404"
+    },
+    {
+      "version": 37,
+      "file": "0037_factory_verification_recovery.sql",
+      "sha384": "d2decaf366ef548308e60083d253e76cfe1b32a53c7ff021be54a46405618fdd3aa8acfe73c99f6350d2c68fa5683f7e"
+    },
+    {
+      "version": 38,
+      "file": "0038_workspace_integrity_quarantine.sql",
+      "sha384": "c9e8b03df1545f747d39d5d39e49c2757c2927c60a228dc353cf3f56fa9cfec5a850780345f0fa6df69aa0b31bd7c1fa"
     }
   ]
 }

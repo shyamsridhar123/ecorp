@@ -28,6 +28,17 @@ Before a non-trivial change, read:
 - Risky effects must suspend through durable approvals and idempotent runner commands.
 - Budget and loop breaker transitions must remain monotonic, auditable, and conversation-aware.
 
+## Harness first
+
+- Before adding execution, tools, sessions, permissions, retries, or workspace behavior, verify
+  what the selected harness and pinned version already provide.
+- Reuse supported native capabilities through thin adapters. Document the specific missing
+  behavior before introducing a custom ECorp mechanism.
+- Do not duplicate an approval for the same currently authorized action and exact scope.
+  Evidence artifacts are not individual human decisions.
+- Preserve ECorp's tenant, shared-state, lineage, budget, and irreversible-effect invariants.
+  Native tool permission is not proof of tenant authorization or operating-system isolation.
+
 ## Validation
 
 Run before committing:

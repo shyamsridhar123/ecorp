@@ -488,6 +488,65 @@ request creation; Alice and Bob resume from independent event cursors; and auto-
 deployment remain disabled. See
 `docs/evidence/2026-09-04-factory-cockpit-restart.md`.
 
+`tools/e2e_factory_verification_recovery.mjs` proves the same source issue, factory item, mission,
+task, branch, and workspace lineage can recover after verification rejection. Its verifier-only
+case rejects evidence through an independent-review gate, replays the keyed decision, creates one
+`verification_only` run, emits zero provider session/output/artifact events, preserves the exact
+head commit, and reaches one verified factory item. A direct-command verifier writes a side-effect
+file during the original run, then attempts to increment it and corrupt `result.md` during
+verifier-only recovery. The later file check still reads a fresh snapshot, while the preserved
+source retains its original side-effect value and valid `result.md`. The runner explicitly removes
+each snapshot before accepted verification and then fingerprints the preserved source. The
+`verifier_snapshot_is_physical_isolated_and_excludes_git_control` unit regression separately checks
+snapshot isolation, `.git` exclusion, bounded explicit cleanup, and copying of untracked and ignored
+source files. Unix coverage additionally rejects a relative symlink that escapes the worktree;
+Windows runtime code rejects escaping symbolic links and reparse points.
+Before recovery, the E2E removes only the source run's fingerprint to reproduce a legacy
+preserved run. Signed artifact metadata is never edited to manufacture that fixture: changing
+it must fail provenance verification. The owning runner checkpoints the legacy workspace without
+provider execution. The separate Codex bridge case verifies an artifact held in signed object
+storage, with no local source copy and no invented file-check evidence.
+Its source-correction case starts with an automated verifier failure, changes the fake GitHub issue
+revision, proves ordinary controller
+replay is mutation-free and rejected, restarts only the test-owned server, stores a versioned
+contract revision, then injects a revoked scoped secret before dispatch. It proves that failure
+terminalizes the run and recovery, clears the active-recovery uniqueness fence, restores
+`verification_failed`, and permits a newly authorized retry after the secret policy is repaired.
+The retry resumes the exact Codex fixture session/worktree, increments the attempt monotonically,
+and completes after independent approval. A verifier-only bridge keeps its own provider-session
+field empty; a later source correction resolves only the existing ancestor session within the
+same Corp, task, agent, and workspace. Repeated verifier-only generations retain the exact
+authorized artifact rather than requiring its producer to be the immediate parent.
+
+Run this destructive-fixture harness only with `CRONY_RECOVERY_TEST=1`, an explicitly owned
+`CRONY_SERVER_HTTP` and `DATABASE_URL`, an independent `CRONY_RECOVERY_SOURCE` repository, and
+`CRONY_RECOVERY_OUTPUT`. Shared/manual ports and the ECorp checkout are rejected. Cases preserve
+earlier results and do not reset the demo between exercises. The report is checkpointed after
+each case in the selected output directory. `--resume-after-bridge` continues only the exact
+documented two-run, version-one source-correction checkpoint; it does not create a replacement
+mission or reset the database.
+
+The Windows restart drill additionally requires `CRONY_TEST_SERVER_BINARY` and a JSON
+`CRONY_TEST_SERVER_PID_FILE` with `test_owned: true`, the exact `workspace`, `server_url`,
+numeric `server` PID, and ISO `server_creation`. `tools/owned_test_stack.mjs` verifies the
+executable, creation time, and listener ownership before stopping it, and records the replacement
+identity. Database credentials are passed through the test supervisor's environment, never
+process arguments. The same helper protects controller/publication reconnect drills.
+
+The same harness interrupts a verifier-only recovery while a snapshot command is active. It proves
+the cancelled run is preserved, the recovery becomes failed, the task and factory item return to
+`verification_failed`, the active slot is released, and a second recovery can be authorized. It
+also inserts 101 newer historical recoveries so the live recovery disappears from the bounded Corp
+snapshot, then proves the exact work-item recovery context still returns and replays the original
+recovery and run.
+
+Integrity regressions hold a deliverable-upload acknowledgment, modify the preserved source,
+and require rejection before either a manual-review wait or accepted completion. The retained
+workspace becomes durably `quarantined`, not an unsealed legacy checkpoint. Cleanup replay cannot
+downgrade that state, and checkpoint, resume, recovery, and publication admission reject it.
+Mode-sensitive snapshot/fingerprint tests must also run on a real Unix filesystem; Windows
+test success does not execute the Unix-only cases.
+
 The September 4, 2026 preflight regression runs both dry-run and execution paths against invalid
 3,000,000-token budgets, verifier timeouts, model and reasoning-policy mismatches, unsafe write
 scope, unsupported description control characters, and an oversized materialization snapshot. Each
@@ -611,6 +670,46 @@ Project-stage renewal is detected after Project refresh and before any Project m
 coverage detaches worktree HEAD and proves the validated branch still produces an importable bundle
 with no temporary ref left behind. See
 `docs/evidence/2026-09-02-idempotent-pull-request-publication.md`.
+
+Store unit regressions cover recovery-aware publication provenance. A completed recovery selects
+its reviewed source revision and recovery ID; recovery selection follows the chosen deliverable
+run's resume lineage; a non-recovery publication retains the original claimed revision with a null
+recovery ID; and legacy schema-version-1 provenance remains resumable while version 2 requires the
+claimed/effective/recovery tuple. Earlier deterministic publication coverage passed, but the
+early September 7, 2026 follow-up failed its concurrent-publication case with a database
+deadlock. The expanded recovery drill also stalled because synthesis could not consume its
+recovered parent's artifact. Issues #165/#166 repair those defects, and both complete local
+suites now pass; see [the runtime-fix report](evidence/2026-09-07-recovery-publication-runtime-fixes.md).
+The earlier failures remain preserved as evidence. These are local fixture results, not a
+new real-GitHub recovery-to-publication effect claim. The separate pre-dispatch state-coherence
+gap in #167 is covered by the [pre-dispatch state report](evidence/2026-09-07-predispatch-state-coherence.md).
+
+Two opt-in SQLx regressions additionally exercise the actual `dependency_artifacts` store
+method with recovered-parent metadata, multiple verifier-only generations, stale runs,
+cycles and cross-boundary/mismatched evidence. Run them with `DATABASE_URL` scoped to an
+explicitly owned QA PostgreSQL maintenance database:
+`cargo test -p crony-store dependency_artifacts_ -- --ignored --test-threads=1`.
+SQLx creates its isolated test databases; ordinary workspace test runs list these as
+ignored unless explicitly selected. These metadata fixtures do not replace real signed
+artifact verification in the full recovery drill.
+
+`tools/e2e_publication_credential_lock.mjs` uses the exact credential-lock SQL selected by
+`publication.rs` and native PostgreSQL sessions to reproduce the shared-lock upgrade
+deadlock. It waits for an observed lock, not a guessed sleep, then verifies both transactions
+complete with the update lock taken upfront. It requires explicit opt-in and an already
+running owned loopback QA container, creates only a uniquely named synthetic schema,
+terminates only its own tagged sessions, removes that schema, and checks that the real
+publisher-credential fingerprint is unchanged. It starts no server, provider or container.
+Complete publication acceptance still requires the server/runner/CLI/Git E2E.
+
+`tools/e2e_predispatch_failure.mjs` adds one new deterministic graph to an explicitly
+owned, quiescent Windows QA stack without bootstrap/reset. It makes only a new
+approved parent's artifact unavailable, then proves the child fails before provider
+start and the factory is atomically blocked rather than awaiting approval. Native
+parent-decision replay and an owned server restart preserve exact state, journal and
+pre-existing fixtures. Direct store SQLx tests additionally exercise duplicate/late/
+foreign callbacks, rollback, legacy projection repair, protected outcomes and shared
+recovery/publication lock ordering. PowerShell 7 is required for the ownership probe.
 
 The controller recovery preview also proves a source `release` item with persisted publication base
 `main` continues to report `main` when a later dry run omits the override. At the Project boundary,

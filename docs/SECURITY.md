@@ -174,8 +174,11 @@ the source checkout. Native mutations also enforce the run's persisted task writ
 directory-create may create only a granted path or an ancestor needed to reach it. This authority
 is rebuilt from the current task on resume. Ordinary Unix executable permission bits are honored;
 privilege bits and invalid modes are rejected before creating a file.
-The SDK-registered `ecorp_mkdir` tool accepts only a relative path and invokes that same scoped
-provider. It is idempotent, cannot delete or chmod, and never starts a command interpreter.
+The SDK-registered `ecorp_mkdir` tool accepts a worktree-relative path or an absolute path
+contained in the assigned worktree and invokes that same scoped provider. Unlike native SDK
+filesystem requests, this tool has no authority over the isolated state directory. It rejects
+root, traversal, Git-internal, link, and out-of-scope targets. It is idempotent, cannot delete
+or chmod, and never starts a command interpreter.
 Its finite directory-creation authority comes from the persisted run contract; the SDK tool
 declaration suppresses a redundant permission prompt for this one guarded primitive, not for
 shell or other tools.
@@ -277,6 +280,22 @@ rechecks ownership before deletion and never deletes shared content-addressed by
 signs provenance with a deployment key and never exposes backend bucket URLs. Downloads require
 `ready` metadata, Corp authorization, and room membership, then revalidate signature, retention,
 digest, length, and media type before returning an attachment with content sniffing disabled.
+
+Verifier-only artifact transfer repeats authorization against the exact pending command, assigned
+runner, Corp, task, source run, current human author role, and mission-room membership. Only the
+ready `provider_evidence` artifact already linked to both runs can be transferred. Its signed
+object is validated before delivery, with a second authority/binding check after storage I/O.
+Transferred bytes are capped at 16 MiB, excluded from persisted commands, and omitted from typed
+debug output. The receiver enforces encoded and decoded bounds, length and SHA-256, and uses a
+fresh private staging name rather than the supplied path. Evidence staging is separate from the
+preserved source, sealed baseline, and per-command snapshots, so it cannot satisfy a missing
+source-file check. All snapshot cleanup must finish before accepted verification.
+
+Prepared-workspace failures preserve or quarantine the workspace instead of leaving a false
+`active` disposition. A rejected fingerprint is not replaced by the newly observed bytes.
+Consumed recovery commands are not replayed, and terminal-target commands are retired without
+execution. Capability negotiation describes this transfer protocol; it is not OS-isolation
+attestation and does not relax source-path, budget, or hard-stop authority.
 
 Portable source exports use a temporary Git index rooted in the assigned worktree. They include
 tracked changes and non-ignored untracked files, exclude provider evidence, and reject symbolic

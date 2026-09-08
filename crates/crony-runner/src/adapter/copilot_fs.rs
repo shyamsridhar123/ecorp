@@ -142,6 +142,37 @@ impl ContainedSessionFs {
         Err(outside_boundary(raw))
     }
 
+    pub(super) fn worktree_directory_path(&self, raw: &str) -> Result<String, FsError> {
+        // The custom directory tool has worktree authority only, unlike native
+        // SDK filesystem requests, which also need the isolated state root.
+        // Reuse the native root comparison, including Windows namespace forms.
+        let requested = Path::new(raw);
+        let relative = if requested.has_root() {
+            relative_to(requested, &self.workspace).ok_or_else(|| outside_boundary(raw))?
+        } else {
+            requested.to_path_buf()
+        };
+        let path = self.resolve(relative.to_str().ok_or_else(|| outside_boundary(raw))?)?;
+        if !Arc::ptr_eq(&path.dir, &self.workspace_dir)
+            || path.relative.as_os_str().is_empty()
+            || relative_to(&self.workspace.join(&path.relative), &self.state_directory).is_some()
+        {
+            return Err(outside_boundary(raw));
+        }
+        // Validate the relative spelling, not the absolute request. Normalize
+        // native separators only: a literal Unix backslash is not a scope separator.
+        let relative = path
+            .relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if !crony_domain::repository_relative_path_is_valid(&relative) {
+            return Err(outside_boundary(raw));
+        }
+        // Creation still goes through SessionFsProvider::mkdir, which enforces
+        // the existing task scope, ancestor-directory and link checks.
+        Ok(relative)
+    }
+
     fn resolve_destructive(&self, raw: &str) -> Result<ScopedPath, FsError> {
         let path = self.resolve(raw)?;
         if path.relative.as_os_str().is_empty() {
@@ -554,6 +585,95 @@ mod tests {
     use super::*;
     use tokio::fs;
 
+    #[tokio::test]
+    async fn worktree_directory_resolution_keeps_native_state_authority_separate() {
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("crony-copilot-directory-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace with spaces");
+        let state = root.join("state");
+        for directory in [&workspace, &state] {
+            fs::create_dir_all(directory).await.expect("fixture root");
+        }
+        let provider = ContainedSessionFs::new(
+            workspace.clone(),
+            state.clone(),
+            vec!["handoffs/visual.md".to_owned()],
+        )
+        .expect("capability roots");
+        for raw in [
+            workspace.join("handoffs").to_string_lossy().into_owned(),
+            "handoffs".to_owned(),
+        ] {
+            let relative = provider
+                .worktree_directory_path(&raw)
+                .expect("same worktree directory");
+            assert_eq!(Path::new(&relative), Path::new("handoffs"));
+            provider
+                .mkdir(&relative, true, None)
+                .await
+                .expect("native scope permits the required ancestor");
+        }
+        for raw in [
+            String::new(),
+            ".".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+            state.join("custom").to_string_lossy().into_owned(),
+            root.join("workspace-other/handoffs")
+                .to_string_lossy()
+                .into_owned(),
+            workspace.join("../outside").to_string_lossy().into_owned(),
+            workspace.join(".git/hooks").to_string_lossy().into_owned(),
+            "/session-state/custom".to_owned(),
+            "/workspace/handoffs".to_owned(),
+        ] {
+            assert!(provider.worktree_directory_path(&raw).is_err(), "{raw}");
+        }
+        let unselected = provider
+            .worktree_directory_path(&workspace.join("unselected").to_string_lossy())
+            .expect("resolution alone does not grant write scope");
+        assert!(provider.mkdir(&unselected, true, None).await.is_err());
+        assert!(!workspace.join("unselected").exists());
+        assert!(!workspace.join(".git").exists());
+        assert!(!root.join("outside").exists());
+        assert!(!root.join("workspace-other").exists());
+        assert!(!state.join("custom").exists());
+        provider
+            .mkdir("/session-state/native", true, None)
+            .await
+            .expect("native SDK retains its existing isolated state access");
+        assert!(state.join("native").is_dir());
+        drop(provider);
+        assert!(root.starts_with(&temporary));
+        fs::remove_dir_all(root).await.expect("fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn worktree_directory_resolution_rejects_state_nested_under_workspace() {
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!(
+            "crony-copilot-nested-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let state = workspace.join("internal-state");
+        fs::create_dir_all(&state).await.expect("fixture roots");
+        let provider =
+            ContainedSessionFs::new(workspace.clone(), state.clone(), vec!["**".to_owned()])
+                .expect("capability roots");
+        for raw in [
+            "internal-state".to_owned(),
+            "internal-state/custom".to_owned(),
+            state.join("custom").to_string_lossy().into_owned(),
+            "/session-state/custom".to_owned(),
+        ] {
+            assert!(provider.worktree_directory_path(&raw).is_err(), "{raw}");
+        }
+        assert!(!state.join("custom").exists());
+        drop(provider);
+        assert!(root.starts_with(&temporary));
+        fs::remove_dir_all(root).await.expect("fixture cleanup");
+    }
+
     #[cfg(windows)]
     #[test]
     fn namespace_spelling_does_not_authorize_another_root_or_device() {
@@ -618,10 +738,26 @@ mod tests {
         let exists = provider.exists(&canonical_seed.to_string_lossy()).await;
         let read = provider.read_file(&canonical_seed.to_string_lossy()).await;
         let stat = provider.stat(&canonical_seed.to_string_lossy()).await;
+        let directory = provider
+            .worktree_directory_path(&canonical_workspace.join("handoffs").to_string_lossy())
+            .expect("namespaced directory resolves under the ordinary root");
+        assert_eq!(Path::new(&directory), Path::new("handoffs"));
+        provider
+            .mkdir(&directory, true, None)
+            .await
+            .expect("namespaced worktree directory");
         drop(provider);
         let provider = ContainedSessionFs::new(canonical_workspace, state, vec!["**".to_owned()])
             .expect("canonical capability roots");
         let reverse = provider.read_file(&ordinary_seed.to_string_lossy()).await;
+        assert_eq!(
+            provider
+                .worktree_directory_path(
+                    &ordinary_seed.with_file_name("handoffs").to_string_lossy()
+                )
+                .expect("ordinary directory resolves under the namespaced root"),
+            directory
+        );
         drop(provider);
         assert!(
             root.starts_with(&temporary),
@@ -743,6 +879,10 @@ mod tests {
             );
         }
         assert!(provider.mkdir("linked/newdir", true, None).await.is_err());
+        let linked_directory = provider
+            .worktree_directory_path(&workspace.join("linked/newdir").to_string_lossy())
+            .expect("lexical resolution does not bypass native link checks");
+        assert!(provider.mkdir(&linked_directory, true, None).await.is_err());
         assert!(provider.readdir("linked").await.is_err());
         assert!(provider.readdir_with_types("linked").await.is_err());
         for root in ["/workspace", "/session-state"] {
@@ -854,6 +994,23 @@ mod tests {
         fs::create_dir_all(&state).await.expect("state");
         let provider = ContainedSessionFs::new(workspace.clone(), state, vec!["**".to_owned()])
             .expect("capability roots");
+        let root_mode = fs::metadata(&workspace)
+            .await
+            .expect("workspace mode")
+            .permissions()
+            .mode();
+        provider
+            .mkdir(&workspace.to_string_lossy(), true, Some(0))
+            .await
+            .expect("native recursive root mkdir stays an unchanged no-op");
+        assert_eq!(
+            fs::metadata(&workspace)
+                .await
+                .expect("unchanged workspace mode")
+                .permissions()
+                .mode(),
+            root_mode
+        );
         provider
             .write_file("check.sh", "#!/bin/sh\n", Some(0o755))
             .await

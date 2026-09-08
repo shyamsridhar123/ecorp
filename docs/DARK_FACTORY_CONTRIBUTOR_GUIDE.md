@@ -65,12 +65,25 @@ The following boundaries are non-negotiable:
 - **The server is authoritative.** A browser, desktop client, controller process, or provider
   process may disappear without erasing durable task, approval, budget, or event state.
 - **The runner owns execution.** The server never executes untrusted agent shell commands.
+- **Reuse native harness capabilities.** Check the selected runtime/version before adding tools,
+  session handling, permissions, or retry machinery. Follow the
+  [harness-first contribution checklist](../CONTRIBUTING.md#reuse-the-harness-before-building);
+  evidence artifacts do not each require their own human decision.
 - **A message is not a task.** Every executable task has an explicit contract, state machine,
   budget, retry policy, and verifier policy.
 - **Provider completion is not accepted completion.** Persisted checks and required manual gates
   must pass.
 - **Publication is not integration.** Creating or recovering a pull request does not authorize
   auto-merge, merge, deployment, or another irreversible effect.
+
+Contributors consuming one backlog must use the **same authenticated server/control plane, the
+same Corp, and the same claim namespace**: canonical GitHub Project owner, Project number, and
+Project item identity. Enroll separate runners into that shared Corp. Separate Corps on one server
+and co-located databases still have independent claim authority; reading the same GitHub Project
+does not give them a shared lock. Until the enforcement
+and multi-host acceptance in [#161](https://github.com/shyamsridhar123/ecorp/issues/161) are complete,
+use that shared authority or explicitly disjoint eligible issue sets; do not rely on a Project
+status change as an atomic cross-machine fence.
 
 ## Local setup
 
@@ -587,23 +600,79 @@ tab, or provider transcript.
 | Staged or orphaned artifact | Use server reconciliation. Do not manually delete bytes that may be reserved or content-addressed. |
 | Dirty, committed, or unverifiable worktree | Preserve it and create durable recovery provenance before any new execution. |
 
-### Current lessons from issues #50 and #113
+### Recovery after verifier or review failure
 
-[Issue #50](https://github.com/shyamsridhar123/ecorp/issues/50) and
-[issue #113](https://github.com/shyamsridhar123/ecorp/issues/113) are current product-gap records,
-not timeless product guarantees.
+[Issue #50](https://github.com/shyamsridhar123/ecorp/issues/50) remains a reminder that a durable
+API is not proof of an operable recovery path. Issue #113 adds the dedicated factory verification
+recovery flow and executable evidence for both supported modes.
 
 - **Budget recovery:** the presence of a budget-revision API does not prove a suspended mission is
   operationally recoverable. After approval and resume, inspect the resulting mission, task, run,
   and factory states. If the lineage still becomes terminal, preserve the remote checkpoint,
   record the defect, and do not claim recovery succeeded.
-- **Verifier-only recovery:** a failed threshold or metadata check does not make a correct source
-  commit disposable. Preserve the commit and evidence. Until same-lineage governed retry works for
-  the specific failure, a linked recovery issue is a transparent workaround, not proof that the
-  original recovery model is complete.
+- **Verifier-only recovery:** use this when the source and preserved checkpoint are correct. ECorp
+  creates one provider-free verification run, checks the exact workspace fingerprint, reuses the
+  durable provider artifact, and preserves the existing head commit. Read-only checks use one
+  sealed physical baseline; each command or test gets its own bounded copy. These snapshots exclude
+  the worktree's `.git` control file and reject escaping links. A command cannot create state for a later check,
+  and bounded snapshot cleanup must finish before verification can be accepted. The runner
+  fingerprints the preserved source worktree again after verification and rejects a mismatch. A
+  preserved run created before
+  fingerprints existed first receives a runner-owned checkpoint command. That command verifies the
+  managed worktree and head, records the full physical-workspace fingerprint, and starts no provider.
+- **Source-correction recovery:** use this when source bytes must change. First store a versioned
+  resume contract revision, then ECorp resumes the exact provider session, branch, and worktree.
+  The revised authority may narrow but cannot silently widen.
+
+Update both server and runner when adopting verified artifact transfer. The runner must advertise
+`verification-artifact-transfer-v1`; an older runner is rejected with an update-required diagnostic.
+Codex evidence may live outside the worktree: do not copy it into application source or rerun the
+provider merely to recreate it. ECorp transfers the original signed object into separate private
+evidence storage, verifies its bytes, and keeps it out of source/check snapshots and durable command
+payloads. Missing, expired, mismatched, or unauthorized evidence fails closed.
+
+After a prepared-workspace error, confirm both the terminal run state and the preserved/quarantined
+workspace outcome. Never treat an `active` workspace label as proof that a provider is still alive,
+or an observed replacement fingerprint as authorized source. These controls do not yet provide the
+budget-boundary checkpoint lane tracked by #148.
 
 These lessons require contributors to report the actual persisted result and to keep correct work
 recoverable even when the control path has a defect.
+
+Ordinary factory polling never restarts `verification_failed` work. An owner, admin, or manager
+must target one issue and state why the recovery is authorized:
+
+```powershell
+crony factory $CorpId $ActorId `
+  --issue 113 `
+  --verification-recovery verifier-only `
+  --verification-recovery-reason "Re-run the corrected verifier metadata against the unchanged checkpoint."
+```
+
+For a bounded source correction:
+
+```powershell
+crony factory $CorpId $ActorId `
+  --issue 113 `
+  --verification-recovery source-correction `
+  --verification-recovery-reason "Resume only to address the recorded independent-review findings."
+```
+
+The trusted controller revalidates the Project item, current issue revision, dependency state,
+persisted source/policy, lease, attempts, budgets, workspace fingerprint, and head commit. A changed
+issue body is stored as reviewed recovery provenance; it is never substituted silently. Project
+status stays `In Progress`, and recovery does not publish, merge, auto-merge, or deploy.
+
+If command decoding, secret resolution, source validation, or another pre-start check fails, do not
+leave the recovery active. The replacement run and recovery must become failed, the factory item
+must return to `verification_failed`, and the durable command must stop redelivering. Repair the
+cause, provide a new recovery reason, and reuse the preserved source checkpoint.
+
+An interrupted verifier-only recovery follows the same fail-closed factory rule: the run records
+`cancelled`, while its task and factory item return to `verification_failed`, the recovery becomes
+terminal, and the one-active-recovery fence is released. Controller retry loads the exact work-item
+recovery context rather than relying on the bounded Corp snapshot, so an active recovery cannot be
+lost behind newer recovery history.
 
 ## Publish a verified result
 
@@ -616,6 +685,16 @@ Publication is allowed only after:
 - current role, room membership, budget, breaker, source, and publication policy still authorize
   the effect; and
 - an owner or admin has created a short-lived publisher credential for the trusted publisher.
+
+For a result completed through verification recovery, review the source-issue provenance as two
+separate facts: `claimed_revision` is the immutable revision from the original factory claim, while
+`revision` is the effective reviewed revision from the completed recovery and `recovery_id` links
+that recovery. Recovery linkage follows the verified deliverable's resume ancestry, including a
+descendant that completes after the first recovery run. New records use provenance schema version 2;
+schema-version-1 in-flight publications remain resumable against their original claimed revision.
+Without a completed recovery, `revision` equals `claimed_revision` and `recovery_id` is null. Do not
+rewrite the original claim or present the reviewed recovery revision as if it were the initially
+claimed source.
 
 ### Create a short-lived publisher credential
 

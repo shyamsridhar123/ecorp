@@ -1,0 +1,27 @@
+{
+  "passed": true,
+  "colors": {
+    ".contract-error": {
+      "foreground": "rgb(134, 36, 58)",
+      "background": "rgb(255, 243, 244)",
+      "font": "16px"
+    },
+    ".strategy-chip": {
+      "foreground": "rgb(53, 70, 80)",
+      "background": "rgb(237, 241, 238)",
+      "font": "12px"
+    },
+    ".contract-version-chip": {
+      "foreground": "rgb(53, 70, 80)",
+      "background": "rgb(237, 241, 238)",
+      "font": "12px"
+    },
+    ".verification-policy-editor": {
+      "foreground": "rgb(32, 43, 54)",
+      "background": "rgb(246, 247, 245)",
+      "font": "16px"
+    }
+  },
+  "errors": [],
+  "mobile_overflow": false
+}
