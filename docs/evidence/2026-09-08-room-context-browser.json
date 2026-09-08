@@ -1,0 +1,105 @@
+{
+  "status": "passed",
+  "started_at": "2026-09-08T02:43:38.017719-05:00",
+  "scope": "Actual QA UI and native snapshot persistence only; no runner/provider proof.",
+  "server_url": "http://127.0.0.1:18574",
+  "web_url": "http://127.0.0.1:15574",
+  "fixture_sha256": "d1c62064391e855f2f4a1ae7575f5ff3952d69abd8c4bf34468f4775c1d1b866",
+  "locator_reference_app_sha256": "68049a8175d2fc32b2611fadd1921b556b59cbf83b7f487ff27aa5f5ec46b651",
+  "corp_id": "00000000-0000-4000-8000-000000000001",
+  "mission_id": "13dcdd66-c613-4378-8490-3a5e916036b2",
+  "room_id": "00000000-0000-4000-8000-000000000184",
+  "marker": "issue184-room-context:a25c5aafcd8b4366b68857529a3800f3",
+  "checks": [
+    "Native fixture preflight: exact actors, non-first owning room, guest and negative controls",
+    "Discussion for routes to the non-first room, resets draft, and scopes messages/links",
+    "Discuss-this-mission independently resolves the authoritative owning room",
+    "One UI POST persisted the exact unique body, Alice attribution, owning room and mission link",
+    "Reload plus native snapshot retains the same message; Comms fits 390px",
+    "Other-room viewer has a positive visible control but no target room, mission or comment",
+    "Guest sees the authorized mission/comment and only a supported Factory/unknown origin label",
+    "All observed pages have zero page errors; no mocks, injected data, or out-of-scope requests"
+  ],
+  "screenshots": [
+    {
+      "file": "alice-discussion-selector-desktop.png",
+      "bytes": 92023,
+      "sha256": "5a3aabc06e4563397d1ebbe8610693f27af04f5e839c1d81dfdc197243119bf6",
+      "viewport": {
+        "width": 1365,
+        "height": 900
+      }
+    },
+    {
+      "file": "alice-posted-desktop.png",
+      "bytes": 110682,
+      "sha256": "86fd980b8d786700fb3271047fb2392a2274c80ecb8cdb1704c1f23807e659a8",
+      "viewport": {
+        "width": 1365,
+        "height": 900
+      }
+    },
+    {
+      "file": "alice-reloaded-390px.png",
+      "bytes": 66490,
+      "sha256": "4ff9aec613a7120d4d0125c8823e2e7da4ca94e09bd98e86d9029a26a14b44dd",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      }
+    },
+    {
+      "file": "bob-other-room-desktop.png",
+      "bytes": 80926,
+      "sha256": "8547be017d061e845e5a9c84e2625503f1777fc431355da2d543a389d9e566a6",
+      "viewport": {
+        "width": 1365,
+        "height": 900
+      }
+    },
+    {
+      "file": "eve-guest-origin-desktop.png",
+      "bytes": 67168,
+      "sha256": "2a795d7361ff9593293b673888192ce3257016ae036c94d5dcdf373d64e642ed",
+      "viewport": {
+        "width": 1365,
+        "height": 900
+      }
+    },
+    {
+      "file": "eve-guest-origin-390px.png",
+      "bytes": 45029,
+      "sha256": "7a9016db02ff8cfa4a775934177466274f71829dd3688df9ce7d169103264bbd",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      }
+    }
+  ],
+  "page_errors": [],
+  "blocked_requests": [],
+  "bootstrap_handshakes": 4,
+  "comment_requests": [
+    {
+      "method": "POST",
+      "path": "/api/corps/00000000-0000-4000-8000-000000000001/rooms/00000000-0000-4000-8000-000000000184/messages",
+      "actor_id": "00000000-0000-4000-8000-000000000011",
+      "idempotency_key": "67c49d05-cfde-4a56-ba8c-ba08b0a65157",
+      "status": 200
+    }
+  ],
+  "snapshot_reads": 7,
+  "other_room_id": "00000000-0000-4000-8000-000000000041",
+  "other_room_message_id": "6fd43b34-867e-49bc-88c4-a6f8be19aa61",
+  "alice_origin_label": "From GitHub issue #184",
+  "persisted_message_id": "feae3a5a-df3b-498b-ab6c-565ed58984e8",
+  "guest_origin_label": "Mission origin unavailable",
+  "finished_at": "2026-09-08T02:44:00.769192-05:00",
+  "actual_ui_workspace": "C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss",
+  "actual_ui_app_sha256": "5E453848F4D8B0E747F415F4812DDE6C81815D7277369CA583868C92E08585C6",
+  "actual_ui_css_sha256": "E11011C9F537968FA950114421FE42FE22FC4074395E2F694BF5C5BFB9F9495E",
+  "actual_binary_sha256": {
+    "runner": "8CB2397324CD06CF85C82C01D24FF46E9BAC888F7C979707D44E3435622917AE",
+    "server": "3F7E5E2A18542F1A6B9A57454D8E7BAD07D464B3D4E3BE0E4AA9F4D897A2FABB"
+  }
+}

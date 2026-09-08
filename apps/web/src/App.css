@@ -1558,6 +1558,7 @@ select:focus-visible {
 
 .room-message-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   gap: 10px;
   max-height: 520px;
@@ -1573,7 +1574,9 @@ select:focus-visible {
 }
 
 .room-message {
+  min-width: 0;
   padding: 12px;
+  overflow-wrap: anywhere;
   border: 1px solid var(--ink);
   background: var(--paper-light);
   box-shadow: 2px 2px 0 rgb(23 39 45 / 24%);
@@ -1587,6 +1590,7 @@ select:focus-visible {
 .room-message-head,
 .room-message-foot {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
@@ -1618,6 +1622,8 @@ select:focus-visible {
 
 .room-message-foot > div {
   display: flex;
+  flex: 1 1 0;
+  min-width: 0;
   flex-wrap: wrap;
   gap: 5px;
 }
