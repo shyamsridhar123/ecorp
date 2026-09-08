@@ -1,5 +1,9 @@
 # Native checkpoint recovery accepted on the original application lineage
 
+**Subsequent acceptance:** [native checkpoint-bound publication](2026-09-08-checkpoint-publication.md)
+now covers this same bundle through real local Git, the controlled GitHub fixture and
+an actual API/runner/web restart. It is not a real GitHub application PR.
+
 September 8, 2026. Scope: #148 / PR #195, following
 [the retained failed application probe](2026-09-08-checkpoint-recovery-review-followup.md).
 

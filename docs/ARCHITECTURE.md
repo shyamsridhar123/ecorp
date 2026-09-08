@@ -889,15 +889,25 @@ provenance keeps the original claim and the reviewed recovery source distinct. T
 `claimed_revision` remains the revision captured by the factory claim, while `revision` records the
 effective reviewed revision observed by the completed recovery and `recovery_id` links that
 recovery. Recovery selection follows the selected deliverable run's persisted resume lineage rather
-than requiring the deliverable to belong directly to the first replacement run. New provenance is
-schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
+than requiring the deliverable to belong directly to the first replacement run. Ordinary provenance
+is schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
 claimed revision so an in-flight publication can survive deployment. Without a completed recovery,
 both revisions are the claimed revision and `recovery_id` is null.
 
+Checkpoint publications additionally retain the original native checkpoint/termination event
+IDs, workspace/fingerprint, original HEAD, verified export HEAD and authority digest under
+`provenance.checkpoint` in schema version 3. Renewal and effect-advancing checkpoints revalidate
+that proof. Validated older schema-1/2 publications may acquire previously absent proof
+transactionally; non-null changed proof and missing schema-3 proof fail closed. Source and
+checkpoint upgrades are combined, and renewal replay returns the upgraded persisted record.
+
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
-expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
-require both current human authority and the independently authenticated publisher identity. The
+expiry, revocation state, and last-use time are stored. Start, renewal and effect advancement require
+current publication authority and the independently authenticated publisher identity. Failure
+reporting retains authenticated Corp identity plus exact actor, publisher, token, version and lease
+ownership, but can close that attempt after effect authority changes. It advances no external
+effect and does not require renewed `Publish` permission. The
 server derives the publisher ID from that workload credential and requires the request's publisher
 ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
 publication request header.
@@ -955,11 +965,18 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
-The selected deliverable run is always checked against current budget and breaker authority. A
+The selected deliverable run is always checked against current budget and breaker authority. By default, a
 `stop` stage anywhere in the mission remains terminal. A historical `suspend` is accepted only when
 it is an explicit resumed ancestor of the selected verified run and its current no-progress and
 repeated-tool counters remain below the current policy limits. Unrelated suspends, stop-level loop
 metrics, and missing, duplicate, or cyclic resume lineage fail closed.
+
+An explicit publication of a completed, exactly bound checkpoint-verification result is a
+zero-provider operation. It may proceed past that checkpoint's measured model-budget stop and
+retrospective shared model counters without changing spending. Other actual stop/suspend state,
+explicit stops, loop limits, quarantine, source/verification identity, actor/room and publisher
+credentials remain effective. This is not a general exemption for publishing arbitrary results.
+See [the native publication and restart evidence](evidence/2026-09-08-checkpoint-publication.md).
 For the Project effect, the publisher reads the exact Project and Status identities, renews
 authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
 state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a

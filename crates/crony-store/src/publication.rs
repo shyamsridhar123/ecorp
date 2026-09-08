@@ -68,6 +68,7 @@ struct PublicationPrerequisites {
     task_ids: Vec<Uuid>,
     run_ids: Vec<Uuid>,
     evidence_ids: Vec<Uuid>,
+    checkpoint: Option<checkpoint_publication::CheckpointPublication>,
 }
 
 struct PublicationPrerequisiteRequest<'a> {
@@ -452,7 +453,7 @@ impl PgStore {
         let publisher_token = Uuid::new_v4();
         let authorization = publication_authorization(&normalized, now);
         let provenance = json!({
-            "schema_version": 2,
+            "schema_version": if prerequisites.checkpoint.is_some() { 3 } else { 2 },
             "source_issue": {
                 "number": prerequisites.work_item.source_issue_number,
                 "node_id": prerequisites.work_item.source_issue_node_id,
@@ -467,6 +468,7 @@ impl PgStore {
             "run_ids": prerequisites.run_ids,
             "verification_evidence_ids": prerequisites.evidence_ids,
             "verification_sha256": prerequisites.verification_sha256,
+            "checkpoint": prerequisites.checkpoint.as_ref().map(|checkpoint| &checkpoint.provenance),
             "deliverable": {
                 "id": normalized.source_deliverable_id,
                 "artifact_id": prerequisites.artifact_id,
@@ -708,11 +710,15 @@ impl PgStore {
                 Some(input.publisher_token),
                 &operation_request,
             )?;
-            let (publication, current_token) =
+            let (publication, _) =
                 publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, true)
                     .await?
                     .context("idempotent publication renewal references a missing publication")?;
             revalidate_publication_authority_tx(&mut tx, &publication, input.actor_id).await?;
+            let (publication, current_token) =
+                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                    .await?
+                    .context("publication disappeared after renewal revalidation")?;
             let publisher_token =
                 replayable_publication_token(&publication, current_token, &operation, now);
             tx.commit().await?;
@@ -885,6 +891,24 @@ impl PgStore {
             },
         )
         .await?;
+
+        let current = if matches!(
+            &checkpoint,
+            PullRequestPublicationCheckpointInput::Failed { .. }
+        ) {
+            // Failure records close this exact owned attempt; they advance no
+            // external effect. Retain the Corp, credential, actor, token, version
+            // and lease checks above even when effect authority was revoked.
+            current
+        } else {
+            // A lease cannot substitute for current source/review/actor authority.
+            revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
+            // Return the persisted upgrade, not the pre-validation copy.
+            publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                .await?
+                .context("publication disappeared after authority revalidation")?
+                .0
+        };
 
         let mut events = Vec::new();
         let (publication, replayed) = match checkpoint {
@@ -1631,13 +1655,27 @@ async fn revalidate_publication_authority_tx(
             "conflict: publication authority no longer matches its verified provenance"
         ));
     }
-    if source_provenance == PublicationSourceProvenanceState::Legacy {
-        let upgraded = upgrade_publication_source_provenance(
+    let source_upgraded = if source_provenance == PublicationSourceProvenanceState::Legacy {
+        upgrade_publication_source_provenance(
             &publication.provenance,
             &prerequisites.work_item.source_revision,
             &prerequisites.effective_source_revision,
             prerequisites.source_recovery_id,
-        )?;
+        )?
+    } else {
+        publication.provenance.clone()
+    };
+    // Older recovered-suspend publications predate checkpoint provenance. Only
+    // reconstruct it after all current source, review and authority bindings pass.
+    // Stamp schema 3 last so the source schema-1 upgrade cannot downgrade it.
+    let upgraded = checkpoint_publication::revalidated_provenance(
+        &source_upgraded,
+        prerequisites
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.provenance),
+    )?;
+    if upgraded != publication.provenance {
         let updated = sqlx::query(
             r#"
             UPDATE pull_request_publications
@@ -1912,6 +1950,15 @@ async fn validate_publication_prerequisites(
         })
         .collect::<Vec<_>>();
     let selected_lineage = publication_resume_lineage(selected_run_id, &resume_edges)?;
+    let checkpoint = checkpoint_publication::authority_tx(
+        tx,
+        request.corp_id,
+        work_item.id,
+        selected_run_id,
+        &selected_lineage,
+        &commit_sha,
+    )
+    .await?;
     if run_rows.iter().any(|run| {
         selected_lineage.contains(&run.get::<Uuid, _>("id"))
             && run
@@ -1961,6 +2008,21 @@ async fn validate_publication_prerequisites(
             run_ids.push(run_id);
             continue;
         }
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.origin_run_id == run_id)
+        {
+            // This exact measured budget stop produced the authorized checkpoint.
+            // Publishing its reviewed bytes starts no model; loops are not waived.
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
+            run_ids.push(run_id);
+            continue;
+        }
         if historical_suspend_is_recovered(
             run_id,
             selected_run_id,
@@ -1976,14 +2038,27 @@ async fn validate_publication_prerequisites(
             run_ids.push(run_id);
             continue;
         }
-        ensure_run_not_hard_blocked_tx(
-            tx,
-            request.corp_id,
-            run_id,
-            &breaker_stage,
-            "pull-request publication",
-        )
-        .await?;
+        if checkpoint.is_some() {
+            // Healthy historical tasks must not inherit a new model-budget veto
+            // from the shared mission/actor counters during this zero-provider effect.
+            // Their real stop/suspend state and current loop limits still apply.
+            ensure_breaker_allows_human_progress(&breaker_stage, "pull-request publication")?;
+            ensure_recovered_suspend_loop_metrics_allow_publication(
+                run.get("no_progress_events"),
+                run.get("repeated_tool_count"),
+                run.get("no_progress_limit"),
+                run.get("repeated_tool_limit"),
+            )?;
+        } else {
+            ensure_run_not_hard_blocked_tx(
+                tx,
+                request.corp_id,
+                run_id,
+                &breaker_stage,
+                "pull-request publication",
+            )
+            .await?;
+        }
         run_ids.push(run_id);
     }
     let evidence_ids = sqlx::query_scalar::<_, Uuid>(
@@ -2025,6 +2100,7 @@ async fn validate_publication_prerequisites(
         task_ids,
         run_ids,
         evidence_ids,
+        checkpoint,
     })
 }
 
@@ -2072,7 +2148,7 @@ fn publication_source_provenance_state(
             PublicationSourceProvenanceState::Invalid
         });
     }
-    if schema_version != Some(2) {
+    if !matches!(schema_version, Some(2 | 3)) {
         return Ok(PublicationSourceProvenanceState::Invalid);
     }
     let persisted_claimed_revision = provenance

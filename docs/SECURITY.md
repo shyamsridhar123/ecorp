@@ -371,6 +371,18 @@ The publisher's mission-room membership is rechecked in the same transaction on 
 idempotent replay, expired-lease recovery, and every renewal. Removing a still-manager actor from
 the room therefore blocks branch, pull-request, and Project effects.
 
+Failure-only checkpoints do not renew or advance publication authority. Their HTTP route still
+authenticates the human Corp identity, then requires the independently authenticated publisher
+credential and the exact attempt actor, token, version and unexpired lease in the store. This
+allows an owned attempt to record its failure after role, room or artifact authority changes.
+It does not grant publication permission, relax ordinary room-scoped reads, or accept a revoked
+publisher credential. All effect-advancing checkpoint variants still require `Publish`.
+
+Checkpoint publication provenance uses schema 3. Previously absent schema-1/2 checkpoint proof
+can be reconstructed only after current native source, review and authority validation. Altered
+non-null legacy proof and missing or altered schema-3 proof reject; reconstruction is not a
+general missing-provenance bypass.
+
 PR adoption also requires the exact authorized title and body. A collaborator-created PR with the
 right branch and SHA but altered content is ignored and cannot advance Project state. Publication
 retries remain pinned to the persisted deliverable ID even when the mission contains other
@@ -405,6 +417,14 @@ body-file normalization matches server canonicalization so idempotency cannot fa
 trailing newline.
 The CLI reads the publisher credential from a file before its first publication API mutation and
 never places it in arguments, plans, output, events, snapshots, or durable publication records.
+
+Publication of an explicitly recovered checkpoint starts no provider. Its model-budget
+exception is derived from exact native origin events, immutable checkpoint authority,
+completed zero-provider recovery, retained fingerprint and the ready verified export.
+The authorization never resets spending or permits another model session; unrelated enforced
+stops, explicit stops, loops and current scoped authority remain guards. New publication
+checkpoints repeat current authority/provenance validation instead of relying on a live lease
+alone. Metadata bindings do not replace the publisher's signed-byte and Git-bundle validation.
 
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.

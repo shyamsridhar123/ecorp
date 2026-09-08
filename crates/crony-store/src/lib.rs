@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod budget_checkpoint;
 mod budget_revision;
+mod checkpoint_publication;
 mod checkpoint_retention;
 mod contract_revision;
 mod factory_controller;

@@ -29,6 +29,19 @@ same-run native re-attestation, Bob's actual browser review and an identical dow
 It preserves the earlier failure and distinguishes deterministic protocol evidence from
 real-vendor inference, publication and production identity.
 
+The [checkpoint publication drill](evidence/2026-09-08-checkpoint-publication.md) continues that
+same retained case through the native publisher, real local Git and the existing fake-GitHub
+boundary. It verifies a single review PR record, unchanged original `main`, checkpoint-bound
+provenance, idempotent replay, and an actual API/runner/web restart. It does not create a real
+GitHub application PR or claim real-provider inference.
+
+The [publication review follow-up](evidence/2026-09-08-publication-review-recovery.md)
+records actual-store failure reporting after role/room/artifact changes, retained publisher
+ownership checks, and transactional legacy source/checkpoint upgrades including renewal replay.
+Server unit coverage checks that only failure reporting uses the cleanup permission; all
+effect-advancing variants retain `Publish`. These are scoped store and server-unit checks,
+not a new real-provider or real-GitHub publication run.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.
