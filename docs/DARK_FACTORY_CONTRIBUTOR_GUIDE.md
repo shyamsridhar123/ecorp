@@ -90,19 +90,19 @@ status change as an atomic cross-machine fence.
 ### Prerequisites
 
 - Git
-- Windows PowerShell
+- PowerShell 7.4+ (`pwsh`) on Windows, not Windows PowerShell 5.1
 - Rust 1.94 or newer
 - Node.js; the repository does not declare a minimum version
 - pnpm 11.19.0
-- Docker with Compose
+- Docker with Compose only for the managed local PostgreSQL database
 - GitHub CLI authenticated with repository and Project access for live factory operations
-- Free local ports:
-  - PostgreSQL: `54329`
+- Available local ports on first start (defaults):
+  - managed PostgreSQL: `54329`
   - server: `8791`
   - web: `5187`
 
 The deterministic `fake-process` adapter works without provider credentials. Real adapters require
-their own authenticated runtime or account.
+each contributor's own authenticated runtime or account.
 
 Verify GitHub CLI access before Project or publication work:
 
@@ -110,45 +110,104 @@ Verify GitHub CLI access before Project or publication work:
 gh auth status
 ```
 
-### Start the complete stack
-
-From an isolated ECorp contribution worktree:
-
-```powershell
-./tools/start_local.ps1
-```
-
-The script:
-
-1. stops only processes recorded for this worktree;
-2. starts PostgreSQL through `deploy/compose/docker-compose.yml`;
-3. installs JavaScript dependencies unless `-SkipInstall` is supplied;
-4. builds `crony-server`, `crony-runner`, and `crony-cli` unless `-SkipBuild` is supplied;
-5. starts the Rust server;
-6. bootstraps the development Corp and creates a one-time runner enrollment;
-7. starts an outbound runner; and
-8. starts the Vite web client.
-
-Reuse existing dependencies and binaries only when they match the current source:
-
-```powershell
-./tools/start_local.ps1 -SkipInstall -SkipBuild
-```
-
 ### Configure the source repository
 
-Set the source repository before starting the stack:
+From an isolated ECorp contribution worktree, choose the source and private execution paths
+**before the first start**:
 
 ```powershell
 $env:CRONY_SOURCE_REPOSITORY = 'C:\path\to\repository'
 $env:CRONY_SOURCE_BASE_REF = 'HEAD'
-$env:CRONY_RUNNER_WORKSPACE = 'C:\path\to\isolated-runner-workspace'
-./tools/start_local.ps1
+$env:CRONY_RUNNER_WORKSPACE = 'C:\path\to\private-runner-workspace'
+$env:CRONY_COPILOT_HOME = 'C:\path\to\private-copilot-home'
 ```
 
 `CRONY_SOURCE_REPOSITORY` is a read-only source checkout from the perspective of write-capable
 runs. The runner must create linked worktrees below `CRONY_RUNNER_WORKSPACE`; it must never fall
-back to editing the configured checkout.
+back to editing the configured checkout. Do not share runner workspaces, credential directories,
+or provider homes between contributors. Other providers retain their own native authentication
+and session behavior; a private Copilot home is not proof of isolation for every adapter.
+
+This local stack is for solo testing or disjoint eligible issue sets. To consume a shared backlog,
+use the [shared authority](#operating-model) with separately enrolled runners and distinct
+`CRONY_RUNNER_ID` values, not another local server pointed at the team's database.
+
+For an existing database, have the trusted host supply `DATABASE_URL` before startup. This
+**bypasses Compose entirely**; no additional database is provisioned. Load connection strings,
+service keys, and provider credentials through trusted host configuration, never as values in
+command arguments, source files, issues, evidence, or logs. Secret values are not saved in the
+process ownership record; environment delivery remains reduced assurance. Re-supply the same
+database connection and required keys when starting a missing server. A retained external stack
+does not fall back to Compose, and even `-Restart` cannot retarget its recorded database identity.
+Shared deployments expose authenticated ECorp access, not shared database credentials.
+
+### Start, reuse, or explicitly restart
+
+Choose an available API/UI port pair on first start; these are the defaults:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1 -ServerPort 8791 -WebPort 5187
+```
+
+For an ordinary subsequent start, no repeated configuration flags are needed:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1
+```
+
+Normal **Start reuses healthy owned processes and recorded configuration**, starts only missing
+services, and serializes concurrent start/stop operations for this checkout. It retains the
+API/UI addresses, source repository/ref, runner ID/workspace, Copilot home, and configured Factory
+controller/Project/repository settings. An occupied port without verified ownership fails closed:
+nothing is stopped and no fallback port is chosen. A live but unready service is not replaced;
+inspect its retained logs and retry.
+
+Start installs dependencies only when starting a missing web client; Rust builds cover
+only missing server, runner, or configured Factory roles. Use `-SkipInstall -SkipBuild` only when
+the dependencies and binaries already match the intended source.
+
+- **First setup:** when Corp/actor IDs are not already recorded or supplied through
+  `CRONY_CORP_ID`/`CRONY_ACTOR_ID`, development startup bootstraps with `seed_agents: false`.
+  A new runner without an existing identity receives one-time enrollment.
+- **Later starts and restarts:** retain the same Corp, runner identity, credential files,
+  workspace, and provider home. The runner's native workload credential rotates on reconnect;
+  startup does not delete it or re-enroll each time. If an existing identity's credential is
+  missing, restore it through the authorized operator rather than wiping state or inventing a
+  replacement. Explicit enrollment/revocation remain separate native operations.
+- **Factory:** `ECORP_FACTORY_WATCH=1` enables the configured watcher. A missing watcher can be
+  added without replacing the healthy API, runner, or UI. `-SkipFactoryController` skips starting
+  a missing watcher; it does not stop one already running. Startup retains the existing controller
+  identity, durable pause state, and outstanding backoff deadline; it does not unpause intake or
+  bypass an upstream wait.
+
+To apply source, binary, port, provider, or other configuration changes to running services,
+coordinate active work first, then explicitly restart:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1 -Restart
+```
+
+Supply changed non-secret settings before that command and add `-ServerPort`/`-WebPort` if changing
+addresses. Plain Start does not reload running processes. `-Restart` stops and replaces only
+verified owned services and can interrupt active work; it is not a data or credential reset.
+
+### Check readiness without changing data
+
+Use the server and web URLs printed by Start. Set these non-secret variables to that configured
+pair (defaults shown), and use the same server address in later CLI/API examples:
+
+```powershell
+$ServerUrl = 'http://127.0.0.1:8791'
+$WebUrl = 'http://127.0.0.1:5187'
+Invoke-RestMethod -Uri "$ServerUrl/health"
+Invoke-WebRequest -Uri $WebUrl
+```
+
+These GET requests check API health and the web response without resetting demo state or launching
+a mission. They do not prove provider execution, artifact verification, or the browser-to-runner
+workflow. Use the configured web URL for interactive work.
+
+### Confirm the source before dispatch
 
 The Missions **Describe & setup** screen lists the structured repository, ref, and immutable commit
 advertised by every connected runner. Select and confirm the intended target before choosing a
@@ -158,7 +217,7 @@ repositories without a GitHub remote use a stable `local/<name>-<digest>` identi
 CLI callers can pin the same tuple explicitly:
 
 ```powershell
-crony mission $corpId $actorId `
+crony --server $ServerUrl mission $corpId $actorId `
   --adapter github-copilot `
   --source-repository local/example-0123456789ab `
   --source-base-ref HEAD `
@@ -169,31 +228,46 @@ crony mission $corpId $actorId `
 For factory work, the configured Git remote, symbolic source ref, and resolved immutable commit must
 match the persisted factory policy and the runner's advertised capability.
 
-### Verify the stack
+### Optional smoke test: disposable fixtures only
+
+**Do not run `e2e_smoke.ps1` against retained manual, team, or production data.** It is not a
+read-only health command or an automatic post-start step. After its health check it calls
+`POST /api/demo/reset`, acquires control leases, creates and launches a mission, and sends live
+control input to the deterministic `fake-process` child. It checks artifact upload/download,
+SHA-256, journal events, and dirty-worktree preservation, then writes `output/e2e-smoke.json`.
+This is fixture execution, not real-provider or browser validation.
+
+Only after confirming a separately owned disposable fixture stack **and database**, explicitly
+target its API address with `-Server` (replace the placeholder):
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8791/health
-Invoke-WebRequest http://127.0.0.1:5187
-./tools/e2e_smoke.ps1
+pwsh -NoProfile -File ./tools/e2e_smoke.ps1 -Server 'http://127.0.0.1:<fixture-server-port>'
 ```
 
-Open `http://127.0.0.1:5187`. The smoke test exercises the real server, runner, child process,
-control lease, artifact upload/download, hash verification, event journal, and worktree
-disposition.
+The script defaults to port `8791`; it does not discover your configured address or enforce
+disposable ownership. Different API/UI ports alone do not isolate database history. Inspect each
+E2E's fixture contract before use; some restart services, create repositories/credentials, or
+manipulate database state.
 
-Stop only this worktree's recorded processes:
+### Stop without erasing retained state
+
+Stop only this worktree's verified owned processes:
 
 ```powershell
-./tools/stop_local.ps1
+pwsh -NoProfile -File ./tools/stop_local.ps1
 ```
 
-`stop_local.ps1` does not stop PostgreSQL. The current Compose project name is shared by worktrees,
-so do not run `docker compose ... down` from one worktree unless every user of that shared database
-has coordinated the shutdown.
+Stop does not stop PostgreSQL or delete credentials, provider homes, worktrees, logs, or ownership
+history.
+Legacy PID-only records and unknown/reused PIDs do not authorize stopping arbitrary processes.
+For a legacy migration, supply the original database/source/address configuration; preserve
+unverified listeners rather than adopting or killing them.
 
-Do not run repository E2E scripts against shared development data unless the script explicitly
-supports it. Factory E2Es may restart the server, create temporary repositories and credentials, or
-modify test database state.
+Managed Compose project names are worktree-derived, but the default database port is still
+`54329`. If it is occupied without that managed container, startup refuses to create another
+container; authorized reuse requires an externally supplied `DATABASE_URL`. Coordinate database
+lifecycle separately; do not tear down a database another session uses or delete its data to make
+Start succeed.
 
 ## Curate the live backlog
 
@@ -322,7 +396,7 @@ $CorpId = '00000000-0000-4000-8000-000000000001'
 $ActorId = '00000000-0000-4000-8000-000000000011'
 $IssueNumber = 123
 
-cargo run -p crony-cli -- factory `
+cargo run -p crony-cli -- --server $ServerUrl factory `
   $CorpId `
   $ActorId `
   --owner shyamsridhar123 `
@@ -384,7 +458,7 @@ pass it explicitly:
 ```
 
 ```powershell
-cargo run -p crony-cli -- factory `
+cargo run -p crony-cli -- --server $ServerUrl factory `
   $CorpId `
   $ActorId `
   --owner shyamsridhar123 `
@@ -643,7 +717,7 @@ Ordinary factory polling never restarts `verification_failed` work. An owner, ad
 must target one issue and state why the recovery is authorized:
 
 ```powershell
-crony factory $CorpId $ActorId `
+crony --server $ServerUrl factory $CorpId $ActorId `
   --issue 113 `
   --verification-recovery verifier-only `
   --verification-recovery-reason "Re-run the corrected verifier metadata against the unchanged checkpoint."
@@ -652,7 +726,7 @@ crony factory $CorpId $ActorId `
 For a bounded source correction:
 
 ```powershell
-crony factory $CorpId $ActorId `
+crony --server $ServerUrl factory $CorpId $ActorId `
   --issue 113 `
   --verification-recovery source-correction `
   --verification-recovery-reason "Resume only to address the recorded independent-review findings."
@@ -714,7 +788,7 @@ New-Item -ItemType Directory -Path $PublisherDirectory -Force | Out-Null
 
 $Publisher = Invoke-RestMethod `
   -Method Post `
-  -Uri "http://127.0.0.1:8791/api/corps/$CorpId/factory/publication-publishers/credentials" `
+  -Uri "$ServerUrl/api/corps/$CorpId/factory/publication-publishers/credentials" `
   -ContentType application/json `
   -Body (@{
     actor_id = $ActorId
@@ -736,7 +810,7 @@ authentication token.
 ```powershell
 $WorkItemId = '<factory-work-item-id>'
 
-cargo run -p crony-cli -- factory-publish `
+cargo run -p crony-cli -- --server $ServerUrl factory-publish `
   $CorpId `
   $ActorId `
   $WorkItemId `
@@ -767,7 +841,7 @@ $CredentialId = $Publisher.credential_id
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "http://127.0.0.1:8791/api/corps/$CorpId/factory/publication-publishers/credentials/$CredentialId/revoke" `
+  -Uri "$ServerUrl/api/corps/$CorpId/factory/publication-publishers/credentials/$CredentialId/revoke" `
   -ContentType application/json `
   -Body (@{
     actor_id = $ActorId

@@ -92,16 +92,20 @@ $env:CRONY_RUNNER_WORKSPACE = Join-Path $env:USERPROFILE '.ecorp\runner-workspac
 pwsh -NoProfile -File ./tools/start_local.ps1
 Invoke-RestMethod http://127.0.0.1:8791/health
 Invoke-WebRequest http://127.0.0.1:5187
-./tools/e2e_smoke.ps1
 pwsh -NoProfile -File ./tools/stop_local.ps1
 ```
+
+Use the addresses printed by Start if configured differently. The GET requests above are
+read-only readiness checks. `e2e_smoke.ps1` is **not** a normal startup step: it resets demo data
+and launches fixture work. Run it only against an explicitly owned disposable fixture and
+database, as described in the [smoke-test guide](docs/DARK_FACTORY_CONTRIBUTOR_GUIDE.md#optional-smoke-test-disposable-fixtures-only).
 
 The server owns authoritative organizational state. The outbound runner owns provider processes and
 isolated worktrees. Closing a browser or desktop client must not terminate a run. Do not share the
 runner workspace, credential directory, or provider state directory with another contributor.
 Shared deployments expose one authenticated ECorp authority, not shared database credentials.
-Contributors running local tests on the same machine must also coordinate the stack's ports and
-shared development Compose database.
+Contributors running local tests on the same machine must also coordinate ports and database
+ownership. Worktree-specific Compose project names do not make the default database port private.
 
 ### Local startup and recovery
 
