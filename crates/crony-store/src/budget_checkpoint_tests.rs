@@ -1956,7 +1956,7 @@ async fn issue148_checkpoint_publication_start_renew_replay_preserves_provenance
         .unwrap();
     assert!(!started.replayed && !started.busy);
     assert_eq!(started.publication.run_id, command.run_id);
-    assert_eq!(started.publication.provenance["schema_version"], 2);
+    assert_eq!(started.publication.provenance["schema_version"], 3);
     assert_eq!(
         started.publication.provenance["checkpoint"],
         json!({
@@ -2408,4 +2408,205 @@ async fn issue148_checkpoint_publication_rechecks_actor_room_and_publisher_crede
             .replayed
     );
     assert_publication_preserves_models(&before, &state(&store).await);
+}
+
+async fn assert_publication_failure_after_revocation(pool: PgPool, revoked: &str) {
+    let (store, _, artifact_id, input) = publication_fixture(pool).await;
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let (statement, target) = match revoked {
+        "role" => ("UPDATE actors SET role='member' WHERE id=$1", OWNER),
+        "room" => ("DELETE FROM room_memberships WHERE actor_id=$1", OWNER),
+        "artifact" => (
+            "UPDATE artifacts SET created_at=now()-interval '2 hours',
+             retention_until=now()-interval '1 hour' WHERE id=$1",
+            artifact_id,
+        ),
+        _ => panic!("unknown fixture revocation"),
+    };
+    sqlx::query(statement)
+        .bind(target)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    reject_publication(&store, &input, Some(&renewal)).await;
+    let before = publication_state(&store).await;
+    let failure = RecordPullRequestPublicationCheckpointInput {
+        corp_id: CORP,
+        publication_id: started.publication.id,
+        actor_id: OWNER,
+        publisher_id: input.publisher_id.clone(),
+        publisher_credential_hash: input.publisher_credential_hash.clone(),
+        publisher_token: started.publisher_token.unwrap(),
+        expected_version: started.publication.version,
+        idempotency_key: Uuid::new_v4().to_string(),
+        checkpoint: PullRequestPublicationCheckpointInput::Failed {
+            failure_detail: "Publication stopped because its authority changed".to_owned(),
+        },
+    };
+    // Failure reporting remains owned; it is not an unauthenticated cleanup API.
+    for mismatch in ["actor", "token", "credential", "version"] {
+        let mut invalid = failure.clone();
+        match mismatch {
+            "actor" => invalid.actor_id = REVIEWER,
+            "token" => invalid.publisher_token = Uuid::new_v4(),
+            "credential" => invalid.publisher_credential_hash = "f".repeat(64),
+            "version" => invalid.expected_version += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .record_pull_request_publication_checkpoint(invalid)
+                .await
+                .is_err()
+        );
+        assert_eq!(publication_state(&store).await, before);
+    }
+    let recorded = store
+        .record_pull_request_publication_checkpoint(failure.clone())
+        .await
+        .unwrap();
+    assert!(recorded.publisher_token.is_none());
+    assert_eq!(
+        recorded.publication.failure_detail.as_deref(),
+        Some("Publication stopped because its authority changed")
+    );
+    let after = publication_state(&store).await;
+    assert_eq!(after["publication"]["attempts"][0]["state"], "failed");
+    assert!(!after["publication"]["attempts"][0]["finished_at"].is_null());
+    assert!(after["publication"]["rows"][0]["publisher_lease_expires_at"].is_null());
+    assert_eq!(after["item"], before["item"]);
+    assert_publication_preserves_models(&before, &after);
+    assert_eq!(
+        after["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "factory.publication_failed")
+            .count(),
+        1
+    );
+    let replayed = store
+        .record_pull_request_publication_checkpoint(failure)
+        .await
+        .unwrap();
+    assert!(replayed.replayed);
+    let replay = publication_state(&store).await;
+    for field in ["rows", "attempts", "operations"] {
+        assert_eq!(replay["publication"][field], after["publication"][field]);
+    }
+    assert_eq!(replay["events"], after["events"]);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_review_failure_after_role_change(pool: PgPool) {
+    assert_publication_failure_after_revocation(pool, "role").await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_review_failure_after_room_revocation(pool: PgPool) {
+    assert_publication_failure_after_revocation(pool, "room").await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_review_failure_after_artifact_expiry(pool: PgPool) {
+    assert_publication_failure_after_revocation(pool, "artifact").await;
+}
+
+async fn assert_legacy_checkpoint_publication_upgrade(pool: PgPool, renewal_replay: bool) {
+    let (store, _, _, input) = publication_fixture(pool).await;
+    let started = store
+        .start_pull_request_publication(input.clone())
+        .await
+        .unwrap();
+    let renewal = publication_renewal(&input, &started);
+    if renewal_replay {
+        store
+            .renew_pull_request_publication(renewal.clone())
+            .await
+            .unwrap();
+    }
+    // Disposable metadata representing an in-flight older deployment. This is
+    // not a claim that an old binary or real remote Git effects ran in this test.
+    let mut legacy = started.publication.provenance.clone();
+    legacy.as_object_mut().unwrap().remove("checkpoint");
+    legacy["schema_version"] = json!(if renewal_replay { 2 } else { 1 });
+    if !renewal_replay {
+        let issue = legacy["source_issue"].as_object_mut().unwrap();
+        issue.remove("claimed_revision");
+        issue.remove("recovery_id");
+    }
+    sqlx::query("UPDATE pull_request_publications SET provenance=$2 WHERE id=$1")
+        .bind(started.publication.id)
+        .bind(legacy)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let before = publication_state(&store).await;
+    let result = if renewal_replay {
+        store.renew_pull_request_publication(renewal).await.unwrap()
+    } else {
+        store
+            .record_pull_request_publication_checkpoint(
+                RecordPullRequestPublicationCheckpointInput {
+                    corp_id: CORP,
+                    publication_id: started.publication.id,
+                    actor_id: OWNER,
+                    publisher_id: input.publisher_id.clone(),
+                    publisher_credential_hash: input.publisher_credential_hash.clone(),
+                    publisher_token: started.publisher_token.unwrap(),
+                    expected_version: started.publication.version,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    checkpoint: PullRequestPublicationCheckpointInput::BranchPushed {
+                        commit_sha: "d".repeat(40),
+                    },
+                },
+            )
+            .await
+            .unwrap()
+    };
+    let after = publication_state(&store).await;
+    assert_eq!(result.replayed, renewal_replay);
+    assert_eq!(result.publication.id, started.publication.id);
+    assert_eq!(result.publication.attempt_count, 1);
+    assert_eq!(result.publication.provenance["schema_version"], 3);
+    assert_eq!(
+        result.publication.provenance["checkpoint"],
+        started.publication.provenance["checkpoint"]
+    );
+    assert_eq!(
+        result.publication.provenance["source_issue"],
+        started.publication.provenance["source_issue"]
+    );
+    assert_eq!(
+        json!(result.publication.provenance),
+        after["publication"]["rows"][0]["provenance"],
+        "the response must return the upgraded, not pre-validation, record"
+    );
+    assert_publication_preserves_models(&before, &after);
+    if renewal_replay {
+        assert_eq!(after["events"], before["events"]);
+        assert_eq!(
+            after["publication"]["operations"],
+            before["publication"]["operations"]
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_review_legacy_upgrade_on_renewal_replay(pool: PgPool) {
+    assert_legacy_checkpoint_publication_upgrade(pool, true).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_publication_review_legacy_upgrade_on_checkpoint(pool: PgPool) {
+    assert_legacy_checkpoint_publication_upgrade(pool, false).await;
 }

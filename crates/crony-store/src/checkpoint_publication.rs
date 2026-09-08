@@ -109,6 +109,41 @@ pub(super) fn provenance_matches(persisted: &Value, expected: Option<&Value>) ->
     }
 }
 
+/// The caller must first revalidate the live native authority and all publication
+/// bindings. Schema 3 makes checkpoint proof mandatory; only older records may
+/// acquire previously absent proof, and non-null conflicting proof never upgrades.
+pub(super) fn revalidated_provenance(persisted: &Value, expected: Option<&Value>) -> Result<Value> {
+    let schema = persisted.get("schema_version").and_then(Value::as_u64);
+    let legacy = matches!(schema, Some(1 | 2));
+    if !legacy && schema != Some(3) {
+        return Err(anyhow!("unsupported publication provenance schema"));
+    }
+    let mut upgraded = persisted.clone();
+    if let Some(expected) = expected {
+        match persisted.get("checkpoint") {
+            Some(proof) if !proof.is_null() && proof != expected => {
+                return Err(anyhow!("publication checkpoint provenance changed"));
+            }
+            None | Some(Value::Null) if !legacy => {
+                return Err(anyhow!("publication checkpoint provenance is missing"));
+            }
+            _ => {}
+        }
+        if legacy {
+            upgraded["checkpoint"] = expected.clone();
+            upgraded["schema_version"] = json!(3);
+        }
+    } else if schema == Some(3) {
+        return Err(anyhow!("checkpoint publication lost its native authority"));
+    }
+    if !provenance_matches(&upgraded, expected) {
+        return Err(anyhow!(
+            "publication authority no longer matches its checkpoint provenance"
+        ));
+    }
+    Ok(upgraded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +167,46 @@ mod tests {
         assert!(!provenance_matches(&json!({"checkpoint":expected}), None));
         assert!(provenance_matches(&json!({}), None));
         assert!(provenance_matches(&json!({"checkpoint":null}), None));
+    }
+
+    #[test]
+    fn legacy_checkpoint_provenance_upgrades_without_weakening_current_proof() {
+        let proof = json!({"origin_run_id":"source","authority_sha256":"exact"});
+        for schema in [1, 2] {
+            for checkpoint in [None, Some(Value::Null), Some(proof.clone())] {
+                let mut legacy =
+                    json!({"schema_version":schema,"source_issue":{"revision":"kept"}});
+                if let Some(checkpoint) = checkpoint {
+                    legacy["checkpoint"] = checkpoint;
+                }
+                let upgraded = revalidated_provenance(&legacy, Some(&proof)).unwrap();
+                assert_eq!(upgraded["schema_version"], 3);
+                assert_eq!(upgraded["checkpoint"], proof);
+                assert_eq!(upgraded["source_issue"], legacy["source_issue"]);
+                assert_eq!(
+                    revalidated_provenance(&upgraded, Some(&proof)).unwrap(),
+                    upgraded
+                );
+            }
+        }
+        for schema in [1, 2, 3] {
+            assert!(
+                revalidated_provenance(
+                    &json!({"schema_version":schema,"checkpoint":{"origin_run_id":"changed"}}),
+                    Some(&proof)
+                )
+                .is_err()
+            );
+        }
+        for current in [
+            json!({"schema_version":3}),
+            json!({"schema_version":3,"checkpoint":null}),
+            json!({"schema_version":4,"checkpoint":proof}),
+        ] {
+            assert!(revalidated_provenance(&current, Some(&proof)).is_err());
+        }
+        assert!(revalidated_provenance(&json!({"schema_version":3}), None).is_err());
+        let ordinary = json!({"schema_version":2,"checkpoint":null});
+        assert_eq!(revalidated_provenance(&ordinary, None).unwrap(), ordinary);
     }
 }

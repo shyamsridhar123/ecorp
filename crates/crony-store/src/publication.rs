@@ -453,7 +453,7 @@ impl PgStore {
         let publisher_token = Uuid::new_v4();
         let authorization = publication_authorization(&normalized, now);
         let provenance = json!({
-            "schema_version": 2,
+            "schema_version": if prerequisites.checkpoint.is_some() { 3 } else { 2 },
             "source_issue": {
                 "number": prerequisites.work_item.source_issue_number,
                 "node_id": prerequisites.work_item.source_issue_node_id,
@@ -710,11 +710,15 @@ impl PgStore {
                 Some(input.publisher_token),
                 &operation_request,
             )?;
-            let (publication, current_token) =
+            let (publication, _) =
                 publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, true)
                     .await?
                     .context("idempotent publication renewal references a missing publication")?;
             revalidate_publication_authority_tx(&mut tx, &publication, input.actor_id).await?;
+            let (publication, current_token) =
+                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                    .await?
+                    .context("publication disappeared after renewal revalidation")?;
             let publisher_token =
                 replayable_publication_token(&publication, current_token, &operation, now);
             tx.commit().await?;
@@ -888,16 +892,23 @@ impl PgStore {
         )
         .await?;
 
-        // A lease is not a substitute for current source/review/actor authority.
-        // Reject new progress if those bindings changed after the remote effect;
-        // a later authorized publisher can adopt the exact existing remote result.
-        revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
-        // Revalidation can upgrade a legacy provenance record. Do not overwrite
-        // that upgrade with the pre-validation copy while applying this checkpoint.
-        let (current, _) =
+        let current = if matches!(
+            &checkpoint,
+            PullRequestPublicationCheckpointInput::Failed { .. }
+        ) {
+            // Failure records close this exact owned attempt; they advance no
+            // external effect. Retain the Corp, credential, actor, token, version
+            // and lease checks above even when effect authority was revoked.
+            current
+        } else {
+            // A lease cannot substitute for current source/review/actor authority.
+            revalidate_publication_authority_tx(&mut tx, &current, input.actor_id).await?;
+            // Return the persisted upgrade, not the pre-validation copy.
             publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
                 .await?
-                .context("publication disappeared after authority revalidation")?;
+                .context("publication disappeared after authority revalidation")?
+                .0
+        };
 
         let mut events = Vec::new();
         let (publication, replayed) = match checkpoint {
@@ -1639,25 +1650,32 @@ async fn revalidate_publication_authority_tx(
         || provenance_deliverable_sha != Some(prerequisites.deliverable_sha256.as_str())
         || provenance_verification_sha != Some(prerequisites.verification_sha256.as_str())
         || source_provenance == PublicationSourceProvenanceState::Invalid
-        || !checkpoint_publication::provenance_matches(
-            &publication.provenance,
-            prerequisites
-                .checkpoint
-                .as_ref()
-                .map(|checkpoint| &checkpoint.provenance),
-        )
     {
         return Err(anyhow!(
             "conflict: publication authority no longer matches its verified provenance"
         ));
     }
-    if source_provenance == PublicationSourceProvenanceState::Legacy {
-        let upgraded = upgrade_publication_source_provenance(
+    let source_upgraded = if source_provenance == PublicationSourceProvenanceState::Legacy {
+        upgrade_publication_source_provenance(
             &publication.provenance,
             &prerequisites.work_item.source_revision,
             &prerequisites.effective_source_revision,
             prerequisites.source_recovery_id,
-        )?;
+        )?
+    } else {
+        publication.provenance.clone()
+    };
+    // Older recovered-suspend publications predate checkpoint provenance. Only
+    // reconstruct it after all current source, review and authority bindings pass.
+    // Stamp schema 3 last so the source schema-1 upgrade cannot downgrade it.
+    let upgraded = checkpoint_publication::revalidated_provenance(
+        &source_upgraded,
+        prerequisites
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.provenance),
+    )?;
+    if upgraded != publication.provenance {
         let updated = sqlx::query(
             r#"
             UPDATE pull_request_publications
@@ -2130,7 +2148,7 @@ fn publication_source_provenance_state(
             PublicationSourceProvenanceState::Invalid
         });
     }
-    if schema_version != Some(2) {
+    if !matches!(schema_version, Some(2 | 3)) {
         return Ok(PublicationSourceProvenanceState::Invalid);
     }
     let persisted_claimed_revision = provenance

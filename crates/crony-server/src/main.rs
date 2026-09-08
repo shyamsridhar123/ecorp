@@ -3855,6 +3855,66 @@ async fn renew_pull_request_publication(
     Ok(Json(publication_response(outcome)))
 }
 
+fn publication_checkpoint_permission(checkpoint: &PullRequestPublicationCheckpoint) -> Permission {
+    match checkpoint {
+        // A demoted actor may close its already-owned attempt, not publish.
+        // The store still requires the independent workload credential and exact
+        // actor, publisher token, version and live lease for failure recording.
+        PullRequestPublicationCheckpoint::Failed { .. } => Permission::Read,
+        PullRequestPublicationCheckpoint::BranchPushed { .. }
+        | PullRequestPublicationCheckpoint::PullRequestCreated { .. }
+        | PullRequestPublicationCheckpoint::Published { .. } => Permission::Publish,
+    }
+}
+
+#[cfg(test)]
+mod publication_checkpoint_permission_tests {
+    use super::*;
+
+    #[test]
+    fn owned_failure_reporting_does_not_grant_effect_permission() {
+        let failure = PullRequestPublicationCheckpoint::Failed {
+            failure_detail: "Authority changed".to_owned(),
+        };
+        assert!(matches!(
+            publication_checkpoint_permission(&failure),
+            Permission::Read
+        ));
+        assert!(CorpRole::Member.allows(publication_checkpoint_permission(&failure)));
+        for progress in [
+            PullRequestPublicationCheckpoint::BranchPushed {
+                commit_sha: "a".repeat(40),
+            },
+            PullRequestPublicationCheckpoint::PullRequestCreated {
+                number: 1,
+                node_id: "fixture-pr".to_owned(),
+                url: "https://github.com/fixture/source/pull/1".to_owned(),
+                state: "OPEN".to_owned(),
+                draft: true,
+                title: "Owned fixture".to_owned(),
+                body: "Scoped metadata".to_owned(),
+                head_ref: "fixture".to_owned(),
+                base_ref: "main".to_owned(),
+                head_sha: "a".repeat(40),
+                head_repository_owner: "fixture".to_owned(),
+                is_cross_repository: false,
+                auto_merge_enabled: false,
+            },
+            PullRequestPublicationCheckpoint::Published {
+                project_status: "In Review".to_owned(),
+                project_field_id: "status".to_owned(),
+                project_option_id: "review".to_owned(),
+            },
+        ] {
+            assert!(matches!(
+                publication_checkpoint_permission(&progress),
+                Permission::Publish
+            ));
+            assert!(!CorpRole::Member.allows(publication_checkpoint_permission(&progress)));
+        }
+    }
+}
+
 async fn record_pull_request_publication_checkpoint(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -3867,7 +3927,7 @@ async fn record_pull_request_publication_checkpoint(
         &principal,
         corp_id,
         Some(request.actor_id),
-        Permission::Publish,
+        publication_checkpoint_permission(&request.checkpoint),
     )
     .await?;
     let publisher = authenticate_publication_publisher(&state, &headers, corp_id).await?;
