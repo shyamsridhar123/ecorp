@@ -2436,18 +2436,20 @@ fn apply_mission_description(plan: &mut TaskGraphPlan, description: &str) -> Res
 }
 
 fn apply_verification_policy(plan: &mut TaskGraphPlan, policy: &VerificationPolicy) {
-    let delivery_depth = plan.tasks.iter().map(|task| task.depth).max().unwrap_or(0);
+    let outcomes = plan.terminal_task_keys();
     for task in &mut plan.tasks {
-        if task.depth == delivery_depth {
+        if outcomes.contains(&task.key) {
             task.verification_policy = policy.clone();
         }
     }
 }
 
 fn enforce_factory_manual_gate(plan: &mut TaskGraphPlan) {
+    // A human reviews the final outcome, not every internal handoff. A
+    // deterministic terminal task cannot launder a provider-backed ancestor.
+    let reviewed_outcomes = plan.provider_backed_outcome_keys();
     for task in &mut plan.tasks {
-        if task.required_adapter != "fake-process" && task.verification_policy.manual_gate.is_none()
-        {
+        if reviewed_outcomes.contains(&task.key) && task.verification_policy.manual_gate.is_none() {
             task.verification_policy.manual_gate =
                 Some(ManualVerificationGate::IndependentReview {
                     roles: vec!["member".to_owned(), "owner".to_owned(), "admin".to_owned()],
@@ -6814,6 +6816,114 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn factory_review_test_plan() -> TaskGraphPlan {
+        let base: PlannedTask = serde_json::from_value(serde_json::json!({
+            "key": "systems", "title": "Systems handoff",
+            "contract": {
+                "objective": "Produce a bounded handoff", "expected_output": "Handoff",
+                "source_repository": null, "source_base_ref": null, "source_base_commit": null,
+                "acceptance_tests": ["exact handoff passes"], "allowed_tools": ["filesystem"],
+                "prohibited_actions": ["do not publish"], "references": [],
+                "write_scope": ["handoffs/systems.md"], "budget_tokens": 1000,
+                "budget_cost_microusd": 1000, "deadline_at": null, "escalation": "ask",
+                "secret_refs": [], "model": null, "reasoning_effort": null
+            },
+            "assigned_agent_id": Uuid::new_v4(), "required_adapter": "github-copilot",
+            "depends_on": [], "depth": 0, "max_attempts": 1,
+            "verification_policy": {"checks": [{"type": "artifact", "min_bytes": 1}], "manual_gate": null}
+        })).expect("valid task");
+        let mut experience = base.clone();
+        experience.key = "experience".to_owned();
+        let mut quality = base.clone();
+        quality.key = "quality".to_owned();
+        let mut delivery = base.clone();
+        delivery.key = "delivery".to_owned();
+        delivery.depth = 1;
+        delivery.depends_on = vec![
+            "systems".to_owned(),
+            "experience".to_owned(),
+            "quality".to_owned(),
+        ];
+        TaskGraphPlan {
+            strategy: "studio-swarm".to_owned(),
+            max_nodes: 4,
+            max_depth: 1,
+            budget_tokens: 4000,
+            budget_cost_microusd: 4000,
+            staffing: Vec::new(),
+            tasks: vec![base, experience, quality, delivery],
+        }
+    }
+
+    #[test]
+    fn factory_review_is_required_for_the_outcome_not_each_internal_handoff() {
+        let mut plan = factory_review_test_plan();
+        let handoff_policies: Vec<_> = plan.tasks[..3]
+            .iter()
+            .map(|task| task.verification_policy.clone())
+            .collect();
+        enforce_factory_manual_gate(&mut plan);
+        for (task, original) in plan.tasks[..3].iter().zip(handoff_policies) {
+            assert_eq!(task.verification_policy, original);
+        }
+        assert!(matches!(
+            plan.tasks[3].verification_policy.manual_gate,
+            Some(ManualVerificationGate::IndependentReview {
+                exclude_requester: true,
+                ..
+            })
+        ));
+        let once = serde_json::to_value(&plan).expect("serialize");
+        enforce_factory_manual_gate(&mut plan);
+        assert_eq!(serde_json::to_value(&plan).expect("serialize"), once);
+    }
+
+    #[test]
+    fn factory_review_preserves_explicit_internal_policy_and_reviews_provider_ancestry() {
+        let mut plan = factory_review_test_plan();
+        let explicit = ManualVerificationGate::HumanApproval {
+            roles: vec!["owner".to_owned()],
+        };
+        plan.tasks[0].verification_policy.manual_gate = Some(explicit.clone());
+        plan.tasks[3].required_adapter = "fake-process".to_owned();
+        enforce_factory_manual_gate(&mut plan);
+        assert_eq!(
+            plan.tasks[0].verification_policy.manual_gate,
+            Some(explicit)
+        );
+        assert!(plan.tasks[3].verification_policy.manual_gate.is_some());
+        for task in &mut plan.tasks {
+            task.required_adapter = "fake-process".to_owned();
+            task.verification_policy.manual_gate = None;
+        }
+        enforce_factory_manual_gate(&mut plan);
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.verification_policy.manual_gate.is_none())
+        );
+    }
+
+    #[test]
+    fn mission_verification_applies_to_every_terminal_output_even_at_different_depths() {
+        let mut plan = factory_review_test_plan();
+        plan.tasks[3].depends_on.retain(|key| key != "quality");
+        let policy = VerificationPolicy {
+            checks: vec![VerifierCheck::File {
+                path: "result.md".to_owned(),
+                min_bytes: 10,
+            }],
+            manual_gate: Some(ManualVerificationGate::HumanApproval {
+                roles: vec!["owner".to_owned()],
+            }),
+        };
+        super::apply_verification_policy(&mut plan, &policy);
+        assert_ne!(plan.tasks[0].verification_policy, policy);
+        assert_ne!(plan.tasks[1].verification_policy, policy);
+        assert_eq!(plan.tasks[2].verification_policy, policy);
+        assert_eq!(plan.tasks[3].verification_policy, policy);
     }
 
     #[test]

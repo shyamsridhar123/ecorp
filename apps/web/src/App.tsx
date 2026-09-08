@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
 import './Arcade.css'
@@ -11,7 +11,7 @@ import { OfficeInspector } from './OfficeInspector'
 import { FactoryPollingNotice } from './FactoryPollingNotice'
 import { factoryControllerState } from './factoryPolling'
 import type { FactoryPolling } from './factoryPolling'
-import { currentOfficeAgents, selectOfficeAgent } from './office/officeModel'
+import { currentOfficeAgents, operatingOfficeAgents, selectOfficeAgent } from './office/officeModel'
 import type { OfficeAgent } from './office/officeModel'
 import {
   availableRunnerAdapters, missionRuntimeError, selectMissionAdapter,
@@ -22,6 +22,11 @@ import {
   buildMissionRequest, currentMissionPreview, missionRequestScope, startMissionPreview,
 } from './missionPreview'
 import type { MissionPreviewLoad, MissionRequestScope } from './missionPreview'
+import { isProviderLiveRun, missionIdForLink, pendingReviewForRun, relatedWorkOptions, reviewBlockedReason, selectMissionEvidenceRun, workLinkLabel, workflowTaskLabel } from './workflowContext'
+import { canPostRoomMessage, discussionScopeKey, missionOrigin, resolveDiscussionRoom, roomDiscussionMessages, roomWorkContext } from './missionProjection'
+import type { DiscussionScope } from './missionProjection'
+import { createSnapshotRefresher } from './snapshotRefresh'
+import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
 
 type Actor = {
   id: string
@@ -37,6 +42,7 @@ type Agent = OfficeAgent & {
 
 type Mission = {
   id: string
+  room_id: string
   requested_by: string
   title: string
   description: string
@@ -521,6 +527,17 @@ type RoomMessage = {
   created_at: string
 }
 
+type RoomPostInput = {
+  source: 'room' | 'factory'
+  scope: DiscussionScope
+  roomId: string
+  body: string
+  replyToId: string | null
+  mentions: string[]
+  link: EntityLink | null
+  idempotencyKey: string
+}
+
 type BrowserSocketMessage =
   | { type: 'ready'; corp_id: string; replayed_through: number }
   | { type: 'event'; event: DomainEvent }
@@ -713,6 +730,25 @@ function capabilitySupports(
 
 function canOperate(role: string): boolean {
   return ['owner', 'admin', 'manager', 'member'].includes(role)
+}
+
+function ReviewEligibilityNotice({ reason, id }: { reason: string; id: string }) {
+  const demo = !storedAccessToken()
+  return (
+    <div className="review-eligibility-notice" id={id} role="status">
+      <strong>A different reviewer is needed</strong>
+      <p>{reason}</p>
+      {demo ? (
+        <button type="button" className="button button-secondary" onClick={() => {
+          const selector = document.getElementById('operator-actor')
+          selector?.scrollIntoView({ block: 'center', behavior: 'auto' })
+          selector?.focus()
+        }}>
+          Choose another demo operator
+        </button>
+      ) : <p>Ask another authorized room member to review using their own account.</p>}
+    </div>
+  )
 }
 
 function terminalRun(status: string): boolean {
@@ -1515,6 +1551,7 @@ function FactoryPanel({
   tasks,
   runs,
   room,
+  scope,
   messages,
   actors,
   agents,
@@ -1531,6 +1568,11 @@ function FactoryPanel({
   onVerificationDecision,
   onClaimLease,
   onSteer,
+  onOpenMission,
+  onDiscussMission,
+  onNewMission,
+  selectedItemId,
+  onSelectItem,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
@@ -1540,6 +1582,7 @@ function FactoryPanel({
   tasks: Task[]
   runs: Run[]
   room: { id: string; name: string; purpose: string } | undefined
+  scope: DiscussionScope
   messages: RoomMessage[]
   actors: Actor[]
   agents: Agent[]
@@ -1554,14 +1597,7 @@ function FactoryPanel({
     controller: FactoryController,
     action: 'pause' | 'resume' | 'reconcile',
   ) => void
-  onPostComment: (input: {
-    roomId: string
-    body: string
-    replyToId: string | null
-    mentions: string[]
-    link: EntityLink | null
-    idempotencyKey: string
-  }) => Promise<boolean>
+  onPostComment: (input: RoomPostInput) => Promise<boolean>
   onActionDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onClaimLease: (agent: Agent) => Promise<void>
@@ -1571,6 +1607,11 @@ function FactoryPanel({
     token: string | undefined,
     idempotencyKey: string,
   ) => Promise<boolean>
+  onOpenMission: (mission: Mission) => void
+  onDiscussMission: (mission: Mission) => void
+  onNewMission: () => void
+  selectedItemId: string | null
+  onSelectItem: (item: FactoryWorkItem) => void
 }) {
   const [commentBody, setCommentBody] = useState('')
   const [steerText, setSteerText] = useState('')
@@ -1585,19 +1626,12 @@ function FactoryPanel({
   const active = items.filter(
     (item) => !['published', 'failed', 'cancelled'].includes(item.state),
   )
-  const [selectedItemId, setSelectedItemId] = useState<string | null>(
-    () => items[0]?.id ?? null,
-  )
   const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
   const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
   const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
   const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
   const selectedRuns = runs.filter((run) => selectedTaskIds.has(run.task_id))
-  const activeRun = selectedRuns.find((run) =>
-    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval'].includes(
-      run.status,
-    ),
-  )
+  const activeRun = selectedRuns.find((run) => isProviderLiveRun(run, verificationRequests))
   const activeAgent = agents.find(
     (agent) => agent.id === activeRun?.agent_id && agent.retired_at == null,
   )
@@ -1616,17 +1650,15 @@ function FactoryPanel({
   const pendingReviews = verificationRequests.filter(
     (request) => selectedRunIds.has(request.run_id) && request.status === 'pending',
   )
-  const linkedIds = new Set([
-    ...(selectedMission ? [selectedMission.id] : []),
-    ...selectedTasks.map((task) => task.id),
-    ...selectedRuns.flatMap((run) => [
-      run.id,
-      ...(run.artifact_id ? [run.artifact_id] : []),
-    ]),
-  ])
-  const contextualMessages = messages
-    .filter((message) => message.link && linkedIds.has(message.link.id))
-    .slice(-8)
+  const contextualMessages = selectedMission
+    ? roomDiscussionMessages(messages, room?.id, selectedMission.id,
+      roomWorkContext({ missions, tasks, runs }, room?.id, selectedMission.id)).slice(-8)
+    : []
+  const otherMissions = missions.filter((mission) =>
+    missionOrigin(mission.id, {
+      factory_work_items: items, pull_request_publications: publications,
+    }).kind === 'unknown',
+  )
   const selectedPublication = publications.find(
     (candidate) => candidate.factory_work_item_id === selected?.id,
   )
@@ -1646,9 +1678,10 @@ function FactoryPanel({
       <div className="panel-heading factory-heading">
         <div>
           <span className="section-code">Factory</span>
-          <h2>Governed issue intake</h2>
+          <h2>GitHub work, on autopilot</h2>
           <p>
-            GitHub work enters one fenced lane, becomes one mission, and advances only on evidence.
+            Factory turns eligible GitHub issues into missions. Agents build, checks verify,
+            and results become ready for review. Merging is a separate decision.
           </p>
         </div>
         <div className="operations-summary">
@@ -1718,10 +1751,22 @@ function FactoryPanel({
             </div>
           </>
         ) : (
-          <p>
-            Configure the trusted controller process to make Factory actively watch GitHub
-            Project intake.
-          </p>
+          <div className="factory-start-help">
+            <p>Automatic GitHub intake is off. Your runner is separate and can still execute direct missions.</p>
+            <button type="button" className="button button-primary"
+              disabled={!canOperate(selectedActor.role)} onClick={onNewMission}>
+              Start a direct mission
+            </button>
+            <details>
+              <summary>How to enable automatic intake</summary>
+              <ol>
+                <li>Choose a GitHub Project and repository, then mark reviewed issues eligible for Factory.</li>
+                <li>Start the trusted <code>crony factory-watch</code> controller for that source. A connected agent runner alone does not start intake.</li>
+                <li>Its status appears here. Use Pause intake, Resume intake and Reconcile now to operate it.</li>
+              </ol>
+              <p>Comments discuss work. Agent direction and review decisions use their own explicit controls.</p>
+            </details>
+          </div>
         )}
         {controller ? <FactoryPollingNotice controller={controller} /> : null}
         {controller?.last_error ? (
@@ -1730,6 +1775,20 @@ function FactoryPanel({
           </p>
         ) : null}
       </section>
+      {otherMissions.length ? (
+        <section className="manual-work-links" aria-label="Other missions">
+          <strong>Other missions</strong>
+          <p>These missions are not linked in this Factory view. Their intake origin may be unavailable.</p>
+          <div className="work-context-actions">
+            {otherMissions.slice(0, 5).map((mission) => (
+              <button key={mission.id} type="button" className="button button-secondary"
+                onClick={() => onOpenMission(mission)}>
+                {mission.title}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
       <div className={`factory-console ${items.length ? '' : 'factory-console-empty'}`}>
         {items.length ? (
           <>
@@ -1748,7 +1807,7 @@ function FactoryPanel({
                     aria-pressed={selected?.id === item.id}
                     aria-controls="factory-workbench"
                     data-status={stateTone(item.state)}
-                    onClick={() => setSelectedItemId(item.id)}
+                    onClick={() => onSelectItem(item)}
                   >
                     <span className="factory-queue-index">
                       {String(index + 1).padStart(2, '0')}
@@ -1790,6 +1849,14 @@ function FactoryPanel({
                       {selected.source_title}
                     </a>
                   </h3>
+                  {selectedMission ? (
+                    <nav className="work-context-actions" aria-label="This work item">
+                      <button type="button" className="button button-secondary"
+                        onClick={() => onOpenMission(selectedMission)}>Open mission and results</button>
+                      <button type="button" className="button button-secondary"
+                        onClick={() => onDiscussMission(selectedMission)}>Open discussion</button>
+                    </nav>
+                  ) : null}
 
                   {selected.failure_detail ? (
                     <section className="factory-failure-dossier" aria-label="Factory failure detail">
@@ -1865,23 +1932,24 @@ function FactoryPanel({
                           const run = selectedRuns.find(
                             (candidate) => candidate.id === request.run_id,
                           )
-                          const eligible =
-                            request.gate.roles.includes(selectedActor.role) &&
-                            !(
-                              request.gate.type === 'independent_review' &&
-                              request.gate.exclude_requester &&
-                              selectedMission.requested_by === selectedActor.id
-                            )
+                          const blockedReason = reviewBlockedReason(
+                            request.gate, selectedActor, selectedMission.requested_by,
+                          )
+                          const eligible = !blockedReason
+                          const noticeId = `factory-review-eligibility-${request.run_id}`
+                          const reviewTask = selectedTasks.find((task) => task.id === request.task_id)
                           return run ? (
                             <article key={request.run_id}>
                               <strong>{statusLabel(request.gate_type)}</strong>
-                              <p>Review the persisted verification evidence for this run.</p>
+                              <p>{reviewTask ? `${workflowTaskLabel(reviewTask.plan_key)}: ${reviewTask.title}` : 'Review the persisted verification evidence for this run.'}</p>
                               <small>Run {shortId(run.id)}</small>
+                              {blockedReason ? <ReviewEligibilityNotice reason={blockedReason} id={noticeId} /> : null}
                               <div>
                                 <button
                                   type="button"
                                   disabled={busy || !eligible}
                                   onClick={() => void onVerificationDecision(run, false)}
+                                  aria-describedby={blockedReason ? noticeId : undefined}
                                 >
                                   Reject
                                 </button>
@@ -1890,8 +1958,9 @@ function FactoryPanel({
                                   className="button button-primary"
                                   disabled={busy || !eligible}
                                   onClick={() => void onVerificationDecision(run, true)}
+                                  aria-describedby={blockedReason ? noticeId : undefined}
                                 >
-                                  Accept evidence
+                                  {busy ? 'Submitting decision…' : 'Accept evidence'}
                                 </button>
                               </div>
                             </article>
@@ -1947,12 +2016,14 @@ function FactoryPanel({
                                 missionId: selectedMission.id,
                               })
                               const operationStorageKey =
-                                `ecorp:factory-comment:${selected.id}:${selectedActor.id}`
+                                `ecorp:factory-comment:${discussionScopeKey(scope)}:${selected.id}`
                               const idempotencyKey = browserOperationKey(
                                 operationStorageKey,
                                 payload,
                               )
                               void onPostComment({
+                                source: 'factory',
+                                scope,
                                 roomId: room.id,
                                 body,
                                 replyToId: null,
@@ -3249,6 +3320,7 @@ function MissionCard({
   verificationRequests,
   actionApprovals,
   factoryItem,
+  origin,
   factoryRecoveries,
   events,
   actorId,
@@ -3263,6 +3335,9 @@ function MissionCard({
   onContractRevision,
   onVerificationDecision,
   onActionApprovalDecision,
+  onDiscuss,
+  onViewAgents,
+  onOpenFactory,
 }: {
   corpId: string
   mission: Mission
@@ -3277,13 +3352,14 @@ function MissionCard({
   verificationRequests: VerificationRequest[]
   actionApprovals: ActionApproval[]
   factoryItem: FactoryWorkItem | undefined
+  origin: ReturnType<typeof missionOrigin>
   factoryRecoveries: FactoryVerificationRecovery[]
   events: DomainEvent[]
   actorId: string
   actorRole: string
   busy: boolean
   onLaunch: (mission: Mission) => Promise<void>
-  onResume: (run: Run) => Promise<void>
+  onResume: (run: Run) => Promise<string | null>
   onDownloadArtifact: (run: Run) => Promise<void>
   onDownloadDeliverable: (deliverable: SourceDeliverable) => Promise<void>
   onProposeBudgetRevision: (
@@ -3303,8 +3379,19 @@ function MissionCard({
   ) => Promise<boolean>
   onVerificationDecision: (run: Run, approved: boolean) => Promise<void>
   onActionApprovalDecision: (approval: ActionApproval, approved: boolean) => Promise<void>
+  onDiscuss: (mission: Mission) => void
+  onViewAgents: (mission: Mission) => void
+  onOpenFactory: () => void
 }) {
   const [copiedRecoveryCommand, setCopiedRecoveryCommand] = useState<string | null>(null)
+  const evidenceStorageKey = evidenceSelectionKey({ server: API_URL, corpId, actorId, missionId: mission.id })
+  const [selectedEvidenceRunId, setSelectedEvidenceRunId] = useState<string | null>(
+    () => readEvidenceSelection(() => window.sessionStorage, evidenceStorageKey),
+  )
+  const rememberEvidenceRun = (runId: string) => {
+    rememberEvidenceSelection(() => window.sessionStorage, evidenceStorageKey, runId)
+    setSelectedEvidenceRunId(runId)
+  }
   const [recoveryContextLoad, setRecoveryContextLoad] = useState<FactoryRecoveryContextLoad | null>(null)
   const [recoveryReload, setRecoveryReload] = useState(0)
   const recoveryItemId = factoryItem?.id
@@ -3325,11 +3412,22 @@ function MissionCard({
     left.depth - right.depth || left.plan_key.localeCompare(right.plan_key),
   )
   const taskById = new Map(tasks.map((task) => [task.id, task]))
-  const latestRun = runs[0]
+  const evidenceRun = selectMissionEvidenceRun(runs, verificationRequests, selectedEvidenceRunId)
+  const displayedEvidenceRunId = evidenceRun?.id
+  useEffect(() => {
+    if (selectedEvidenceRunId !== null || !displayedEvidenceRunId) return
+    // Pin the initial viewed run too: another reviewer completing it, a newer
+    // worker, navigation or reload must not silently move this review context.
+    const remembered = rememberEvidenceSelection(
+      () => window.sessionStorage, evidenceStorageKey, displayedEvidenceRunId,
+    )
+    // One guarded synchronization when the first run arrives, never per streamed event.
+    // oxlint-disable-next-line react/set-state-in-effect
+    setSelectedEvidenceRunId(remembered ? displayedEvidenceRunId : '')
+  }, [displayedEvidenceRunId, evidenceStorageKey, selectedEvidenceRunId])
   const completedTasks = tasks.filter((task) => task.status === 'completed').length
-  const activeRuns = runs.filter((run) =>
-    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
-  ).length
+  const activeRuns = runs.filter((run) => isProviderLiveRun(run, verificationRequests)).length
+  const hasUnfinishedRuns = runs.some((run) => !terminalRun(run.status))
   const consumedTokens = runs.reduce(
     (total, run) => total + run.input_tokens + run.output_tokens,
     0,
@@ -3346,45 +3444,43 @@ function MissionCard({
   )
   const resumableRun = runs.find(
     (run) =>
+      run.task_id === evidenceRun?.task_id &&
       run.provider_session_id &&
       run.workspace_disposition === 'preserved' &&
       terminalRun(run.status),
   )
-  const pendingRun = runs.find((run) => run.status === 'waiting_for_approval')
   const resumeStopBlocked = resumableRun?.breaker_stage === 'stop'
-  const pendingRequest = pendingRun
-    ? verificationRequests.find(
-        (request) => request.run_id === pendingRun.id && request.status === 'pending',
-      )
-    : undefined
+  const pendingReviewRuns = runs.filter((run) => pendingReviewForRun(run, verificationRequests))
+  const pendingRequest = pendingReviewForRun(evidenceRun, verificationRequests)
+  const pendingRun = selectedEvidenceRunId !== null && pendingRequest ? evidenceRun : undefined
   const runIds = new Set(runs.map((run) => run.id))
   const pendingActionApprovals = actionApprovals.filter(
     (approval) => runIds.has(approval.run_id) && approval.status === 'pending',
   )
-  const automated = automatedVerificationPresentation(latestRun, evidence, events, factoryRecoveries)
-  const latestEvidence = automated.records
-  const latestVerificationRequest = latestRun
+  const automated = automatedVerificationPresentation(evidenceRun, evidence, events, factoryRecoveries)
+  const runEvidence = automated.records
+  const runVerificationRequest = evidenceRun
     ? verificationRequests.find(
-        (request) => request.run_id === latestRun.id && request.task_id === latestRun.task_id,
+        (request) => request.run_id === evidenceRun.id && request.task_id === evidenceRun.task_id,
       )
     : undefined
-  const reviewRejected = latestVerificationRequest?.status === 'rejected'
-  const reviewDecisionLabel = latestVerificationRequest?.gate_type === 'independent_review'
+  const reviewRejected = runVerificationRequest?.status === 'rejected'
+  const reviewDecisionLabel = runVerificationRequest?.gate_type === 'independent_review'
     ? 'Independent review'
     : 'Human approval'
-  const reviewer = actors.find((actor) => actor.id === latestVerificationRequest?.decided_by)
-  const reviewDecisionNote = latestVerificationRequest?.decision_note?.trim() ||
+  const reviewer = actors.find((actor) => actor.id === runVerificationRequest?.decided_by)
+  const reviewDecisionNote = runVerificationRequest?.decision_note?.trim() ||
     'No reason was recorded for this decision.'
   const compactReviewNote = reviewDecisionNote.replace(/\s+/g, ' ')
   const reviewDecisionSummary = compactReviewNote.length > 240
     ? `${compactReviewNote.slice(0, 237).trimEnd()}…`
     : compactReviewNote
-  const latestDeliverable = latestRun
-    ? deliverables.find((deliverable) => deliverable.run_id === latestRun.id)
+  const runDeliverable = evidenceRun
+    ? deliverables.find((deliverable) => deliverable.run_id === evidenceRun.id)
     : undefined
   const terminalSummary =
-    latestRun && terminalRun(latestRun.status)
-      ? latestRun.summary ?? latestRun.verification_summary
+    evidenceRun && terminalRun(evidenceRun.status)
+      ? evidenceRun.summary ?? evidenceRun.verification_summary
       : null
   const recovery = factoryRecoveryPresentation(recoveryContext, runs)
   // The endpoint selects the task. This exact-ID lookup supplies command metadata
@@ -3451,12 +3547,24 @@ function MissionCard({
       setCopiedRecoveryCommand(null)
     }
   }
+  const decideEvidence = (approved: boolean) => {
+    if (!pendingRun || !pendingRequest) return
+    // Keep the decided run visible across snapshot refresh, reload and navigation.
+    // Another review needs an explicit selector/next-review action.
+    rememberEvidenceRun(pendingRun.id)
+    void onVerificationDecision(pendingRun, approved)
+  }
+  const resumeEvidence = async () => {
+    if (!resumableRun) return
+    const resumedRunId = await onResume(resumableRun)
+    if (resumedRunId) rememberEvidenceRun(resumedRunId)
+  }
   return (
     <article
       className="mission-card"
       data-testid={`mission-${mission.id}`}
       data-mission-id={mission.id}
-      data-run-id={latestRun?.id}
+      data-run-id={evidenceRun?.id}
       tabIndex={-1}
     >
       <div className="mission-card-top">
@@ -3464,6 +3572,24 @@ function MissionCard({
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
+      <div className="mission-work-context">
+        <p>
+          <strong>{origin.label}</strong>
+          {' · '}
+          {origin.detail}
+        </p>
+        <nav className="work-context-actions" aria-label="Mission workspace">
+          <button type="button" className="button button-secondary" onClick={() => onViewAgents(mission)}>
+            {activeRuns ? 'View live agents' : 'View task owners'}
+          </button>
+          <button type="button" className="button button-secondary" onClick={() => onDiscuss(mission)}>
+            Discuss this mission
+          </button>
+          {factoryItem ? <button type="button" className="button button-secondary" onClick={onOpenFactory}>
+            View GitHub intake
+          </button> : null}
+        </nav>
+      </div>
       {mission.description ? (
         <details className="mission-dossier mission-briefing">
           <summary>
@@ -3484,7 +3610,7 @@ function MissionCard({
         </div>
         <div>
           <dt>Runs</dt>
-          <dd>{activeRuns ? `${activeRuns} active` : `${runs.length} attempts`}</dd>
+          <dd>{activeRuns ? `${activeRuns} live` : `${runs.length} run${runs.length === 1 ? '' : 's'}`}</dd>
         </div>
       </dl>
       <details
@@ -3528,7 +3654,7 @@ function MissionCard({
               tabIndex={-1}
             >
               <summary className="task-graph-row">
-                <span>{task.plan_key}</span>
+                <span>{workflowTaskLabel(task.plan_key)}</span>
                 <strong>{statusLabel(task.status)}</strong>
                 <small>d{task.depth} · {task.attempt_count}/{task.max_attempts}</small>
               </summary>
@@ -3635,45 +3761,98 @@ function MissionCard({
         </details>
       ) : null}
       </details>
-      {latestRun?.artifact_sha256 && latestRun.artifact_uri ? (
+      {runs.length ? (
+        <section
+          className="mission-evidence-context"
+          aria-label="Run evidence"
+          data-evidence-run-id={evidenceRun?.id}
+          data-evidence-task-id={evidenceRun?.task_id}
+        >
+          <label htmlFor={`mission-evidence-${mission.id}`}>Evidence for</label>
+          <select
+            id={`mission-evidence-${mission.id}`}
+            value={evidenceRun?.id ?? ''}
+            disabled={busy}
+            onChange={(event) => rememberEvidenceRun(event.target.value)}
+          >
+            {!evidenceRun ? <option value="" disabled>Choose a run to inspect</option> : null}
+            {runs.map((run) => (
+              <option key={run.id} value={run.id}>
+                {taskById.get(run.task_id)?.title ?? 'Task'} · {shortId(run.id)} · {statusLabel(run.status)}
+                {pendingReviewForRun(run, verificationRequests) ? ' · Review needed' : ''}
+              </option>
+            ))}
+          </select>
+          {evidenceRun ? (
+            <>
+              <p>
+                Produced by {agents.find((agent) => agent.id === evidenceRun.agent_id)?.name ?? shortId(evidenceRun.agent_id)}
+                {' · '}run {shortId(evidenceRun.id)}
+              </p>
+              <p>Downloads, checks and evidence decisions below apply only to this run.</p>
+            </>
+          ) : (
+            <p role="status">Choose a run to view its evidence. Reviews never transfer between runs.</p>
+          )}
+          {pendingReviewRuns.length ? (
+            <div className="work-context-actions">
+              <strong>{pendingReviewRuns.length} evidence review{pendingReviewRuns.length === 1 ? '' : 's'} pending</strong>
+              {!pendingRequest || pendingReviewRuns.length > 1 ? (
+                <button
+                  className="button button-secondary"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    const current = pendingReviewRuns.findIndex((run) => run.id === evidenceRun?.id)
+                    rememberEvidenceRun(pendingReviewRuns[(current + 1) % pendingReviewRuns.length].id)
+                  }}
+                >
+                  Review next pending run
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+      {evidenceRun?.artifact_sha256 && evidenceRun.artifact_uri ? (
         <div
           className="evidence-box evidence-provider"
           data-testid="provider-evidence"
-          data-artifact-id={latestRun.artifact_id}
+          data-artifact-id={evidenceRun.artifact_id}
         >
           <strong>Provider evidence</strong>
-          <span>{shortId(latestRun.artifact_sha256)}…</span>
+          <span>{shortId(evidenceRun.artifact_sha256)}…</span>
           <button
             type="button"
             className="artifact-download"
-            onClick={() => void onDownloadArtifact(latestRun)}
+            onClick={() => void onDownloadArtifact(evidenceRun)}
           >
-            {latestRun.verification_status === 'passed'
+            {evidenceRun.verification_status === 'passed'
               ? 'Download verified artifact'
               : 'Download submitted artifact'}
           </button>
         </div>
       ) : null}
-      {latestDeliverable ? (
+      {runDeliverable ? (
         <div className="evidence-box evidence-source" data-testid="source-deliverable">
-          <strong>Source deliverable · {statusLabel(latestDeliverable.form)}</strong>
-          <span>{latestDeliverable.file_name} · {latestDeliverable.bytes.toLocaleString()} bytes</span>
+          <strong>Source deliverable · {statusLabel(runDeliverable.form)}</strong>
+          <span>{runDeliverable.file_name} · {runDeliverable.bytes.toLocaleString()} bytes</span>
           <small>
-            Verification {shortId(latestDeliverable.verification_sha256)}… · bytes {shortId(latestDeliverable.sha256)}…
+            Verification {shortId(runDeliverable.verification_sha256)}… · bytes {shortId(runDeliverable.sha256)}…
           </small>
           <button
             type="button"
             className="artifact-download"
-            onClick={() => void onDownloadDeliverable(latestDeliverable)}
+            onClick={() => void onDownloadDeliverable(runDeliverable)}
           >
             Download source deliverable
           </button>
         </div>
       ) : null}
-      {latestRun &&
-      (latestRun.verification_status !== 'pending' || latestEvidence.length > 0) ? (
+      {evidenceRun &&
+      (evidenceRun.verification_status !== 'pending' || runEvidence.length > 0) ? (
         <details
-          key={`verification-${latestRun.id}`}
+          key={`verification-${evidenceRun.id}`}
           className={`verification-box operations-verification verification-${automated.status}`}
           data-testid="verification-evidence"
           data-check-total={automated.total ?? 'unknown'}
@@ -3693,9 +3872,9 @@ function MissionCard({
             </span>
             <span className="operations-disclosure-mark" aria-hidden="true">+</span>
           </summary>
-          {latestEvidence.length ? (
+          {runEvidence.length ? (
             <ol className="evidence-checks">
-              {latestEvidence.map((item) => (
+              {runEvidence.map((item) => (
                 <li className={`evidence-check evidence-check-${item.status}`} key={item.id}>
                   <strong>{statusLabel(item.kind)}</strong>
                   <span>{statusLabel(item.status)}</span>
@@ -3718,13 +3897,13 @@ function MissionCard({
           <small>
             {reviewer
               ? `Reviewed by ${reviewer.name}`
-              : latestVerificationRequest?.decided_by
-                ? `Reviewer ${shortId(latestVerificationRequest.decided_by)} (name unavailable)`
+              : runVerificationRequest?.decided_by
+                ? `Reviewer ${shortId(runVerificationRequest.decided_by)} (name unavailable)`
                 : 'Reviewer not recorded'}
           </small>
           <p>{reviewDecisionSummary}</p>
           {reviewDecisionSummary !== reviewDecisionNote ? (
-            <details className="operations-review-details" key={latestVerificationRequest?.run_id}>
+            <details className="operations-review-details" key={runVerificationRequest?.run_id}>
               <summary>Read full reviewer findings</summary>
               <div
                 className="operations-review-full"
@@ -3853,65 +4032,65 @@ function MissionCard({
           </> : null}
         </section>
       ) : null}
-      {latestRun && terminalRun(latestRun.status) ? (
+      {evidenceRun && terminalRun(evidenceRun.status) ? (
         reviewRejected ? (
-          <details className="operations-run-outcome" key={`run-outcome-${latestRun.id}`}>
-            <summary>Run record · {statusLabel(latestRun.status)}</summary>
+          <details className="operations-run-outcome" key={`run-outcome-${evidenceRun.id}`}>
+            <summary>Run record · {statusLabel(evidenceRun.status)}</summary>
             <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
             <small>
-              Worktree: {latestRun.workspace_disposition
-                ? statusLabel(latestRun.workspace_disposition)
+              Worktree: {evidenceRun.workspace_disposition
+                ? statusLabel(evidenceRun.workspace_disposition)
                 : 'cleanup pending'}
-              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+              {evidenceRun.workspace_detail ? ` · ${evidenceRun.workspace_detail}` : ''}
             </small>
           </details>
         ) : (
-          <div className={`terminal-summary terminal-${latestRun.status}`}>
-            <strong>{statusLabel(latestRun.status)}</strong>
+          <div className={`terminal-summary terminal-${evidenceRun.status}`}>
+            <strong>{statusLabel(evidenceRun.status)}</strong>
             <p>{terminalSummary ?? 'The run ended without a summary.'}</p>
             <small>
-              Worktree: {latestRun.workspace_disposition
-                ? statusLabel(latestRun.workspace_disposition)
+              Worktree: {evidenceRun.workspace_disposition
+                ? statusLabel(evidenceRun.workspace_disposition)
                 : 'cleanup pending'}
-              {latestRun.workspace_detail ? ` · ${latestRun.workspace_detail}` : ''}
+              {evidenceRun.workspace_detail ? ` · ${evidenceRun.workspace_detail}` : ''}
             </small>
           </div>
         )
       ) : null}
-      {latestRun && (
-        latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ||
-        latestRun.model || latestRun.workspace_branch
+      {evidenceRun && (
+        evidenceRun.input_tokens > 0 || evidenceRun.output_tokens > 0 ||
+        evidenceRun.model || evidenceRun.workspace_branch
       ) ? (
         <dl className="operations-run-metadata" aria-label="Run details">
-          {latestRun.input_tokens > 0 || latestRun.output_tokens > 0 ? (
+          {evidenceRun.input_tokens > 0 || evidenceRun.output_tokens > 0 ? (
             <div>
               <dt>Usage</dt>
-              <dd>{latestRun.input_tokens.toLocaleString()} in · {latestRun.output_tokens.toLocaleString()} out</dd>
+              <dd>{evidenceRun.input_tokens.toLocaleString()} in · {evidenceRun.output_tokens.toLocaleString()} out</dd>
             </div>
           ) : null}
-          {latestRun.model ? (
+          {evidenceRun.model ? (
             <div>
               <dt>Model</dt>
               <dd>
-                {latestRun.model}
-                {latestRun.reasoning_effort ? ` · ${latestRun.reasoning_effort} reasoning` : ''}
+                {evidenceRun.model}
+                {evidenceRun.reasoning_effort ? ` · ${evidenceRun.reasoning_effort} reasoning` : ''}
               </dd>
             </div>
           ) : null}
-          {latestRun.workspace_branch ? (
-            <div title={latestRun.workspace_detail ?? undefined}>
-              <dt>{statusLabel(latestRun.workspace_disposition ?? 'active')} worktree</dt>
-              <dd>{latestRun.workspace_branch}</dd>
+          {evidenceRun.workspace_branch ? (
+            <div title={evidenceRun.workspace_detail ?? undefined}>
+              <dt>{statusLabel(evidenceRun.workspace_disposition ?? 'active')} worktree</dt>
+              <dd>{evidenceRun.workspace_branch}</dd>
             </div>
           ) : null}
         </dl>
       ) : null}
-      {latestDeliverable ? (
+      {runDeliverable ? (
         <div className="workspace-box integration-box" data-testid="integration-state">
-          <span>Integration · {statusLabel(latestDeliverable.integration_state)}</span>
+          <span>Integration · {statusLabel(runDeliverable.integration_state)}</span>
           <strong>
-            {latestDeliverable.head_commit
-              ? `${latestDeliverable.branch} @ ${shortId(latestDeliverable.head_commit)}`
+            {runDeliverable.head_commit
+              ? `${runDeliverable.branch} @ ${shortId(runDeliverable.head_commit)}`
               : 'No publication or merge requested'}
           </strong>
           <small>Pull-request publication and merge require separate authorization.</small>
@@ -3962,7 +4141,7 @@ function MissionCard({
           })}
         </div>
       ) : null}
-      {resumableRun && activeRuns === 0 && factoryItem?.state !== 'verification_failed' ? (
+      {resumableRun && resumableRun.id === evidenceRun?.id && !hasUnfinishedRuns && factoryItem?.state !== 'verification_failed' ? (
         <>
           <button
             className="button button-secondary mission-launch"
@@ -3973,7 +4152,7 @@ function MissionCard({
               resumeBudgetBlocked ||
               Boolean(pendingBudgetRevision)
             }
-            onClick={() => onResume(resumableRun)}
+            onClick={() => void resumeEvidence()}
           >
             {resumeStopBlocked
               ? 'Stop-stage run cannot resume'
@@ -4001,39 +4180,38 @@ function MissionCard({
         </>
       ) : null}
       {pendingRun && pendingRequest ? (
-        <div className="verification-actions">
+        <div className="verification-actions" data-review-run-id={pendingRun.id} data-review-task-id={pendingRun.task_id}>
           {(() => {
             const requiredRoles = pendingRequest.gate.roles
-            const requesterExcluded =
-              pendingRequest.gate.type === 'independent_review' &&
-              pendingRequest.gate.exclude_requester &&
-              mission.requested_by === actorId
-            const canDecide = requiredRoles.includes(actorRole) && !requesterExcluded
+            const blockedReason = reviewBlockedReason(
+              pendingRequest.gate,
+              { id: actorId, role: actorRole, name: actors.find((actor) => actor.id === actorId)?.name },
+              mission.requested_by,
+            )
+            const canDecide = !blockedReason
+            const noticeId = `mission-review-eligibility-${pendingRun.id}`
             return (
               <>
                 <span>
                   {statusLabel(pendingRequest.gate_type)} · eligible: {requiredRoles.join(', ')}
                 </span>
-                {!canDecide ? (
-                  <small>
-                    {requesterExcluded
-                      ? 'The requester cannot approve an independent review. Switch operator.'
-                      : `Your ${actorRole} role is not eligible for this gate.`}
-                  </small>
-                ) : null}
+                <span>{taskById.get(pendingRun.task_id)?.title ?? 'Task'} · run {shortId(pendingRun.id)}</span>
+                {blockedReason ? <ReviewEligibilityNotice reason={blockedReason} id={noticeId} /> : null}
           <button
             className="button button-primary"
             type="button"
                   disabled={busy || !canDecide}
-            onClick={() => onVerificationDecision(pendingRun, true)}
+            onClick={() => decideEvidence(true)}
+            aria-describedby={blockedReason ? noticeId : undefined}
           >
-            Approve evidence
+            {busy ? 'Submitting decision…' : 'Accept evidence'}
           </button>
           <button
             className="button button-danger"
             type="button"
                   disabled={busy || !canDecide}
-            onClick={() => onVerificationDecision(pendingRun, false)}
+            onClick={() => decideEvidence(false)}
+            aria-describedby={blockedReason ? noticeId : undefined}
           >
             Reject evidence
           </button>
@@ -4071,6 +4249,7 @@ function EventRow({ event, actors }: { event: DomainEvent; actors: Actor[] }) {
 
 function RoomPanel({
   room,
+  scope,
   messages,
   actors,
   selectedActor,
@@ -4079,27 +4258,48 @@ function RoomPanel({
   runs,
   onPost,
   onNavigateLink,
+  onContextChange,
 }: {
   room: { id: string; name: string; purpose: string } | undefined
+  scope: DiscussionScope
   messages: RoomMessage[]
   actors: Actor[]
   selectedActor: Actor
   missions: Mission[]
   tasks: Task[]
   runs: Run[]
-  onPost: (input: {
-    roomId: string
-    body: string
-    replyToId: string | null
-    mentions: string[]
-    link: EntityLink | null
-    idempotencyKey: string
-  }) => Promise<boolean>
+  onPost: (input: RoomPostInput) => Promise<boolean>
   onNavigateLink: (link: EntityLink) => void
+  onContextChange: (missionId: string | null) => void
 }) {
   const [body, setBody] = useState('')
   const [replyToId, setReplyToId] = useState<string | null>(null)
   const [linkValue, setLinkValue] = useState('')
+  const [posting, setPosting] = useState(false)
+  const contextMissionId = scope.missionId
+  const context = roomWorkContext({ missions, tasks, runs }, room?.id, contextMissionId)
+  const contextMission = missions.find((mission) => mission.id === contextMissionId)
+  const contextSelector = (
+    <div className="room-context-bar">
+      <label htmlFor="room-context">Discussion for</label>
+      <select id="room-context" value={contextMissionId ?? ''} disabled={posting}
+        onChange={(event) => onContextChange(event.target.value || null)}>
+        <option value="">All room discussion</option>
+        {contextMissionId && !contextMission ? (
+          <option value={contextMissionId} disabled>Unavailable mission</option>
+        ) : null}
+        {missions.map((mission) => (
+          <option key={mission.id} value={mission.id}>{mission.title}</option>
+        ))}
+      </select>
+      {room && contextMission ? (
+        <button type="button" className="button button-secondary"
+          onClick={() => onNavigateLink({ kind: 'mission', id: contextMission.id })}>
+          Open mission and results
+        </button>
+      ) : null}
+    </div>
+  )
 
   if (!room) {
     return (
@@ -4107,53 +4307,44 @@ function RoomPanel({
         <div className="panel-heading">
           <div>
             <span className="section-code">Project room</span>
-            <h2>No room access</h2>
-            <p>{selectedActor.name} is not a member of this project room.</p>
+            <h2>Discussion unavailable</h2>
+            <p>The selected mission or room is not available in {selectedActor.name}&apos;s current view.</p>
           </div>
         </div>
-        <div className="room-denied">Room messages and room-scoped work are hidden.</div>
+        {contextSelector}
+        <div className="room-denied">Choose an available mission. No comment can be posted to an unverified room.</div>
       </section>
     )
   }
 
-  const linkedOptions = Array.from(
-    new Map(
-      [
-        ...missions.slice(0, 2).map((mission) => ({
-          value: `mission:${mission.id}`,
-          label: `Mission · ${mission.title}`,
-        })),
-        ...tasks.slice(0, 2).map((task) => ({
-          value: `task:${task.id}`,
-          label: `Task · ${task.title}`,
-        })),
-        ...runs.slice(0, 2).flatMap((run) => [
-          { value: `run:${run.id}`, label: `Run · ${shortId(run.id)} · ${run.status}` },
-          ...(run.artifact_sha256 && run.artifact_id
-            ? [{
-                value: `artifact:${run.artifact_id}`,
-                label: `Artifact · ${shortId(run.artifact_sha256)}`,
-              }]
-            : []),
-        ]),
-      ].map((option) => [option.value, option] as const),
-    ).values(),
-  )
-  const visibleMessages = messages.slice(-40)
+  const linkedOptions = relatedWorkOptions(context)
+  const scopedMessages = roomDiscussionMessages(messages, room.id, contextMissionId, context)
+  const visibleMessages = scopedMessages.slice(-40)
   const replyTarget = replyToId
-    ? messages.find((message) => message.id === replyToId)
+    ? scopedMessages.find((message) => message.id === replyToId)
     : undefined
+  const inheritedLink = replyTarget?.link ??
+    scopedMessages.find((message) => message.id === replyTarget?.thread_root_id)?.link
+  const replyLink = inheritedLink && missionIdForLink(inheritedLink, context) ? inheritedLink : null
+  const effectiveLinkValue = linkValue || (replyLink
+    ? `${replyLink.kind}:${replyLink.id}`
+    : contextMission ? `mission:${contextMission.id}` : '')
+  const composerError = replyToId && !replyTarget
+    ? 'The reply target is no longer in this discussion.'
+    : effectiveLinkValue && !linkedOptions.some((option) => option.value === effectiveLinkValue)
+      ? 'The related work is no longer in this discussion.'
+      : null
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!body.trim()) return
+    if (!body.trim() || posting || composerError) return
     const mentionedNames = Array.from(body.matchAll(/@([A-Za-z0-9_-]+)/g), (match) =>
       match[1].toLowerCase(),
     )
     const mentions = actors
       .filter((actor) => mentionedNames.includes(actor.name.toLowerCase()))
       .map((actor) => actor.id)
-    const [kind, id] = linkValue.split(':')
+    const [kind, id] = effectiveLinkValue.split(':')
     const link =
       kind && id
         ? ({ kind, id } as EntityLink)
@@ -4165,16 +4356,24 @@ function RoomPanel({
       mentions,
       link,
     })
-    const operationStorageKey = `ecorp:room-message:${room.id}:${selectedActor.id}`
+    const operationStorageKey = `ecorp:room-message:${discussionScopeKey(scope)}`
     const idempotencyKey = browserOperationKey(operationStorageKey, payload)
-    const saved = await onPost({
-      roomId: room.id,
-      body: body.trim(),
-      replyToId,
-      mentions,
-      link,
-      idempotencyKey,
-    })
+    setPosting(true)
+    let saved = false
+    try {
+      saved = await onPost({
+        source: 'room',
+        scope,
+        roomId: room.id,
+        body: body.trim(),
+        replyToId,
+        mentions,
+        link,
+        idempotencyKey,
+      })
+    } finally {
+      setPosting(false)
+    }
     if (saved) {
       clearBrowserOperation(operationStorageKey)
       setBody('')
@@ -4193,17 +4392,18 @@ function RoomPanel({
       <div className="panel-heading">
         <div>
           <span className="section-code">Project room</span>
-          <h2>{room.name} channel</h2>
-          <p>Every human and agent message is durable, attributable, and linked to the work.</p>
+          <h2>{contextMission ? contextMission.title : `${room.name} discussion`}</h2>
+          <p>{room.name} · Comments are shared discussion—not agent instructions, new tasks, or approvals.</p>
         </div>
-        <div className="room-count">{messages.length} messages</div>
+        <div className="room-count">{scopedMessages.length} comments</div>
       </div>
+      {contextSelector}
       <div className="room-layout">
         <ol className="room-message-list" data-testid="room-message-list">
           {visibleMessages.length ? (
             visibleMessages.map((message) => {
               const author = actors.find((actor) => actor.id === message.actor_id)
-              const linked = message.link
+              const linked = message.link && missionIdForLink(message.link, context) ? message.link : null
               return (
                 <li
                   key={message.id}
@@ -4231,7 +4431,7 @@ function RoomPanel({
                           className="entity-link"
                           onClick={() => onNavigateLink(linked)}
                         >
-                          {statusLabel(linked.kind)} · {shortId(linked.id)}
+                          {workLinkLabel(linked, context)}
                         </button>
                       ) : null}
                     </div>
@@ -4244,13 +4444,21 @@ function RoomPanel({
             })
           ) : (
             <li className="empty-state">
-              <strong>The room is quiet</strong>
-              <span>Post the first durable message.</span>
+              <strong>{contextMission ? 'No discussion for this mission yet' : 'The room is quiet'}</strong>
+              <span>Leave a comment for your collaborators. Use the mission's agent controls to send instructions.</span>
             </li>
           )}
         </ol>
-        <form className="room-composer" onSubmit={submit}>
+        <form className="room-composer" onSubmit={submit} aria-busy={posting}>
           <label htmlFor="room-message">Post as {selectedActor.name}</label>
+          {composerError ? (
+            <div className="room-denied" role="alert">
+              {composerError}
+              <button type="button" onClick={() => { setReplyToId(null); setLinkValue('') }}>
+                Reset reply and related work
+              </button>
+            </div>
+          ) : null}
           {replyTarget ? (
             <div className="reply-context">
               Replying to {actors.find((actor) => actor.id === replyTarget.actor_id)?.name ?? 'message'}
@@ -4263,16 +4471,26 @@ function RoomPanel({
             onChange={(event) => setBody(event.target.value)}
             placeholder="Write a message. Mention a colleague with @Name."
             rows={5}
+            disabled={posting}
+            aria-describedby="room-comment-purpose"
           />
-          <label htmlFor="room-link">Structured link</label>
-          <select id="room-link" value={linkValue} onChange={(event) => setLinkValue(event.target.value)}>
+          <p className="room-comment-purpose" id="room-comment-purpose">
+            This records a comment only. To direct a worker, open the mission and choose View live agents.
+          </p>
+          <label htmlFor="room-link">Related work</label>
+          <select id="room-link" value={effectiveLinkValue} disabled={posting}
+            onChange={(event) => {
+              const value = event.target.value
+              setLinkValue(value)
+              setReplyToId(null)
+            }}>
             <option value="">No linked work item</option>
             {linkedOptions.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
           </select>
-          <button className="button button-primary" type="submit" disabled={!body.trim()}>
-            Post to room
+          <button className="button button-primary" type="submit" disabled={posting || !body.trim() || Boolean(composerError)}>
+            {posting ? 'Posting comment…' : 'Post comment'}
           </button>
         </form>
       </div>
@@ -4349,8 +4567,13 @@ function MissionAllocationPreview({
 
 function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null)
-  const [data, setData] = useState<SnapshotResponse | null>(null)
+  const [connectionAttempt, setConnectionAttempt] = useState(0)
+  const [snapshotLoad, setSnapshotLoad] = useState<{
+    corpId: string; actorId: string; response: SnapshotResponse
+  } | null>(null)
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
+  const data = snapshotLoad && snapshotLoad.corpId === bootstrap?.corp_id &&
+    snapshotLoad.actorId === selectedActorId ? snapshotLoad.response : null
   const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
   const [missionDescription, setMissionDescription] = useState('')
   const [missionObjective, setMissionObjective] = useState('')
@@ -4386,8 +4609,12 @@ function App() {
   const [pauseAfterPlanning, setPauseAfterPlanning] = useState(false)
   const [developerMode, setDeveloperMode] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [showRegisteredCrew, setShowRegisteredCrew] = useState(false)
   const [floorInspectorOpen, setFloorInspectorOpen] = useState(false)
   const [selectedMissionId, setSelectedMissionId] = useState<string | null>(null)
+  const [roomMissionId, setRoomMissionId] = useState<string | null>(null)
+  const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null)
+  const [selectedFactoryItemId, setSelectedFactoryItemId] = useState<string | null>(null)
   const [activeWorkspaceView, setActiveWorkspaceView] = useState<WorkspaceView>(() =>
     workspaceViewFromHash(window.location.hash),
   )
@@ -4406,6 +4633,12 @@ function App() {
   const [connectionToken, setConnectionToken] = useState('')
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
+  const currentViewer = useRef<{ corpId: string; actorId: string } | null>(null)
+  const currentComments = useRef<{
+    snapshot: SnapshotResponse['snapshot']
+    room: DiscussionScope
+    factory: DiscussionScope
+  } | null>(null)
   const composerInitialized = useRef(false)
   const initialWorkspaceHash = useRef(window.location.hash)
 
@@ -4462,6 +4695,8 @@ function App() {
   const navigateToWorkspaceEntity = useCallback(
     (kind: EntityLink['kind'] | 'room', targetId: string) => {
       if (kind === 'room') {
+        setRoomMissionId(null)
+        setSelectedRoomId(targetId)
         setActiveWorkspaceView('room')
         window.history.replaceState(null, '', '#room')
         setAnnouncement('Comms opened.')
@@ -4482,7 +4717,16 @@ function App() {
             ? data?.snapshot.tasks.find((task) => task.id === linkedRun.task_id)
             : undefined
       const missionId = kind === 'mission' ? targetId : linkedTask?.mission_id
-      if (missionId) setSelectedMissionId(missionId)
+      if (!missionId || !data?.snapshot.missions.some((mission) => mission.id === missionId)) {
+        setError('The linked mission is unavailable in the current view.')
+        return
+      }
+      if (missionId) {
+        setSelectedMissionId(missionId)
+        setRoomMissionId(missionId)
+        setSelectedRoomId(null)
+        setMissionComposerCollapsed(true)
+      }
       setActiveWorkspaceView('missions')
       window.history.replaceState(null, '', '#missions')
       setAnnouncement(`${statusLabel(kind)} opened in Missions.`)
@@ -4533,20 +4777,32 @@ function App() {
   }, [bootstrap, navigateToWorkspaceEntity])
   const lastEventSeq = useRef<Record<string, number>>({})
 
-  const refresh = useCallback(async (corpId: string, actorId: string) => {
+  const refresh = useCallback(async (corpId: string, actorId: string, signal?: AbortSignal) => {
     const snapshot = await api<SnapshotResponse>(
       `/api/corps/${corpId}/snapshot?actor_id=${actorId}`,
+      { signal },
     )
+    if (signal?.aborted) throw new DOMException('Obsolete snapshot scope', 'AbortError')
+    if (snapshot.snapshot.corp.id !== corpId) throw new Error('Snapshot Corp does not match the requested Corp.')
+    if (currentViewer.current?.corpId !== corpId || currentViewer.current.actorId !== actorId) {
+      return snapshot
+    }
     const newest = snapshot.snapshot.events.at(-1)?.seq ?? 0
     lastEventSeq.current[actorId] = Math.max(lastEventSeq.current[actorId] ?? 0, newest)
-    setData(snapshot)
+    setSnapshotLoad({ corpId, actorId, response: snapshot })
     return snapshot
   }, [])
 
   useEffect(() => {
     let cancelled = false
+    let timedOut = false
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, 30_000)
     void (async () => {
-      const health = await fetch(`${API_URL}/health`).then((response) =>
+      const health = await fetch(`${API_URL}/health`, { signal: controller.signal }).then((response) =>
         response.json() as Promise<HealthResponse>,
       )
       if (health.mode === 'production') {
@@ -4570,14 +4826,16 @@ function App() {
           codex_agent_id: '',
         }
         if (cancelled) return
+        currentViewer.current = { corpId, actorId }
         setBootstrap(result)
         setSelectedActorId(actorId)
-        await refresh(corpId, actorId)
+        await refresh(corpId, actorId, controller.signal)
         return
       }
       const result = await api<BootstrapResponse>('/api/demo/bootstrap?seed_crew=false', {
         method: 'POST',
         body: '{}',
+        signal: controller.signal,
       })
       if (cancelled) return
       setBootstrap(result)
@@ -4587,19 +4845,34 @@ function App() {
         : actorName?.toLowerCase() === 'eve'
           ? result.eve_actor_id
           : result.alice_actor_id
+      currentViewer.current = { corpId: result.corp_id, actorId: initialActor }
       setSelectedActorId(initialActor)
-      await refresh(result.corp_id, initialActor)
+      await refresh(result.corp_id, initialActor, controller.signal)
     })()
-      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)))
+      .catch((caught: unknown) => {
+        if (cancelled) return
+        setError(timedOut
+          ? 'ECorp did not finish connecting within 30 seconds. Agent runs are independent of this tab. Retry the connection; do not restart the mission.'
+          : caught instanceof Error ? caught.message : String(caught))
+      })
+      .finally(() => window.clearTimeout(timeout))
     return () => {
       cancelled = true
+      window.clearTimeout(timeout)
+      controller.abort()
     }
-  }, [refresh])
+  }, [refresh, connectionAttempt])
 
   useEffect(() => {
     if (!bootstrap || !selectedActorId) return
     let disposed = false
     let socket: WebSocket | null = null
+    const snapshotRefresh = createSnapshotRefresher({
+      refresh: (signal) => refresh(bootstrap.corp_id, selectedActorId, signal),
+      onError: (caught) => {
+        if (!disposed) setError(caught instanceof Error ? caught.message : String(caught))
+      },
+    })
 
     const connect = async () => {
       if (disposed) return
@@ -4634,6 +4907,7 @@ function App() {
         `${wsUrl}/ws/corps/${bootstrap.corp_id}?${authorization}&after_seq=${lastEventSeq.current[selectedActorId] ?? 0}`,
       )
       socket.onmessage = (event) => {
+        if (disposed) return
         const message = JSON.parse(event.data) as BrowserSocketMessage
         if (message.type === 'ready') {
           lastEventSeq.current[selectedActorId] = Math.max(
@@ -4642,7 +4916,7 @@ function App() {
           )
           replaying = false
           setConnection('live')
-          if (replayChanged) void refresh(bootstrap.corp_id, selectedActorId)
+          if (replayChanged) snapshotRefresh.request()
           return
         }
         if (message.event.seq <= (lastEventSeq.current[selectedActorId] ?? 0)) return
@@ -4652,9 +4926,11 @@ function App() {
           replayChanged = true
           return
         }
-        void refresh(bootstrap.corp_id, selectedActorId)
+        snapshotRefresh.request()
       }
-      socket.onerror = () => setConnection('offline')
+      socket.onerror = () => {
+        if (!disposed) setConnection('offline')
+      }
       socket.onclose = () => {
         if (disposed) return
         setConnection('offline')
@@ -4665,6 +4941,7 @@ function App() {
     void connect()
     return () => {
       disposed = true
+      snapshotRefresh.dispose()
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
       socket?.close()
     }
@@ -4696,7 +4973,36 @@ function App() {
     [data, selectedMissionSource],
   )
   const selectedActor =
-    humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
+    humans.find((actor) => actor.id === selectedActorId) ?? null
+  const room = data
+    ? resolveDiscussionRoom(data.snapshot.rooms, data.snapshot.missions, roomMissionId, selectedRoomId)
+    : undefined
+  // Keep each scope stable across snapshot refreshes, but replace it on context
+  // changes (including A -> B -> A) so an old submission cannot become current again.
+  const roomScope = useMemo<DiscussionScope>(() => ({
+    corpId: bootstrap?.corp_id ?? '',
+    actorId: selectedActorId ?? '',
+    roomId: room?.id ?? null,
+    missionId: roomMissionId,
+  }), [bootstrap?.corp_id, selectedActorId, room?.id, roomMissionId])
+  const factorySelection = data?.snapshot.factory_work_items.find((item) =>
+    item.id === selectedFactoryItemId,
+  ) ?? data?.snapshot.factory_work_items[0]
+  const factoryRoom = data && factorySelection?.mission_id
+    ? resolveDiscussionRoom(data.snapshot.rooms, data.snapshot.missions, factorySelection.mission_id)
+    : undefined
+  const factoryScope = useMemo<DiscussionScope>(() => ({
+    corpId: bootstrap?.corp_id ?? '',
+    actorId: selectedActorId ?? '',
+    roomId: factoryRoom?.id ?? null,
+    missionId: factorySelection?.mission_id ?? null,
+  }), [bootstrap?.corp_id, selectedActorId, factoryRoom?.id, factorySelection?.mission_id])
+  useLayoutEffect(() => {
+    currentComments.current = data && selectedActor
+      ? { snapshot: data.snapshot, room: roomScope, factory: factoryScope }
+      : null
+    return () => { currentComments.current = null }
+  })
   const deterministicHarness = usesDeterministicHarness(missionStrategy)
   const studioTeam = missionStrategy === STUDIO_STRATEGY
   const selectedAdapter = selectMissionAdapter(missionStrategy, availableAdapters, missionAdapter)
@@ -4750,6 +5056,8 @@ function App() {
     !runtimeError && missionVerifierErrors.length === 0
 
   const selectActor = (actor: Actor) => {
+    currentViewer.current = bootstrap ? { corpId: bootstrap.corp_id, actorId: actor.id } : null
+    currentComments.current = null
     setSelectedActorId(actor.id)
     setAnnouncement(`Switching operations view to ${actor.name}.`)
     const url = new URL(window.location.href)
@@ -4875,8 +5183,8 @@ function App() {
     }
   }
 
-  const resumeAgentRun = async (run: Run) => {
-    if (!bootstrap || !selectedActor) return
+  const resumeAgentRun = async (run: Run): Promise<string | null> => {
+    if (!bootstrap || !selectedActor) return null
     setBusy(true)
     setError(null)
     try {
@@ -4888,9 +5196,13 @@ function App() {
             'Continue the prior session in the same repository. Inspect the current state, complete any remaining mission work, and verify the result.',
         }),
       })
-      await refresh(bootstrap.corp_id, selectedActor.id)
+      const updated = await refresh(bootstrap.corp_id, selectedActor.id)
+      return updated.snapshot.runs.find(
+        (candidate) => candidate.task_id === run.task_id && candidate.resumed_from_run_id === run.id,
+      )?.id ?? null
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+      return null
     } finally {
       setBusy(false)
     }
@@ -5207,21 +5519,21 @@ function App() {
     }
   }
 
-  const postRoomMessage = async (input: {
-    roomId: string
-    body: string
-    replyToId: string | null
-    mentions: string[]
-    link: EntityLink | null
-    idempotencyKey: string
-  }): Promise<boolean> => {
-    if (!bootstrap || !selectedActor) return false
+  const postRoomMessage = async (input: RoomPostInput): Promise<boolean> => {
+    const isCurrent = () => {
+      const current = currentComments.current
+      return current !== null &&
+        currentViewer.current?.corpId === input.scope.corpId &&
+        currentViewer.current.actorId === input.scope.actorId &&
+        canPostRoomMessage(current.snapshot, current[input.source], input.scope, input)
+    }
+    if (!isCurrent()) return false
     setError(null)
     try {
-      await api(`/api/corps/${bootstrap.corp_id}/rooms/${input.roomId}/messages`, {
+      await api(`/api/corps/${input.scope.corpId}/rooms/${input.roomId}/messages`, {
         method: 'POST',
         body: JSON.stringify({
-          actor_id: selectedActor.id,
+          actor_id: input.scope.actorId,
           body: input.body,
           reply_to_id: input.replyToId,
           mentions: input.mentions,
@@ -5229,10 +5541,13 @@ function App() {
           idempotency_key: input.idempotencyKey,
         }),
       })
-      await refresh(bootstrap.corp_id, selectedActor.id)
-      return true
+      // A saved comment belongs to its original scope. A late response must not
+      // refresh another viewer or clear a newer room/mission's draft.
+      if (!isCurrent()) return false
+      await refresh(input.scope.corpId, input.scope.actorId)
+      return isCurrent()
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught))
+      if (isCurrent()) setError(caught instanceof Error ? caught.message : String(caught))
       return false
     }
   }
@@ -5376,6 +5691,8 @@ function App() {
     const actorId = connectionActorId.trim()
     const token = connectionToken.trim()
     if (!corpId || !actorId || !token) return
+    currentViewer.current = { corpId, actorId }
+    currentComments.current = null
     setBusy(true)
     setError(null)
     window.sessionStorage.setItem('ecorp_corp_id', corpId)
@@ -5454,20 +5771,36 @@ function App() {
         <div className="loading-stamp">ECORP OPERATIONS NETWORK</div>
         <h1>Authorizing the operations console…</h1>
         {error ? <p className="error-banner">{error}</p> : <p>Waiting for the control plane.</p>}
+        {error ? (
+          <button
+            className="button button-primary"
+            type="button"
+            onClick={() => {
+              setError(null)
+              setConnectionAttempt((attempt) => attempt + 1)
+            }}
+          >
+            Retry connection
+          </button>
+        ) : null}
       </main>
     )
   }
 
   const latestMissions = data.snapshot.missions.slice(0, 8)
   const latestEvents = data.snapshot.events.toReversed().slice(0, 28)
-  const room = data.snapshot.rooms[0]
   const connectedRunners = data.runners.filter((runner) => runner.connected)
   const runnerLabel = connectedRunners.length
     ? `${connectedRunners.length} runner${connectedRunners.length === 1 ? '' : 's'} online`
     : data.runners.some((runner) => runner.status === 'grace')
       ? 'Runner reconnecting'
       : 'No runner'
-  const selectedAgent = selectOfficeAgent(currentAgents, selectedAgentId)
+  const floorAgents = operatingOfficeAgents(
+    currentAgents,
+    new Set(allAvailableAdapters.map((adapter) => adapter.name)),
+    showRegisteredCrew,
+  )
+  const selectedAgent = selectOfficeAgent(floorAgents, selectedAgentId)
   const selectedAgentCapability = connectedRunners
     .flatMap((runner) => runner.capabilities)
     .find(
@@ -5490,11 +5823,9 @@ function App() {
     (request) => request.status === 'pending',
   )
   const activeRuns = data.snapshot.runs.filter((run) =>
-    ['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'].includes(run.status),
+    isProviderLiveRun(run, data.snapshot.verification_requests),
   )
-  const acceptedArtifacts = data.snapshot.runs.filter(
-    (run) => run.verification_status === 'passed' && run.artifact_uri,
-  )
+  const completedMissions = data.snapshot.missions.filter((mission) => mission.status === 'completed')
   const productionAuthenticated = Boolean(storedAccessToken())
   const activeFactoryItems = data.snapshot.factory_work_items.filter(
     (item) => !['published', 'failed', 'cancelled'].includes(item.state),
@@ -5512,6 +5843,15 @@ function App() {
   const selectedMissionRuns = selectedMission
     ? data.snapshot.runs.filter((run) => selectedMissionTaskIds.has(run.task_id))
     : []
+
+  const selectDiscussionMission = (missionId: string | null) => {
+    const destination = missionId === null ? room : resolveDiscussionRoom(
+      data.snapshot.rooms, data.snapshot.missions, missionId,
+    )
+    setSelectedRoomId(destination?.id ?? selectedRoomId)
+    setRoomMissionId(missionId)
+    if (missionId) setSelectedMissionId(missionId)
+  }
 
   const activateWorkspaceView = (view: WorkspaceView) => {
     const destination = WORKSPACE_VIEWS.find((candidate) => candidate.id === view)
@@ -5578,7 +5918,7 @@ function App() {
             <small id="operator-identity-help">
               {productionAuthenticated
                 ? 'Locked to your authenticated OIDC account. Identity switching is disabled.'
-                : 'Alice, Bob and Eve are seeded local demo users. Switching changes demo permissions, not your GitHub sign-in.'}
+                : 'Local demo permissions—not GitHub sign-in.'}
             </small>
           </div>
         </div>
@@ -5619,7 +5959,15 @@ function App() {
           <small>{currentWorkspaceView.description}</small>
         </div>
         <div className="arcade-command-meters">
-          <button type="button" onClick={() => activateWorkspaceView('floor')}>
+          <button type="button" onClick={() => {
+            if (activeRuns[0]) {
+              setSelectedAgentId(activeRuns[0].agent_id)
+              setFloorInspectorOpen(true)
+            } else {
+              setFloorInspectorOpen(false)
+            }
+            activateWorkspaceView('floor')
+          }}>
             <span>Live runs</span>
             <strong>{activeRuns.length}</strong>
             <small>Take control</small>
@@ -5631,7 +5979,11 @@ function App() {
                 ? 'arcade-meter-alert'
                 : ''
             }
-            onClick={() => activateWorkspaceView('missions')}
+            onClick={() => {
+              const runId = pendingApprovals[0]?.run_id ?? pendingVerificationRequests[0]?.run_id
+              if (runId) navigateToWorkspaceEntity('run', runId)
+              else activateWorkspaceView('missions')
+            }}
           >
             <span>Decisions</span>
             <strong>{pendingApprovals.length + pendingVerificationRequests.length}</strong>
@@ -5642,10 +5994,13 @@ function App() {
             <strong>{activeFactoryItems.length}</strong>
             <small>Active items</small>
           </button>
-          <button type="button" onClick={() => activateWorkspaceView('activity')}>
-            <span>Verified</span>
-            <strong>{acceptedArtifacts.length}</strong>
-            <small>Evidence ready</small>
+          <button type="button" onClick={() => {
+            if (completedMissions[0]) navigateToWorkspaceEntity('mission', completedMissions[0].id)
+            else activateWorkspaceView('missions')
+          }}>
+            <span>Results</span>
+            <strong>{completedMissions.length}</strong>
+            <small>Completed missions</small>
           </button>
         </div>
       </section>
@@ -5699,15 +6054,16 @@ function App() {
                   </small>
                 </div>
               </li>
-              <li className={acceptedArtifacts.length ? 'journey-complete' : pendingApprovals.length ? 'journey-current' : ''}>
+              <li className={pendingApprovals.length + pendingVerificationRequests.length
+                ? 'journey-current' : completedMissions.length ? 'journey-complete' : ''}>
                 <span>4</span>
                 <div>
                   <strong>Operate and review</strong>
                   <small>
-                    {pendingApprovals.length
-                      ? `${pendingApprovals.length} decision${pendingApprovals.length === 1 ? '' : 's'} waiting`
-                      : acceptedArtifacts.length
-                        ? `${acceptedArtifacts.length} verified artifact${acceptedArtifacts.length === 1 ? '' : 's'} ready`
+                    {pendingApprovals.length + pendingVerificationRequests.length
+                      ? `${pendingApprovals.length + pendingVerificationRequests.length} decision${pendingApprovals.length + pendingVerificationRequests.length === 1 ? '' : 's'} waiting`
+                      : completedMissions.length
+                        ? `${completedMissions.length} completed mission${completedMissions.length === 1 ? '' : 's'} ready`
                         : 'Watch the floor, steer an agent, approve risk, then download evidence.'}
                   </small>
                 </div>
@@ -5785,6 +6141,7 @@ function App() {
 
       <div className="workspace-surface" hidden={activeWorkspaceView !== 'factory'}>
         <FactoryPanel
+          key={`factory:${discussionScopeKey(factoryScope)}:${factorySelection?.id ?? ''}`}
           items={data.snapshot.factory_work_items}
           missions={data.snapshot.missions}
           publications={data.snapshot.pull_request_publications}
@@ -5792,7 +6149,8 @@ function App() {
           controllers={data.snapshot.factory_controllers ?? []}
           tasks={data.snapshot.tasks}
           runs={data.snapshot.runs}
-          room={room}
+          room={factoryRoom}
+          scope={factoryScope}
           messages={data.snapshot.room_messages}
           actors={data.snapshot.actors}
           agents={data.snapshot.agents}
@@ -5809,6 +6167,23 @@ function App() {
           onVerificationDecision={decideVerification}
           onClaimLease={claimLease}
           onSteer={sendMessage}
+          selectedItemId={selectedFactoryItemId}
+          onSelectItem={(item) => {
+            setSelectedFactoryItemId(item.id)
+            if (item.mission_id) {
+              selectDiscussionMission(item.mission_id)
+            }
+          }}
+          onOpenMission={(mission) => navigateToWorkspaceEntity('mission', mission.id)}
+          onDiscussMission={(mission) => {
+            selectDiscussionMission(mission.id)
+            activateWorkspaceView('room')
+          }}
+          onNewMission={() => {
+            setMissionComposerStep('brief')
+            setMissionComposerCollapsed(false)
+            activateWorkspaceView('missions')
+          }}
         />
       </div>
 
@@ -5831,11 +6206,16 @@ function App() {
               <span className="section-code">ECorp · Control floor</span>
               <h2>{room?.name ?? 'Automation division'}</h2>
             </div>
-            <p>A place for your agents. A clear view of their work.</p>
+            <p>Live work comes from missions. Idle workers are not running model processes.</p>
           </div>
+          <label className="office-roster-toggle">
+            <input type="checkbox" checked={showRegisteredCrew}
+              onChange={(event) => setShowRegisteredCrew(event.target.checked)} />
+            Show offline and test identities
+          </label>
           <div className="floor-plan">
             {activeWorkspaceView === 'floor' ? <OfficeFloor
-              agents={currentAgents}
+              agents={floorAgents}
               selectedAgentId={selectedAgent?.id ?? null}
               pendingApprovalRunIds={new Set(pendingApprovals.map((approval) => approval.run_id))}
               pendingReviewRunIds={new Set(pendingVerificationRequests.map((request) => request.run_id))}
@@ -6606,7 +6986,7 @@ function App() {
             <div className="mission-list">
               {selectedMission ? (
                 <MissionCard
-                  key={selectedMission.id}
+                  key={`${bootstrap.corp_id}:${selectedActor.id}:${selectedMission.id}`}
                   corpId={bootstrap.corp_id}
                   mission={selectedMission}
                   tasks={selectedMissionTasks}
@@ -6626,6 +7006,7 @@ function App() {
                   factoryItem={data.snapshot.factory_work_items.find(
                     (item) => item.mission_id === selectedMission.id,
                   )}
+                  origin={missionOrigin(selectedMission.id, data.snapshot)}
                   factoryRecoveries={data.snapshot.factory_verification_recoveries.filter(
                     (recovery) => recovery.mission_id === selectedMission.id,
                   )}
@@ -6642,6 +7023,27 @@ function App() {
                   onContractRevision={createContractRevision}
                   onVerificationDecision={decideVerification}
                   onActionApprovalDecision={decideActionApproval}
+                  onDiscuss={(mission) => {
+                    selectDiscussionMission(mission.id)
+                    activateWorkspaceView('room')
+                  }}
+                  onViewAgents={() => {
+                    const run = selectedMissionRuns.find((candidate) => !terminalRun(candidate.status))
+                    if (run && currentAgents.some((agent) => agent.id === run.agent_id)) {
+                      setSelectedAgentId(run.agent_id)
+                      setFloorInspectorOpen(true)
+                      activateWorkspaceView('floor')
+                    } else if (selectedMissionTasks[0]) {
+                      navigateToWorkspaceEntity('task', selectedMissionTasks[0].id)
+                    }
+                  }}
+                  onOpenFactory={() => {
+                    const item = data.snapshot.factory_work_items.find(
+                      (candidate) => candidate.mission_id === selectedMission.id,
+                    )
+                    if (item) setSelectedFactoryItemId(item.id)
+                    activateWorkspaceView('factory')
+                  }}
                 />
               ) : (
                 <div className="empty-state">
@@ -6656,7 +7058,9 @@ function App() {
 
       <div className="workspace-surface" hidden={activeWorkspaceView !== 'room'}>
         <RoomPanel
+          key={discussionScopeKey(roomScope)}
           room={room}
+          scope={roomScope}
           messages={data.snapshot.room_messages}
           actors={data.snapshot.actors}
           selectedActor={selectedActor}
@@ -6665,6 +7069,7 @@ function App() {
           runs={data.snapshot.runs}
           onPost={postRoomMessage}
           onNavigateLink={(link) => navigateToWorkspaceEntity(link.kind, link.id)}
+          onContextChange={selectDiscussionMission}
         />
       </div>
 

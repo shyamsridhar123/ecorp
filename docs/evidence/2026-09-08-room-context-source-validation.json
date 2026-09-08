@@ -1,0 +1,106 @@
+{
+  "observed_at": "2026-09-08T07:40:45.3956495Z",
+  "workspace": "C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss",
+  "head": "304a60be19a0661f25bf8b4b2babfa633f43a111",
+  "pending_merge": null,
+  "status": "passed",
+  "source_unchanged": true,
+  "source_paths": [
+    "crates\\crony-domain\\src\\lib.rs",
+    "crates\\crony-server\\src\\main.rs",
+    "crates\\crony-store\\src\\lib.rs",
+    "crates\\crony-store\\src\\factory_recovery_loss_tests.rs",
+    "apps\\web\\src\\App.tsx",
+    "apps\\web\\src\\App.css",
+    "apps\\web\\src\\missionProjection.ts",
+    "apps\\web\\src\\missionProjection.test.mjs"
+  ],
+  "source_sha256": [
+    "6D9FDB428EC9CA5ADC6C8B44E03424AAD971BB3DF27FD7F64447248B99CCB07B",
+    "4924562C1877F8EB6A24CBB96C8E96A67CB522986B592C78B29C8950142342B0",
+    "C75DD4D5A8BE1700CD6B67278452BD2A1B394B69449011231797790681E41327",
+    "C44592E86709274BA7A446585C4242BC1EA74B5A5134BF2EF3CE0F180E114DF0",
+    "5E453848F4D8B0E747F415F4812DDE6C81815D7277369CA583868C92E08585C6",
+    "E11011C9F537968FA950114421FE42FE22FC4074395E2F694BF5C5BFB9F9495E",
+    "1AE56A6810C20EAAE6E80CBD35E67B4F4986CABBF0FC9E5646B93A51BF3E716E",
+    "E305796156569411E281CAA1F34CB480B338C04B51A7C28D4D1AC65F0CE45969"
+  ],
+  "checks": [
+    {
+      "name": "migrations",
+      "command": "node tools/check_migrations.mjs",
+      "exit_code": 0,
+      "seconds": 0.54,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\migrations.log"
+    },
+    {
+      "name": "format",
+      "command": "cargo fmt --check",
+      "exit_code": 0,
+      "seconds": 5.78,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\format.log"
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "seconds": 100.65,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\clippy.log"
+    },
+    {
+      "name": "rust-tests",
+      "command": "cargo test --workspace",
+      "exit_code": 0,
+      "seconds": 348.48,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\rust-tests.log"
+    },
+    {
+      "name": "frontend-tests",
+      "command": "node --test C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\evidenceSelection.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\factoryPolling.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\missionPreview.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\missionProjection.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\missionRuntime.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\office\\officeModel.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\snapshotRefresh.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-stack-recovery-loss\\apps\\web\\src\\workflowContext.test.mjs",
+      "exit_code": 0,
+      "seconds": 0.81,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\frontend-tests.log"
+    },
+    {
+      "name": "web-build",
+      "command": "pnpm build:web",
+      "exit_code": 0,
+      "seconds": 16.24,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\web-build.log"
+    },
+    {
+      "name": "web-lint",
+      "command": "pnpm lint:web",
+      "exit_code": 0,
+      "seconds": 3.91,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\web-lint.log"
+    },
+    {
+      "name": "startup-regressions",
+      "command": "node --test tools/local_stack_lifecycle.test.mjs tools/local_stack_operation.test.mjs",
+      "exit_code": 0,
+      "seconds": 22.5,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\startup-regressions.log"
+    },
+    {
+      "name": "runtime-binaries",
+      "command": "cargo build -p crony-server -p crony-runner -p crony-cli",
+      "exit_code": 0,
+      "seconds": 76.97,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\runtime-binaries.log"
+    },
+    {
+      "name": "whitespace",
+      "command": "git diff --check HEAD",
+      "exit_code": 0,
+      "seconds": 0.22,
+      "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue183-recovery-loss-20260908\\validation-20260908T073108258\\whitespace.log"
+    }
+  ],
+  "limitations": [
+    "Ignored SQLx suites were not run by these workspace gates.",
+    "The separate new issue183 SQLx red/green evidence is retained.",
+    "No browser or provider acceptance is inferred from these source checks.",
+    "No hosted Actions, merge, auto-merge, or deployment is performed by this script."
+  ]
+}
