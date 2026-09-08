@@ -7,6 +7,7 @@ import path from 'node:path'
 import { createInterface } from 'node:readline'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { runInNewContext } from 'node:vm'
 
 const script = fileURLToPath(new URL('../scripts/fake-codex-app-server.mjs', import.meta.url))
 
@@ -18,6 +19,7 @@ async function observe(marker, interrupt = false) {
   })
   const lines = createInterface({ input: child.stdout })
   const usage = []
+  const messages = []
   let stderr = ''
   child.stderr.on('data', chunk => {
     stderr += chunk.toString()
@@ -32,6 +34,7 @@ async function observe(marker, interrupt = false) {
     lines.on('line', line => {
       try {
         const message = JSON.parse(line)
+        messages.push(message)
         if (message.id === 1) {
           send({ id: 2, method: 'thread/start', params: { cwd: root } })
         } else if (message.id === 2) {
@@ -51,7 +54,7 @@ async function observe(marker, interrupt = false) {
     })
     child.once('exit', code => {
       if (code !== 0 || !terminal) reject(new Error(`fixture exited without terminal proof: ${code}`))
-      else resolve({ usage, terminal })
+      else resolve({ usage, terminal, messages })
     })
   })
   try {
@@ -89,4 +92,68 @@ test('native interrupt prevents later usage and completion in the UI fixture', a
   const observed = await observe('[budget-stream-ui]', true)
   assert.equal(observed.terminal, 'interrupted')
   assert.deepEqual(observed.usage.map(item => item.last.inputTokens), [300000])
+})
+
+test('original budget-stream still interrupts before its second usage and scheduled completion', async () => {
+  const observed = await observe('[budget-stream]', true)
+  assert.equal(observed.terminal, 'interrupted')
+  assert.deepEqual(observed.usage.map(item => item.last.inputTokens), [3000])
+})
+
+test('queued completion emits exact usage and completed before a subsequent interrupt response', async () => {
+  // A protocol-only subprocess, not an ECorp server/runner race test.
+  const observed = await observe('[budget-queued-completion]', true)
+  assert.equal(observed.terminal, 'completed')
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [3000, 3000])
+  assert.deepEqual(observed.usage.map(item => item.total.totalTokens), [3000, 6000])
+  assert.ok(observed.usage.every(item => item.last.inputTokens === 3000 && item.last.outputTokens === 0))
+  const completed = observed.messages.findIndex(item => item.method === 'turn/completed')
+  const acknowledged = observed.messages.findIndex(item => item.id === 4)
+  assert.ok(completed >= 0 && acknowledged > completed)
+  assert.equal(observed.messages.filter(item => item.method === 'turn/completed').length, 1)
+})
+
+test('actual queued fixture writes base then emits both usages and finish synchronously without timers', () => {
+  // Run the actual fixture handler with in-memory stdio/files/timers. This proves
+  // one JS turn, not a guessed millisecond interval or any server-side admission.
+  const source = readFileSync(script, 'utf8')
+  const imports = source.match(/^import .+ from 'node:[^']+'\r?$/gmu)
+  assert.equal(imports?.length, 3, 'review the sandbox when fixture imports change')
+  const timeline = []
+  const timers = []
+  let onLine
+  let nextId = 0
+  runInNewContext(source.replace(/^import .+ from 'node:[^']+'\r?$/gmu, ''), {
+    randomUUID: () => `fixture-${++nextId}`,
+    writeFileSync: (file, bytes) => timeline.push({ file, bytes }),
+    createInterface: () => ({ on: (type, callback) => {
+      assert.equal(type, 'line')
+      onLine = callback
+    } }),
+    process: {
+      argv: [], cwd: () => '/fixture', platform: 'fixture', stdin: {},
+      stdout: { write: line => { timeline.push(JSON.parse(line)); return true } },
+    },
+    setTimeout: (...args) => { timers.push(args); return timers.length },
+    clearTimeout: () => assert.fail('queued completion must not schedule or cancel a timer'),
+  }, { timeout: 1000, filename: script })
+  onLine(JSON.stringify({ id: 1, method: 'thread/start', params: { cwd: '/fixture' } }))
+  timeline.length = 0
+  onLine(JSON.stringify({ id: 2, method: 'turn/start',
+    params: { input: [{ type: 'text', text: '[budget-queued-completion]' }] } }))
+  timeline.push({ test: 'handler_returned' })
+
+  const base = timeline.findIndex(item => item.file === '/fixture/base.txt')
+  const usages = timeline.flatMap((item, index) =>
+    item.method === 'thread/tokenUsage/updated' ? [{ index, usage: item.params.tokenUsage }] : [])
+  const completed = timeline.findIndex(item => item.method === 'turn/completed')
+  assert.equal(timeline[base].bytes, 'base\n')
+  assert.equal(timeline.filter(item => item.file).length, 1)
+  assert.deepEqual(usages.map(item => item.usage.last.totalTokens), [3000, 3000])
+  assert.deepEqual(usages.map(item => item.usage.total.totalTokens), [3000, 6000])
+  assert.ok(base < usages[0].index && usages[0].index < usages[1].index &&
+    usages[1].index < completed && completed < timeline.length - 1)
+  assert.equal(timeline[completed].params.turn.status, 'completed')
+  assert.equal(timeline.filter(item => item.method === 'item/agentMessage/delta').length, 1)
+  assert.deepEqual(timers, [])
 })
