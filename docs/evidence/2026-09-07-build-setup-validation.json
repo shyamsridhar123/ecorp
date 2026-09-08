@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "issue": 173,
+  "source_base_commit": "eeb1dbdefe0e992970615854878683b64a4edb9e",
+  "observed_at": "2026-09-08T00:19:37.670Z",
+  "result": "UI_SCOPE_PASS",
+  "product_and_test_files": [
+    {
+      "path": "apps/web/src/App.tsx",
+      "working_tree_sha256": "56a6d2bb23a80606d227393d4c2a3ca1ceb60d5a55d15a1fad9ad2a910185cf4",
+      "git_blob_oid": "b0f47a8c31b27371fe439086d0fe616c800c8e1b"
+    },
+    {
+      "path": "apps/web/src/OperationsUx.css",
+      "working_tree_sha256": "8542f9b1014da201b21aa8fe215bfa468f74a7dff5d997230b915cd43cd74c13",
+      "git_blob_oid": "1ffb023104edafbfced11d2c5c1edf83b04c595f"
+    },
+    {
+      "path": "apps/web/src/missionComposer.test.mjs",
+      "working_tree_sha256": "8ae51a40a4358e3d9b75181f9b1aa18fd38c28e35c44f8f55ba53806908efda9",
+      "git_blob_oid": "aea4e6ff24b0d357f107cbec10692931126230e9"
+    },
+    {
+      "path": "tools/e2e_launch_admission_browser.mjs",
+      "working_tree_sha256": "ff9bf37bf24293ce6cb27308abaede7201ae4cf9cf8bfca537f9b1d7792a1532",
+      "git_blob_oid": "21b221597d54ee707b2b8d7d6cc0bf30e126e97a"
+    },
+    {
+      "path": "tools/e2e_recovery_operations_browser.mjs",
+      "working_tree_sha256": "6ea1a37f5b69d8a51d67afe6c2ef23a5f26025fa277c958e8f1ce02845911b0f",
+      "git_blob_oid": "44f69abc84e3b450cc3434388294003c3605dda6"
+    }
+  ],
+  "launch_handler_unchanged_from_base": true,
+  "form_unchanged_after_navigation_only_review_correction": true,
+  "full_local_gate": {
+    "observed_at": "2026-09-08T00:07:05.7674823Z",
+    "rust": {
+      "passed": 358,
+      "failed": 0,
+      "ignored": 62
+    },
+    "frontend_passed": 107,
+    "checks": [
+      {
+        "name": "migrations",
+        "exit_code": 0,
+        "seconds": 0.297
+      },
+      {
+        "name": "format",
+        "exit_code": 0,
+        "seconds": 5.722
+      },
+      {
+        "name": "clippy",
+        "exit_code": 0,
+        "seconds": 50.28
+      },
+      {
+        "name": "rust",
+        "exit_code": 0,
+        "seconds": 381.089
+      },
+      {
+        "name": "web-tests",
+        "exit_code": 0,
+        "seconds": 2.606
+      },
+      {
+        "name": "web-build",
+        "exit_code": 0,
+        "seconds": 40.791
+      },
+      {
+        "name": "web-lint",
+        "exit_code": 0,
+        "seconds": 8.561
+      },
+      {
+        "name": "diff",
+        "exit_code": 0,
+        "seconds": 0.474
+      }
+    ],
+    "source_files": [
+      {
+        "sha256": "E6E6010B496773D3774D9B2EE7A1EDB9B908B9A907F99161231D00B46DEF58F0",
+        "path": "apps\\web\\src\\App.tsx"
+      },
+      {
+        "sha256": "8542F9B1014DA201B21AA8FE215BFA468F74A7DFF5D997230B915CD43CD74C13",
+        "path": "apps\\web\\src\\OperationsUx.css"
+      },
+      {
+        "sha256": "BAF3A1C740AEF922E42DFB812C529A6E6A25C2EF1E3188E4F278D8416E7542A5",
+        "path": "apps\\web\\src\\missionComposer.test.mjs"
+      },
+      {
+        "sha256": "FF9BF37BF24293CE6CB27308ABAEDE7201AE4CF9CF8BFCA537F9B1D7792A1532",
+        "path": "tools\\e2e_launch_admission_browser.mjs"
+      },
+      {
+        "sha256": "6EA1A37F5B69D8A51D67AFE6C2EF23A5F26025FA277C958E8F1CE02845911B0F",
+        "path": "tools\\e2e_recovery_operations_browser.mjs"
+      }
+    ]
+  },
+  "final_frontend_gate": {
+    "observed_at": "2026-09-08T00:13:15.2093447Z",
+    "passed": 108,
+    "failed": 0,
+    "backend_migration_dependency_inputs_unchanged": true,
+    "checks": [
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\web-tests.log",
+        "seconds": 1.191,
+        "exit_code": 0,
+        "name": "web-tests"
+      },
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\web-build.log",
+        "seconds": 22.529,
+        "exit_code": 0,
+        "name": "web-build"
+      },
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\web-lint.log",
+        "seconds": 8.43,
+        "exit_code": 0,
+        "name": "web-lint"
+      },
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\admission-helper-syntax.log",
+        "seconds": 0.41,
+        "exit_code": 0,
+        "name": "admission-helper-syntax"
+      },
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\recovery-helper-syntax.log",
+        "seconds": 0.374,
+        "exit_code": 0,
+        "name": "recovery-helper-syntax"
+      },
+      {
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue145-build-journey-20260907\\validation-final-ui\\diff.log",
+        "seconds": 0.431,
+        "exit_code": 0,
+        "name": "diff"
+      }
+    ]
+  },
+  "browser": {
+    "checks": [
+      {
+        "check": "review navigation remains unsent",
+        "pass": true
+      },
+      {
+        "check": "custom checks keep Build",
+        "pass": true
+      },
+      {
+        "check": "optional settings keyboard toggle",
+        "pass": true
+      },
+      {
+        "check": "explicit Save plan survives check toggles",
+        "pass": true
+      },
+      {
+        "check": "close restores records and focus; reopen preserves draft",
+        "pass": true
+      },
+      {
+        "check": "390px setup/review no overflow; keyboard navigation stays unsent",
+        "pass": true
+      },
+      {
+        "check": "turning off Developer fixtures removes fake runtime",
+        "pass": true
+      },
+      {
+        "check": "no available AI runtime stays explicit, never fake success",
+        "pass": true
+      }
+    ],
+    "desktop_width": 1280,
+    "desktop_no_horizontal_overflow": true,
+    "sampled_min_contrast": 6.158972462539137,
+    "narrow_setup": {
+      "clientWidth": 375,
+      "formWidth": 333.6000061035156,
+      "scrollWidth": 375,
+      "width": 390
+    },
+    "narrow_review": {
+      "action": "Save plan",
+      "clientWidth": 375,
+      "heading": "Review and build",
+      "outline": "solid",
+      "scrollWidth": 375,
+      "width": 390
+    },
+    "viewport_restored": true,
+    "existing_work_navigation": {
+      "observed_at": "2026-09-08T00:11:16.568Z",
+      "result": "PASS",
+      "formVisible": false,
+      "missionId": "d561cc2b-8d5e-44c9-b9da-ae6060af78b3"
+    },
+    "state_retention": {
+      "observed_at": "2026-09-08T00:19:36.436Z",
+      "result": "PASS",
+      "final_interactions_mutation_free": true,
+      "original_history_unchanged": true,
+      "earlier_unintended_diagnostic_preserved": true,
+      "hashes": {
+        "missions": {
+          "count": 2,
+          "sha256": "53e38a2f46a8e133e19bde6c8ea35c3ddbe1fe61df74ca4648d2234f79a4303b"
+        },
+        "tasks": {
+          "count": 5,
+          "sha256": "9c22707abb0729282e47c79ffdf4c24f411a3add5d2ca998b441854c1de4cb59"
+        },
+        "runs": {
+          "count": 7,
+          "sha256": "99dca701090bc0cb97c71ff3ab3c7cbc3386c7e76db5db70a5dd60cf86d7db35"
+        },
+        "verification_evidence": {
+          "count": 21,
+          "sha256": "b40714a915ddcc917464cfdf6d8571eb3dc26492b13033a6e5a04afc8b18fcff"
+        },
+        "verification_requests": {
+          "count": 1,
+          "sha256": "3ede3039846b00dcf8d559535b8fdf2bddf750b9c0d85912c7cb5bc45df8c1bb"
+        },
+        "action_approvals": {
+          "count": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "source_deliverables": {
+          "count": 7,
+          "sha256": "148ba7511680faff365b7ae67e53cfbacfae226ca1a11e234622c25fcb2063e4"
+        },
+        "factory_work_items": {
+          "count": 1,
+          "sha256": "35dc057c268011cb345e5fc71e8e5d88b50af6a7a4bc2602ab965eba0b6fe190"
+        },
+        "actors": {
+          "count": 7,
+          "sha256": "e84cce5e90816e1cf3d2938e4e20675ed460697d8970101f34f392f143f588a8"
+        },
+        "agents": {
+          "count": 4,
+          "sha256": "5a298756cc3215f8d19fb9bbede3ff71f9b374add82ed61843d517cb72dd3fdf"
+        }
+      }
+    }
+  },
+  "retained_failures": [
+    {
+      "case": "Custom checks silently force a held plan",
+      "source_red_exit_code": 1,
+      "log": "composer-red.log",
+      "fixed": true
+    },
+    {
+      "case": "Intermediate UI navigation click unexpectedly submits",
+      "mission_id": "f521956e-008b-416e-a1d6-f82530d134b5",
+      "run_id": "000cd9a8-1dee-4c9e-8579-8ca8ae467261",
+      "runtime": "fake-process",
+      "real_ai_inference": false,
+      "application_build_claim": false,
+      "preserved": true,
+      "fixed_by": "distinct navigation/submit keys and preventDefault"
+    },
+    {
+      "case": "Draft hides explicit existing-work navigation",
+      "red": "existing-mission-navigation-red.json",
+      "green": "existing-mission-navigation-green.json",
+      "fixed": true
+    }
+  ],
+  "review": {
+    "initial_new_finding": "Existing work links must collapse setup without clearing its draft",
+    "short_rereview": "No findings",
+    "scope": "read-only source review; not runtime proof"
+  },
+  "images": [
+    "assets/2026-09-07-build-setup/setup-before.png",
+    "assets/2026-09-07-build-setup/review-after.png",
+    "assets/2026-09-07-build-setup/review-mobile.png"
+  ],
+  "rejected_capture": {
+    "file": "06-setup-after.png",
+    "reason": "Full-page capture duplicated/stitched content; not used as accepted visual evidence. DOM and viewport captures show one repository control."
+  },
+  "limits": [
+    "Final browser checks exercised setup, read-only server preview, explicit launch/save intent, keyboard/390px layout, and existing-work navigation.",
+    "No Build or Save button was intentionally invoked in the green acceptance. A prior unintended deterministic diagnostic is retained, not relabeled as a real app build.",
+    "No new real-provider mission, full screen-reader audit, complete accessibility conformance, game preview, merge, auto-merge or deployment is claimed.",
+    "No ignored SQLx suite was executed. Backend gates are the completed full run; final frontend-only correction was revalidated separately.",
+    "Issue 172 remains incomplete: its denied QA bridge restart was not retried, and its one-mission/six-run fixture assumptions must account for the explicitly retained UI diagnostic without erasing history."
+  ]
+}

@@ -405,3 +405,154 @@
 .mission-evidence-context .work-context-actions {
   align-items: center;
 }
+
+/* Composer only: replace residual Arcade surfaces without changing the office or mission records. */
+#missions .mission-form {
+  min-width: 0;
+  overflow: visible;
+  color: var(--ink);
+  background: var(--paper-light);
+}
+
+#missions .mission-form .mission-stage-screen { min-height: 0; padding: 16px; }
+#missions .mission-form .mission-stage-content { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 0; }
+#missions .mission-form .mission-stage-content > * { grid-area: auto; min-width: 0; }
+#missions .mission-form .stage-title { margin-bottom: 0; }
+#missions .mission-form .mission-composer-heading { color: var(--ink); scroll-margin-block: 16px; }
+
+/* Controls retain Accessible.css keyboard rings; the programmatic step heading needs :focus too. */
+#missions .mission-form .mission-composer-heading:focus {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+#missions .mission-form :is(.arcade-composer-header, .arcade-form-controls) { flex-wrap: wrap; gap: 12px; padding: 16px; }
+#missions .mission-form .arcade-composer-header > div { min-width: 0; }
+#missions .mission-form .mission-composer-cancel { flex: 0 0 auto; min-height: 44px; align-self: start; }
+#missions .mission-form button { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+
+#missions .mission-form .mission-stage-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: visible; }
+#missions .mission-form .mission-stage-nav button { display: block; }
+#missions .mission-form :is(.contract-tab-nav, .verification-check-tabs) { flex-wrap: wrap; overflow: visible; }
+#missions .mission-form .contract-tab-nav button { flex: 1 1 auto; }
+#missions .mission-form .verification-check-tabs button { grid-template-columns: 24px minmax(0, 1fr); }
+
+#missions .mission-form :is(.loadout-grid, .mission-contract-grid, .verification-check-grid) {
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+#missions .mission-form :is(.mission-field, .mission-advanced-options, .mission-review-target) {
+  min-width: 0;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #f6f7f5;
+  overflow-wrap: anywhere;
+}
+
+#missions .mission-form .mission-field { gap: 6px; padding: 12px; }
+#missions .mission-form label { min-width: 0; color: var(--ink); font-size: 14px; line-height: 1.4; letter-spacing: 0; }
+#missions .mission-form .arcade-input > span { flex-wrap: wrap; }
+#missions .mission-form .arcade-input > span small { color: var(--ink-soft); font-size: 13px; line-height: 1.4; }
+
+#missions .mission-form :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  color: var(--ink);
+  border: 1px solid #667369;
+  background: var(--paper-light);
+  box-shadow: none;
+}
+
+#missions .mission-form :is(input, textarea)::placeholder { color: var(--ink-soft); opacity: 1; }
+#missions .mission-form .loadout-switches { gap: 12px; margin-top: 0; }
+#missions .mission-form :is(.mission-run-toggle, .developer-mode-toggle) {
+  padding: 12px;
+  color: var(--ink);
+  border-radius: 3px;
+  background: var(--paper-light);
+}
+
+#missions .mission-form .repository-target-summary {
+  min-width: 0;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 10px;
+  border-color: var(--line);
+  border-radius: 3px;
+  background: var(--paper-light);
+}
+
+#missions .mission-form .mission-advanced-options { padding: 0 12px; }
+#missions .mission-form .mission-advanced-options[open] { padding-bottom: 12px; }
+#missions .mission-form :is(.mission-advanced-options, .verification-plan-disclosure) > summary {
+  display: list-item;
+  min-height: 44px;
+  padding: 12px;
+  color: var(--cobalt-dark);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.4;
+  list-style: disclosure-closed inside;
+  cursor: pointer;
+}
+
+#missions .mission-form :is(.mission-advanced-options, .verification-plan-disclosure)[open] > summary { list-style-type: disclosure-open; }
+#missions .mission-form .mission-advanced-options > summary { padding-inline: 0; }
+#missions .mission-form .mission-advanced-options[open] > summary { margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+#missions .mission-form .mission-advanced-options > :not(summary) + :not(summary) { margin-top: 12px; }
+
+#missions .mission-form .mission-review-target {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--cobalt);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+#missions .mission-form .mission-review-target > * { min-width: 0; margin: 0; }
+#missions .mission-form .mission-review-target code { white-space: normal; }
+#missions .mission-form :is(.verification-policy-editor, .manual-gate-editor, fieldset) { min-width: 0; }
+#missions .mission-form :is(.contract-section-heading, .verification-check-toolbar) { flex-wrap: wrap; gap: 12px; }
+
+#missions .mission-form :is(.verification-plan-disclosure, .verification-policy-preview) {
+  min-width: 0;
+  color: var(--ink);
+  border-color: var(--line);
+  background: var(--paper-light);
+  overflow-wrap: anywhere;
+}
+
+#missions .mission-form .verification-policy-preview :is(p, small) { font-size: 13px; line-height: 1.5; }
+#missions .mission-form .verification-policy-preview li > span { color: var(--cobalt-dark); background: var(--surface-selected); font-size: 12px; }
+#missions .mission-form .default-gate-callout {
+  margin-top: 0;
+  padding: 12px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--cobalt);
+  border-radius: 3px;
+  background: #f6f7f5;
+}
+
+#missions .mission-form .mission-plan-summary { max-inline-size: none; padding: 12px 16px; overflow-wrap: anywhere; }
+#missions .mission-form .mission-plan-summary .evidence-check { grid-template-columns: minmax(0, 1fr) auto; }
+
+@media (max-width: 600px) {
+  #missions .mission-form :is(.loadout-grid, .loadout-switches, .mission-contract-grid, .verification-check-grid) { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 480px) {
+  #missions .mission-form { margin: 12px; }
+  #missions .mission-form :is(.mission-stage-screen, .arcade-composer-header, .arcade-form-controls, .mission-plan-summary) { padding: 12px; }
+  #missions .mission-form :is(.mission-stage-nav, .contract-tab-nav) { display: grid; grid-template-columns: minmax(0, 1fr); }
+  #missions .mission-form .arcade-form-controls { display: grid; grid-template-columns: minmax(0, 1fr); }
+  #missions .mission-form .arcade-form-controls .button { width: 100%; }
+  #missions .mission-form .mission-plan-summary .evidence-check { grid-template-columns: minmax(0, 1fr); }
+}

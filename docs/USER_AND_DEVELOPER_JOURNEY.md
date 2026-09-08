@@ -54,7 +54,7 @@ let an agent edit the configured source checkout directly.
 
 ### 2. Choose the crew
 
-In **Run setup**, select and confirm the exact source repository, symbolic ref, and immutable
+In **Describe & setup**, select and confirm the exact source repository, symbolic ref, and immutable
 commit advertised by a connected runner. The mission composer then lists only compatible adapters,
 models, and reasoning levels for that source.
 
@@ -63,10 +63,11 @@ models, and reasoning levels for that source.
 - **Claude Code** and **OpenCode** use normalized external-CLI runtimes on Windows. Their Unix
   adapters are currently disabled because equivalent descendant-process containment is not proven.
 - **Test harness** is deterministic, quota-free, and contains no AI. Use it to test ECorp behavior,
-  not to judge agent quality.
+  not to judge agent quality. It appears only after explicitly enabling **Developer fixtures**
+  inside **Model, limits and output**; it is never the fallback for an ordinary application build.
 
-For providers with model catalogs, choose a model and supported reasoning effort. Leaving the model
-blank uses that provider's default.
+For providers with model catalogs, expand **Model, limits and output** to choose a model and
+supported reasoning effort. Leaving the model blank uses that provider's default.
 
 ECorp can provision mission-owned workers when the accepted graph is saved; a proposal alone does
 not create a crew. **Studio team · 3 Copilot agents** requires a compatible GitHub Copilot runner.
@@ -79,21 +80,25 @@ remain available for testing.
 A mission is an outcome with a task contract, not a chat message. State the expected result and the
 evidence that should prove it.
 
-The arcade-style composer keeps one decision screen visible at a time:
+The light retro composer has two steps:
 
-1. **Mission:** short outcome plus the complete durable specification.
-2. **Run setup:** confirmed repository/ref/commit, runtime, model, budget, deliverable, and execution strategy.
-3. **Verification:** tabbed outcome, guardrail, context, and verifier controls.
+1. **Describe & setup:** enter the goal, confirm the repository/ref/commit, and choose the coding
+   agent and team. Additional specification, model, budget, and output settings are optional
+   disclosures rather than separate required screens.
+2. **Review & build:** inspect the exact destination, current server-derived allocation and
+   completion checks, then **Build**. Detailed requirements remain available on demand.
 
 Verification accepts explicit objectives, expected output, acceptance criteria, allowed tools,
 prohibited actions, repository or issue references, approved context sources, and
 worktree-relative write scope. Enable **Custom verification** to add typed artifact, file, command,
 test, JSON-schema, or screenshot checks and an optional human-approval or independent-review gate.
-Enabling it pauses after planning by default. Expand each planned task to inspect the exact
-persisted completion plan before dispatch. After a mission is created, the composer collapses to a
-single **New mission** control so the active mission log remains primary.
+Enabling or editing checks does **not** change the separately selected launch-vs-save intent.
+Expand each planned task to inspect the exact persisted completion plan before dispatch.
+**Close setup** returns to the selected existing mission without creating work; the unsaved
+draft stays on the current page. While setup is open, old mission evidence is not mixed into the
+form. After creation, the new mission becomes the selected work item.
 
-Choose the portable result before dispatch:
+Use **Model, limits and output** to change the portable result before dispatch:
 
 - **Source archive** packages changed tracked and non-ignored untracked files with hashes.
 - **Git patch** produces deterministic binary patch bytes.
@@ -105,8 +110,8 @@ Choose the portable result before dispatch:
 The optional commit toggle never publishes or merges. Pull-request publication and merge are
 separate authorized effects.
 
-By default, **Launch mission** creates the task graph and requests dispatch. Enable **Hold at
-briefing** to use **Create mission plan** instead. Its persisted **Awaiting dispatch** state survives
+By default, **Build** creates the task graph and requests dispatch. Explicitly enable **Save without
+starting** to use **Save plan** instead. Its persisted **Awaiting dispatch** state survives
 closing the browser and restarting the server; only an explicit authorized **Dispatch mission**
 can release the first run. Normal dependency release and retries apply only after launch.
 
