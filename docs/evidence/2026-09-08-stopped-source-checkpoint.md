@@ -3,7 +3,8 @@
 - **Issue:** #190, first implementation layer of #148.
 - **Source base:** `d1d9dcc113345486a1fb7abbe4365707bd514521`.
 - **Observed:** September 8, 2026, Windows.
-- **Status:** native-runner coverage passed; full-stack budget recovery remains unproven.
+- **Status:** checkpoint emission accepted through the server/runner and browser;
+  full budget recovery remains unproven.
 
 ## Implemented boundary
 
@@ -49,7 +50,7 @@ acknowledgment remains negative when the same command is retried.
 
 ## Observed verification
 
-The final full repository gate passed:
+The initial native-only repository gate passed:
 
 | Check | Result |
 | --- | --- |
@@ -72,16 +73,18 @@ quarantine, byte limits, and blocked capture deadlines.
 Independent source review exposed the late-verification, capture-duration and
 finalization-window gaps. They were corrected and the regressions expanded.
 The earlier 11-, 15-, and 16-case focused outputs remain in the task transcript;
-the final full gate additionally covers the command-ID replay assertion.
+that full gate additionally covers the command-ID replay assertion.
 
 Exact commands, original output, and hashes for all four product files are in
 `C:\Users\shyamsridhar\.codex\dogfood\remaining-work-20260908\issue190-20260908T111437742\result.json`
 and its adjacent logs. The full gate completed at `2026-09-08T11:22:19Z`.
 
-## Not established by this layer
+## Limits of the initial native-unit checkpoint
 
-This does not prove server receipt/persistence of the new proof, browser
-acceptance, a real vendor run, or full #148 recovery. The existing store,
+Those initial checks did not prove server receipt/persistence of the new proof,
+browser acceptance, a real vendor run, or full #148 recovery. The follow-up below
+adds scoped server/browser evidence, not a real-vendor or full-recovery claim.
+The existing store,
 source-correction, generic resume, budget/attempt, review and publication gates
 are unchanged. In particular, budget-stopped sources are not newly admitted to
 verifier-only recovery by this patch.
@@ -141,3 +144,65 @@ The corrected source gate is
 `C:\Users\shyamsridhar\.codex\dogfood\remaining-work-20260908\issue190-runtime-fix-20260908T121229935\result.json`.
 Corrected-candidate server/browser acceptance must be recorded separately; the
 failed browser run is not overwritten or relabeled as successful.
+
+## Corrected-candidate runtime acceptance
+
+Candidate `fb6c526c6272e30c6169b453e42aa58aadd3e77f` passed the additive native
+API cases and a new browser-created case:
+
+| Case | Original ceiling | Synthetic usage | Persisted outcome |
+| --- | ---: | ---: | --- |
+| API suspend | 6,000 | 6,000 | Cancelled, source checkpoint preserved |
+| API stop | 5,000 | 6,000 | Cancelled, source checkpoint preserved |
+| Browser stop | 500,000 | 600,000 | Cancelled, source checkpoint preserved |
+
+The API cases retained run IDs `fb798400-6532-4c52-a42f-6a37a00fbc12` and
+`3e19a177-4c5b-443b-9c54-5fb93ecd801b`. Complete actor-visible journal replay
+proved usage → hard breaker → command acknowledgment → provider termination →
+checkpoint → terminal ordering, with one task/run/attempt per case, exact source
+and policy bindings, zero accepted artifacts/completion, and no automatic retry.
+
+The driver initially rejected the valid native `healthy` breaker projection
+because its local schema incorrectly named it `none`. That checker failure was
+retained; its already-launched suspend case was continued with the **same run ID**,
+not replaced. The corrected checker uses the migration's exact enum and rejects
+`none`; all **96 pure driver/protocol tests** passed.
+
+The corrected browser mission `b8c3db6f-5e92-4973-8c98-e05a13e9b269` produced run
+`b5db42f9-26a6-4a95-846a-0cfc2c0c8cc1`. Its persisted sequence is:
+
+```text
+188–189  synthetic usage
+190      hard breaker
+191      native command acknowledgment
+192      provider terminated
+193      source checkpoint preserved
+194      run cancelled
+```
+
+The real browser submitted the unchanged 500K preset, exact source, `base.txt`
+write scope and file verifier. Reload showed the same cancelled run, explicit
+hard-stop reason and preserved-worktree detail, with zero browser console errors.
+The source file's exact five bytes and all three policy digests were independently
+checked. This proves the intended stopped-source outcome, **not** a completed app.
+
+![Retained original browser failure](assets/stopped-source-checkpoint/browser-original-failure.png)
+
+![Corrected stopped-source result](assets/stopped-source-checkpoint/browser-corrected-after-reload.png)
+
+[Bounded runtime receipt](assets/stopped-source-checkpoint/runtime-summary.json)
+records IDs, digests, ordering and scope. Original two-mission/two-run database
+fingerprints matched exactly after the probe; the database contains six retained
+missions/runs and zero active runs. The initial failed browser run remains intact.
+The configured source checkout is unchanged.
+
+Only the QA runner was replaced for the correction. The QA server/UI remained
+running until acceptance finished, then all three QA processes and the temporary
+browser tab were closed. Ports 18574/15574 are free. The manual app and protected
+#172 API/relay retained their original process identities; no container or
+database was created or reset.
+
+The manual-origin label still reports unavailable for these browser-created
+missions; this separate UX observation is recorded under #145. #193's
+already-queued-upload race and the remaining #148 verifier-only recovery,
+publication and original-source guarantees are not waived by this acceptance.

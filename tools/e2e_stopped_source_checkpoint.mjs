@@ -95,7 +95,8 @@ const SHA256 = /^[0-9a-f]{64}$/u
 const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u
 const LIVE = new Set(['provisioning', 'starting', 'running', 'waiting_for_input', 'waiting_for_approval', 'verifying'])
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'lost'])
-const STAGES = ['none', 'steer', 'constrain', 'suspend', 'stop']
+// Exact native enum: db/migrations/0012_approvals_and_budgets.sql.
+const STAGES = ['healthy', 'steer', 'constrain', 'suspend', 'stop']
 const ROWS = ['missions', 'tasks', 'runs']
 const ABSENCE_TABLES = ['verification_evidence', 'verification_requests', 'source_deliverables']
 const RECEIPT_KEYS = [

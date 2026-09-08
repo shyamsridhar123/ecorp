@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-08T12:46:51.0389461Z",
+  "candidate": "fb6c526c6272e30c6169b453e42aa58aadd3e77f",
+  "scope": "Native server/runner and browser with deterministic Codex protocol fixture; not real vendor inference or completed application acceptance.",
+  "api_status": "passed",
+  "api_cases": {
+    "suspend": {
+      "budget_tokens": 6000,
+      "create_attempted": true,
+      "launch_attempted": true,
+      "mission_id": "c65aa883-55c6-4976-ae95-2b9eef05aa3f",
+      "task_id": "0021e4b9-ec69-459e-82fb-3a0a580d75c7",
+      "agent_id": "ba55b9ae-368a-41b4-aea1-ffbca60c4c14",
+      "run_id": "fb798400-6532-4c52-a42f-6a37a00fbc12",
+      "contract_sha256": "9ea089192c3e2004d2fb39303329e2d1b333179e569e43b3c0c3b215c30339c7",
+      "phase": "passed",
+      "latest": {
+        "status": "cancelled",
+        "breaker_stage": "suspend",
+        "input_tokens": 6000,
+        "output_tokens": 0,
+        "cost_microusd": 0,
+        "workspace_disposition": "preserved"
+      },
+      "journal_observation": {
+        "through": 177,
+        "events": [
+          {
+            "seq": 146,
+            "id": "5db183a3-a6d0-4224-8d45-d5c0a0210fcf",
+            "type": "run.requested",
+            "payload_sha256": "db6a62f6fee6f2469411eddced6287fcc37b11526fd5586a49bfc60db9ddd993"
+          },
+          {
+            "seq": 147,
+            "id": "6993eeb3-6d26-4cca-95af-42b7f57c531b",
+            "type": "run.started",
+            "payload_sha256": "6cc4762e4cbb6cff75f7e2d59541b67b9dfd3db405364df53950d5c09ad97ece"
+          },
+          {
+            "seq": 148,
+            "id": "2173292b-affe-410a-b9c3-06cca58a0ef2",
+            "type": "run.session",
+            "payload_sha256": "a6838d954dc7ddb1220e186b986cd0943c2b2000acea23d627c7889022c86246"
+          },
+          {
+            "seq": 149,
+            "id": "700ccea7-7ad2-468c-aaa0-b39a3361f991",
+            "type": "run.status",
+            "payload_sha256": "b18601a2eddf305169174389c1a77edc77b7967327d1998fa5ab53c825c47aa5"
+          },
+          {
+            "seq": 150,
+            "id": "1cbb356f-e10d-4f66-9845-b94b99996667",
+            "type": "run.status",
+            "payload_sha256": "c465e38e818ce98da753336b7f26e7191b4ac8768e0f3ad2cde82aa58c932f1b"
+          },
+          {
+            "seq": 151,
+            "id": "7c28cffd-e3a5-4829-92da-6828940ed136",
+            "type": "run.output",
+            "payload_sha256": "6e69671ca20ee49b9f22ea97b972673aac750bc264bb5aa8c5ff9400be5fca19"
+          },
+          {
+            "seq": 152,
+            "id": "28b2095d-6de3-4f11-b74a-3cb33679bbbf",
+            "type": "run.usage",
+            "payload_sha256": "0e9454eb585e7e92c2fdee08edb4a32a50a7368524214c70b799f4e861efaf1d"
+          },
+          {
+            "seq": 153,
+            "id": "499436be-a0ea-412a-81a2-326f9060654b",
+            "type": "run.usage",
+            "payload_sha256": "0e9454eb585e7e92c2fdee08edb4a32a50a7368524214c70b799f4e861efaf1d"
+          },
+          {
+            "seq": 154,
+            "id": "a6bcbe22-59f0-4414-9be9-e2b9df04fa41",
+            "type": "run.breaker_transition",
+            "payload_sha256": "1c565516c8319c71d19d9730576fe0c7410c31ca553a40f2402b60c236949e3f"
+          },
+          {
+            "seq": 155,
+            "id": "d820aa99-3820-4449-9169-f35e8f8fceef",
+            "type": "runner.command_acknowledged",
+            "payload_sha256": "2e3e30b10b23c6e713ded0160ecaf312f446821ffc76668207159dc5c3221d1c"
+          },
+          {
+            "seq": 156,
+            "id": "d5742d58-195a-49fc-8c11-e5e3eb0a0c62",
+            "type": "run.session_terminated",
+            "payload_sha256": "911dfd163fe9f397cdbf1fc1f95b49c3b185a5b1520e509f6d2705f6b19c5e97"
+          },
+          {
+            "seq": 157,
+            "id": "e6da4250-e39c-4491-9b29-2f04cd4d6175",
+            "type": "run.workspace_preserved",
+            "payload_sha256": "c96c9caab2d729fb610794a286c5223d7238c2fbfa1ae50eb87de3856aaf781c"
+          },
+          {
+            "seq": 158,
+            "id": "401b0153-89f2-469b-8a5b-2590e2af993e",
+            "type": "run.cancelled",
+            "payload_sha256": "9a61d447c95f75660195db8611bf804335ef702bd4ccfb9fa4680e8e3f5261f8"
+          }
+        ]
+      },
+      "evidence": {
+        "source_checkpoint": {
+          "schema_version": 1,
+          "corp_id": "00000000-0000-4000-8000-000000000001",
+          "mission_id": "c65aa883-55c6-4976-ae95-2b9eef05aa3f",
+          "task_id": "0021e4b9-ec69-459e-82fb-3a0a580d75c7",
+          "run_id": "fb798400-6532-4c52-a42f-6a37a00fbc12",
+          "workspace_run_id": "fb798400-6532-4c52-a42f-6a37a00fbc12",
+          "agent_id": "ba55b9ae-368a-41b4-aea1-ffbca60c4c14",
+          "runner_id": "issue174-local-start",
+          "source_repository": "shyamsridhar123/ecorp-enterprise-lab",
+          "source_base_ref": "HEAD",
+          "source_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "workspace_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "branch": "crony/task-0021e4b9ec69459e82fb3a0a580d75c7/run-fb79840065324c52a42f6a37a00fbc12",
+          "head_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "workspace_fingerprint": "0b3f09abd3838134771e2a9279e3d1509ef2e34889ad87101962bb0ba72b3ef0",
+          "verification_policy_sha256": "ed3134fee2a1aea1f200d8873e97248113a033ec9102e84f0de5a6ef11fb9609",
+          "write_scope_sha256": "20c834d07d665b7cca9bec4b2189a521019a4f59f2bd75ac7300faf060910379",
+          "deliverable_policy_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+        },
+        "provider_session_sha256": "c36f5b0d2dc50ce1e26bde275169b46c0c3d1dacc8fa2e02685290eccc32235d",
+        "budget_tokens": 6000,
+        "persisted_usage": {
+          "input_tokens": 6000,
+          "output_tokens": 0,
+          "cost_microusd": 0
+        },
+        "breaker_stage": "suspend",
+        "terminal_status": "cancelled",
+        "provider_outcome": "cancelled",
+        "ordering": {
+          "requested": 146,
+          "started": 147,
+          "usage": [
+            152,
+            153
+          ],
+          "breaker": 154,
+          "acknowledged": 155,
+          "session_terminated": 156,
+          "workspace_preserved": 157,
+          "terminal": 158
+        },
+        "policy_digests": {
+          "verification_policy_sha256": "ed3134fee2a1aea1f200d8873e97248113a033ec9102e84f0de5a6ef11fb9609",
+          "write_scope_sha256": "20c834d07d665b7cca9bec4b2189a521019a4f59f2bd75ac7300faf060910379",
+          "deliverable_policy_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+        },
+        "journal_through": 177,
+        "run_event_count": 13,
+        "task_run_count": 1,
+        "attempt_count": 1,
+        "accepted_provider_artifacts": 0,
+        "accepted_source_deliverables": 0,
+        "verification_started": false,
+        "accepted_completion": false,
+        "base_file": {
+          "path": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue174-startup-20260907\\runner-workspaces\\worktrees\\0021e4b9ec69459e82fb3a0a580d75c7\\fb79840065324c52a42f6a37a00fbc12\\base.txt",
+          "bytes": 5,
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac"
+        },
+        "quiet_observation_ms": 3412
+      }
+    },
+    "stop": {
+      "budget_tokens": 5000,
+      "create_attempted": true,
+      "launch_attempted": true,
+      "mission_id": "221e46e3-2aef-4867-84c3-f3f82e7817ac",
+      "task_id": "cdc9d030-38da-4ef1-88b6-e98884f6faa4",
+      "agent_id": "a8d4eb2a-77c7-46e6-8127-f9f2325b95fc",
+      "run_id": "3e19a177-4c5b-443b-9c54-5fb93ecd801b",
+      "contract_sha256": "3a12858ff37283e4d04ef41e0b03028a401faf56c115c8801d40a278f99cd364",
+      "phase": "passed",
+      "latest": {
+        "status": "cancelled",
+        "breaker_stage": "stop",
+        "input_tokens": 6000,
+        "output_tokens": 0,
+        "cost_microusd": 0,
+        "workspace_disposition": "preserved"
+      },
+      "journal_observation": {
+        "through": 177,
+        "events": [
+          {
+            "seq": 164,
+            "id": "802d5534-d6a6-48b6-be16-b6a57e239f52",
+            "type": "run.requested",
+            "payload_sha256": "dcda101e13f1befccb53acc44426788c9153475524657d297ba81422d0ce562b"
+          },
+          {
+            "seq": 165,
+            "id": "d3c6dfe6-12d4-409e-95f6-6d8aa2f26f7a",
+            "type": "run.started",
+            "payload_sha256": "29e42191e445744afc0937c387adf5cd0406cd8ff41417d1824cd2ca8f425c9f"
+          },
+          {
+            "seq": 166,
+            "id": "dbae3d9a-35a4-42ac-9a73-9f7bef226db1",
+            "type": "run.session",
+            "payload_sha256": "4c6b9ee7c680517be570a25a9fbb3c75e52371276198b6841527ab1d719e0fdc"
+          },
+          {
+            "seq": 167,
+            "id": "826ae953-7e52-4dbc-9dc2-5b84d81526da",
+            "type": "run.status",
+            "payload_sha256": "b18601a2eddf305169174389c1a77edc77b7967327d1998fa5ab53c825c47aa5"
+          },
+          {
+            "seq": 168,
+            "id": "39ed744e-8d74-45f5-bed8-cdfc999f9efa",
+            "type": "run.status",
+            "payload_sha256": "c465e38e818ce98da753336b7f26e7191b4ac8768e0f3ad2cde82aa58c932f1b"
+          },
+          {
+            "seq": 169,
+            "id": "b8331eeb-de50-46cc-b8fe-ea5904b350e8",
+            "type": "run.output",
+            "payload_sha256": "6e69671ca20ee49b9f22ea97b972673aac750bc264bb5aa8c5ff9400be5fca19"
+          },
+          {
+            "seq": 170,
+            "id": "e2ea1a5a-800f-42d8-a350-1fbb4599aca5",
+            "type": "run.usage",
+            "payload_sha256": "0e9454eb585e7e92c2fdee08edb4a32a50a7368524214c70b799f4e861efaf1d"
+          },
+          {
+            "seq": 171,
+            "id": "5fef28b4-1506-4f66-aceb-88894c023fa9",
+            "type": "run.usage",
+            "payload_sha256": "0e9454eb585e7e92c2fdee08edb4a32a50a7368524214c70b799f4e861efaf1d"
+          },
+          {
+            "seq": 172,
+            "id": "3bd38134-4819-46b7-83cc-16fc808ea69b",
+            "type": "run.breaker_transition",
+            "payload_sha256": "1ba934504bd55784f1b32ffd49d352d62125d56e5ebbd7e127ffac57c31e3caf"
+          },
+          {
+            "seq": 173,
+            "id": "9e6ab341-7be7-4bfe-ad17-131da776c22b",
+            "type": "runner.command_acknowledged",
+            "payload_sha256": "13b0bbcea617c62272d4e94997cdf8d69c1270f2c5a6c3bc3133b683f7e7499e"
+          },
+          {
+            "seq": 174,
+            "id": "33b3142a-b40e-4926-848b-54a31ffe8b73",
+            "type": "run.session_terminated",
+            "payload_sha256": "911dfd163fe9f397cdbf1fc1f95b49c3b185a5b1520e509f6d2705f6b19c5e97"
+          },
+          {
+            "seq": 175,
+            "id": "82f69b85-c75e-4ac0-bafa-fae06fe88379",
+            "type": "run.workspace_preserved",
+            "payload_sha256": "0455e3025aef71a369495b3ef69343fb9d425280fbadaf314ee624825e664170"
+          },
+          {
+            "seq": 176,
+            "id": "2973ba5f-4339-48d9-940d-3b25866a3a5d",
+            "type": "run.cancelled",
+            "payload_sha256": "9f26df43d71964a8d87f1153bcabfbc0f5900d9ff2b0477630d912d421ca8c3b"
+          }
+        ]
+      },
+      "evidence": {
+        "source_checkpoint": {
+          "schema_version": 1,
+          "corp_id": "00000000-0000-4000-8000-000000000001",
+          "mission_id": "221e46e3-2aef-4867-84c3-f3f82e7817ac",
+          "task_id": "cdc9d030-38da-4ef1-88b6-e98884f6faa4",
+          "run_id": "3e19a177-4c5b-443b-9c54-5fb93ecd801b",
+          "workspace_run_id": "3e19a177-4c5b-443b-9c54-5fb93ecd801b",
+          "agent_id": "a8d4eb2a-77c7-46e6-8127-f9f2325b95fc",
+          "runner_id": "issue174-local-start",
+          "source_repository": "shyamsridhar123/ecorp-enterprise-lab",
+          "source_base_ref": "HEAD",
+          "source_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "workspace_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "branch": "crony/task-cdc9d03038da4ef188b6e98884f6faa4/run-3e19a1774c5b443b9c545fb93ecd801b",
+          "head_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+          "workspace_fingerprint": "0b3f09abd3838134771e2a9279e3d1509ef2e34889ad87101962bb0ba72b3ef0",
+          "verification_policy_sha256": "ed3134fee2a1aea1f200d8873e97248113a033ec9102e84f0de5a6ef11fb9609",
+          "write_scope_sha256": "20c834d07d665b7cca9bec4b2189a521019a4f59f2bd75ac7300faf060910379",
+          "deliverable_policy_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+        },
+        "provider_session_sha256": "3f245dbde96abaa8f105f71732c05621e4a97ee0d0f3e427f4a09a215147f6e7",
+        "budget_tokens": 5000,
+        "persisted_usage": {
+          "input_tokens": 6000,
+          "output_tokens": 0,
+          "cost_microusd": 0
+        },
+        "breaker_stage": "stop",
+        "terminal_status": "cancelled",
+        "provider_outcome": "cancelled",
+        "ordering": {
+          "requested": 164,
+          "started": 165,
+          "usage": [
+            170,
+            171
+          ],
+          "breaker": 172,
+          "acknowledged": 173,
+          "session_terminated": 174,
+          "workspace_preserved": 175,
+          "terminal": 176
+        },
+        "policy_digests": {
+          "verification_policy_sha256": "ed3134fee2a1aea1f200d8873e97248113a033ec9102e84f0de5a6ef11fb9609",
+          "write_scope_sha256": "20c834d07d665b7cca9bec4b2189a521019a4f59f2bd75ac7300faf060910379",
+          "deliverable_policy_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+        },
+        "journal_through": 177,
+        "run_event_count": 13,
+        "task_run_count": 1,
+        "attempt_count": 1,
+        "accepted_provider_artifacts": 0,
+        "accepted_source_deliverables": 0,
+        "verification_started": false,
+        "accepted_completion": false,
+        "base_file": {
+          "path": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue174-startup-20260907\\runner-workspaces\\worktrees\\cdc9d03038da4ef188b6e98884f6faa4\\3e19a1774c5b443b9c545fb93ecd801b\\base.txt",
+          "bytes": 5,
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac"
+        },
+        "quiet_observation_ms": 3462
+      }
+    }
+  },
+  "browser": {
+    "observed_at": "2026-09-08T12:43:42.3129608Z",
+    "status": "passed",
+    "scope": "Browser create/launch, actual server/runner, synthetic Codex protocol, persisted ordered checkpoint and reload; not vendor or completed application acceptance.",
+    "mission_id": "b8c3db6f-5e92-4973-8c98-e05a13e9b269",
+    "run_id": "b5db42f9-26a6-4a95-846a-0cfc2c0c8cc1",
+    "budget_tokens": 500000,
+    "synthetic_tokens": 600000,
+    "checkpoint": {
+      "agent_id": "8672821b-4294-48f7-bae3-c28fb75e2205",
+      "branch": "crony/task-a887e0dc06624767884f38acec964a25/run-b5db42f926a64a95846a0cfc2c0c8cc1",
+      "corp_id": "00000000-0000-4000-8000-000000000001",
+      "deliverable_policy_sha256": "dded075803106da70649e5bf2a287c09e1cc44a1ffb7075f734b0fabec9e4cea",
+      "head_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+      "mission_id": "b8c3db6f-5e92-4973-8c98-e05a13e9b269",
+      "run_id": "b5db42f9-26a6-4a95-846a-0cfc2c0c8cc1",
+      "runner_id": "issue174-local-start",
+      "schema_version": 1,
+      "source_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+      "source_base_ref": "HEAD",
+      "source_repository": "shyamsridhar123/ecorp-enterprise-lab",
+      "task_id": "a887e0dc-0662-4767-884f-38acec964a25",
+      "verification_policy_sha256": "39b35cbacc204caaa481fcc9677c9227f3fa723acaa9caaac21e54d2903158be",
+      "workspace_base_commit": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+      "workspace_fingerprint": "0b3f09abd3838134771e2a9279e3d1509ef2e34889ad87101962bb0ba72b3ef0",
+      "workspace_run_id": "b5db42f9-26a6-4a95-846a-0cfc2c0c8cc1",
+      "write_scope_sha256": "20c834d07d665b7cca9bec4b2189a521019a4f59f2bd75ac7300faf060910379"
+    },
+    "ordered_events": [
+      {
+        "seq": 182,
+        "type": "run.requested"
+      },
+      {
+        "seq": 183,
+        "type": "run.started"
+      },
+      {
+        "seq": 184,
+        "type": "run.session"
+      },
+      {
+        "seq": 185,
+        "type": "run.status"
+      },
+      {
+        "seq": 186,
+        "type": "run.status"
+      },
+      {
+        "seq": 187,
+        "type": "run.output"
+      },
+      {
+        "seq": 188,
+        "type": "run.usage"
+      },
+      {
+        "seq": 189,
+        "type": "run.usage"
+      },
+      {
+        "seq": 190,
+        "type": "run.breaker_transition"
+      },
+      {
+        "seq": 191,
+        "type": "runner.command_acknowledged"
+      },
+      {
+        "seq": 192,
+        "type": "run.session_terminated"
+      },
+      {
+        "seq": 193,
+        "type": "run.workspace_preserved"
+      },
+      {
+        "seq": 194,
+        "type": "run.cancelled"
+      }
+    ],
+    "base_sha256": "F34848CA92665C342ABD5816C9E3EDA0E82180671195362BCD0080544A3BC2AC",
+    "source_checkout_clean": true,
+    "source_head": "a8894b5f02d56f10e2da38df47a450ff71e92fbe",
+    "original_failed_run_preserved": true,
+    "api_cases_passed": true,
+    "server_pid": 50228,
+    "runner_pid": 51872,
+    "browser_reload_observed": true
+  },
+  "original_history": {
+    "missions": 6,
+    "runs": 6,
+    "active_runs": 0,
+    "original_mission_fingerprint": "07645a2d6e73808bcc5ec9a8efd619ba",
+    "original_run_fingerprint": "3c0b8f43bcfce80d0dd3ab0705ef3906"
+  },
+  "qa_stopped": true,
+  "manual_and_protected_qa_unchanged": true,
+  "console_errors": 0,
+  "retained_failures": [
+    "Original browser run f345625a-5df4-4b21-bcf8-7b6e7190a736 and its rejected post-stop artifact upload.",
+    "Native red test: 0 passed/1 failed, exit101.",
+    "Private startup probe used nested runners instead of the actual top-level field; same healthy processes continued.",
+    "Driver initially used none instead of native healthy stage; original launched suspend run was retained and continued."
+  ],
+  "limitations": [
+    "No queued-upload-before-control delivery proof; #193 remains open.",
+    "No full #148 provider-free recovery, bundle, review or publication proof.",
+    "No production OIDC or real multi-human identity proof."
+  ]
+}

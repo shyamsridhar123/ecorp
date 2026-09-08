@@ -246,7 +246,7 @@ function memoryHarness(config, options = {}) {
       }
       if (options.live && name === 'suspend') {
         fixture.run.status = 'running'
-        fixture.run.breaker_stage = 'none'
+        fixture.run.breaker_stage = 'healthy'
         fixture.run.workspace_disposition = 'active'
         fixture.run.input_tokens = 0
         state.snapshot.missions.find((item) => item.id === missionId).status = 'running'
@@ -555,6 +555,7 @@ const evidenceFailures = [
   ['policy weakening', (f) => { f.task.verification_policy.manual_gate = null }],
   ['path outside runner', (f) => { f.run.workspace_path = path.join(ROOT, 'outside') }],
   ['unknown projection strings are not logged', (f) => { f.run.breaker_stage = SENTINEL }],
+  ['non-native none breaker projection is rejected', (f) => { f.run.breaker_stage = 'none' }],
   ['accepted evidence row', (f) => {
     f.state.snapshot.verification_evidence.push({ id: id(999), corp_id: f.run.corp_id, run_id: f.run.id, task_id: f.task.id })
   }],
