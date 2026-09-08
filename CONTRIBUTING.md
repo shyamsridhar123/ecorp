@@ -74,7 +74,7 @@ the **same authenticated server/control plane, the same Corp, and the same claim
 Database co-location, separate Corps on one server, or a shared GitHub Project alone do not unify
 claim authority.
 
-Prerequisites are Git, Windows PowerShell, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
+Prerequisites are Git, PowerShell 7.4+ on Windows, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
 Compose, GitHub CLI authenticated for the repository and Project #3, and any provider entitlement
 required for real-agent work.
 
@@ -89,11 +89,11 @@ $env:CRONY_SOURCE_REPOSITORY = (Get-Location).Path
 $env:CRONY_SOURCE_BASE_REF = 'HEAD'
 $env:CRONY_RUNNER_WORKSPACE = Join-Path $env:USERPROFILE '.ecorp\runner-workspaces'
 
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 Invoke-RestMethod http://127.0.0.1:8791/health
 Invoke-WebRequest http://127.0.0.1:5187
 ./tools/e2e_smoke.ps1
-./tools/stop_local.ps1
+pwsh -NoProfile -File ./tools/stop_local.ps1
 ```
 
 The server owns authoritative organizational state. The outbound runner owns provider processes and
@@ -103,6 +103,45 @@ Shared deployments expose one authenticated ECorp authority, not shared database
 Contributors running local tests on the same machine must also coordinate the stack's ports and
 shared development Compose database.
 
+### Local startup and recovery
+
+Use the same command for first setup and an ordinary subsequent start:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1
+```
+
+It reuses healthy owned processes, starts only missing services, and serializes concurrent
+start/stop commands for the checkout. It retains the API/UI address pair, source repository/ref,
+runner ID/workspace, Copilot home, and configured Factory controller/Project/repository.
+The native runner credential still rotates normally; it is not deleted or replaced by enrollment
+on every start. Enabling a missing Factory worker leaves a healthy API, runner and UI running.
+
+Use `-ServerPort 8791 -WebPort 5187` to choose addresses. Once recorded, normal start reuses them
+without repeating flags. To apply changes affecting an already running service, use the explicit
+restart command; it can interrupt that service's active work:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1 -Restart
+pwsh -NoProfile -File ./tools/stop_local.ps1
+```
+
+An externally supplied `DATABASE_URL` bypasses Compose entirely. Load it and any custom service
+keys/provider credentials through trusted host configuration before startup; do not put their
+values in arguments, issues, source files or logs. Secret values are not saved in the process
+ownership record. Environment delivery remains reduced assurance.
+
+For an additional runner on a shared authority, choose a distinct `CRONY_RUNNER_ID`. If that
+identity already exists but its local credential is missing, restore the existing credential
+instead of using start as an implicit re-enrollment. Native explicit enrollment/revocation remain
+separate operator actions. An explicit `CRONY_RUNNER_STARTUP_RECOVERY=false` is forwarded to the
+server rather than silently discarded.
+
+Legacy PID-only records and unknown/reused PIDs are not process-control authority. They are
+preserved rather than used to stop arbitrary processes. During a one-time legacy migration,
+provide the original database/source/address configuration; an unverified existing listener is
+left untouched. There is no fallback port, database reset, credential wipe or automatic unpause.
+
 ### Use GitHub Copilot
 
 ECorp's `github-copilot` adapter uses the official GitHub Copilot SDK. By default, the runner uses
@@ -111,7 +150,7 @@ the contributor's logged-in GitHub identity:
 ```powershell
 gh auth status
 $env:CRONY_COPILOT_USE_LOGGED_IN_USER = 'true'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
 The account and organization policy must allow GitHub Copilot. The runner discovers the models and
@@ -123,7 +162,7 @@ workspace:
 
 ```powershell
 $env:CRONY_COPILOT_GITHUB_TOKEN_FILE = 'C:\secure\ecorp\copilot.token'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
 Never place the token value in a prompt, command argument, log, issue, worktree, or committed file.

@@ -25,6 +25,9 @@ mod factory_controller;
 mod publication;
 mod staffing;
 
+#[cfg(test)]
+mod factory_recovery_loss_tests;
+
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
 const DEMO_BOB_ID: &str = "00000000-0000-4000-8000-000000000012";
@@ -7590,7 +7593,7 @@ impl PgStore {
             SELECT r.task_id, r.verification_status AS run_verification_status,
                    r.breaker_stage, r.workspace_fingerprint AS existing_workspace_fingerprint,
                    r.workspace_disposition AS existing_workspace_disposition,
-                   r.execution_mode,
+                   r.execution_mode, r.status AS run_status,
                    t.mission_id, t.contract, t.verification_policy, m.room_id,
                    t.attempt_count, t.max_attempts
             FROM runs r
@@ -8383,6 +8386,51 @@ impl PgStore {
                 .bind(run_id)
                 .execute(&mut *tx)
                 .await?;
+                if row.get::<String, _>("run_status") == "lost"
+                    && row.get::<String, _>("execution_mode") == "provider"
+                    && disposition == "preserved"
+                    && workspace_fingerprint.is_some()
+                {
+                    let checkpoint =
+                        source_workspace_checkpoint_tx(&mut tx, corp_id, run_id).await?;
+                    if checkpoint.source_correction_recovery {
+                        // ACK may arrive before run.started. Native cleanup is
+                        // the first proof that this exact assignment survived;
+                        // recover only its missing, already-authorized metadata,
+                        // never a path supplied by the cleanup event or an old
+                        // fingerprint in place of the newly confirmed bytes.
+                        sqlx::query(
+                            r#"
+                            UPDATE runs current
+                            SET workspace_path = COALESCE(current.workspace_path, previous.workspace_path),
+                                workspace_branch = COALESCE(current.workspace_branch, previous.workspace_branch),
+                                workspace_base_ref = COALESCE(current.workspace_base_ref, previous.workspace_base_ref),
+                                workspace_base_commit = COALESCE(current.workspace_base_commit, previous.workspace_base_commit)
+                            FROM factory_verification_recoveries recovery
+                            JOIN runs previous
+                              ON previous.id = recovery.source_run_id AND previous.corp_id = recovery.corp_id
+                            WHERE current.id = $1 AND current.corp_id = $2 AND current.status = 'lost'
+                              AND current.execution_mode = 'provider'
+                              AND recovery.replacement_run_id = current.id AND recovery.corp_id = current.corp_id
+                              AND recovery.mode = 'source_correction' AND recovery.status = 'failed'
+                              AND previous.id = current.resumed_from_run_id
+                              AND previous.task_id = current.task_id AND previous.agent_id = current.agent_id
+                              AND previous.runner_id = current.runner_id
+                              AND previous.workspace_run_id = current.workspace_run_id
+                              AND previous.source_repository IS NOT DISTINCT FROM current.source_repository
+                              AND previous.source_base_ref IS NOT DISTINCT FROM current.source_base_ref
+                              AND previous.source_base_commit IS NOT DISTINCT FROM current.source_base_commit
+                              AND previous.workspace_fingerprint = recovery.request->>'expected_workspace_fingerprint'
+                              AND previous.workspace_disposition = 'preserved'
+                              AND previous.workspace_path IS NOT NULL AND previous.workspace_path <> ''
+                            "#,
+                        )
+                        .bind(run_id)
+                        .bind(corp_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
             }
             "run.completed" => {
                 if run_verification_status != "passed" {
@@ -10794,19 +10842,70 @@ async fn mark_runner_runs_lost_tx(
     created_before: Option<chrono::DateTime<Utc>>,
     reason: &str,
 ) -> Result<Vec<DomainEvent>> {
+    // Use the existing recovery/publication gates before taking lifecycle rows.
+    // Pin the candidate set so a newly allocated run cannot enter the locked
+    // query without its Factory gate; terminal/claimed candidates are rechecked.
+    let candidates = sqlx::query(
+        r#"
+        SELECT r.id, r.corp_id, item.id AS factory_id
+        FROM runs r
+        JOIN tasks t ON t.id = r.task_id AND t.corp_id = r.corp_id
+        JOIN missions m ON m.id = t.mission_id AND m.corp_id = t.corp_id
+        LEFT JOIN factory_work_items item ON item.mission_id = m.id AND item.corp_id = m.corp_id
+        WHERE r.runner_id = $1
+          AND r.status IN ('provisioning', 'starting', 'running',
+                           'waiting_for_input', 'waiting_for_approval', 'verifying')
+          AND (cardinality($2::uuid[]) = 0 OR NOT (r.id = ANY($2::uuid[])))
+          AND ($3::timestamptz IS NULL OR r.created_at <= $3)
+        "#,
+    )
+    .bind(runner_id)
+    .bind(excluded_run_ids)
+    .bind(created_before)
+    .fetch_all(&mut **tx)
+    .await?;
+    let run_ids: Vec<Uuid> = candidates.iter().map(|row| row.get("id")).collect();
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let gate_keys = candidates
+        .iter()
+        .filter_map(|row| {
+            row.get::<Option<Uuid>, _>("factory_id")
+                .map(|item| (row.get::<Uuid, _>("corp_id"), item))
+        })
+        .flat_map(|(corp, item)| {
+            [
+                format!("factory:item:{corp}:{item}"),
+                format!("publication:factory:{corp}:{item}"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lock_factory_keys_tx(tx, &gate_keys).await?;
     let rows = sqlx::query(
         r#"
         SELECT r.id AS run_id, r.corp_id, r.task_id, r.agent_id,
-               t.mission_id, m.room_id, recovery.id AS verifier_recovery_id
+               t.mission_id, m.room_id, recovery.id AS factory_recovery_id,
+               recovery.mode AS recovery_mode
         FROM runs r
         JOIN tasks t ON t.id = r.task_id
         JOIN missions m ON m.id = t.mission_id
         LEFT JOIN factory_verification_recoveries recovery
           ON recovery.replacement_run_id = r.id AND recovery.corp_id = r.corp_id
          AND recovery.task_id = r.task_id AND recovery.mission_id = m.id
-         AND recovery.mode = 'verifier_only' AND r.execution_mode = 'verification_only'
+         AND (
+             (recovery.mode = 'verifier_only' AND r.execution_mode = 'verification_only')
+             OR (recovery.mode = 'source_correction' AND r.execution_mode = 'provider')
+         )
          AND recovery.status IN ('authorized', 'running')
+         AND recovery.source_run_id = r.resumed_from_run_id
+         AND EXISTS (
+             SELECT 1 FROM factory_work_items item
+             WHERE item.id = recovery.factory_work_item_id AND item.corp_id = r.corp_id
+               AND item.mission_id = m.id
+         )
         WHERE r.runner_id = $1
+          AND r.id = ANY($4::uuid[])
           AND r.status IN ('provisioning', 'starting', 'running',
                            'waiting_for_input', 'waiting_for_approval', 'verifying')
           AND (
@@ -10824,13 +10923,14 @@ async fn mark_runner_runs_lost_tx(
                 AND command.status = 'pending'
             )
           )
-        ORDER BY r.created_at
+        ORDER BY r.created_at, r.id
         FOR UPDATE OF r, t, m
         "#,
     )
     .bind(runner_id)
     .bind(excluded_run_ids)
     .bind(created_before)
+    .bind(&run_ids)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -10842,7 +10942,12 @@ async fn mark_runner_runs_lost_tx(
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
-        if let Some(recovery_id) = row.get::<Option<Uuid>, _>("verifier_recovery_id") {
+        if let Some(recovery_id) = row.get::<Option<Uuid>, _>("factory_recovery_id") {
+            let cause = if row.get::<String, _>("recovery_mode") == "source_correction" {
+                "source_correction_runner_lost"
+            } else {
+                "verifier_runner_lost"
+            };
             if let Some(event) = terminalize_factory_recovery_run_tx(
                 tx,
                 corp_id,
@@ -10853,7 +10958,7 @@ async fn mark_runner_runs_lost_tx(
                 room_id,
                 reason,
                 "lost",
-                "verifier_runner_lost",
+                cause,
             )
             .await?
             {
@@ -11975,6 +12080,7 @@ fn latest_workspace_source_id(lineage: &[sqlx::postgres::PgRow]) -> Result<Uuid>
 struct SourceWorkspaceCheckpoint {
     status: String,
     execution_mode: String,
+    source_correction_recovery: bool,
     verification_status: String,
     workspace_path: Option<String>,
     disposition: Option<String>,
@@ -11985,11 +12091,11 @@ struct SourceWorkspaceCheckpoint {
 
 impl SourceWorkspaceCheckpoint {
     fn ensure_factory_terminal(&self) -> Result<()> {
-        if !factory_recovery_source_is_terminal(&self.status, &self.execution_mode)
-            || self.verification_status != "failed"
-        {
+        let terminal = factory_recovery_source_is_terminal(&self.status, &self.execution_mode)
+            || (self.status == "lost" && self.source_correction_recovery);
+        if !terminal || self.verification_status != "failed" {
             return Err(anyhow!(
-                "factory recovery requires a failed, cancelled, or lost verifier-only source with failed verification"
+                "factory recovery requires failed verification on a terminal source or an exactly bound lost recovery"
             ));
         }
         Ok(())
@@ -12009,6 +12115,11 @@ impl SourceWorkspaceCheckpoint {
                 .as_deref()
                 .context("verifier-only source has no confirmed workspace fingerprint")?;
             self.validate_report(fingerprint, None)?;
+        }
+        if self.status == "lost" && self.source_correction_recovery && self.fingerprint.is_none() {
+            return Err(anyhow!(
+                "lost source-correction recovery requires a runner-confirmed workspace fingerprint"
+            ));
         }
         Ok(())
     }
@@ -12068,7 +12179,7 @@ async fn source_workspace_checkpoint_tx(
         SELECT run.status, run.execution_mode, run.verification_status,
                run.workspace_path, run.workspace_disposition, run.workspace_fingerprint,
                deliverable.head_commit, recovery.id AS recovery_id,
-               recovery.status AS recovery_status,
+               recovery.status AS recovery_status, recovery.mode AS recovery_mode,
                recovery.request->>'expected_workspace_fingerprint' AS authorized_fingerprint,
                recovery.request->>'expected_head_commit' AS authorized_head,
                previous.id AS previous_run_id
@@ -12080,7 +12191,10 @@ async fn source_workspace_checkpoint_tx(
         LEFT JOIN factory_verification_recoveries recovery
           ON recovery.replacement_run_id = run.id AND recovery.corp_id = run.corp_id
          AND recovery.task_id = run.task_id AND recovery.mission_id = task.mission_id
-         AND recovery.mode = 'verifier_only'
+         AND (
+             (recovery.mode = 'verifier_only' AND run.execution_mode = 'verification_only')
+             OR (recovery.mode = 'source_correction' AND run.execution_mode = 'provider')
+         )
          AND EXISTS (
              SELECT 1 FROM factory_work_items item
              WHERE item.id = recovery.factory_work_item_id AND item.corp_id = run.corp_id
@@ -12106,6 +12220,13 @@ async fn source_workspace_checkpoint_tx(
     .context("source workspace checkpoint was not found")?;
     let execution_mode: String = row.get("execution_mode");
     let status: String = row.get("status");
+    // A lost ordinary provider remains ineligible. Only this exact governed
+    // recovery, with its original assignment/source binding and failed receipt,
+    // may return after native cleanup confirms the actual preserved bytes.
+    let source_correction_recovery = execution_mode == "provider"
+        && row.get::<Option<String>, _>("recovery_mode").as_deref() == Some("source_correction")
+        && row.get::<Option<String>, _>("recovery_status").as_deref() == Some("failed")
+        && row.get::<Option<Uuid>, _>("previous_run_id").is_some();
     let mut head: Option<String> = row.get("head_commit");
     let expected_verifier_fingerprint = if execution_mode == "verification_only" {
         if row.get::<Option<Uuid>, _>("recovery_id").is_none()
@@ -12135,6 +12256,7 @@ async fn source_workspace_checkpoint_tx(
     Ok(SourceWorkspaceCheckpoint {
         status,
         execution_mode,
+        source_correction_recovery,
         verification_status: row.get("verification_status"),
         workspace_path: row.get("workspace_path"),
         disposition: row.get("workspace_disposition"),
@@ -15780,6 +15902,7 @@ mod tests {
         super::SourceWorkspaceCheckpoint {
             status: "lost".to_owned(),
             execution_mode: "verification_only".to_owned(),
+            source_correction_recovery: false,
             verification_status: "failed".to_owned(),
             workspace_path: Some("workspace".to_owned()),
             disposition: Some("active".to_owned()),

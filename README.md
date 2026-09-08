@@ -129,17 +129,21 @@ Artifact bytes move through bounded staging, content-addressed storage, signed p
 ## Start locally
 
 **Prerequisites:** repository access, Git, Rust 1.94 or newer, Node.js compatible with the pinned
-pnpm/Vite toolchain, pnpm 11.19.0, Docker with Compose, and Windows PowerShell. Provider credentials
+pnpm/Vite toolchain, pnpm 11.19.0, Docker with Compose, and PowerShell 7.4+ on Windows. Provider credentials
 are optional for the deterministic harness; real-agent work requires the selected provider's access.
 
 ```powershell
 git clone https://github.com/shyamsridhar123/ecorp.git
 cd ecorp
 pnpm install --frozen-lockfile
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
-Open **http://127.0.0.1:5187**. The script starts Postgres, the Rust control plane, an enrolled outbound runner, and the React operations console, then checks service health and runner connectivity.
+Open **http://127.0.0.1:5187** by default, or the retained address printed by the command.
+Start reuses healthy owned services and starts only missing ones. It keeps the database, native
+runner identity, provider home, worktrees and diagnostics rather than resetting them.
+An explicitly supplied `DATABASE_URL` uses that database without starting Docker; otherwise,
+first-time local setup uses the workspace's managed Compose database.
 This is your local ECorp console, not the public product-site tour. Use the
 [five-step mission guide](docs/USER_AND_DEVELOPER_JOURNEY.md) for repository confirmation, staffing,
 verification, and review.
@@ -149,25 +153,32 @@ To start the configured trusted GitHub Project watcher with the same stack:
 ```powershell
 $env:ECORP_FACTORY_WATCH = '1'
 $env:ECORP_FACTORY_ADAPTER = 'github-copilot'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
-When configured, startup waits for a fresh controller heartbeat and Factory displays `Watching`.
+Adding a missing Factory worker does not restart a healthy API, runner or UI. Startup checks the
+configured controller's heartbeat and preserves its existing paused/running intent.
 Pause stops new intake without interrupting active missions. GitHub authentication remains in the
 controller process; it is not forwarded to runners or agents.
 
-Stop the stack with:
+Normal start is not a restart. To deliberately restart owned services, or stop them:
 
 ```powershell
-./tools/stop_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1 -Restart
+pwsh -NoProfile -File ./tools/stop_local.ps1
 ```
+
+Neither command removes the database, credentials, worktrees or historical logs. Process control
+checks executable, creation time and workspace; old numeric-only PID files do not authorize a kill.
+See [local startup and recovery](CONTRIBUTING.md#local-startup-and-recovery) for configured ports,
+existing identities and trusted environment settings.
 
 ### Point ECorp at another repository
 
 ```powershell
 $env:CRONY_SOURCE_REPOSITORY = 'C:\path\to\your\repository'
 $env:CRONY_SOURCE_BASE_REF = 'HEAD'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1 -Restart
 ```
 
 The runner validates the repository and base ref before accepting work. Mission worktrees are created beneath `CRONY_RUNNER_WORKSPACE`, never in the configured source checkout.

@@ -571,6 +571,17 @@ source-validation, adapter, or other pre-start rejection terminalizes the replac
 recovery, returns the factory item to `verification_failed`, consumes the failed command, and leaves
 the preserved source checkpoint eligible for a separately authorized retry.
 
+Runner loss terminalizes an exactly bound active recovery in either mode, including a
+source-correction command acknowledged before its start report arrives. The recovery slot is
+released and the Factory/task projections return to `verification_failed`; the run remains
+`lost`. A lost source-correction run becomes eligible for the existing recovery flow only after
+the assigned runner confirms preserved bytes with a fingerprint. If its start report was missing,
+that cleanup can restore missing assignment metadata from its exact authorized parent, never from
+a path supplied in the cleanup message. It cannot replace existing metadata or an earlier
+fingerprint, adopt an unrelated provider loss, bypass quarantine, or manufacture preservation.
+The next separately authorized native recovery retains the current checkpoint and immutable
+source, session, attempt and budget history. Recovery/publication gates precede loss row locks.
+
 ## Agent adapters
 
 `execute` and `resume` are terminal lifecycle boundaries: an adapter may return only after its

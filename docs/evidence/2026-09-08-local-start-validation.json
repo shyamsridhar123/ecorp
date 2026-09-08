@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "issue": 174,
+  "observed_at": "2026-09-08T05:19:02.5336220Z",
+  "source_base_commit": "18cd802161c9ce0a697f5620da3df1041b4d097f",
+  "branch": "codex/issue-174-local-start",
+  "product_and_test_files": [
+    {
+      "path": "tools/start_local.ps1",
+      "sha256": "b4a7d1830fd1e868f56616626d2e0b2939d4637f44634cbadf0f44dc7a8b0c17"
+    },
+    {
+      "path": "tools/stop_local.ps1",
+      "sha256": "ba9d8d27d79fee0d6b9e9b36666de3224efe66b13d45005c6a6e769044036d7e"
+    },
+    {
+      "path": "tools/local_stack.psm1",
+      "sha256": "c7a3c1c408e6b042947bed8518e63dd1beb86f905e777f5b653cc96d6a162042"
+    },
+    {
+      "path": "tools/local_stack_start.ps1",
+      "sha256": "7a50d3d6d5a1187d83cb773ec65de87fa11bf2e1af82f5ff8a5147e1f6a53d42"
+    },
+    {
+      "path": "tools/local_stack_lifecycle.test.mjs",
+      "sha256": "7288c088fefe37379fb488519b137d95798c13affbecaa9bfe7695d1aae324db"
+    },
+    {
+      "path": "tools/local_stack_lifecycle.test.ps1",
+      "sha256": "209dc198df5f92969df0f5b0869cde2241821dcea53ac699fb4e065e7adfe4f1"
+    },
+    {
+      "path": "tools/local_stack_operation.ps1",
+      "sha256": "b3cbe2f33934e8543b5a0b199d63338fa7558e44557aa178aede9dbced99d0d3"
+    },
+    {
+      "path": "tools/local_stack_operation.test.mjs",
+      "sha256": "4d826ea69610a9c01ea713aa685188a46f45dbb8b2fa74ef1fa1a87d075330b8"
+    }
+  ],
+  "repository_gates": {
+    "schema_version": 1,
+    "issue": 174,
+    "observed_at": "2026-09-07T23:10:23.3185848-05:00",
+    "branch": "codex/issue-174-local-start",
+    "source_base_commit": "18cd802161c9ce0a697f5620da3df1041b4d097f",
+    "cargo_target_directory": "C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue174-local-start\\target",
+    "status": "passed",
+    "application_inputs_unchanged": true,
+    "checks": [
+      {
+        "name": "migration-check",
+        "command": "node tools/check_migrations.mjs",
+        "exit_code": 0,
+        "seconds": 0.23,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-migration-check.log"
+      },
+      {
+        "name": "rust-format",
+        "command": "cargo fmt --check",
+        "exit_code": 0,
+        "seconds": 1.87,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-rust-format.log"
+      },
+      {
+        "name": "rust-clippy",
+        "command": "cargo clippy --workspace --all-targets -- -D warnings",
+        "exit_code": 0,
+        "seconds": 245.99,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-rust-clippy.log"
+      },
+      {
+        "name": "rust-tests",
+        "command": "cargo test --workspace",
+        "exit_code": 0,
+        "seconds": 390.03,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-rust-tests.log"
+      },
+      {
+        "name": "frontend-tests",
+        "command": "node --test C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue174-local-start\\apps\\web\\src\\factoryPolling.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue174-local-start\\apps\\web\\src\\missionRuntime.test.mjs C:\\Users\\shyamsridhar\\.codex\\worktrees\\ecorp-issue174-local-start\\apps\\web\\src\\office\\officeModel.test.mjs",
+        "exit_code": 0,
+        "seconds": 0.45,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-frontend-tests.log"
+      },
+      {
+        "name": "web-build",
+        "command": "pnpm build:web",
+        "exit_code": 0,
+        "seconds": 15.92,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-web-build.log"
+      },
+      {
+        "name": "web-lint",
+        "command": "pnpm lint:web",
+        "exit_code": 0,
+        "seconds": 2.86,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-web-lint.log"
+      },
+      {
+        "name": "diff-check",
+        "command": "git diff --check",
+        "exit_code": 0,
+        "seconds": 0.16,
+        "log": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\stacked-pr-rollout-20260907\\issue174-diff-check.log"
+      }
+    ],
+    "limitations": [
+      "These are the required repository gates for the independent main-based change.",
+      "Local-start module, source, concurrency and native full-stack acceptance are separate.",
+      "No ignored SQLx cases, hosted Actions, live service restarts, database resets or real-provider execution."
+    ]
+  },
+  "startup_tests": {
+    "skipped": 0,
+    "failed": 0,
+    "passed": 34,
+    "command": "node --test tools/local_stack_lifecycle.test.mjs tools/local_stack_operation.test.mjs"
+  },
+  "native_runtime_retention": {
+    "observed_at": "2026-09-08T05:01:48.8553046Z",
+    "exact_historical_rows_unchanged": true,
+    "original_event_seq": 78,
+    "original_journal_unchanged": true,
+    "four_processes_actually_restarted": true,
+    "native_home_and_workspace_unchanged": true,
+    "preserved_worktree_exists": true,
+    "rows": [
+      "missions|1|b03a1fd5a7e9ba9b66fea85f9a2ca45931b006d8fb6ae231b94573ffd045bdc0",
+      "tasks|1|1554ee8163f8baf1342a95a17cdf42ac2a88052698fbdc8a99b127bd3623cdaa",
+      "runs|1|3221abad314f13447c485bce790afe0a61865c3832854809d2054d96668a55ad",
+      "room_messages|1|a522301ebd633305f484f839e9bb9d0e3d7a8a7c72091d699208f6f3e2eaac78",
+      "artifacts|2|6ad4625ed00ec75dad4138cc2e15d20ba21030938037a6f8ef9f350c201d1b04",
+      "source_deliverables|1|56d6e7e2042196cc564c2b70acb2c1f850606025f86047f660974f2878b0f8d0"
+    ]
+  },
+  "browser_after_restart": {
+    "browser_reloaded_retained_mission": true,
+    "mission_linked_message_visible": true,
+    "factory_still_paused": true,
+    "signed_downloads": [
+      {
+        "id": "0bc20588-fa01-4056-b0af-25646d2065b9",
+        "sha256": "014a24757d3ddb7e2b2ae004538d3919bd4a7e897272f7d4097082b2a7a96132",
+        "bytes": 1638
+      },
+      {
+        "id": "c54f0ccb-6d7a-493b-8843-378799326aa8",
+        "sha256": "e2f46b5519bb03b26b29f748e7d73060117e8c1f3a6170f4749468d4ba4ffd7a",
+        "bytes": 515
+      }
+    ],
+    "page_errors": [],
+    "mobile_scroll_width": 390,
+    "mobile_viewport": 390
+  },
+  "missing_factory_recovery": {
+    "observed_at": "2026-09-08T05:13:30.404165Z",
+    "factory_added_without_restarting_healthy_api_runner_ui": true,
+    "factory_enabled": true,
+    "factory_controller_id": "00000000-0000-4000-8000-000000000174"
+  },
+  "cleanup": {
+    "observed_at": "2026-09-08T05:16:16.4432624Z",
+    "qa_processes_stopped": true,
+    "qa_ports_free": true,
+    "database_and_credentials_retained": true,
+    "original_listener_identities": [
+      {
+        "port": 18961,
+        "pid": 32148
+      },
+      {
+        "port": 18962,
+        "pid": 41628
+      },
+      {
+        "port": 15491,
+        "pid": 54412
+      }
+    ],
+    "missing_factory_was_genuinely_added": true
+  },
+  "logs": [
+    {
+      "name": "issue174-rust-clippy.log",
+      "sha256": "4bb263fc252c2b2eda0a9eb9ce3b2d1430d1fff66c112b80f3ec144bf1fc0af3"
+    },
+    {
+      "name": "issue174-rust-tests.log",
+      "sha256": "a8de207778660d5dd6470f3eb7c470cb617fccbb135a6a070e171352ca1db26e"
+    },
+    {
+      "name": "issue174-frontend-tests.log",
+      "sha256": "afc77944419dd52d0d838f8a201c4db49f400a5f2039365c971ed77143c12b4a"
+    },
+    {
+      "name": "issue174-web-build.log",
+      "sha256": "44499b38b0c12b54b54b1c91641e7a99cae80ee2e2933b48603cc9893f8ad58c"
+    },
+    {
+      "name": "issue174-web-lint.log",
+      "sha256": "827b649d485c99a80680a27128e7b9fcb299a1edc963402b6fe41d46295a856c"
+    },
+    {
+      "name": "issue174-final-startup-tests.log",
+      "sha256": "b28ee9ce74622a2b23cf09c5ddb05888a5e6f8e9a38005e11f976fe33a466ca7"
+    },
+    {
+      "name": "issue174-native-binaries.log",
+      "sha256": "9504a10659a3fe5227cba04d7a80b22691249b9f116572e6057962ff24756f8b"
+    }
+  ],
+  "limits": [
+    "Windows native lifecycle test with deterministic provider and local fake GitHub only.",
+    "Synthetic source repository, not a fetched or published enterprise-lab commit.",
+    "No production OIDC, real-model generation, global deadlock freedom or forced-kernel-failure claim.",
+    "No merge, auto-merge, deployment or hosted Actions result."
+  ]
+}
