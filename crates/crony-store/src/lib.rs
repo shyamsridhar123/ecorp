@@ -25,6 +25,7 @@ mod factory_controller;
 mod factory_run_failure;
 mod publication;
 mod staffing;
+mod terminal_accounting;
 
 #[cfg(test)]
 mod factory_recovery_loss_tests;
@@ -7635,7 +7636,7 @@ impl PgStore {
                 r.status IN ('provisioning', 'starting', 'running',
                              'waiting_for_input', 'waiting_for_approval', 'verifying')
                 OR (
-                  $6::text IN ('run.workspace_preserved', 'run.workspace_removed')
+                  $6::text IN ('run.workspace_preserved', 'run.workspace_removed', 'run.session_terminated')
                   AND r.status IN ('completed', 'failed', 'cancelled', 'lost')
                 )
               )
@@ -7686,6 +7687,17 @@ impl PgStore {
         let existing_workspace_disposition: Option<String> =
             row.get("existing_workspace_disposition");
         let breaker_stage: String = row.get("breaker_stage");
+        if event_type == "run.session_terminated" {
+            terminal_accounting::validate_termination_tx(
+                &mut tx,
+                corp_id,
+                task_id,
+                run_id,
+                &row.get::<String, _>("execution_mode"),
+                &payload,
+            )
+            .await?;
+        }
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode task verification policy")?;
