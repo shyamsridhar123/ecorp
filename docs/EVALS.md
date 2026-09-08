@@ -87,7 +87,7 @@ dispatch, fresh continuation run IDs, and normal graph dependencies/retries. Its
 resetting their database or source.
 
 `tools/e2e_launch_admission_browser.mjs` uses the actual mission composer, repository confirmation,
-**Hold at briefing**, and **Dispatch mission** controls. It closes the browser before unrelated
+**Save without starting**, **Save plan**, and **Dispatch mission** controls. It closes the browser before unrelated
 work completes and checks the saved plan again after the supervisor's restart. It also checks
 390-pixel layout and a successful, nonduplicating launch replay.
 

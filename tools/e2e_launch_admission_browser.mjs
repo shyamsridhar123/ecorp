@@ -111,8 +111,9 @@ try {
   if (phase === 'prepare') {
     await page.getByRole('button', { name: 'New mission', exact: true }).click()
     await page.locator('#mission-title').fill(checkpoint.title)
+    await page.locator('details.mission-advanced-options')
+      .filter({ has: page.locator('#mission-description') }).locator('summary').click()
     await page.locator('#mission-description').fill('Isolated deterministic fixture: save this plan without running it; verify explicit dispatch after restart. No real AI inference.')
-    await page.getByRole('button', { name: 'Configure run', exact: true }).click()
     const wanted = process.env.CRONY_ADMISSION_SOURCE_REPOSITORY || 'ecorp-fixture/launch-admission'
     const choices = await page.locator('#mission-repository option').evaluateAll((items) =>
       items.filter((item) => item.value).map((item) => ({ value: item.value, source: JSON.parse(item.value) })))
@@ -121,16 +122,18 @@ try {
     checkpoint.source = { repository: targets[0].source[0], base_ref: targets[0].source[1], base_commit: targets[0].source[2] }
     await page.locator('#mission-repository').selectOption(targets[0].value)
     await page.getByRole('checkbox', { name: /Confirm this target/ }).check()
+    await page.locator('details.mission-advanced-options')
+      .filter({ has: page.locator('#mission-deliverable') }).locator('summary').click()
     await page.getByRole('checkbox', { name: /Developer fixtures/ }).check()
     await page.locator('#mission-adapter').selectOption('fake-process')
     await page.locator('#mission-strategy').selectOption('single')
     await page.locator('#mission-deliverable').selectOption('review_only_report')
     await page.getByRole('checkbox', { name: /Commit verified work/ }).uncheck()
-    await page.getByRole('checkbox', { name: /Hold at briefing/ }).check()
-    await page.getByRole('button', { name: 'Set verification', exact: true }).click()
+    await page.getByRole('checkbox', { name: /Save without starting/ }).check()
+    await page.getByRole('button', { name: 'Review and build', exact: true }).click()
     const responsePromise = page.waitForResponse((response) =>
       response.url() === `${server}${api('/missions')}` && response.request().method() === 'POST')
-    await page.getByRole('button', { name: 'Create mission plan', exact: true }).click()
+    await page.getByRole('button', { name: 'Save plan', exact: true }).click()
     const response = await responsePromise
     assert.equal(response.status(), 200)
     checkpoint.mission_id = (await response.json()).mission_id

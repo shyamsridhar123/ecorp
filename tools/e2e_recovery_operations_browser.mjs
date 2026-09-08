@@ -439,22 +439,22 @@ async function verifierTabs(name, width) {
   const newMission = missions.getByRole('button', { name: 'New mission', exact: true })
   if (await newMission.isVisible()) await newMission.click()
   const stages = missions.locator('.mission-stage-nav')
-  await stages.getByRole('button', { name: 'Run setup', exact: true }).click()
-  const strategy = missions.getByLabel('Execution strategy', { exact: true })
+  await stages.getByRole('button', { name: 'Describe & setup', exact: true }).click()
+  const strategy = missions.getByLabel('Team', { exact: true })
   const originalStrategy = await strategy.inputValue()
   const approvalExpectations = []
   for (const [value, expected] of [
-    ['single', /Solo run can still need decisions for risky actions/],
-    ['parallel-specialists', /Two specialists and synthesis can request different scoped actions/],
+    ['single', /Routine work uses the agent's native permissions/],
+    ['parallel-specialists', /Routine work uses the agent's native permissions/],
   ]) {
     await strategy.selectOption(value)
     const text = normalizedText(await missions.locator('#mission-strategy-policy').innerText())
     assert.match(text, expected)
-    assert.match(text, /not duplicate grants for the same action/)
+    assert.match(text, /without duplicate grants for the same action/)
     approvalExpectations.push({ strategy: value, text })
   }
   await strategy.selectOption(originalStrategy)
-  await stages.getByRole('button', { name: 'Verification', exact: true }).click()
+  await stages.getByRole('button', { name: 'Review & build', exact: true }).click()
   const custom = missions.getByRole('checkbox', { name: /Custom verification/ })
   assert.equal(await custom.isEnabled(), true, 'Use the normal composer, not a deterministic cartridge')
   await custom.check()
