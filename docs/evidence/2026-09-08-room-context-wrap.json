@@ -1,0 +1,47 @@
+{
+  "status": "passed",
+  "scope": "read-only follow-up of existing message, no additional comment",
+  "original_receipt": "2026-09-08T06:53:27.378861+00:00",
+  "message_id": "234e82e0-c714-4007-9cb8-36666578c365",
+  "initial_visual_finding": "Page width passed but long marker clipped timestamp and Reply inside the message list.",
+  "measurements": [
+    {
+      "class": "room-panel panel",
+      "client": 372,
+      "scroll": 372
+    },
+    {
+      "class": "room-message-list",
+      "client": 346,
+      "scroll": 346
+    },
+    {
+      "class": "room-message ",
+      "client": 312,
+      "scroll": 312
+    },
+    {
+      "class": "room-message-foot",
+      "client": 288,
+      "scroll": 288
+    }
+  ],
+  "reply_bounds": {
+    "x": 285.28125,
+    "y": 1113.5,
+    "width": 53.71875,
+    "height": 44
+  },
+  "message_bounds": {
+    "x": 38,
+    "y": 973.359375,
+    "width": 314,
+    "height": 197.140625
+  },
+  "page_errors": [],
+  "mutations": [
+    "/api/demo/bootstrap"
+  ],
+  "screenshot": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue184-room-context-20260908\\room-wrap-390px.png",
+  "screenshot_sha256": "f017bdc6ec67995e89636eb1921cec8ec563e22615d2aac2aa6a2f289f387f48"
+}
