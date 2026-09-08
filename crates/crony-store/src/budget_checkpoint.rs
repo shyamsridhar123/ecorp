@@ -427,10 +427,12 @@ pub(super) async fn zero_provider_allocation_tx(
     corp_id: Uuid,
     run_id: Uuid,
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar(
+    let row = sqlx::query(
         r#"
-        SELECT EXISTS (
-          SELECT 1 FROM runs run
+          SELECT source.id AS source_run_id, origin.id AS origin_run_id,
+                 recovery.request->>'expected_head_commit' AS requested_head,
+                 recovery.checkpoint_authority->'checkpoint'->>'head_commit' AS origin_head
+          FROM runs run
           JOIN tasks task ON task.id=run.task_id AND task.corp_id=run.corp_id
           JOIN factory_verification_recoveries recovery
             ON recovery.replacement_run_id=run.id AND recovery.corp_id=run.corp_id
@@ -466,8 +468,6 @@ pub(super) async fn zero_provider_allocation_tx(
             AND recovery.request->>'expected_workspace_fingerprint'=source.workspace_fingerprint
             AND recovery.request->>'expected_workspace_fingerprint'
                 =recovery.checkpoint_authority->'checkpoint'->>'workspace_fingerprint'
-            AND recovery.request->>'expected_head_commit'
-                =recovery.checkpoint_authority->'checkpoint'->>'head_commit'
             AND source.workspace_disposition='preserved'
             AND origin.workspace_disposition='preserved'
             AND origin.execution_mode='provider' AND origin.breaker_stage IN ('suspend','stop')
@@ -480,11 +480,27 @@ pub(super) async fn zero_provider_allocation_tx(
                 WHERE lineage.corp_id=run.corp_id
                   AND lineage.workspace_run_id=run.workspace_run_id
             )
-        )
         "#,
     )
     .bind(run_id)
     .bind(corp_id)
-    .fetch_one(&mut **tx)
-    .await?)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let source_run_id: Uuid = row.get("source_run_id");
+    // Reuse the exact retained-export/lineage validation without introducing
+    // ancestor row locks into event accounting. A verifier retry's HEAD can
+    // differ from the immutable provider origin after an authorized export.
+    let checkpoint =
+        source_workspace_checkpoint_with_lock_tx(tx, corp_id, source_run_id, false).await?;
+    let expected_head = match checkpoint.execution_mode.as_str() {
+        "provider" if source_run_id == row.get::<Uuid, _>("origin_run_id") => {
+            row.get::<Option<String>, _>("origin_head")
+        }
+        "verification_only" => checkpoint.expected_head_commit,
+        _ => return Ok(false),
+    };
+    Ok(expected_head.is_some() && expected_head == row.get::<Option<String>, _>("requested_head"))
 }

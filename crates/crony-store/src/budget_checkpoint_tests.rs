@@ -1250,6 +1250,130 @@ async fn reject_retention_request(store: &PgStore, input: CheckpointFactoryWorks
     assert_eq!(state(store).await, before);
 }
 
+async fn assert_exported_checkpoint_retry(pool: PgPool, terminal_event: &str) {
+    let (store, command, _) = waiting_export_fixture(pool).await;
+    let mut preserved = retention_event(&command);
+    preserved.payload["head_commit"] = json!("d".repeat(40));
+    store
+        .apply_runner_event(event(
+            command.run_id,
+            preserved.assignment_token,
+            terminal_event,
+            json!({"error":"Native verifier interrupted after source export"}),
+        ))
+        .await
+        .unwrap();
+    store.apply_runner_event(preserved).await.unwrap();
+    let before = state(&store).await;
+    let context = store
+        .factory_verification_recovery_context(CORP, OWNER, ITEM)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.source_run_id, command.run_id);
+    assert!(context.checkpoint_verification);
+    assert_eq!(context.expected_head_commit, Some("d".repeat(40)));
+    assert_eq!(context.workspace_fingerprint, Some("b".repeat(64)));
+    assert_eq!(
+        state(&store).await,
+        before,
+        "preview must not mutate history"
+    );
+
+    let mut input = request();
+    input.source_run_id = context.source_run_id;
+    input.expected_factory_version = context.work_item.version;
+    input.expected_head_commit = context.expected_head_commit;
+    input.expected_workspace_fingerprint = context.workspace_fingerprint.unwrap();
+    let mut stale = input.clone();
+    stale.expected_head_commit = Some("a".repeat(40));
+    rejected_without_changes(&store, stale).await;
+    let recovery = store
+        .create_factory_verification_recovery(input.clone())
+        .await
+        .unwrap();
+    let FactoryVerificationRecoveryLaunch::VerifierOnly(launch) = recovery.launch else {
+        panic!("checkpoint retry must not launch a provider")
+    };
+    assert_eq!(launch.expected_head_commit, Some("d".repeat(40)));
+    assert_eq!(launch.source_run_id, command.run_id);
+    let after = state(&store).await;
+    for key in [
+        "source",
+        "artifacts",
+        "deliverables",
+        "verification_evidence",
+    ] {
+        assert_eq!(after[key], before[key], "{key}");
+    }
+    assert_eq!(
+        retained_run(&after, command.run_id),
+        retained_run(&before, command.run_id),
+        "failed verifier history must remain immutable"
+    );
+    assert_eq!(
+        after["task"]["attempt_count"],
+        before["task"]["attempt_count"]
+    );
+    let next = retained_run(&after, launch.run_id);
+    assert_eq!(next["workspace_run_id"], json!(SOURCE));
+    assert_eq!(next["resumed_from_run_id"], json!(command.run_id));
+    assert_eq!(next["input_tokens"], 0);
+    assert_eq!(next["output_tokens"], 0);
+    assert_eq!(next["cost_microusd"], 0);
+    assert!(next["provider_session_id"].is_null());
+    let next_recovery = after["recoveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["replacement_run_id"] == json!(launch.run_id))
+        .unwrap();
+    assert_eq!(
+        next_recovery["request"]["expected_head_commit"],
+        "d".repeat(40)
+    );
+    assert_eq!(
+        next_recovery["checkpoint_authority"]["checkpoint"]["head_commit"],
+        "a".repeat(40),
+        "original provider head remains separate admission authority"
+    );
+    let mut tx = store.pool.begin().await.unwrap();
+    assert!(
+        budget_checkpoint::zero_provider_allocation_tx(&mut tx, CORP, launch.run_id)
+            .await
+            .unwrap(),
+        "the exported-head retry must remain a valid provider-free allocation"
+    );
+    tx.rollback().await.unwrap();
+    let next_command = store
+        .pending_runner_commands(RUNNER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|pending| pending.run_id == launch.run_id)
+        .unwrap();
+    assert_eq!(next_command.payload["expected_head_commit"], "d".repeat(40));
+    assert_dispatch_read(&store, &next_command, true).await;
+    let replay = store
+        .create_factory_verification_recovery(input)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(state(&store).await, after);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_exported_retry_after_failure_preserves_head(pool: PgPool) {
+    assert_exported_checkpoint_retry(pool, "run.failed").await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue148_checkpoint_exported_retry_after_cancellation_preserves_head(pool: PgPool) {
+    assert_exported_checkpoint_retry(pool, "run.cancelled").await;
+}
+
 #[sqlx::test(migrations = "../../db/migrations")]
 #[ignore = "requires explicitly owned SQLx maintenance database"]
 async fn issue148_checkpoint_retention_binds_export_head_by_mode_without_rewriting_origin(

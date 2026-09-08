@@ -4413,7 +4413,12 @@ impl PgStore {
                 source_run_id,
             )
             .await?;
-            checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit);
+            // A retry may have already exported its authorized verification
+            // commit. Preserve that bound head; the provider origin remains
+            // immutable authority, not the verifier's current checkout head.
+            if checkpoint.execution_mode == "provider" {
+                checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit);
+            }
         } else {
             checkpoint.ensure_factory_terminal()?;
         }
@@ -4721,7 +4726,9 @@ impl PgStore {
                     "checkpoint verification cannot clear an unrelated factory state"
                 ));
             }
-            checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit.clone());
+            if checkpoint.execution_mode == "provider" {
+                checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit.clone());
+            }
             Some(authority)
         } else {
             checkpoint.ensure_factory_terminal()?;
@@ -12397,13 +12404,23 @@ async fn source_workspace_checkpoint_tx(
     corp_id: Uuid,
     run_id: Uuid,
 ) -> Result<SourceWorkspaceCheckpoint> {
-    let row = sqlx::query(
+    source_workspace_checkpoint_with_lock_tx(tx, corp_id, run_id, true).await
+}
+
+async fn source_workspace_checkpoint_with_lock_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+    lock_source: bool,
+) -> Result<SourceWorkspaceCheckpoint> {
+    let source_lock = if lock_source { "FOR UPDATE OF run" } else { "" };
+    let row = sqlx::query(&format!(
         r#"
         SELECT run.status, run.execution_mode, run.verification_status,
                run.workspace_path, run.workspace_disposition, run.workspace_fingerprint,
                run.deliverable_sha256,
-               COALESCE(task.contract#>>'{deliverable,form}'='commit_branch'
-                 OR task.contract#>>'{deliverable,commit_after_verification}'='true',false)
+               COALESCE(task.contract#>>'{{deliverable,form}}'='commit_branch'
+                 OR task.contract#>>'{{deliverable,commit_after_verification}}'='true',false)
                  AS expects_verification_commit,
                deliverable.head_commit, recovery.id AS recovery_id,
                recovery.status AS recovery_status, recovery.mode AS recovery_mode,
@@ -12437,9 +12454,9 @@ async fn source_workspace_checkpoint_tx(
          AND previous.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
          AND previous.workspace_fingerprint = recovery.request->>'expected_workspace_fingerprint'
         WHERE run.id = $1 AND run.corp_id = $2
-        FOR UPDATE OF run
+        {source_lock}
         "#,
-    )
+    ))
     .bind(run_id)
     .bind(corp_id)
     .fetch_optional(&mut **tx)
