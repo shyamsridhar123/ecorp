@@ -52,10 +52,12 @@ with the recorded parent branch only after coordinating the landing order.
 
 A contributor clone contains the ECorp dark-factory implementation. OpenAI Symphony inspired parts
 of the operating model, but Symphony is not an ECorp dependency and does not need to be installed.
-Each contributor runs a local ECorp server and runner, supplies their own provider identity, and
-uses a private runner workspace while coordinating work through the shared Project #3.
+Contributors supply their own provider identity and private runner workspace. A local server is
+appropriate for isolated testing or a disjoint backlog. Factories consuming the same backlog must
+use the same authenticated control plane, Corp and claim namespace. A shared GitHub Project alone
+is not an execution lock.
 
-Prerequisites are Git, Windows PowerShell, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
+Prerequisites are Git, PowerShell 7.4+ on Windows, Rust 1.94 or newer, Node.js, pnpm 11.19.0, Docker with
 Compose, GitHub CLI authenticated for the repository and Project #3, and any provider entitlement
 required for real-agent work.
 
@@ -70,18 +72,58 @@ $env:CRONY_SOURCE_REPOSITORY = (Get-Location).Path
 $env:CRONY_SOURCE_BASE_REF = 'HEAD'
 $env:CRONY_RUNNER_WORKSPACE = Join-Path $env:USERPROFILE '.ecorp\runner-workspaces'
 
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 Invoke-RestMethod http://127.0.0.1:8791/health
 Invoke-WebRequest http://127.0.0.1:5187
 ./tools/e2e_smoke.ps1
-./tools/stop_local.ps1
+pwsh -NoProfile -File ./tools/stop_local.ps1
 ```
 
 The server owns authoritative organizational state. The outbound runner owns provider processes and
 isolated worktrees. Closing a browser or desktop client must not terminate a run. Do not share the
-runner workspace, credential directory, provider state directory, or local database with another
-contributor. Contributors running on the same machine must also coordinate the stack's ports and
+runner workspace, credential directory or provider state directory with another contributor.
+Shared operation uses the authenticated control plane, not shared database credentials.
+Contributors running on the same machine must also coordinate the stack's ports and
 shared development Compose database.
+
+### Local startup and recovery
+
+Use the same command for first setup and an ordinary subsequent start:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1
+```
+
+It reuses healthy owned processes, starts only missing services, and serializes concurrent
+start/stop commands for the checkout. It retains the API/UI address pair, source repository/ref,
+runner ID/workspace, Copilot home, and configured Factory controller/Project/repository.
+The native runner credential still rotates normally; it is not deleted or replaced by enrollment
+on every start. Enabling a missing Factory worker leaves a healthy API, runner and UI running.
+
+Use `-ServerPort 8791 -WebPort 5187` to choose addresses. Once recorded, normal start reuses them
+without repeating flags. To apply changes affecting an already running service, use the explicit
+restart command; it can interrupt that service's active work:
+
+```powershell
+pwsh -NoProfile -File ./tools/start_local.ps1 -Restart
+pwsh -NoProfile -File ./tools/stop_local.ps1
+```
+
+An externally supplied `DATABASE_URL` bypasses Compose entirely. Load it and any custom service
+keys/provider credentials through trusted host configuration before startup; do not put their
+values in arguments, issues, source files or logs. Secret values are not saved in the process
+ownership record. Environment delivery remains reduced assurance.
+
+For an additional runner on a shared authority, choose a distinct `CRONY_RUNNER_ID`. If that
+identity already exists but its local credential is missing, restore the existing credential
+instead of using start as an implicit re-enrollment. Native explicit enrollment/revocation remain
+separate operator actions. An explicit `CRONY_RUNNER_STARTUP_RECOVERY=false` is forwarded to the
+server rather than silently discarded.
+
+Legacy PID-only records and unknown/reused PIDs are not process-control authority. They are
+preserved rather than used to stop arbitrary processes. During a one-time legacy migration,
+provide the original database/source/address configuration; an unverified existing listener is
+left untouched. There is no fallback port, database reset, credential wipe or automatic unpause.
 
 ### Use GitHub Copilot
 
@@ -91,7 +133,7 @@ the contributor's logged-in GitHub identity:
 ```powershell
 gh auth status
 $env:CRONY_COPILOT_USE_LOGGED_IN_USER = 'true'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
 The account and organization policy must allow GitHub Copilot. The runner discovers the models and
@@ -103,7 +145,7 @@ workspace:
 
 ```powershell
 $env:CRONY_COPILOT_GITHUB_TOKEN_FILE = 'C:\secure\ecorp\copilot.token'
-./tools/start_local.ps1
+pwsh -NoProfile -File ./tools/start_local.ps1
 ```
 
 Never place the token value in a prompt, command argument, log, issue, worktree, or committed file.
