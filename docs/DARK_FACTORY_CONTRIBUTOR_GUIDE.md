@@ -150,7 +150,7 @@ $env:CRONY_RUNNER_WORKSPACE = 'C:\path\to\isolated-runner-workspace'
 runs. The runner must create linked worktrees below `CRONY_RUNNER_WORKSPACE`; it must never fall
 back to editing the configured checkout.
 
-The Missions **Run setup** screen lists the structured repository, ref, and immutable commit
+The Missions **Describe & setup** screen lists the structured repository, ref, and immutable commit
 advertised by every connected runner. Select and confirm the intended target before choosing a
 runtime. Runtime and model choices are filtered to runners serving that exact source. Local
 repositories without a GitHub remote use a stable `local/<name>-<digest>` identity.

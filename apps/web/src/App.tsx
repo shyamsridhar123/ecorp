@@ -592,7 +592,6 @@ type HealthResponse = {
 }
 
 const API_URL = import.meta.env.VITE_CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const DEFAULT_MISSION = 'Prepare a verified launch-readiness brief for the ECorp alpha.'
 const MISSION_EXAMPLES = [
   {
     label: 'Build a feature',
@@ -4547,7 +4546,7 @@ function App() {
   const [connectionAttempt, setConnectionAttempt] = useState(0)
   const [data, setData] = useState<SnapshotResponse | null>(null)
   const [selectedActorId, setSelectedActorId] = useState<string | null>(null)
-  const [missionTitle, setMissionTitle] = useState(DEFAULT_MISSION)
+  const [missionTitle, setMissionTitle] = useState('')
   const [missionDescription, setMissionDescription] = useState('')
   const [missionObjective, setMissionObjective] = useState('')
   const [missionExpectedOutput, setMissionExpectedOutput] = useState('')
@@ -4563,7 +4562,7 @@ function App() {
       manual_gate: null,
     }))
   const [missionComposerStep, setMissionComposerStep] = useState<
-    'brief' | 'loadout' | 'proof'
+    'brief' | 'proof'
   >('brief')
   const [missionComposerCollapsed, setMissionComposerCollapsed] = useState(false)
   const [missionContractTab, setMissionContractTab] = useState<
@@ -4607,6 +4606,13 @@ function App() {
   const reconnectTimer = useRef<number | null>(null)
   const composerInitialized = useRef(false)
   const initialWorkspaceHash = useRef(window.location.hash)
+  const missionComposerHeading = useRef<HTMLHeadingElement | null>(null)
+
+  useEffect(() => {
+    if (missionComposerCollapsed || activeWorkspaceView !== 'missions') return
+    // Step changes should not leave keyboard users halfway down the old screen.
+    missionComposerHeading.current?.focus()
+  }, [missionComposerStep, missionComposerCollapsed, activeWorkspaceView])
 
   useEffect(() => {
     if (!data || composerInitialized.current) return
@@ -4681,7 +4687,10 @@ function App() {
             ? data?.snapshot.tasks.find((task) => task.id === linkedRun.task_id)
             : undefined
       const missionId = kind === 'mission' ? targetId : linkedTask?.mission_id
-      if (missionId) setSelectedMissionId(missionId)
+      if (missionId) {
+        setSelectedMissionId(missionId)
+        setMissionComposerCollapsed(true)
+      }
       setActiveWorkspaceView('missions')
       window.history.replaceState(null, '', '#missions')
       setAnnouncement(`${statusLabel(kind)} opened in Missions.`)
@@ -4918,8 +4927,9 @@ function App() {
     () =>
       selectedMissionSource
         ? availableRunnerAdapters(data, selectedMissionSource)
+          .filter((adapter) => developerMode || adapter.name !== 'fake-process')
         : [],
-    [data, selectedMissionSource],
+    [data, selectedMissionSource, developerMode],
   )
   const selectedActor =
     humans.find((actor) => actor.id === selectedActorId) ?? humans[0] ?? null
@@ -4986,6 +4996,12 @@ function App() {
         setError(caught instanceof Error ? caught.message : String(caught))
       })
     }
+  }
+
+  const closeMissionComposer = () => {
+    setMissionComposerCollapsed(true)
+    setAnnouncement('Setup closed. Your draft stays on this page.')
+    window.requestAnimationFrame(() => document.getElementById('new-mission-button')?.focus())
   }
 
   const createMission = async (event: FormEvent) => {
@@ -6136,6 +6152,7 @@ function App() {
                 const task = data.snapshot.tasks.find((candidate) => candidate.id === run?.task_id)
                 const missionId = task?.mission_id ?? agent?.mission_id
                 if (missionId) setSelectedMissionId(missionId)
+                setMissionComposerCollapsed(true)
                 activateWorkspaceView('missions')
               }}
               onFactory={() => activateWorkspaceView('factory')}
@@ -6180,6 +6197,7 @@ function App() {
             </div>
             {missionComposerCollapsed && (
               <button
+                id="new-mission-button"
                 className="button button-primary"
                 type="button"
                 onClick={() => {
@@ -6197,21 +6215,18 @@ function App() {
               <div>
                 <span className="arcade-ready">Mission setup</span>
                 <strong>New mission</strong>
-                <small>Define the outcome, runtime, and verification.</small>
+                <small>Describe the work, choose a repository, then review and build.</small>
               </div>
-              <div className="arcade-score" aria-label="Mission configuration status">
-                <span>SPEC</span>
-                <strong>{missionDescription ? 'ON' : 'OFF'}</strong>
-                <span>GATES</span>
-                <strong>{customVerification ? missionVerificationPolicy.checks.length : 0}</strong>
-              </div>
+              <button className="button button-quiet mission-composer-cancel" type="button"
+                disabled={busy} onClick={closeMissionComposer}>
+                Close setup
+              </button>
             </div>
 
             <nav className="mission-stage-nav" aria-label="Mission setup stages">
               {[
-                ['brief', '01', 'Mission'],
-                ['loadout', '02', 'Run setup'],
-                ['proof', '03', 'Verification'],
+                ['brief', '01', 'Describe & setup'],
+                ['proof', '02', 'Review & build'],
               ].map(([step, number, label]) => (
                 <button
                   key={step}
@@ -6219,7 +6234,7 @@ function App() {
                   className={missionComposerStep === step ? 'stage-active' : ''}
                   aria-current={missionComposerStep === step ? 'step' : undefined}
                   onClick={() =>
-                    setMissionComposerStep(step as 'brief' | 'loadout' | 'proof')
+                    setMissionComposerStep(step as 'brief' | 'proof')
                   }
                 >
                   <span>{number}</span>
@@ -6232,9 +6247,9 @@ function App() {
               {missionComposerStep === 'brief' ? (
                 <div className="mission-stage-content stage-brief">
                   <div className="stage-title">
-                    <span>Mission brief</span>
-                    <h3>Name the outcome</h3>
-                    <p>Give the crew one clear objective, then attach the full specification.</p>
+                    <span>Your goal</span>
+                    <h3 className="mission-composer-heading" tabIndex={-1} ref={missionComposerHeading}>What should ECorp build?</h3>
+                    <p>Describe an application, a feature, or a fix. Add a full specification only if you need one.</p>
                   </div>
                   <label className="arcade-input mission-title-input">
                     Mission outcome
@@ -6244,7 +6259,7 @@ function App() {
                       aria-label="Mission outcome"
                       value={missionTitle}
                       onChange={(event) => setMissionTitle(event.target.value)}
-                      placeholder="Fix checkout totals and prove the browser flow."
+                      placeholder="Build a vendor approval portal with roles, an audit trail, and tests."
                       rows={3}
                       maxLength={240}
                     />
@@ -6260,9 +6275,11 @@ function App() {
                       </button>
                     ))}
                   </div>
+                  <details className="mission-advanced-options">
+                    <summary>Additional details or a specification{missionDescription ? ' · added' : ' (optional)'}</summary>
                   <label className="arcade-input mission-description-field">
                     <span>
-                      Durable specification
+                      Additional details
                       <small>{missionDescription.length.toLocaleString()}/100,000</small>
                     </span>
                     <textarea
@@ -6275,15 +6292,16 @@ function App() {
                       maxLength={100_000}
                     />
                   </label>
+                  </details>
                 </div>
               ) : null}
 
-              {missionComposerStep === 'loadout' ? (
+              {missionComposerStep === 'brief' ? (
                 <div className="mission-stage-content stage-loadout">
                   <div className="stage-title">
-                    <span>Run configuration</span>
-                    <h3>Choose how the work runs</h3>
-                    <p>Pick the runtime, budget, delivery format, and orchestration pattern.</p>
+                    <span>Repository and team</span>
+                    <h3>Where should ECorp work?</h3>
+                    <p>Choose a repository and coding agent. Optional settings are below.</p>
                   </div>
                   <div className="loadout-grid">
                     <div className="mission-field repository-target-field">
@@ -6359,7 +6377,7 @@ function App() {
                       ) : null}
                     </div>
                     <div className="mission-field">
-                      <label htmlFor="mission-adapter">Agent runtime</label>
+                      <label htmlFor="mission-adapter">Coding agent</label>
                       <select
                         id="mission-adapter"
                         value={effectiveMissionAdapter}
@@ -6399,9 +6417,59 @@ function App() {
                             ? 'Studio team uses GitHub Copilot for all three workers and the later integration pass. Model and reasoning settings come from the selected source runner.'
                           : selectedAdapter
                             ? adapterDescription(selectedAdapter.name)
-                            : 'Connect a runner to unlock an agent runtime.'}
+                            : selectedMissionSource
+                              ? 'No coding agent is available for this repository. Its runner must be connected.'
+                              : 'Choose a repository to see its available coding agents.'}
                       </small>
                     </div>
+                    <div className="mission-field">
+                      <label htmlFor="mission-strategy">Team</label>
+                      <select
+                        id="mission-strategy"
+                        value={missionStrategy}
+                        aria-describedby="mission-strategy-help mission-strategy-policy"
+                        onChange={(event) => {
+                          const strategy = event.target.value
+                          setMissionStrategy(strategy)
+                          if (strategy === STUDIO_STRATEGY) {
+                            setMissionAdapter('github-copilot')
+                            if (effectiveMissionAdapter !== 'github-copilot') {
+                              setMissionModel('')
+                              setMissionReasoningEffort('')
+                            }
+                          }
+                        }}
+                      >
+                        <option value="single">Solo run</option>
+                        <option value="parallel-specialists">Two specialists and synthesis</option>
+                        <option value={STUDIO_STRATEGY}>{STUDIO_STRATEGY_LABEL}</option>
+                        {developerMode ? (
+                          <optgroup label="Test fixtures">
+                            <option value="verification-matrix">Verification matrix</option>
+                            <option value="human-approval">Human approval</option>
+                            <option value="independent-review">Independent review</option>
+                            <option value="verification-failure">Failure path</option>
+                          </optgroup>
+                        ) : null}
+                      </select>
+                      <small id="mission-strategy-help">
+                        {studioTeam
+                          ? 'Three Copilot agents work in parallel, then one integrates their verified handoffs.'
+                          : missionStrategy === 'parallel-specialists'
+                          ? 'Two agents work in parallel, then a final task combines their results.'
+                          : missionStrategy === 'single'
+                            ? 'One agent handles the work.'
+                            : 'A deterministic product-behavior fixture.'}
+                      </small>
+                      <small id="mission-strategy-policy" className="operations-approval-note">
+                        Routine work uses the agent&apos;s native permissions. New scoped actions and any
+                        required review keep their existing authority, without duplicate grants for the same action.
+                      </small>
+                    </div>
+                  </div>
+                  <details className="mission-advanced-options">
+                    <summary>Model, limits and output{pauseAfterPlanning ? ' · save without starting' : ' (optional)'}</summary>
+                    <div className="loadout-grid">
                     {!deterministicHarness && selectedAdapter && (selectedAdapter.models.length > 0 || missionModel) ? (
                       <div className="mission-field">
                         <label htmlFor="mission-model">Model</label>
@@ -6503,60 +6571,7 @@ function App() {
                       </select>
                       <small>Portable source bytes, never a runner-local path.</small>
                     </div>
-                    <div className="mission-field">
-                      <label htmlFor="mission-strategy">Execution strategy</label>
-                      <select
-                        id="mission-strategy"
-                        value={missionStrategy}
-                        aria-describedby="mission-strategy-help mission-strategy-policy"
-                        onChange={(event) => {
-                          const strategy = event.target.value
-                          setMissionStrategy(strategy)
-                          if (strategy === STUDIO_STRATEGY) {
-                            setMissionAdapter('github-copilot')
-                            if (effectiveMissionAdapter !== 'github-copilot') {
-                              setMissionModel('')
-                              setMissionReasoningEffort('')
-                            }
-                          }
-                        }}
-                      >
-                        <option value="single">Solo run</option>
-                        <option value="parallel-specialists">Two specialists and synthesis</option>
-                        <option value={STUDIO_STRATEGY}>{STUDIO_STRATEGY_LABEL}</option>
-                        {developerMode ? (
-                          <optgroup label="Test fixtures">
-                            <option value="verification-matrix">Verification matrix</option>
-                            <option value="human-approval">Human approval</option>
-                            <option value="independent-review">Independent review</option>
-                            <option value="verification-failure">Failure path</option>
-                          </optgroup>
-                        ) : null}
-                      </select>
-                      <small id="mission-strategy-help">
-                        {studioTeam
-                          ? 'ECorp provisions 3 distinct mission workers on GitHub Copilot. Verified handoffs from all three gate a later integration pass by one of those workers—not a fourth concurrent worker.'
-                          : missionStrategy === 'parallel-specialists'
-                          ? 'Parallel roots converge on one synthesis task.'
-                          : missionStrategy === 'single'
-                            ? 'One bounded worker owns the outcome.'
-                            : 'A deterministic product-behavior fixture.'}
-                      </small>
-                      <small id="mission-strategy-policy" className="operations-approval-note">
-                        {studioTeam
-                          ? 'Three workers hand off verified work to a later integration pass; this does not create a fourth concurrent worker or a grant per artifact.'
-                          : missionStrategy === 'parallel-specialists'
-                            ? 'Two specialists and synthesis can request different scoped actions; choosing parallel work does not pre-approve them.'
-                            : missionStrategy === 'single'
-                              ? 'One worker limits coordination, not authorization: a Solo run can still need decisions for risky actions.'
-                              : 'Fixture checks exercise recorded evidence and the configured review gate, not blanket permissions.'}
-                        {' '}Reuse the harness within current authorized scope. Shell, network and
-                        other risky effects need their existing scoped authorization, not duplicate
-                        grants for the same action. Persisted verifier checks and required outcome
-                        review remain separate.
-                      </small>
                     </div>
-                  </div>
                   <div className="loadout-switches">
                     <label className="mission-run-toggle">
                       <input
@@ -6577,8 +6592,8 @@ function App() {
                         onChange={(event) => setPauseAfterPlanning(event.target.checked)}
                       />
                       <span>
-                        <strong>Hold at briefing</strong>
-                        <small>Saved on the server; stays held even when you close this page.</small>
+                        <strong>Save without starting</strong>
+                        <small>Save a plan now and start it later. Leave off to build immediately.</small>
                       </span>
                     </label>
                     <label className="developer-mode-toggle">
@@ -6588,9 +6603,14 @@ function App() {
                         onChange={(event) => {
                           const enabled = event.target.checked
                           setDeveloperMode(enabled)
-                          if (!enabled && usesDeterministicHarness(missionStrategy)) {
-                            setMissionStrategy('single')
-                          }
+                           if (!enabled && usesDeterministicHarness(missionStrategy)) {
+                             setMissionStrategy('single')
+                           }
+                           if (!enabled && effectiveMissionAdapter === 'fake-process') {
+                             setMissionAdapter('')
+                             setMissionModel('')
+                             setMissionReasoningEffort('')
+                           }
                         }}
                       />
                       <span>
@@ -6599,16 +6619,27 @@ function App() {
                       </span>
                     </label>
                   </div>
+                  </details>
                 </div>
               ) : null}
 
               {missionComposerStep === 'proof' ? (
                 <div className="mission-stage-content stage-proof">
                   <div className="stage-title">
-                    <span>Verification policy</span>
-                    <h3>Define completion evidence</h3>
-                    <p>Only the active contract panel is shown. The persisted plan stays inspectable.</p>
+                    <span>Ready to build</span>
+                    <h3 className="mission-composer-heading" tabIndex={-1} ref={missionComposerHeading}>Review and build</h3>
+                    <p>Check the destination and completion checks. Build starts the work; only choose Save if you want to start later.</p>
                   </div>
+                  <div className="mission-review-target">
+                    <strong>{selectedMissionSource?.repository ?? 'Choose a repository in setup'}</strong>
+                    {selectedMissionSource ? (
+                      <span>{selectedMissionSource.baseRef} · {selectedMissionSource.baseCommit.slice(0, 12)}</span>
+                    ) : null}
+                    <span>{selectedAdapter ? adapterLabel(selectedAdapter.name) : 'No coding agent selected'}</span>
+                    <span>{pauseAfterPlanning ? 'Save plan — work will not start' : 'Build immediately'}</span>
+                  </div>
+                  <details className="mission-advanced-options">
+                    <summary>Detailed requirements{missionContractHasInput ? ' · configured' : ' (optional)'}</summary>
                   <div className="contract-tab-shell">
                     <nav className="contract-tab-nav" aria-label="Mission contract sections">
                       {[
@@ -6725,6 +6756,8 @@ function App() {
                     </div>
                   </div>
 
+                  </details>
+
                   <label className="mission-run-toggle custom-verification-toggle">
                     <input
                       type="checkbox"
@@ -6732,12 +6765,11 @@ function App() {
                       disabled={deterministicHarness}
                       onChange={(event) => {
                         setCustomVerification(event.target.checked)
-                        if (event.target.checked) setPauseAfterPlanning(true)
                       }}
                     />
                     <span>
                       <strong>Custom verification</strong>
-                      <small>Run exact file, test, schema, screenshot, and reviewer checks.</small>
+                      <small>Add exact tests, files or a reviewer. This does not change whether work starts now.</small>
                     </span>
                   </label>
                   {customVerification && !deterministicHarness ? (
@@ -6776,51 +6808,35 @@ function App() {
                 <MissionAllocationPreview key={currentMissionRequest.key} scope={currentMissionRequest} />
               ) : (
                 <p className="operations-approval-note" role="status">
-                  {busy ? 'Submission in progress; no preview is current.'
-                    : 'Select an authorized operator, complete valid inputs and confirm the source to preview exact task allocations.'}
+                  {busy ? 'Starting your mission…'
+                    : !selectedActor || !canOperate(selectedActor.role) ? 'Your role cannot start missions.'
+                    : !missionTitle.trim() ? 'Describe the work to start setting up your mission.'
+                    : !selectedMissionSource ? 'Choose the repository you want ECorp to work in.'
+                    : !missionSourceConfirmed ? 'Confirm the selected repository to see the exact plan.'
+                    : runtimeError ?? 'Complete the check settings to see the exact plan.'}
                 </p>
               )}
             </section>
             <div className="arcade-form-controls">
-              {missionComposerStep !== 'brief' ? (
-                <button
-                  className="button button-quiet"
-                  type="button"
-                  onClick={() =>
-                    setMissionComposerStep(
-                      missionComposerStep === 'proof' ? 'loadout' : 'brief',
-                    )
-                  }
-                >
-                  Back
+              {missionComposerStep === 'proof' ? (
+                <button className="button button-quiet" type="button"
+                  onClick={() => setMissionComposerStep('brief')}>
+                  Back to setup
                 </button>
               ) : <span />}
               {missionComposerStep === 'brief' ? (
-                <button
-                  className="button button-primary"
-                  type="button"
-                  disabled={!missionTitle.trim()}
-                  onClick={() => setMissionComposerStep('loadout')}
-                >
-                  Configure run
+                <button key="review-setup" className="button button-primary" type="button"
+                  onClick={(event) => {
+                    // Keep this navigation click from becoming a submit when
+                    // React replaces the setup controls with the Build button.
+                    event.preventDefault()
+                    setMissionComposerStep('proof')
+                  }}>
+                  Review and build
                 </button>
-              ) : null}
-              {missionComposerStep === 'loadout' ? (
+              ) : (
                 <button
-                  className="button button-primary"
-                  type="button"
-                  disabled={
-                    !selectedMissionSource ||
-                    !missionSourceConfirmed ||
-                    Boolean(runtimeError)
-                  }
-                  onClick={() => setMissionComposerStep('proof')}
-                >
-                  Set verification
-                </button>
-              ) : null}
-              {missionComposerStep === 'proof' ? (
-                <button
+                  key="submit-mission"
                   className="button button-primary mission-submit"
                   type="submit"
                   disabled={
@@ -6832,29 +6848,26 @@ function App() {
                     missionVerifierErrors.length > 0
                   }
                 >
-                  {busy
-                    ? 'Starting mission'
-                    : pauseAfterPlanning
-                      ? 'Create mission plan'
-                      : 'Launch mission'}
+                  {busy ? 'Starting mission' : pauseAfterPlanning ? 'Save plan' : 'Build'}
                 </button>
-              ) : null}
+              )}
             </div>
             {missionVerifierErrors.length ? (
               <p className="contract-error">{missionVerifierErrors[0]}</p>
             ) : null}
-            {missionComposerStep !== 'brief' && runtimeError ? (
+            {missionComposerStep === 'proof' && selectedMissionSource && runtimeError ? (
               <p className="contract-error" role="status">{runtimeError}</p>
             ) : null}
             {missionComposerStep === 'proof' ? (
               <p className="mission-submit-note">
                 {pauseAfterPlanning
-                  ? 'The crew waits at briefing until you dispatch the reviewed plan.'
-                  : 'The mission launches immediately. Risky effects still require approval.'}
+                  ? 'This saves the plan without starting. You can start it from the mission when ready.'
+                  : 'Build starts the mission in its isolated workspace. Any permission exception or required review appears with the work.'}
               </p>
             ) : null}
           </form>
           )}
+          {missionComposerCollapsed && (
           <div
             className={`mission-console ${
               latestMissions.length ? '' : 'mission-console-empty'
@@ -6957,6 +6970,7 @@ function App() {
               )}
             </div>
           </div>
+          )}
         </aside>
       </section>
 

@@ -88,8 +88,13 @@ is terminal and no live control or cleanup obligations remain; their history sta
 The [studio implementation and recorded evidence](docs/evidence/2026-09-06-mission-staffing.md)
 spell out the checks and remaining staffing work.
 
-Want to inspect the plan first? **Hold at briefing** saves it on the server as **Awaiting dispatch**.
+Want to start later? Expand **Model, limits and output**, choose **Save without starting**, then
+**Save plan**. It is stored on the server as **Awaiting dispatch**.
 It stays held across browser closure and server restart until an authorized launch.
+Adding custom tests or a reviewer does not silently switch a build into a held plan.
+In the normal build form, the deterministic **Test harness** is available only when
+**Developer fixtures** is explicitly enabled; an unavailable coding agent never silently becomes
+a simulated application build.
 
 ## Bring your agents
 
@@ -172,10 +177,13 @@ $env:CRONY_SOURCE_BASE_REF = 'HEAD'
 
 The runner validates the repository and base ref before accepting work. Mission worktrees are created beneath `CRONY_RUNNER_WORKSPACE`, never in the configured source checkout.
 
-In the Missions **Run setup** screen, select and confirm the exact repository, ref, and immutable
+In Missions, use **Describe & setup** to enter the goal and confirm the exact repository, ref, and immutable
 commit before launch. ECorp filters runtimes to runners serving that source and persists the tuple
 in every task and run. Use a separate dogfood repository for disposable application scenarios
 rather than selecting the ECorp product repository.
+Then use **Review & build** to inspect the current server-derived plan and completion checks.
+**Build** creates and launches the mission; model, budget, output and detailed requirements remain
+available in optional disclosures.
 
 ### Run the repository checks
 
