@@ -1,41 +1,47 @@
+#requires -Version 7.4
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$pidFile = Join-Path $root 'output\local-pids.json'
-
-if (-not (Test-Path -LiteralPath $pidFile)) {
-    Write-Host 'No ECorp local PID file exists.'
-    exit 0
-}
-
-$roots = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
-$rootIds = @($roots.server, $roots.runner, $roots.factoryController, $roots.web) |
-    Where-Object { $_ -is [int] -or $_ -is [long] } |
-    ForEach-Object { [int]$_ }
-
-$all = Get-CimInstance Win32_Process
-$targets = New-Object 'System.Collections.Generic.HashSet[int]'
-
-function Add-ProcessTree {
-    param([int]$ProcessId)
-    if (-not $targets.Add($ProcessId)) {
+Import-Module (Join-Path $PSScriptRoot 'local_stack.psm1') -Force
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'local_stack_operation.ps1')
+Invoke-LocalStackOperation -Workspace $root -Action {
+    $stateFile = Join-Path $root 'output\local-pids.json'
+    $state = Read-LocalStackState -Path $stateFile -Workspace $root
+    if (!$state) {
+        Write-Host 'No local ECorp ownership record exists. Nothing was stopped.'
         return
     }
-    foreach ($child in $all | Where-Object ParentProcessId -eq $ProcessId) {
-        Add-ProcessTree -ProcessId ([int]$child.ProcessId)
+    if ($state.schema_version -ne 2) {
+        throw 'The old PID-only record is preserved, but cannot authorize process control. No process or descendant was stopped.'
     }
-}
 
-foreach ($rootId in $rootIds) {
-    Add-ProcessTree -ProcessId $rootId
+    $stopped = 0
+    $unverified = 0
+    foreach ($role in @('factoryController', 'runner', 'server', 'web')) {
+        if (!$state.processes.ContainsKey($role) -or !$state.processes[$role]) { continue }
+        $record = $state.processes[$role]
+        if (Stop-LocalOwnedProcess -Record $record -Workspace $root) {
+            $record.stopped_at = [DateTime]::UtcNow.ToString('o')
+            $record.stop_outcome = 'verified_root_stopped'
+            $state[$role] = $null
+            $stopped++
+        } else {
+            $current = Get-LocalProcessIdentity -ProcessId ([int]$record.pid)
+            if ($current) {
+                $record.stop_outcome = 'identity_not_verified_preserved'
+                $unverified++
+            } else {
+                $record.stop_outcome = 'already_absent'
+                $state[$role] = $null
+            }
+        }
+        Save-LocalStackState -Path $stateFile -State $state -Workspace $root
+    }
+    $state.last_stop_at = [DateTime]::UtcNow.ToString('o')
+    Save-LocalStackState -Path $stateFile -State $state -Workspace $root
+    Write-Host "Stopped $stopped verified local ECorp process(es). $unverified unverified/reused PID(s) were left untouched."
+    Write-Host 'The database, credentials, provider homes, worktrees, logs and ownership history are retained.'
 }
-
-foreach ($processId in ($targets | Sort-Object -Descending)) {
-    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-}
-
-Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-Write-Host "Stopped $($targets.Count) ECorp process(es)."
 
