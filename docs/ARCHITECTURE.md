@@ -606,6 +606,18 @@ existing `VerifyRun` command, with no model, provider session, provider secrets,
 allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
 unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
 
+Legacy controller catch-up could project that recoverable suspension as a terminal Factory
+`cancelled` item. The exact recovery-context endpoint now returns a
+`checkpoint_cancellation_event_id` only when native source authority and the current
+controller-cancellation operation prove that specific case. Explicit checkpoint recovery
+reconciles it through a separate, actor-authorized operation, appending
+`factory.checkpoint_cancellation_reconciled` and advancing only the Factory version/state.
+The CLI then refreshes context and uses the existing claim and recovery path. Dry runs never
+reconcile; generic polling, provider resume, and other recovery modes cannot reopen cancelled
+work. Future catch-up leaves server-validated checkpoints recoverable instead of mirroring
+them into terminal cancellation. See
+[the reconciliation evidence](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md).
+
 The original checkpoint HEAD still guards admission, while the native exporter may create a
 first verification commit. Retention accepts that new HEAD only through the exact verifier's
 ready source artifact and source/policy/verification bindings. A missing or mismatched commit

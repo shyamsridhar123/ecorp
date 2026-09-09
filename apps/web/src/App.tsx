@@ -12,6 +12,11 @@ import { FactoryPollingNotice } from './FactoryPollingNotice'
 import { factoryControllerState } from './factoryPolling'
 import { selectFactoryController } from './factoryControllerSelection'
 import type { FactoryPolling } from './factoryPolling'
+import {
+  factoryRecoveryBlocksProviderResume, factoryRecoveryConnection,
+  factoryRecoveryModes, needsFactoryRecoveryContext,
+} from './factoryCheckpointRecovery'
+import type { FactoryRecoveryCommandMode } from './factoryCheckpointRecovery'
 import { currentOfficeAgents, operatingOfficeAgents, selectOfficeAgent } from './office/officeModel'
 import type { OfficeAgent } from './office/officeModel'
 import {
@@ -467,7 +472,7 @@ type FactoryVerificationRecovery = {
   task_id: string
   source_run_id: string
   replacement_run_id: string | null
-  mode: 'source_correction' | 'verifier_only'
+  mode: 'source_correction' | 'verifier_only' | 'checkpoint_verification'
   status: 'authorized' | 'running' | 'completed' | 'failed'
   authorized_by: string
   reason: string
@@ -490,6 +495,8 @@ type FactoryVerificationRecoveryContextResponse = {
   remaining_mission_cost_microusd: number
   workspace_fingerprint: string | null
   expected_head_commit: string | null
+  checkpoint_verification?: boolean
+  checkpoint_cancellation_event_id?: string | null
 }
 
 type FactoryRecoveryContextScope = {
@@ -3275,7 +3282,10 @@ function requestFactoryRecoveryContext(
     if (typeof data.task_id !== 'string' || !data.task_id ||
       typeof data.source_run_id !== 'string' || !data.source_run_id ||
       !Array.isArray(data.recoveries) ||
-      !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+       !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+       !(data.expected_head_commit === null || typeof data.expected_head_commit === 'string') ||
+       !(data.checkpoint_verification === undefined || typeof data.checkpoint_verification === 'boolean') ||
+       !(data.checkpoint_cancellation_event_id == null || typeof data.checkpoint_cancellation_event_id === 'string') ||
       ![data.remaining_attempts, data.remaining_mission_tokens, data.remaining_mission_cost_microusd].every(Number.isFinite)) {
       throw new Error('Recovery context is missing required source, checkpoint or remaining-budget fields. No snapshot fallback is used.')
     }
@@ -3311,13 +3321,19 @@ function factoryRecoveryPresentation(
   const active = context.recoveries.find((recovery) =>
     recovery.status === 'authorized' || recovery.status === 'running',
   )
+  const checkpointVerification = factoryRecoveryModes(context).includes('checkpoint-verification')
+  const cancelledBlocked = context.work_item.state === 'cancelled' && !checkpointVerification
   const state = quarantined ? 'quarantined' : active ? 'active'
+    : cancelledBlocked ? 'unavailable'
+      : checkpointVerification && context.checkpoint_cancellation_event_id ? 'reconciliation_required'
     : context.workspace_fingerprint ? 'ready' : 'checkpoint_required'
   return {
     run,
     state,
     heading: quarantined ? 'Quarantine warning — inspect controller context'
       : active ? 'Recovery already authorized'
+        : cancelledBlocked ? 'Cancelled Factory intent remains protected'
+          : checkpointVerification ? 'Verify retained checkpoint'
         : context.workspace_fingerprint ? 'Recover preserved work' : 'Checkpoint and recheck',
     detail: quarantined
       ? run
@@ -3325,10 +3341,16 @@ function factoryRecoveryPresentation(
         : 'A visible mission workspace is quarantined, but this endpoint does not include source-workspace lineage details. The checkpoint hash is withheld until the native controller can resolve that warning.'
       : active
         ? 'An existing recovery is authorized or running. Inspect that operation through the controller; do not create a duplicate grant. Copied templates are not a new authorization.'
+        : cancelledBlocked
+          ? 'The current server context does not authorize checkpoint reconciliation for this cancellation. User stops and unrelated cancellations cannot be overridden here.'
+          : checkpointVerification
+            ? context.checkpoint_cancellation_event_id
+              ? 'The server validated this retained checkpoint. Explicit checkpoint verification first reconciles the controller cancellation, then rechecks the same source without a provider. Original spend and history remain unchanged.'
+              : 'Recheck this server-validated retained checkpoint without starting a provider. Original spend, source and verification requirements remain unchanged.'
         : context.workspace_fingerprint
           ? 'Recheck saved work without a model call, or request a focused correction in the same session. The controller rechecks authorization before running.'
           : 'The controller can ask the owning runner to seal this older workspace before rechecking it. The original work stays in place; copying a command executes nothing.',
-    checkpoint: quarantined || active ? null : context.workspace_fingerprint,
+    checkpoint: quarantined || active || cancelledBlocked ? null : context.workspace_fingerprint,
     recoveryCount: context.recoveries.length,
   }
 }
@@ -3425,7 +3447,7 @@ function MissionCard({
   const recoveryItemVersion = factoryItem?.version
   const recoveryItemState = factoryItem?.state
   const recoveryScope = useMemo<FactoryRecoveryContextScope | null>(() =>
-    recoveryItemId && recoveryItemVersion !== undefined && recoveryItemState === 'verification_failed'
+    recoveryItemId && recoveryItemVersion !== undefined && needsFactoryRecoveryContext(recoveryItemState)
       ? { corpId, actorId, missionId: mission.id, itemId: recoveryItemId, version: recoveryItemVersion, reload: recoveryReload }
       : null,
   [corpId, actorId, mission.id, recoveryItemId, recoveryItemVersion, recoveryItemState, recoveryReload])
@@ -3516,6 +3538,8 @@ function MissionCard({
     ? tasks.find((task) => task.id === recoveryContext.task_id && task.mission_id === recoveryContext.mission_id)
     : undefined
   const recoveryItem = recoveryContext?.work_item
+  const recoveryModes = factoryRecoveryModes(recoveryContext)
+  const resumeRecoveryBlocked = factoryRecoveryBlocksProviderResume(Boolean(recoveryScope), recoveryContext)
   const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
   const recoveryAgent = recoveryTask?.assigned_agent_id
     ? agents.find((agent) => agent.id === recoveryTask.assigned_agent_id)
@@ -3523,12 +3547,20 @@ function MissionCard({
   const recoveryAdapter = recoveryTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
   const recoverySourceBase = typeof recoveryItem?.policy.source_base_ref === 'string'
     ? recoveryItem.policy.source_base_ref : recoveryTask?.contract.source_base_ref
-  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase)
-  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
-    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase) return ''
+  const recoveryConnectionId = recoveryItem ? factoryRecoveryConnection(recoveryItem.policy) : undefined
+  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase
+    && recoveryConnectionId !== undefined && recoveryModes.length
+    && recovery?.state !== 'quarantined')
+  const recoveryCommand = (mode: FactoryRecoveryCommandMode) => {
+    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase
+      || recoveryConnectionId === undefined || !recoveryModes.includes(mode)
+      || recovery?.state === 'quarantined') return ''
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
     const command = [
-      'crony factory',
+      'crony',
+      '--server',
+      quote(API_URL),
+      'factory',
       quote(corpId),
       quote(actorId),
       '--owner',
@@ -3552,6 +3584,9 @@ function MissionCard({
       '--verification-recovery-reason',
       quote('Explain why this bounded recovery is authorized.'),
     ]
+    if (recoveryConnectionId) {
+      command.push('--workspace-connection-id', quote(recoveryConnectionId))
+    }
     if (recoveryTask.contract.model) {
       command.push('--model', quote(recoveryTask.contract.model))
     }
@@ -3560,10 +3595,10 @@ function MissionCard({
     }
     return command.join(' ')
   }
-  const recoveryCopyKey = (mode: 'verifier-only' | 'source-correction') =>
+  const recoveryCopyKey = (mode: FactoryRecoveryCommandMode) =>
     `${scopedRecoveryLoad?.scopeKey}:${recoveryContext?.source_run_id}:${recoveryCommand(mode)}`
   const copyRecoveryCommand = async (
-    mode: 'verifier-only' | 'source-correction',
+    mode: FactoryRecoveryCommandMode,
   ) => {
     const command = recoveryCommand(mode)
     if (!command || !canAuthorizeRecovery) return
@@ -3582,7 +3617,7 @@ function MissionCard({
     void onVerificationDecision(pendingRun, approved)
   }
   const resumeEvidence = async () => {
-    if (!resumableRun) return
+    if (!resumableRun || resumeRecoveryBlocked) return
     const resumedRunId = await onResume(resumableRun)
     if (resumedRunId) rememberEvidenceRun(resumedRunId)
   }
@@ -3954,7 +3989,11 @@ function MissionCard({
           </p>
         </section>
       ) : null}
-      {factoryItem && recoveryScope ? (
+      {factoryItem && recoveryScope && (
+        ['verification_failed', 'cancelled'].includes(factoryItem.state)
+        || recoveryContext?.checkpoint_verification
+        || (resumableRun && !hasUnfinishedRuns)
+      ) ? (
         <section
           className="factory-recovery-callout"
           aria-labelledby={`factory-recovery-${factoryItem.id}`}
@@ -3964,6 +4003,7 @@ function MissionCard({
           data-recovery-run-id={recoveryContext?.source_run_id}
           data-recovery-task-id={recoveryContext?.task_id}
           data-recovery-item-version={recoveryContext?.work_item.version}
+          data-checkpoint-reconciliation-needed={recoveryContext?.checkpoint_cancellation_event_id ? 'true' : 'false'}
           aria-busy={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
         >
           <div className="factory-recovery-heading">
@@ -4030,35 +4070,33 @@ function MissionCard({
           </p>
           {recoveryCommandAvailable && canAuthorizeRecovery ? (
             <div className="factory-recovery-actions">
+              {recoveryModes.map((mode) => (
               <button
+                key={mode}
                 className="button button-secondary"
                 type="button"
-                onClick={() => void copyRecoveryCommand('verifier-only')}
+                onClick={() => void copyRecoveryCommand(mode)}
               >
-                {copiedRecoveryCommand === recoveryCopyKey('verifier-only')
-                  ? 'Verifier command copied'
-                  : 'Copy verifier-only command'}
+                {copiedRecoveryCommand === recoveryCopyKey(mode)
+                  ? mode === 'checkpoint-verification' ? 'Checkpoint command copied'
+                    : mode === 'verifier-only' ? 'Verifier command copied' : 'Correction command copied'
+                  : mode === 'checkpoint-verification' ? 'Copy checkpoint-verification command'
+                    : mode === 'verifier-only' ? 'Copy verifier-only command' : 'Copy source-correction command'}
               </button>
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => void copyRecoveryCommand('source-correction')}
-              >
-                {copiedRecoveryCommand === recoveryCopyKey('source-correction')
-                  ? 'Correction command copied'
-                  : 'Copy source-correction command'}
-              </button>
+              ))}
             </div>
           ) : (
             <p className="factory-recovery-role-note">
               {canAuthorizeRecovery
-                ? 'The exact endpoint returns task/source IDs, not the task contract or adapter. Selected-task command metadata is missing in this snapshot; inspect the native controller. No substitute is inferred.'
+                ? recoveryModes.length === 0
+                  ? 'No new recovery command is available in this current context. Inspect or refresh the native controller context; no replacement work is inferred.'
+                  : 'Exact source/connection command metadata is missing or quarantined; inspect the native controller. No substitute is inferred.'
                 : 'An owner, admin, or manager must authorize the recovery.'}
             </p>
           )}
           {recoveryCommandAvailable && canAuthorizeRecovery ? <details>
             <summary>Show trusted controller command</summary>
-            <code>{recoveryCommand('verifier-only')}</code>
+            <code>{recoveryCommand(recoveryModes[0] ?? 'verifier-only')}</code>
           </details> : null}
           </> : null}
         </section>
@@ -4172,7 +4210,7 @@ function MissionCard({
           })}
         </div>
       ) : null}
-      {resumableRun && resumableRun.id === evidenceRun?.id && !hasUnfinishedRuns && factoryItem?.state !== 'verification_failed' ? (
+      {resumableRun && resumableRun.id === evidenceRun?.id && !hasUnfinishedRuns && !resumeRecoveryBlocked && factoryItem?.state !== 'verification_failed' ? (
         <>
           <button
             className="button button-secondary mission-launch"

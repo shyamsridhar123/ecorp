@@ -58,14 +58,15 @@ use crony_protocol::{
     PreflightFactoryMissionRequest, PreflightFactoryMissionResponse, PreviewMissionResponse,
     PreviewMissionTask, ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
     PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
-    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
-    RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
-    ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
-    RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
-    RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SetBudgetPolicyRequest, SnapshotResponse, StartPullRequestPublicationRequest,
-    TransferLeaseRequest, TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
-    VerificationArtifactReference, VerificationDecisionRequest, VerificationDecisionResponse,
+    ReconcileFactoryCheckpointCancellationRequest, RecordPullRequestPublicationCheckpointRequest,
+    ReleaseLeaseRequest, RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest,
+    ResolvedSecret, ResumeRunRequest, ResumeRunResponse,
+    RevokePublicationPublisherCredentialRequest, RevokePublicationPublisherCredentialResponse,
+    RevokeRunnerRequest, RevokeRunnerResponse, RevokeSecretRequest, RunnerCapability,
+    RunnerSummary, RunnerToServer, ServerToRunner, SetBudgetPolicyRequest, SnapshotResponse,
+    StartPullRequestPublicationRequest, TransferLeaseRequest, TransitionFactoryWorkItemRequest,
+    UpgradeFactorySourceCommitRequest, VerificationArtifactReference, VerificationDecisionRequest,
+    VerificationDecisionResponse,
 };
 use crony_store::{
     CheckpointFactoryWorkspaceInput, ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput,
@@ -564,6 +565,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/verification-recoveries",
             get(get_factory_verification_recovery_context)
                 .post(create_factory_verification_recovery),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/checkpoint-reconciliation",
+            post(reconcile_factory_checkpoint_cancellation),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
@@ -3251,6 +3256,48 @@ async fn get_factory_verification_recovery_context(
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
         checkpoint_verification: context.checkpoint_verification,
+        checkpoint_cancellation_event_id: context.checkpoint_cancellation_event_id,
+    }))
+}
+
+async fn reconcile_factory_checkpoint_cancellation(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ReconcileFactoryCheckpointCancellationRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .reconcile_checkpoint_cancellation(crony_store::ReconcileCheckpointCancellationInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            source_run_id: request.source_run_id,
+            expected_factory_version: request.expected_factory_version,
+            cancellation_event_id: request.cancellation_event_id,
+            expected_workspace_fingerprint: request.expected_workspace_fingerprint,
+            expected_head_commit: request.expected_head_commit,
+            observed_source_revision: request.observed_source_revision,
+            idempotency_key: request.idempotency_key,
+            reason: request.reason,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: None,
+        replayed: outcome.replayed,
     }))
 }
 

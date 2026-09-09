@@ -21,8 +21,10 @@ use uuid::Uuid;
 
 mod budget_checkpoint;
 mod budget_revision;
+mod checkpoint_cancellation;
 mod checkpoint_publication;
 mod checkpoint_retention;
+pub use checkpoint_cancellation::ReconcileCheckpointCancellationInput;
 mod contract_revision;
 mod factory_controller;
 mod factory_run_failure;
@@ -312,6 +314,7 @@ pub struct FactoryVerificationRecoveryContext {
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
     pub checkpoint_verification: bool,
+    pub checkpoint_cancellation_event_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -4462,6 +4465,7 @@ impl PgStore {
             row.get::<String, _>("breaker_stage").as_str(),
             "suspend" | "stop"
         ) || row.get::<bool, _>("checkpoint_recovery");
+        let mut checkpoint_cancellation_event_id = None;
         if checkpoint_verification {
             let authority = budget_checkpoint::source_authority_tx(
                 &mut tx,
@@ -4470,6 +4474,9 @@ impl PgStore {
                 source_run_id,
             )
             .await?;
+            checkpoint_cancellation_event_id =
+                checkpoint_cancellation::cancellation_event_tx(&mut tx, &work_item, source_run_id)
+                    .await?;
             // A retry may have already exported its authorized verification
             // commit. Preserve that bound head; the provider origin remains
             // immutable authority, not the verifier's current checkout head.
@@ -4499,6 +4506,7 @@ impl PgStore {
             workspace_fingerprint: checkpoint.fingerprint,
             expected_head_commit: checkpoint.expected_head_commit,
             checkpoint_verification,
+            checkpoint_cancellation_event_id,
         };
         tx.commit().await?;
         Ok(Some(context))

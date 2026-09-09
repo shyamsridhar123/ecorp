@@ -60,6 +60,17 @@ The final integration source was retained after a task-budget stop; its
 verification/review/publication remain pending #206. Passing preflight or
 specialist handoffs must not be reported as an accepted application.
 
+## Checkpoint cancellation reconciliation
+
+The [#206 reconciliation report](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md)
+separates eleven actual-migration store cases from CLI/client coverage and the retained
+application's runtime outcome. Store cases exercise the exact legacy controller cancellation,
+current authority and replay, actor-demotion serialization, quarantined predecessors, stale
+events/source proof, explicit stops, policy cancellations and transactional rollback.
+Run only the explicitly owned `issue206_` SQLx lane for those cases; ordinary workspace tests
+leave it ignored. A successful reconciliation is not application verification, review or
+publication, and a missing required artifact must still fail its persisted check.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

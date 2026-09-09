@@ -300,6 +300,16 @@ Explicit stop, loop and quarantine checks, current room/role authority, independ
 the separate publication/merge/deployment boundaries remain. Missing artifact evidence cannot be
 manufactured or dropped from the persisted verifier policy.
 
+Checkpoint-cancellation reconciliation is not a generic terminal-state override. It requires
+current owner/admin/manager authority and mission-room membership, holds the actor row through
+commit, and reuses the native source, lineage, budget and Factory/publication locks. The exact
+current cancellation event must match its original controller transition operation, claim,
+actor, mission and version; later events, explicit stops, policy cancellations and quarantined
+lineage remain ineligible. A controller operation-key pattern identifies provenance, not
+authentication. Reconciliation grants no claim token, provider execution or publication right,
+and replay repeats current authorization. It does not rewrite original runs, task contracts,
+source evidence, attempts or accounting.
+
 Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
 verification commit. Ready-artifact joins bind the new head to its run, producer, source,
 policy and verification digest; these relational checks are not fresh signature/byte validation.

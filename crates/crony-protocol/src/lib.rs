@@ -679,6 +679,22 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub expected_head_commit: Option<String>,
     #[serde(default)]
     pub checkpoint_verification: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cancellation_event_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileFactoryCheckpointCancellationRequest {
+    pub actor_id: Uuid,
+    pub source_run_id: Uuid,
+    pub expected_factory_version: i64,
+    pub cancellation_event_id: Uuid,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: String,
+    pub observed_source_revision: String,
+    pub idempotency_key: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
