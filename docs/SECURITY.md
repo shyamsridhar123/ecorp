@@ -436,6 +436,20 @@ advancing or being recorded as reviewed.
 
 ## Required production boundaries
 
+Saved execution connections add a room-scoped resource boundary, not a remote
+shell API. Setup requests are typed and actor-authorized; local checkout imports
+also remain inside operator-configured roots. Private native state is outside
+source repositories and agent worktrees. Provider sign-in instructions and
+repository catalogues are visible only to the requesting actor, while shared
+connection status uses fixed non-sensitive copy.
+
+Personal native GitHub configuration does not constitute a separate OS identity.
+Native keychain/file-storage behavior and environment delivery retain their
+reported assurance; setup does not claim stronger containment than the selected
+harness and operating system provide. One-time Claude authorization-code input
+is transient, prompt-ID bound, and may reach only its matching native login
+process—not an agent session or a general stdin/shell endpoint.
+
 - Every persistent object is scoped to a Corp.
 - Authorization runs before reads, writes, and subscriptions.
 - Human identity uses OIDC and passkeys.

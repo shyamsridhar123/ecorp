@@ -27,6 +27,12 @@ import { canPostRoomMessage, discussionScopeKey, missionOrigin, resolveDiscussio
 import type { DiscussionScope } from './missionProjection'
 import { createSnapshotRefresher } from './snapshotRefresh'
 import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
+import { ConnectionsPanel } from './ConnectionsPanel'
+import {
+  connectionLabel, connectionRunnerRevision, connectionScope, connectionStatusLabel,
+  connectionTarget, connectionsNeedPresenceRefresh,
+} from './workspaceConnections'
+import type { WorkspaceConnection, WorkspaceConnections } from './workspaceConnections'
 
 type Actor = {
   id: string
@@ -4610,6 +4616,11 @@ function App() {
   const [missionStrategy, setMissionStrategy] = useState('single')
   const [missionSourceKey, setMissionSourceKey] = useState('')
   const [missionSourceConfirmed, setMissionSourceConfirmed] = useState(false)
+  const [connectionsOpen, setConnectionsOpen] = useState(false)
+  const [savedConnectionLoad, setSavedConnectionLoad] = useState<{
+    scope: string; data: WorkspaceConnections
+  } | null>(null)
+  const restoredConnectionScope = useRef('')
   const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
   const [missionDeliverable, setMissionDeliverable] =
     useState<NonNullable<TaskContract['deliverable']>['form']>('archive')
@@ -4888,6 +4899,13 @@ function App() {
         if (!disposed) setError(caught instanceof Error ? caught.message : String(caught))
       },
     })
+    // Idle runner presence can change without a run event. Reuse the bounded
+    // snapshot refresher so an open console does not stay falsely online.
+    const refreshVisiblePresence = () => {
+      if (document.visibilityState === 'visible') snapshotRefresh.request()
+    }
+    const presenceTimer = window.setInterval(refreshVisiblePresence, 5_000)
+    document.addEventListener('visibilitychange', refreshVisiblePresence)
 
     const connect = async () => {
       if (disposed) return
@@ -4956,6 +4974,8 @@ function App() {
     void connect()
     return () => {
       disposed = true
+      window.clearInterval(presenceTimer)
+      document.removeEventListener('visibilitychange', refreshVisiblePresence)
       snapshotRefresh.dispose()
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
       socket?.close()
@@ -4970,7 +4990,72 @@ function App() {
     () => currentOfficeAgents(data?.snapshot.agents ?? []),
     [data],
   )
-  const missionRepositoryTargets = useMemo(() => repositoryTargets(data), [data])
+  const connectionRoom = data
+    ? resolveDiscussionRoom(data.snapshot.rooms, data.snapshot.missions, roomMissionId, selectedRoomId)
+    : undefined
+  const savedConnectionScope = bootstrap?.corp_id && selectedActorId && connectionRoom
+    ? connectionScope(bootstrap.corp_id, connectionRoom.id, selectedActorId) : ''
+  const savedConnectionCorpId = bootstrap?.corp_id
+  const savedConnectionRoomId = connectionRoom?.id
+  const canUseSavedConnections = humans.some((actor) => actor.id === selectedActorId && canOperate(actor.role))
+  const savedConnections = savedConnectionLoad?.scope === savedConnectionScope
+    ? savedConnectionLoad.data : null
+  const savedConnectionRunners = useRef<RunnerNode[]>([])
+  useLayoutEffect(() => { savedConnectionRunners.current = data?.runners ?? [] }, [data?.runners])
+  const savedRunnerRevision = connectionRunnerRevision(data?.runners ?? [])
+  const connectionRevision = data?.snapshot.events.reduce((last, event) =>
+    event.type.startsWith('workspace.connection') ||
+      ['runner.capabilities_updated', 'runner.credential_rotated', 'runner.enrolled',
+        'runner.grace_started', 'runner.revoked'].includes(event.type)
+      ? Math.max(last, event.seq) : last, 0) ?? 0
+  useEffect(() => {
+    if (!savedConnectionScope || !savedConnectionCorpId || !selectedActorId || !savedConnectionRoomId ||
+      !canUseSavedConnections) return
+    let current = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let attempts = 0
+    const load = async () => {
+      attempts += 1
+      try {
+        const response = await api<WorkspaceConnections>(
+          `/api/corps/${savedConnectionCorpId}/rooms/${savedConnectionRoomId}/connections?actor_id=${selectedActorId}`,
+        )
+        if (!current) return
+        setSavedConnectionLoad({ scope: savedConnectionScope, data: response })
+        if (restoredConnectionScope.current !== savedConnectionScope) {
+          restoredConnectionScope.current = savedConnectionScope
+          const selected = response.connections.find((connection) => connection.id === response.selected_connection_id)
+          if (selected) {
+            setMissionSourceKey(`connection:${selected.id}`)
+            setMissionAdapter(selected.agent)
+            setMissionSourceConfirmed(Boolean(selected.source && !selected.source.repository.toLowerCase().endsWith('/ecorp')))
+          }
+        }
+        // Registration presence can precede live dispatch readiness. Re-read
+        // the authoritative endpoint briefly; never manufacture a Ready state.
+        if (attempts < 5 && connectionsNeedPresenceRefresh(response.connections, savedConnectionRunners.current)) {
+          timer = setTimeout(() => void load(), 1000)
+        }
+      } catch {
+        // Older nodes keep the existing mission path; a missing setup API must
+        // not erase a draft or silently replace a saved source.
+      }
+    }
+    void load()
+    return () => {
+      current = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [savedConnectionCorpId, selectedActorId, savedConnectionRoomId, savedConnectionScope, connectionRevision, savedRunnerRevision, canUseSavedConnections])
+  const missionRepositoryTargets = useMemo(() => {
+    const saved = (savedConnections?.connections ?? [])
+      .map((connection) => connectionTarget(connection, data?.runners ?? []))
+      .filter((target): target is RepositoryTarget => Boolean(target))
+    return [...saved, ...repositoryTargets(data)]
+  }, [data, savedConnections])
+  const selectedMissionConnection = missionSourceKey.startsWith('connection:')
+    ? savedConnections?.connections.find((connection) => `connection:${connection.id}` === missionSourceKey)
+    : undefined
   const selectedMissionSource = useMemo(
     () =>
       missionRepositoryTargets.find((target) => target.key === missionSourceKey),
@@ -5075,6 +5160,12 @@ function App() {
     currentViewer.current = bootstrap ? { corpId: bootstrap.corp_id, actorId: actor.id } : null
     currentComments.current = null
     setSelectedActorId(actor.id)
+    setConnectionsOpen(false)
+    setSavedConnectionLoad(null)
+    setMissionSourceKey('')
+    setMissionSourceConfirmed(false)
+    setMissionAdapter('')
+    setMissionModel('')
     setAnnouncement(`Switching operations view to ${actor.name}.`)
     const url = new URL(window.location.href)
     url.searchParams.set('actor', actor.name.toLowerCase())
@@ -5133,8 +5224,8 @@ function App() {
       setMissionProhibitedActions('')
       setMissionReferences('')
       setMissionWriteScope('')
-      setMissionSourceKey('')
-      setMissionSourceConfirmed(false)
+      if (!selectedMissionSource.workspaceConnectionId) setMissionSourceKey('')
+      setMissionSourceConfirmed(Boolean(selectedMissionSource.workspaceConnectionId && !isEcorpRepository(selectedMissionSource)))
       setCustomVerification(false)
       setMissionVerificationPolicy({
         checks: [defaultVerifierCheck('artifact')],
@@ -6407,31 +6498,52 @@ function App() {
                   <div className="loadout-grid">
                     <div className="mission-field repository-target-field">
                       <label htmlFor="mission-repository">Target repository</label>
+                      <button className="button button-secondary" type="button"
+                        onClick={() => setConnectionsOpen(true)}>
+                        Connect a repository or coding agent
+                      </button>
                       <select
                         id="mission-repository"
                         value={missionSourceKey}
                         aria-describedby="mission-repository-help"
                         onChange={(event) => {
                           setMissionSourceKey(event.target.value)
-                          setMissionSourceConfirmed(false)
-                          setMissionAdapter('')
+                          const saved = savedConnections?.connections.find((connection) =>
+                            `connection:${connection.id}` === event.target.value)
+                          setMissionSourceConfirmed(Boolean(saved?.source && !saved.source.repository.toLowerCase().endsWith('/ecorp')))
+                          setMissionAdapter(saved?.agent ?? '')
                           setMissionModel('')
                           setMissionReasoningEffort('')
                         }}
                       >
-                        <option value="">Select a connected repository</option>
-                        {missionRepositoryTargets.map((target) => (
-                          <option key={target.key} value={target.key}>
-                            {target.repository} · {target.baseRef} ·{' '}
-                            {target.baseCommit.slice(0, 12)}
-                          </option>
-                        ))}
+                        <option value="">Choose a repository</option>
+                        {(savedConnections?.connections ?? []).filter((connection) => !connection.source).map((connection) =>
+                          <option key={connection.id} value={`connection:${connection.id}`}>
+                            {connection.label} · {connectionStatusLabel(connection)}
+                          </option>)}
+                        {missionRepositoryTargets.map((target) => {
+                          const saved = savedConnections?.connections.find(
+                            (connection) => connection.id === target.workspaceConnectionId,
+                          )
+                          return (
+                            <option key={target.key} value={target.key}>
+                              {saved
+                                ? `${saved.label} · ${connectionLabel(saved.agent)} · ${connectionStatusLabel(saved)}`
+                                : `${target.repository} · ${target.baseRef} · ${target.baseCommit.slice(0, 12)}`}
+                            </option>
+                          )
+                        })}
                       </select>
                       <small id="mission-repository-help">
                         {missionRepositoryTargets.length
                           ? 'The exact repository, ref, and commit are persisted in every task.'
-                          : 'Connect a runner configured for the repository you want to change.'}
+                          : 'Connect your repository and coding agent above. You will not need to configure them for every mission.'}
                       </small>
+                      {selectedMissionConnection && !selectedMissionConnection.runner_connected && (
+                        <p className="field-warning" role="status">
+                          This saved machine is offline. Your repository choice is kept; reconnect it or choose another connection.
+                        </p>
+                      )}
                       {selectedMissionSource ? (
                         <div className="repository-target-summary">
                           <strong>{selectedMissionSource.repository}</strong>
@@ -6458,7 +6570,7 @@ function App() {
                               repository for disposable applications and acceptance probes.
                             </p>
                           ) : null}
-                          <label className="repository-confirmation">
+                          {(!selectedMissionSource.workspaceConnectionId || isEcorpRepository(selectedMissionSource)) ? <label className="repository-confirmation">
                             <input
                               type="checkbox"
                               checked={missionSourceConfirmed}
@@ -6473,7 +6585,7 @@ function App() {
                                 immutable commit.
                               </small>
                             </span>
-                          </label>
+                          </label> : <p className="connections-help">Using your saved connection. ECorp rechecks this exact source before starting.</p>}
                         </div>
                       ) : null}
                     </div>
@@ -7133,6 +7245,44 @@ function App() {
           ))}
         </ol>
       </section>
+      {connectionsOpen && bootstrap && selectedActor && connectionRoom && (
+        <ConnectionsPanel
+          key={savedConnectionScope}
+          corpId={bootstrap.corp_id}
+          roomId={connectionRoom.id}
+          actorId={selectedActor.id}
+          actorRole={selectedActor.role}
+          runners={data.runners}
+          initialSource={selectedMissionSource}
+          api={api}
+          refreshRevision={connectionRevision}
+          onClose={() => setConnectionsOpen(false)}
+          onSelect={(connection: WorkspaceConnection) => {
+            const viewer = currentViewer.current
+            if (viewer?.corpId !== connection.corp_id || viewer.actorId !== selectedActor.id ||
+              connection.room_id !== connectionRoom.id) return
+            setSavedConnectionLoad((previous) => ({
+              scope: savedConnectionScope,
+              data: {
+                connections: [
+                  ...(previous?.scope === savedConnectionScope ? previous.data.connections : [])
+                    .filter((candidate) => candidate.id !== connection.id),
+                  connection,
+                ],
+                operations: previous?.scope === savedConnectionScope ? previous.data.operations : [],
+                selected_connection_id: connection.id,
+              },
+            }))
+            setMissionSourceKey(`connection:${connection.id}`)
+            setMissionAdapter(connection.agent)
+            setMissionModel('')
+            setMissionReasoningEffort('')
+            setMissionSourceConfirmed(Boolean(connection.source && !connection.source.repository.toLowerCase().endsWith('/ecorp')))
+            setConnectionsOpen(false)
+            setAnnouncement('Connection selected. Describe what you want ECorp to build.')
+          }}
+        />
+      )}
     </main>
   )
 }

@@ -9,7 +9,7 @@ type MissionDraft<Contract, Policy> = {
   model: string
   selectedModel: { id: string; supported_reasoning_efforts: readonly string[] } | undefined
   reasoningEffort: string
-  source: { repository: string; baseRef: string; baseCommit: string }
+  source: { repository: string; baseRef: string; baseCommit: string; workspaceConnectionId?: string }
   budgetTokens: number
   deliverableForm: string
   commitDeliverable: boolean
@@ -36,6 +36,7 @@ export function buildMissionRequest<Contract, Policy>(draft: MissionDraft<Contra
       base_ref: draft.source.baseRef,
       base_commit: draft.source.baseCommit,
     },
+    ...(draft.source.workspaceConnectionId ? { workspace_connection_id: draft.source.workspaceConnectionId } : {}),
     budget_tokens: deterministic ? null : draft.budgetTokens,
     deliverable: {
       form: draft.deliverableForm,

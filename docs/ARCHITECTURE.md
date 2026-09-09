@@ -201,6 +201,24 @@ filesystem boundary; external CLI adapters currently refuse Unix execution.
 
 ## Mission launch admission
 
+### Saved project execution connections
+
+Room-scoped `workspace_connections` retain repository/agent/node configuration
+independently of live runner inventory. Actor-private setup operations cross the
+existing authenticated runner channel as fixed native operations, not server
+shell execution. GitHub CLI and the native coding-agent authentication/catalog
+interfaces remain the implementation boundary. Shared events carry only status
+refresh hints; private sign-in instructions and discovery catalogues do not enter
+the shared connection DTO.
+
+Runs persist an optional execution-connection ID. Planning, run admission,
+dispatch and resume retain that binding alongside the immutable source tuple.
+Legacy unbound work uses only legacy capabilities; it cannot borrow another
+project connection's account or source. Source-only recovery resolves previously
+accepted pins without requiring a new provider sign-in. Native final setup
+receipts survive reconnect and wait for a server acknowledgement before provider
+readiness becomes dispatchable. See [project connections](PROJECT_CONNECTIONS.md).
+
 A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
 Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
 materialization leave the mission in that held state. The existing authenticated launch endpoint
