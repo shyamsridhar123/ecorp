@@ -515,6 +515,10 @@ async fn main() -> anyhow::Result<()> {
             post(preview_mission),
         )
         .route(
+            "/api/corps/{corp_id}/missions/{mission_id}/context",
+            get(get_mission_context),
+        )
+        .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
             post(lookup_factory_work_items),
         )
@@ -2782,6 +2786,34 @@ fn mission_preview_response(plan: &TaskGraphPlan) -> PreviewMissionResponse {
             })
             .collect(),
     }
+}
+
+async fn get_mission_context(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<(HeaderMap, Json<crony_domain::MissionContext>), ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let context = state
+        .store
+        .mission_context(corp_id, actor_id, mission_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("mission context was not found"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok((headers, Json(context)))
 }
 
 async fn preview_mission(

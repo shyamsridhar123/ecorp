@@ -74,6 +74,13 @@ Publication states cannot be asserted through the generic factory transition end
 Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
 events omit GitHub source metadata; once a mission exists, factory events inherit its room
 visibility.
+The exact mission-context read retains `Operate` authorization and repeats
+human operator-role, Corp and mission-room membership checks in the same SQL
+statement as linkage lookup. It does not reveal hidden Factory context to guests
+or infer Direct from a denied/filtered query. Its minimal projection excludes
+claim tokens, policies, native sign-in details and credentials. This is an
+inspection surface, not publication or execution authority.
+
 The controller's selected-Project-item lookup requires Corp `Operate` authorization and repeats the
 store-side human operator-role check before returning source or policy metadata. Requests are
 bounded to 1,000 Project item IDs of at most 160 characters and are deduplicated before the query.

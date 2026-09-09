@@ -302,6 +302,30 @@ pub struct Mission {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Exact, viewer-scoped linkage for a mission; not a filtered snapshot inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionContext {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub mission_id: Uuid,
+    pub room_id: Uuid,
+    pub origin: MissionOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MissionOrigin {
+    /// The complete stored relationship has no Factory work item.
+    /// This does not distinguish browser creation from other direct clients.
+    Direct,
+    Factory {
+        work_item_id: Uuid,
+        source_repository: String,
+        source_issue_number: i64,
+        source_issue_url: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionContractRevisionAction {
@@ -1132,6 +1156,41 @@ pub struct CorpSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mission_context_wire_shape_contains_only_scoped_source_linkage() {
+        let mut context = MissionContext {
+            corp_id: Uuid::from_u128(1),
+            actor_id: Uuid::from_u128(2),
+            mission_id: Uuid::from_u128(3),
+            room_id: Uuid::from_u128(4),
+            origin: MissionOrigin::Direct,
+        };
+        let direct = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(direct["origin"], serde_json::json!({"kind": "direct"}));
+        assert_eq!(direct.as_object().expect("object").len(), 5);
+
+        context.origin = MissionOrigin::Factory {
+            work_item_id: Uuid::from_u128(5),
+            source_repository: "example/project".to_owned(),
+            source_issue_number: 199,
+            source_issue_url: "https://github.com/example/project/issues/199".to_owned(),
+        };
+        let factory = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(factory["origin"]["kind"], "factory");
+        assert_eq!(
+            factory["origin"].as_object().expect("origin object").len(),
+            5
+        );
+        for private_field in ["claim_token", "policy", "account_login", "sign_in"] {
+            assert!(factory.get(private_field).is_none());
+            assert!(factory["origin"].get(private_field).is_none());
+        }
+        assert_eq!(
+            serde_json::from_value::<MissionContext>(factory).expect("round trip"),
+            context
+        );
+    }
 
     #[test]
     fn status_serialization_is_stable() {

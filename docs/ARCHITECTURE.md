@@ -752,6 +752,24 @@ revision. GitHub Project status remains `In Progress`; only verified publication
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.
+The snapshot is not an origin index: an omitted Factory item cannot establish
+that a mission was created directly.
+
+`GET /api/corps/{corp_id}/missions/{mission_id}/context` resolves one authorized
+mission's exact stored Factory link. It uses the existing unique mission-to-item
+relationship, not the recent-item window. Authorization and the left join share
+one database statement; only current human operators who belong to the mission's
+room receive a result. The response contains the echoed viewer/mission/room scope
+and minimal issue/link metadata, not a claim token, policy or account report.
+Unknown, hidden or unavailable context stays neutral in the UI.
+
+Factory materialization commits mission creation and the unique link together,
+and no supported path later adopts or unlinks a committed mission. Therefore a
+successful complete lookup without a link establishes a direct/non-Factory
+mission. It does not prove that somebody used the browser rather than another
+direct client. An inconsistent cross-Corp link is rejected rather than filtered
+into a false Direct classification.
+
 Controller discovery does not use that bounded snapshot as an index. After listing the current
 GitHub Project candidates, the trusted controller sends only those Project item IDs to a
 Corp-authorized lookup endpoint together with the normalized Project owner and Project number. The

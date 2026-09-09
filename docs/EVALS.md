@@ -42,6 +42,15 @@ Server unit coverage checks that only failure reporting uses the cleanup permiss
 effect-advancing variants retain `Publish`. These are scoped store and server-unit checks,
 not a new real-provider or real-GitHub publication run.
 
+## Exact mission-to-Factory context
+
+The [exact mission-context report](evidence/2026-09-09-mission-work-context.md)
+records the separate #199 source-attribution check: twelve actual-migration
+store cases, including a target outside the 500-item Factory window, plus
+authorized API/browser reads and a guest-visible mission that retains neutral
+origin. It creates no new provider run and does not replace Factory publication
+or production-identity acceptance.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

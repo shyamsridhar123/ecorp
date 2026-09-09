@@ -28,6 +28,7 @@ import type { DiscussionScope } from './missionProjection'
 import { createSnapshotRefresher } from './snapshotRefresh'
 import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
 import { ConnectionsPanel } from './ConnectionsPanel'
+import { MissionOriginDetails } from './MissionOriginDetails'
 import {
   connectionLabel, connectionRunnerRevision, connectionScope, connectionStatusLabel,
   connectionTarget, connectionsNeedPresenceRefresh,
@@ -3587,11 +3588,15 @@ function MissionCard({
       </div>
       <h3>{mission.title}</h3>
       <div className="mission-work-context">
-        <p>
-          <strong>{origin.label}</strong>
-          {' · '}
-          {origin.detail}
-        </p>
+        <MissionOriginDetails
+          corpId={corpId}
+          actorId={actorId}
+          actorRole={actorRole}
+          missionId={mission.id}
+          roomId={mission.room_id}
+          api={api}
+          fallback={origin}
+        />
         <nav className="work-context-actions" aria-label="Mission workspace">
           <button type="button" className="button button-secondary" onClick={() => onViewAgents(mission)}>
             {activeRuns ? 'View live agents' : 'View task owners'}

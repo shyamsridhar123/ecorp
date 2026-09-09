@@ -26,6 +26,7 @@ mod checkpoint_retention;
 mod contract_revision;
 mod factory_controller;
 mod factory_run_failure;
+mod mission_context;
 mod publication;
 mod staffing;
 mod terminal_accounting;
@@ -39,6 +40,8 @@ pub use workspace_connections::{
 mod budget_checkpoint_tests;
 #[cfg(test)]
 mod factory_recovery_loss_tests;
+#[cfg(test)]
+mod mission_context_tests;
 #[cfg(test)]
 mod workspace_connections_tests;
 
