@@ -1047,9 +1047,9 @@ pub(super) async fn plan_room_tx(
     Ok(room_id)
 }
 
-/// Called inside the same transaction that creates a new run. Resume/recovery
-/// inherits the original binding; mutable task metadata cannot switch its home.
-pub(super) async fn bind_new_run_tx(
+/// Shared read-only run connection admission. Resume/recovery inherits the
+/// original binding; mutable task metadata cannot switch its home.
+pub(super) async fn validate_run_connection_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     run_id: Uuid,
@@ -1122,6 +1122,16 @@ pub(super) async fn bind_new_run_tx(
             return Err(anyhow!("the saved source revision changed before dispatch"));
         }
     }
+    Ok(connection_id)
+}
+
+/// Persist the binding only in the transaction that creates a new run.
+pub(super) async fn bind_new_run_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+) -> Result<Option<Uuid>> {
+    let connection_id = validate_run_connection_tx(tx, corp_id, run_id).await?;
     sqlx::query("UPDATE runs SET workspace_connection_id=$3 WHERE corp_id=$1 AND id=$2")
         .bind(corp_id)
         .bind(run_id)

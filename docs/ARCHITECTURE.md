@@ -606,6 +606,23 @@ existing `VerifyRun` command, with no model, provider session, provider secrets,
 allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
 unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
 
+When that checkpoint verifier finds work still to correct, an explicit `source_correction`
+may continue the exact preserved provider session after a measured **suspension**, provided
+ordinary remaining mission/requester/Corp limits and provider attempts still allow it.
+This is not the zero-provider operation above. A separate `source_correction_authority`
+record binds the failed checkpoint verifier, native suspension/termination/checkpoint proof,
+original policy, current contract revision, saved execution connection and provider session.
+Only that historical suspension is admitted; stops, unrelated suspensions, loop failures
+and quarantine remain protected. Dispatch repeats current authority and connection admission
+before and after secret resolution, and ordinary publication revalidates the correction's
+origin. A temporary authorization database failure leaves the durable command pending.
+
+Recovery context distinguishes checkpoint-family history, currently available source-only
+checks, and currently available provider correction. A valid revised policy may allow the
+latter without permitting the former. The browser uses this exact context for its controls
+and revision source; it does not silently choose an older provider from the run list.
+See [the correction evidence](evidence/2026-09-09-checkpoint-source-correction.md).
+
 Legacy controller catch-up could project that recoverable suspension as a terminal Factory
 `cancelled` item. The exact recovery-context endpoint now returns a
 `checkpoint_cancellation_event_id` only when native source authority and the current

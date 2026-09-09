@@ -22,6 +22,7 @@ use uuid::Uuid;
 mod budget_checkpoint;
 mod budget_revision;
 mod checkpoint_cancellation;
+mod checkpoint_correction;
 mod checkpoint_publication;
 mod checkpoint_retention;
 pub use checkpoint_cancellation::ReconcileCheckpointCancellationInput;
@@ -314,6 +315,8 @@ pub struct FactoryVerificationRecoveryContext {
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
     pub checkpoint_verification: bool,
+    pub checkpoint_source_correction: bool,
+    pub checkpoint_verification_available: bool,
     pub checkpoint_cancellation_event_id: Option<Uuid>,
 }
 
@@ -4436,7 +4439,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT task.attempt_count, task.max_attempts,
-                   mission.budget_tokens, mission.budget_cost_microusd,
+                   mission.budget_tokens, mission.budget_cost_microusd, mission.requested_by,
                    source.id, source.breaker_stage,
                    EXISTS (
                      SELECT 1 FROM factory_verification_recoveries recovery
@@ -4466,17 +4469,43 @@ impl PgStore {
             "suspend" | "stop"
         ) || row.get::<bool, _>("checkpoint_recovery");
         let mut checkpoint_cancellation_event_id = None;
+        let mut checkpoint_verification_available = checkpoint_verification;
+        let mut revised_correction_authority = None;
         if checkpoint_verification {
-            let authority = budget_checkpoint::source_authority_tx(
+            let authority = match budget_checkpoint::source_authority_tx(
                 &mut tx,
                 corp_id,
                 work_item_id,
                 source_run_id,
             )
-            .await?;
-            checkpoint_cancellation_event_id =
-                checkpoint_cancellation::cancellation_event_tx(&mut tx, &work_item, source_run_id)
-                    .await?;
+            .await
+            {
+                Ok(authority) => authority,
+                Err(error) if error.downcast_ref::<sqlx::Error>().is_some() => return Err(error),
+                Err(error) => {
+                    let Some(correction) = checkpoint_correction::revised_context_authority_tx(
+                        &mut tx,
+                        &work_item,
+                        source_run_id,
+                    )
+                    .await?
+                    else {
+                        return Err(error);
+                    };
+                    checkpoint_verification_available = false;
+                    let authority = correction.checkpoint.clone();
+                    revised_correction_authority = Some(correction);
+                    authority
+                }
+            };
+            if checkpoint_verification_available {
+                checkpoint_cancellation_event_id = checkpoint_cancellation::cancellation_event_tx(
+                    &mut tx,
+                    &work_item,
+                    source_run_id,
+                )
+                .await?;
+            }
             // A retry may have already exported its authorized verification
             // commit. Preserve that bound head; the provider origin remains
             // immutable authority, not the verifier's current checkout head.
@@ -4489,6 +4518,24 @@ impl PgStore {
         checkpoint.ensure_preserved()?;
         let (mission_tokens_used, mission_cost_used) =
             budget_revision::mission_usage_tx(&mut tx, corp_id, mission_id).await?;
+        let rolling =
+            rolling_budget_remaining_tx(&mut tx, corp_id, row.get("requested_by")).await?;
+        let checkpoint_source_correction = row.get::<i32, _>("attempt_count")
+            < row.get::<i32, _>("max_attempts")
+            && mission_tokens_used < row.get::<i64, _>("budget_tokens")
+            && mission_cost_used < row.get::<i64, _>("budget_cost_microusd")
+            && rolling.actor_tokens > 0
+            && rolling.actor_cost_microusd > 0
+            && rolling.corp_tokens > 0
+            && rolling.corp_cost_microusd > 0
+            && checkpoint_correction::context_eligible_tx(
+                &mut tx,
+                &work_item,
+                source_run_id,
+                viewer_actor_id,
+                revised_correction_authority.as_ref(),
+            )
+            .await?;
         let context = FactoryVerificationRecoveryContext {
             work_item,
             recoveries,
@@ -4506,6 +4553,8 @@ impl PgStore {
             workspace_fingerprint: checkpoint.fingerprint,
             expected_head_commit: checkpoint.expected_head_commit,
             checkpoint_verification,
+            checkpoint_source_correction,
+            checkpoint_verification_available,
             checkpoint_cancellation_event_id,
         };
         tx.commit().await?;
@@ -4640,6 +4689,7 @@ impl PgStore {
                     .context("idempotent factory recovery references a missing work item")?;
             let launch =
                 factory_verification_recovery_launch_tx(&mut tx, &recovery, &reason).await?;
+            checkpoint_correction::replay_authority_tx(&mut tx, &recovery).await?;
             tx.commit().await?;
             return Ok(FactoryVerificationRecoveryOutcome {
                 recovery,
@@ -4857,11 +4907,36 @@ impl PgStore {
             ));
         }
         let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
+        let source_correction_authority = if input.mode
+            == FactoryVerificationRecoveryMode::SourceCorrection
+            && lineage
+                .iter()
+                .any(|candidate| candidate.get::<String, _>("breaker_stage") == "suspend")
+        {
+            Some(
+                checkpoint_correction::admit_tx(
+                    &mut tx,
+                    &work_item,
+                    input.source_run_id,
+                    input.contract_revision_id,
+                    input.actor_id,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         if lineage.iter().any(|candidate| {
             (matches!(
                 candidate.get::<String, _>("breaker_stage").as_str(),
                 "suspend" | "stop"
-            ) && !checkpoint_verification)
+            ) && !checkpoint_verification
+                && !source_correction_authority
+                    .as_ref()
+                    .is_some_and(|authority| {
+                        candidate.get::<Uuid, _>("id") == authority.checkpoint.checkpoint.run_id
+                            && candidate.get::<String, _>("breaker_stage") == "suspend"
+                    }))
                 || candidate
                     .get::<Option<String>, _>("workspace_disposition")
                     .as_deref()
@@ -5155,11 +5230,11 @@ impl PgStore {
                 reason, idempotency_key, observed_source_revision,
                 reviewed_source_snapshot, contract_revision_id,
                 previous_verification_policy, replacement_verification_policy, request,
-                checkpoint_authority
+                checkpoint_authority, source_correction_authority
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, $11,
-                $12, $13, $14, $15, $16, $17, $18
+                $12, $13, $14, $15, $16, $17, $18, $19
             )
             "#,
         )
@@ -5182,6 +5257,12 @@ impl PgStore {
         .bind(&request)
         .bind(
             checkpoint_authority
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
+        .bind(
+            source_correction_authority
                 .as_ref()
                 .map(serde_json::to_value)
                 .transpose()?,
@@ -5305,6 +5386,8 @@ impl PgStore {
                         "mode": input.mode,
                         "observed_source_revision": observed_source_revision,
                         "contract_revision_id": input.contract_revision_id,
+                        "source_correction_origin_run_id": source_correction_authority
+                            .as_ref().map(|authority| authority.checkpoint.checkpoint.run_id),
                         "reason": reason,
                     }),
                 )

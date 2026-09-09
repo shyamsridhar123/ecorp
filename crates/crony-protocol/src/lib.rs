@@ -679,6 +679,10 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub expected_head_commit: Option<String>,
     #[serde(default)]
     pub checkpoint_verification: bool,
+    #[serde(default)]
+    pub checkpoint_source_correction: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_verification_available: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_cancellation_event_id: Option<Uuid>,
 }

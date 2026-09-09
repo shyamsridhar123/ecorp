@@ -1597,7 +1597,10 @@ async fn dispatch_pending_runner_commands_for_epoch(
             let outgoing = match decoded {
                 Ok(Some(outgoing)) => outgoing,
                 Ok(None) => continue,
-                Err(error) if command.command_kind == "factory_verification_recovery" => {
+                Err(error)
+                    if command.command_kind == "factory_verification_recovery"
+                        && !factory_recovery_failure_is_retryable(&error) =>
+                {
                     let detail = factory_recovery_dispatch_failure_detail(&error);
                     for event in state
                         .store
@@ -1715,6 +1718,9 @@ async fn decode_recovery_runner_command(
             }
             match payload.mode {
                 FactoryVerificationRecoveryMode::SourceCorrection => {
+                    if !source_correction_authority_is_current(state, command).await? {
+                        return Ok(None);
+                    }
                     let secrets = resolve_secret_refs(
                         state,
                         payload.corp_id,
@@ -1725,6 +1731,9 @@ async fn decode_recovery_runner_command(
                     )
                     .await?;
                     if !recovery_command_can_dispatch(state, command).await? {
+                        return Ok(None);
+                    }
+                    if !source_correction_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::ResumeRun {
@@ -1887,6 +1896,31 @@ async fn verification_recovery_authority_is_current(
     Err(anyhow::anyhow!(
         "current recovery authorization is unavailable; no verifier command was dispatched"
     ))
+}
+
+async fn source_correction_authority_is_current(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<bool> {
+    if state
+        .store
+        .source_correction_command_authorized(command)
+        .await?
+    {
+        return Ok(true);
+    }
+    if !recovery_command_can_dispatch(state, command).await? {
+        return Ok(false);
+    }
+    Err(anyhow::anyhow!(
+        "current source-correction authorization is unavailable; no provider command was dispatched"
+    ))
+}
+
+fn factory_recovery_failure_is_retryable(error: &anyhow::Error) -> bool {
+    // An unavailable database must leave the durable command pending, not
+    // consume the final provider attempt as a new execution failure.
+    error.downcast_ref::<sqlx::Error>().is_some()
 }
 
 async fn recovery_command_can_dispatch(
@@ -3256,6 +3290,8 @@ async fn get_factory_verification_recovery_context(
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
         checkpoint_verification: context.checkpoint_verification,
+        checkpoint_source_correction: context.checkpoint_source_correction,
+        checkpoint_verification_available: Some(context.checkpoint_verification_available),
         checkpoint_cancellation_event_id: context.checkpoint_cancellation_event_id,
     }))
 }
@@ -6863,6 +6899,19 @@ mod tests {
         ]));
         capability.available = true;
         assert!(super::supports_checkpoint_verification(&[capability]));
+    }
+
+    #[test]
+    fn issue210_transient_authorization_reads_do_not_terminalize_recovery() {
+        let unavailable = anyhow::Error::new(sqlx::Error::PoolTimedOut)
+            .context("source-correction authority read");
+        assert!(super::factory_recovery_failure_is_retryable(&unavailable));
+        assert!(!super::factory_recovery_failure_is_retryable(
+            &anyhow::anyhow!("current source-correction authorization is unavailable")
+        ));
+        assert!(!super::factory_recovery_failure_is_retryable(
+            &anyhow::anyhow!("source-correction command omitted provider session")
+        ));
     }
 
     fn mission_preview_test_request() -> CreateMissionRequest {

@@ -310,6 +310,22 @@ authentication. Reconciliation grants no claim token, provider execution or publ
 and replay repeats current authorization. It does not rewrite original runs, task contracts,
 source evidence, attempts or accounting.
 
+Provider source-correction after failed checkpoint verification has separate, versioned
+origin provenance. It never receives a checkpoint-verification model-budget exemption.
+Admission requires the exact native failed verifier and a current explicit resume contract
+revision, and can recognize only its original measured `suspend`—never `stop`, an explicit
+stop request, another suspension, a loop failure or quarantined lineage. Original proof is
+checked against immutable historical policy, separately from the authorized replacement.
+Original usage and attempts remain; a correction consumes a normal provider attempt and
+positive remaining allocation.
+
+The pending correction command repeats current actor/room, Factory, assignment, source,
+policy, saved connection and remaining-budget checks before and after secret resolution.
+Native mutation gates are acquired before row waits, and command state is re-read before
+commit. Unavailable database reads do not turn into a failed provider attempt. Missing or
+changed correction-origin provenance denies replay and publication through ordinary errors;
+it does not authorize a fresh provider, artifact, merge or deployment.
+
 Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
 verification commit. Ready-artifact joins bind the new head to its run, producer, source,
 policy and verification digest; these relational checks are not fresh signature/byte validation.

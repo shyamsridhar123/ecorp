@@ -71,6 +71,16 @@ Run only the explicitly owned `issue206_` SQLx lane for those cases; ordinary wo
 leave it ignored. A successful reconciliation is not application verification, review or
 publication, and a missing required artifact must still fail its persisted check.
 
+## Source correction after checkpoint verification
+
+The [#210 source-correction report](evidence/2026-09-09-checkpoint-source-correction.md)
+separates the reproduced native admission failure, actual-store regression checks,
+browser reproductions in the retained application, and final runtime acceptance.
+Its `issue210_` SQLx family uses only the approved disposable maintenance fixture;
+it must not be run against the application database. A source-only check or an
+admitted correction does not establish artifact creation, successful browser
+behavior, authorized outcome review or publication.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

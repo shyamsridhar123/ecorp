@@ -1906,6 +1906,7 @@ async fn validate_publication_prerequisites(
         ));
     }
     let selected_run_id: Uuid = row.get("run_id");
+    checkpoint_correction::publication_authority_tx(tx, &work_item, selected_run_id).await?;
     ensure_run_not_hard_blocked_tx(
         tx,
         request.corp_id,

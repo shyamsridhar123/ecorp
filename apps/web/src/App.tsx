@@ -13,7 +13,7 @@ import { factoryControllerState } from './factoryPolling'
 import { selectFactoryController } from './factoryControllerSelection'
 import type { FactoryPolling } from './factoryPolling'
 import {
-  factoryRecoveryBlocksProviderResume, factoryRecoveryConnection,
+  factoryContractRevisionSource, factoryRecoveryBlocksProviderResume, factoryRecoveryConnection,
   factoryRecoveryModes, needsFactoryRecoveryContext,
 } from './factoryCheckpointRecovery'
 import type { FactoryRecoveryCommandMode } from './factoryCheckpointRecovery'
@@ -496,6 +496,8 @@ type FactoryVerificationRecoveryContextResponse = {
   workspace_fingerprint: string | null
   expected_head_commit: string | null
   checkpoint_verification?: boolean
+  checkpoint_verification_available?: boolean
+  checkpoint_source_correction?: boolean
   checkpoint_cancellation_event_id?: string | null
 }
 
@@ -1373,6 +1375,8 @@ function ContractRevisionPanel({
   mission,
   task,
   runs,
+  recoveryScope,
+  recoveryLoad,
   actorId,
   actorRole,
   busy,
@@ -1381,6 +1385,8 @@ function ContractRevisionPanel({
   mission: Mission
   task: Task
   runs: Run[]
+  recoveryScope: FactoryRecoveryContextScope | null
+  recoveryLoad: FactoryRecoveryContextLoad | null
   actorId: string
   actorRole: string
   busy: boolean
@@ -1404,16 +1410,29 @@ function ContractRevisionPanel({
     actorId === mission.requested_by || ['owner', 'admin', 'manager'].includes(actorRole)
   const activeRun = runs.some((run) => !terminalRun(run.status))
   const redispatchEligible = mission.status === 'ready' && runs.length === 0
-  const sourceRun = runs.find(
-    (run) =>
-      run.task_id === task.id &&
-      terminalRun(run.status) &&
-      run.provider_session_id &&
-      run.workspace_disposition === 'preserved' &&
-      run.breaker_stage !== 'stop',
-  )
+  const scopedRecoveryLoad = currentFactoryRecoveryLoad(recoveryScope, recoveryLoad)
+  const recoveryContext = scopedRecoveryLoad?.status === 'ready' ? scopedRecoveryLoad.data : null
+  const sourceRunId = recoveryScope
+    ? factoryContractRevisionSource(recoveryContext, recoveryScope, task.id)
+    : runs.find(
+      (run) =>
+        run.task_id === task.id &&
+        terminalRun(run.status) &&
+        run.provider_session_id &&
+        run.workspace_disposition === 'preserved' &&
+        run.breaker_stage !== 'stop',
+    )?.id ?? null
   const nextAction: MissionContractRevisionInput['next_action'] | null =
-    !activeRun && redispatchEligible ? 'redispatch' : !activeRun && sourceRun ? 'resume' : null
+    !recoveryScope && !activeRun && redispatchEligible ? 'redispatch' : !activeRun && sourceRunId ? 'resume' : null
+  const recoverySourceNotice = recoveryScope && !activeRun && task.status !== 'completed'
+    ? scopedRecoveryLoad?.status === 'error'
+      ? 'Recovery source unavailable. Refresh recovery context below before revising.'
+      : scopedRecoveryLoad?.status !== 'ready'
+        ? 'Loading the current recovery source…'
+        : recoveryContext?.task_id === task.id && !sourceRunId
+          ? 'Source correction is not available in the current recovery context.'
+          : null
+    : null
   const resetDraft = () => {
     setDescription(mission.description)
     setReason('')
@@ -1441,12 +1460,12 @@ function ContractRevisionPanel({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!nextAction || !parsedContract || !parsedPolicy || !reason.trim() || parseError) return
+    if (!canRevise || busy || !nextAction || !parsedContract || !parsedPolicy || !reason.trim() || parseError) return
     const saved = await onRevise(mission, task, {
       task_id: task.id,
       expected_contract_version: task.contract_version,
       next_action: nextAction,
-      source_run_id: nextAction === 'resume' ? sourceRun?.id ?? null : null,
+      source_run_id: nextAction === 'resume' ? sourceRunId : null,
       reason,
       idempotency_key: idempotencyKey,
       description,
@@ -1459,15 +1478,24 @@ function ContractRevisionPanel({
     }
   }
 
-  if (!nextAction || !canRevise) return null
+  if (!canRevise) return null
+  if (!nextAction) return recoverySourceNotice ? (
+    <p className="factory-recovery-role-note"
+      data-testid={`contract-revision-source-${task.id}`}
+      role={scopedRecoveryLoad?.status === 'error' ? 'alert' : 'status'}>
+      {recoverySourceNotice}
+    </p>
+  ) : null
   return (
-    <div className="contract-revision-panel" data-testid={`contract-revision-${task.id}`}>
+    <div className="contract-revision-panel" data-testid={`contract-revision-${task.id}`}
+      data-source-run-id={sourceRunId}>
       {open ? (
         <form onSubmit={submit}>
           <div className="contract-section-heading">
             <div>
               <strong>
-                Revise for {nextAction === 'resume' ? 'preserved-session resume' : 'redispatch'}
+                Revise for {nextAction === 'resume'
+                  ? recoveryScope ? 'source correction' : 'preserved-session resume' : 'redispatch'}
               </strong>
               <span>
                 Revision {task.contract_version + 1} is durable and never starts work automatically.
@@ -1532,7 +1560,8 @@ function ContractRevisionPanel({
           <div className="contract-revision-footer">
             <span className={parseError ? 'contract-error' : ''}>
               {parseError ??
-                `Save revision ${task.contract_version + 1}; then explicitly ${nextAction === 'resume' ? 'resume the preserved run' : 'dispatch the mission'}.`}
+                `Save revision ${task.contract_version + 1}; then explicitly ${nextAction === 'resume'
+                  ? recoveryScope ? 'request source correction' : 'resume the preserved run' : 'dispatch the mission'}.`}
             </span>
             <button
               className="button button-primary"
@@ -1550,7 +1579,7 @@ function ContractRevisionPanel({
           disabled={busy}
           onClick={() => setOpen(true)}
         >
-          Revise contract for {nextAction}
+          Revise contract for {nextAction === 'resume' && recoveryScope ? 'source correction' : nextAction}
         </button>
       )}
     </div>
@@ -3285,6 +3314,8 @@ function requestFactoryRecoveryContext(
        !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
        !(data.expected_head_commit === null || typeof data.expected_head_commit === 'string') ||
        !(data.checkpoint_verification === undefined || typeof data.checkpoint_verification === 'boolean') ||
+       !(data.checkpoint_verification_available === undefined || typeof data.checkpoint_verification_available === 'boolean') ||
+       !(data.checkpoint_source_correction === undefined || typeof data.checkpoint_source_correction === 'boolean') ||
        !(data.checkpoint_cancellation_event_id == null || typeof data.checkpoint_cancellation_event_id === 'string') ||
       ![data.remaining_attempts, data.remaining_mission_tokens, data.remaining_mission_cost_microusd].every(Number.isFinite)) {
       throw new Error('Recovery context is missing required source, checkpoint or remaining-budget fields. No snapshot fallback is used.')
@@ -3321,10 +3352,13 @@ function factoryRecoveryPresentation(
   const active = context.recoveries.find((recovery) =>
     recovery.status === 'authorized' || recovery.status === 'running',
   )
-  const checkpointVerification = factoryRecoveryModes(context).includes('checkpoint-verification')
+  const recoveryModes = factoryRecoveryModes(context)
+  const checkpointVerification = recoveryModes.includes('checkpoint-verification')
+  const checkpointCorrection = context.checkpoint_verification === true && recoveryModes.includes('source-correction')
+  const checkpointUnavailable = context.checkpoint_verification === true && recoveryModes.length === 0
   const cancelledBlocked = context.work_item.state === 'cancelled' && !checkpointVerification
   const state = quarantined ? 'quarantined' : active ? 'active'
-    : cancelledBlocked ? 'unavailable'
+    : cancelledBlocked || checkpointUnavailable ? 'unavailable'
       : checkpointVerification && context.checkpoint_cancellation_event_id ? 'reconciliation_required'
     : context.workspace_fingerprint ? 'ready' : 'checkpoint_required'
   return {
@@ -3333,7 +3367,9 @@ function factoryRecoveryPresentation(
     heading: quarantined ? 'Quarantine warning — inspect controller context'
       : active ? 'Recovery already authorized'
         : cancelledBlocked ? 'Cancelled Factory intent remains protected'
-          : checkpointVerification ? 'Verify retained checkpoint'
+          : checkpointUnavailable ? 'Recovery unavailable'
+          : checkpointCorrection ? checkpointVerification ? 'Verify or fix saved work' : 'Fix saved work'
+            : checkpointVerification ? 'Verify retained checkpoint'
         : context.workspace_fingerprint ? 'Recover preserved work' : 'Checkpoint and recheck',
     detail: quarantined
       ? run
@@ -3343,6 +3379,12 @@ function factoryRecoveryPresentation(
         ? 'An existing recovery is authorized or running. Inspect that operation through the controller; do not create a duplicate grant. Copied templates are not a new authorization.'
         : cancelledBlocked
           ? 'The current server context does not authorize checkpoint reconciliation for this cancellation. User stops and unrelated cancellations cannot be overridden here.'
+          : checkpointUnavailable
+            ? 'No recovery mode is currently available for this checkpoint. Refresh recovery context to check again.'
+          : checkpointCorrection
+            ? checkpointVerification
+              ? 'Recheck saved work without starting an agent, or request a focused fix in the same saved session. A fix uses the remaining budget and attempts; required checks stay in place.'
+              : 'Request a focused fix in the same saved session. A fix uses the remaining budget and attempts; required checks stay in place. Checkpoint verification is not available for the current contract.'
           : checkpointVerification
             ? context.checkpoint_cancellation_event_id
               ? 'The server validated this retained checkpoint. Explicit checkpoint verification first reconciles the controller cancellation, then rechecks the same source without a provider. Original spend and history remain unchanged.'
@@ -3350,7 +3392,7 @@ function factoryRecoveryPresentation(
         : context.workspace_fingerprint
           ? 'Recheck saved work without a model call, or request a focused correction in the same session. The controller rechecks authorization before running.'
           : 'The controller can ask the owning runner to seal this older workspace before rechecking it. The original work stays in place; copying a command executes nothing.',
-    checkpoint: quarantined || active || cancelledBlocked ? null : context.workspace_fingerprint,
+    checkpoint: quarantined || active || cancelledBlocked || checkpointUnavailable ? null : context.workspace_fingerprint,
     recoveryCount: context.recoveries.length,
   }
 }
@@ -3779,6 +3821,8 @@ function MissionCard({
                   mission={mission}
                   task={task}
                   runs={runs}
+                  recoveryScope={recoveryScope}
+                  recoveryLoad={scopedRecoveryLoad}
                   actorId={actorId}
                   actorRole={actorRole}
                   busy={busy}
