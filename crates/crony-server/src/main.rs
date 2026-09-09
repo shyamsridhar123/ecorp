@@ -1,6 +1,8 @@
 mod artifacts;
 mod auth;
 mod dependency_source;
+#[cfg(test)]
+mod factory_connection_tests;
 mod planning;
 mod secrets;
 mod staffing;
@@ -3422,10 +3424,13 @@ async fn preflight_factory_mission(
         Permission::Operate,
     )
     .await?;
-    let staffing_source = if needs_factory_staffing_source(
-        request.strategy.as_deref(),
-        request.preferred_adapter.as_deref(),
-    ) {
+    let workspace_connection_id = crony_domain::factory_workspace_connection_id(&request.policy)
+        .map_err(ApiError::bad_request)?;
+    let staffing_source = if workspace_connection_id.is_some()
+        || needs_factory_staffing_source(
+            request.strategy.as_deref(),
+            request.preferred_adapter.as_deref(),
+        ) {
         Some(MissionSource {
             repository: format!(
                 "{}/{}",
@@ -3447,7 +3452,7 @@ async fn preflight_factory_mission(
         &state,
         corp_id,
         MissionPlanInput {
-            workspace_connection_id: None,
+            workspace_connection_id,
             actor_id: request.actor_id,
             title: &request.title,
             description: &request.description,
@@ -3576,37 +3581,38 @@ async fn materialize_factory_mission(
             replayed: true,
         }));
     }
-    let staffing_source = if needs_factory_staffing_source(
-        request.strategy.as_deref(),
-        request.preferred_adapter.as_deref(),
-    ) {
-        match state
-            .store
-            .factory_staffing_source(corp_id, work_item_id, actor_id)
-            .await
-        {
-            Ok((repository, base_ref, base_commit)) => Some(MissionSource {
-                repository,
-                base_ref,
-                base_commit,
-            }),
-            Err(error) => {
-                return Err(reject_factory_materialization_error(
-                    &state,
-                    &materialize_input,
-                    map_store_error(error),
-                )
-                .await);
-            }
+    // Read the source and connection together from the immutable claimed policy.
+    // A materialization request cannot substitute its own account or machine.
+    let (repository, base_ref, base_commit, workspace_connection_id) = match state
+        .store
+        .factory_staffing_source(corp_id, work_item_id, actor_id)
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            return Err(reject_factory_materialization_error(
+                &state,
+                &materialize_input,
+                map_store_error(error),
+            )
+            .await);
         }
-    } else {
-        None
     };
+    let staffing_source = (workspace_connection_id.is_some()
+        || needs_factory_staffing_source(
+            request.strategy.as_deref(),
+            request.preferred_adapter.as_deref(),
+        ))
+    .then_some(MissionSource {
+        repository,
+        base_ref,
+        base_commit,
+    });
     let plan = match plan_mission(
         &state,
         corp_id,
         MissionPlanInput {
-            workspace_connection_id: None,
+            workspace_connection_id,
             actor_id,
             title: &request.title,
             description: &request.description,
@@ -3628,9 +3634,7 @@ async fn materialize_factory_mission(
     {
         Ok(plan) => plan,
         Err(error) => {
-            return Err(
-                reject_factory_materialization_error(&state, &materialize_input, error).await,
-            );
+            return Err(reject_factory_admission_error(&state, &materialize_input, error).await);
         }
     };
     let outcome = match state
@@ -3667,6 +3671,17 @@ async fn reject_factory_materialization_error(
     if error.status == StatusCode::CONFLICT {
         return error;
     }
+    reject_factory_admission_error(state, input, error).await
+}
+
+// A connection becoming unavailable or changing source is an admission conflict,
+// not an idempotency/version conflict. Release that exact claim generation even
+// for HTTP 409; the existing compensation transaction fences newer owners/mission.
+async fn reject_factory_admission_error(
+    state: &AppState,
+    input: &MaterializeFactoryMissionInput,
+    error: ApiError,
+) -> ApiError {
     match persist_factory_materialization_rejection(state, input, &error.message).await {
         Ok(()) => error,
         Err(compensation) if compensation.status == StatusCode::CONFLICT => {

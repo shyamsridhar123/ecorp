@@ -62,6 +62,13 @@ prohibitions, write scope, token budget, or cost budget. Factory `verified` stat
 authoritative completed mission and passing task-verification records.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
+An optional saved execution-connection ID is part of the immutable Factory policy.
+Malformed/nil IDs and task-policy mismatches fail closed; an omitted legacy binding
+does not grant access to a bound native account. The exact connection lookup uses
+current Corp/room/operator authorization and emits only the shared DTO. Preflight
+and materialization reuse connection/source/readiness admission, and the native
+run/resume boundary keeps the persisted connection. Changing controller options
+cannot rebind an existing Factory lineage.
 Provider-backed factory outcomes require a manual verification gate; an artifact-only final
 result cannot become accepted completion without an authorized evidence decision. Internal
 handoffs retain their automated file, integrity, and content checks without an additional

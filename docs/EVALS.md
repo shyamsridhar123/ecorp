@@ -51,6 +51,15 @@ authorized API/browser reads and a guest-visible mission that retains neutral
 origin. It creates no new provider run and does not replace Factory publication
 or production-identity acceptance.
 
+## Saved-connection Factory routing
+
+The [saved-connection report](evidence/2026-09-09-factory-saved-connections.md)
+separates 14 actual-store cases, four actual-handler/real-migration cases,
+read-only native API checks, and a real three-specialist Copilot dispatch.
+The final integration source was retained after a task-budget stop; its
+verification/review/publication remain pending #206. Passing preflight or
+specialist handoffs must not be reported as an accepted application.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

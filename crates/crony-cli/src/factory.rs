@@ -67,6 +67,10 @@ pub struct FactoryArgs {
     )]
     pub source_repository_path: PathBuf,
 
+    /// Reuse a saved native project/agent connection rather than legacy runner routing.
+    #[arg(long, env = "ECORP_FACTORY_WORKSPACE_CONNECTION_ID")]
+    pub workspace_connection_id: Option<Uuid>,
+
     #[arg(long)]
     pub adapter: String,
 
@@ -371,18 +375,18 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         args.active_issue
             .store(evaluated[index].issue.number, Ordering::Relaxed);
     }
-    let selected_source_base_commit = selected_index
-        .map(|index| {
-            if evaluated[index].recovery {
-                resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)
-            } else {
-                resolve_source_base_commit(&args).map(|commit| ResolvedSourceCommit {
-                    commit,
-                    legacy_upgrade_required: false,
-                })
+    let selected_source_base_commit = if let Some(index) = selected_index {
+        Some(if evaluated[index].recovery {
+            resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)?
+        } else {
+            ResolvedSourceCommit {
+                commit: resolve_new_source_base_commit(client, server, &args).await?,
+                legacy_upgrade_required: false,
             }
         })
-        .transpose()?;
+    } else {
+        None
+    };
     let preview_publication_base_ref = selected_index
         .map(|index| {
             if evaluated[index].recovery {
@@ -506,7 +510,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )?
     } else {
         ResolvedSourceCommit {
-            commit: resolve_source_base_commit(&args)?,
+            commit: resolve_new_source_base_commit(client, server, &args).await?,
             legacy_upgrade_required: false,
         }
     };
@@ -1268,7 +1272,7 @@ fn new_factory_policy(
     verification_policy: Option<&VerificationPolicy>,
     adapter_allowlist: &[String],
 ) -> Value {
-    json!({
+    let mut policy = json!({
         "schema_version": 1,
         "source_of_truth": "github_project",
         "project_owner": args.owner,
@@ -1309,7 +1313,13 @@ fn new_factory_policy(
             "deploy": false
         },
         "verification_policy": verification_policy,
-    })
+    });
+    // Omit the field for legacy work so its exact policy/idempotency snapshots
+    // do not change merely because the CLI was upgraded.
+    if let Some(connection_id) = args.workspace_connection_id {
+        policy["workspace_connection_id"] = json!(connection_id);
+    }
+    policy
 }
 
 fn preflight_policy(policy: &Value, source_base_commit: &str) -> Result<Value> {
@@ -1414,6 +1424,9 @@ async fn preflight_factory_mission(
 
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
+    if args.workspace_connection_id.is_some_and(|id| id.is_nil()) {
+        bail!("factory workspace_connection_id must be a non-nil UUID");
+    }
     validate_source_base_ref(&args.source_base_ref)?;
     validate_publication_base_ref(args)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
@@ -1595,17 +1608,22 @@ fn validate_publication_base_ref(args: &FactoryArgs) -> Result<()> {
     let Some(branch) = publication_base_branch(publication_base_ref)? else {
         return Ok(());
     };
-    source_git_output(
-        &args.source_repository_path,
-        &["check-ref-format", "--branch", branch],
-    )
-    .map(|_| ())
-    .with_context(|| {
-        format!(
-            "factory publication base ref {} is not a valid Git branch",
-            publication_base_ref
-        )
-    })
+    // Git validates a branch name without a repository. A saved connection's
+    // source lives on its runner; do not require a second controller checkout
+    // just to perform this native syntax check.
+    let directory = if args.workspace_connection_id.is_some() {
+        Path::new(".")
+    } else {
+        args.source_repository_path.as_path()
+    };
+    source_git_output(directory, &["check-ref-format", "--branch", branch])
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "factory publication base ref {} is not a valid Git branch",
+                publication_base_ref
+            )
+        })
 }
 
 fn selected_publication_base_ref(args: &FactoryArgs) -> &str {
@@ -1671,6 +1689,7 @@ fn resolve_recovery_source_base_commit_from_item(
     args: &FactoryArgs,
     item: &ExistingFactoryItem,
 ) -> Result<ResolvedSourceCommit> {
+    ensure_recovery_connection_matches(args, &item.policy)?;
     let policy = item
         .policy
         .as_object()
@@ -1708,8 +1727,63 @@ fn resolve_recovery_source_base_commit_from_item(
     })
 }
 
-fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
-    resolve_source_base_commit_at_ref(args, &args.source_base_ref)
+fn ensure_recovery_connection_matches(args: &FactoryArgs, policy: &Value) -> Result<()> {
+    let persisted =
+        crony_domain::factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
+    if persisted != args.workspace_connection_id {
+        bail!(
+            "factory recovery workspace connection differs from the persisted policy; retain the original connection option"
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_new_source_base_commit(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+) -> Result<String> {
+    let Some(connection_id) = args.workspace_connection_id else {
+        return resolve_source_base_commit_at_ref(args, &args.source_base_ref);
+    };
+    let value = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/connections/{connection_id}?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await
+    .context("read the selected saved Factory connection")?;
+    checked_connection_source(args, value)
+}
+
+fn checked_connection_source(args: &FactoryArgs, value: Value) -> Result<String> {
+    let connection: crony_domain::WorkspaceConnection = serde_json::from_value(value)
+        .map_err(|_| anyhow!("invalid saved Factory connection response"))?;
+    if Some(connection.id) != args.workspace_connection_id || connection.corp_id != args.corp_id {
+        bail!("saved Factory connection response does not match the requested scope");
+    }
+    if connection.status != crony_domain::WorkspaceConnectionStatus::Ready
+        || !connection.runner_connected
+    {
+        bail!("the saved Factory connection needs attention; test or reconnect its machine");
+    }
+    if connection.agent.as_str() != args.adapter {
+        bail!("Factory must use the coding agent configured for the saved connection");
+    }
+    let source = connection
+        .source
+        .context("the saved Factory repository has not been checked")?;
+    if !source.repository.eq_ignore_ascii_case(&args.repository)
+        || source.base_ref != args.source_base_ref
+    {
+        bail!("Factory repository and source ref must match the saved connection");
+    }
+    validate_source_base_commit(&source.base_commit)?;
+    Ok(source.base_commit.to_ascii_lowercase())
 }
 
 fn resolve_source_base_commit_at_ref(args: &FactoryArgs, source_base_ref: &str) -> Result<String> {
@@ -3830,13 +3904,14 @@ mod tests {
         FactoryVerificationRecoveryMode, IssueLabel, IssueView, ProjectContent, ProjectItem,
         RECOVERY_SOURCE_REFERENCE_PREFIX, VerificationRecoveryModeArg, acceptance_tests,
         active_recovery_contract_revision, blocked_dependency_numbers,
-        cached_recovery_contract_revision, evaluate_items, factory_completion_is_ready,
-        factory_item_recoverable_by, factory_recovery_source_matches, graphql_envelope_has_errors,
-        issue_numbers, normalize_github_component, parse_exact_project_item,
-        parse_github_repository_identity, publication_base_branch, recovery_contract_request,
-        recovery_replacement_contract, recovery_revision_key, recovery_revision_required,
-        resolve_recovery_publication_base_ref, reviewed_recovery_source, sanitize_failure_detail,
-        selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
+        cached_recovery_contract_revision, ensure_recovery_connection_matches, evaluate_items,
+        factory_completion_is_ready, factory_item_recoverable_by, factory_recovery_source_matches,
+        graphql_envelope_has_errors, issue_numbers, new_factory_policy, normalize_github_component,
+        parse_exact_project_item, parse_github_repository_identity, publication_base_branch,
+        recovery_contract_request, recovery_replacement_contract, recovery_revision_key,
+        recovery_revision_required, resolve_recovery_publication_base_ref,
+        reviewed_recovery_source, sanitize_failure_detail, selected_publication_base_ref,
+        truncate_utf8, validate_args, validate_source_base_commit,
     };
 
     struct RecoveryFixture {
@@ -3859,6 +3934,7 @@ mod tests {
                 source_base_ref: "main".to_owned(),
                 publication_base_ref: None,
                 source_repository_path: ".".into(),
+                workspace_connection_id: None,
                 adapter: "github-copilot".to_owned(),
                 allowed_adapters: Vec::new(),
                 strategy: "single".to_owned(),
@@ -4581,6 +4657,7 @@ Blocked by #999 outside the section.
             source_base_ref: "release".to_owned(),
             publication_base_ref: None,
             source_repository_path: ".".into(),
+            workspace_connection_id: None,
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
@@ -4638,6 +4715,7 @@ Blocked by #999 outside the section.
             source_base_ref: "release".to_owned(),
             publication_base_ref: None,
             source_repository_path: ".".into(),
+            workspace_connection_id: None,
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
@@ -4664,6 +4742,211 @@ Blocked by #999 outside the section.
         assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
         item.policy = json!({});
         assert!(resolve_recovery_publication_base_ref(&args, &item).is_err());
+    }
+
+    #[test]
+    fn issue204_new_policy_pins_connection_without_changing_legacy_shape() {
+        let mut fixture = RecoveryFixture::new();
+        let legacy = new_factory_policy(
+            &fixture.args,
+            &fixture.selected,
+            &"a".repeat(40),
+            "main",
+            None,
+            &["github-copilot".to_owned()],
+        );
+        assert!(legacy.get("workspace_connection_id").is_none());
+        let id = Uuid::new_v4();
+        fixture.args.workspace_connection_id = Some(id);
+        let mut connected = new_factory_policy(
+            &fixture.args,
+            &fixture.selected,
+            &"a".repeat(40),
+            "main",
+            None,
+            &["github-copilot".to_owned()],
+        );
+        assert_eq!(connected["workspace_connection_id"], json!(id));
+        connected
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_connection_id");
+        assert_eq!(connected, legacy);
+    }
+
+    #[test]
+    fn issue204_recovery_rejects_connection_substitution_or_silent_fallback() {
+        let mut args = RecoveryFixture::new().args;
+        assert!(ensure_recovery_connection_matches(&args, &json!({})).is_ok());
+        let id = Uuid::new_v4();
+        let policy = json!({"workspace_connection_id": id});
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_err());
+        args.workspace_connection_id = Some(id);
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_ok());
+        assert!(ensure_recovery_connection_matches(&args, &json!({})).is_err());
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_err());
+        assert!(
+            ensure_recovery_connection_matches(
+                &args,
+                &json!({"workspace_connection_id": "invalid"})
+            )
+            .is_err()
+        );
+    }
+
+    fn issue204_connection_response(args: &FactoryArgs) -> Value {
+        json!({
+            "id": args.workspace_connection_id.unwrap(),
+            "corp_id": args.corp_id,
+            "room_id": Uuid::new_v4(),
+            "created_by": args.actor_id,
+            "runner_id": "issue204-fixture",
+            "label": "Shared project",
+            "agent": args.adapter,
+            "source": {
+                "repository": args.repository,
+                "repository_id": "fixture-repository",
+                "base_ref": args.source_base_ref,
+                "base_commit": "a".repeat(40),
+            },
+            "status": "ready",
+            "detail": "Synthetic checked source",
+            "models": [],
+            "version": 1,
+            "last_checked_at": Utc::now(),
+            "runner_connected": true,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        })
+    }
+
+    #[test]
+    fn issue204_checked_source_fences_scope_readiness_adapter_and_revision() {
+        use super::checked_connection_source;
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        let valid = issue204_connection_response(&args);
+        assert_eq!(
+            checked_connection_source(&args, valid.clone()).unwrap(),
+            "a".repeat(40)
+        );
+        for (field, value) in [
+            ("id", json!(Uuid::new_v4())),
+            ("corp_id", json!(Uuid::new_v4())),
+            ("runner_connected", json!(false)),
+            ("status", json!("offline")),
+            ("status", json!("needs_sign_in")),
+            ("agent", json!("codex")),
+            ("source", Value::Null),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            assert!(
+                checked_connection_source(&args, changed).is_err(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("repository", "another/project"),
+            ("base_ref", "another-branch"),
+            ("base_commit", "not-a-commit"),
+        ] {
+            let mut changed = valid.clone();
+            changed["source"][field] = json!(value);
+            assert!(
+                checked_connection_source(&args, changed).is_err(),
+                "{field}"
+            );
+        }
+        let mut malformed = valid;
+        malformed["status"] = json!("private-diagnostic-must-not-be-echoed");
+        let error = checked_connection_source(&args, malformed).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid saved Factory connection response"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue204_bound_source_resolution_needs_no_controller_checkout() {
+        use super::resolve_new_source_base_commit;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        args.source_repository_path = "__issue204_no_controller_checkout__".into();
+        // Cover the complete admission path, not only the final source lookup.
+        validate_args(&args).unwrap();
+        let response = issue204_connection_response(&args).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = format!(
+            "GET /api/corps/{}/connections/{}?actor_id={} HTTP/1.1",
+            args.corp_id,
+            args.workspace_connection_id.unwrap(),
+            args.actor_id
+        );
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 8192];
+            let length = socket.read(&mut buffer).await.unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..length]).starts_with(&expected));
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            resolve_new_source_base_commit(&client, &format!("http://{address}"), &args)
+                .await
+                .unwrap(),
+            "a".repeat(40)
+        );
+        request.await.unwrap();
+    }
+
+    #[test]
+    fn issue204_factory_option_is_typed_and_rejects_nil() {
+        use clap::Parser;
+        let id = Uuid::new_v4();
+        for command in ["factory", "factory-watch"] {
+            let parsed = crate::Args::try_parse_from([
+                "crony",
+                command,
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000011",
+                "--adapter",
+                "github-copilot",
+                "--budget-tokens",
+                "1000",
+                "--budget-cost-microusd",
+                "1000000",
+                "--workspace-connection-id",
+                &id.to_string(),
+            ])
+            .unwrap();
+            let args = match parsed.command {
+                crate::Command::Factory { args } => *args,
+                crate::Command::FactoryWatch { args } => args.factory,
+                _ => unreachable!(),
+            };
+            assert_eq!(args.workspace_connection_id, Some(id));
+            assert!(validate_args(&args).is_ok());
+        }
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::nil());
+        assert!(
+            validate_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("non-nil")
+        );
     }
 
     #[test]

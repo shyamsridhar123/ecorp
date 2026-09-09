@@ -96,6 +96,41 @@ Native result receipts persist until the server acknowledges them and are
 replayed after reconnect. Late acknowledgements cannot select an older
 configuration over a newer one.
 
+## Use the same connection for Factory
+
+Direct missions and Factory can use the same saved GitHub repository and native
+coding-agent connection. The trusted controller selects it explicitly:
+
+```powershell
+$env:ECORP_FACTORY_WORKSPACE_CONNECTION_ID = '<saved-connection-id>'
+$env:ECORP_FACTORY_REPOSITORY = 'your-team/your-application'
+$env:ECORP_FACTORY_SOURCE_BASE_REF = 'main'
+```
+
+For `crony factory` or `crony factory-watch`, the equivalent option is
+`--workspace-connection-id <saved-connection-id>`. Select the same repository,
+source ref and coding agent as the saved connection. The existing authorized
+room-connections API returns the connection ID; the exact connection read
+returns only its shared configuration/status, never native sign-in details.
+
+For a saved connection, new intake uses its runner-checked immutable source
+identity. The controller does not need another manually cloned source checkout.
+The server rechecks the current connection, source, room membership and live
+runner before admitting the plan. A Ready connection is not authorization to
+run another account's environment or a different revision.
+
+Factory persists the connection in its claimed policy and carries it through
+every task and run. Recovery must retain that original connection option; it
+cannot substitute a new connection or silently fall back to legacy routing.
+The supported launcher remembers these non-secret Factory settings. Changing
+a running controller's configuration still uses explicit restart, not an
+implicit replacement of the runner or its source checkout.
+
+Omitting the connection option preserves legacy Factory routing through its
+configured source checkout. Existing unbound policy snapshots are not rewritten.
+This does not change GitHub Project eligibility, outcome review, publication
+authorization or the separate authorization required for merge/deployment.
+
 ## Validation scope
 
 Connection unit/SQLx tests prove their named metadata, authority and lifecycle

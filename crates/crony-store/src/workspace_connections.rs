@@ -199,7 +199,7 @@ fn needs_machine_authority(action: &WorkspaceSetupAction) -> bool {
     }
 }
 
-async fn actor_role_tx(
+pub(super) async fn actor_role_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     room_id: Uuid,
@@ -269,6 +269,20 @@ async fn connection_row_tx(
          WHERE connection.corp_id=$1 AND connection.id=$2{lock_clause}"
     )).bind(corp_id).bind(id).fetch_optional(&mut **tx).await?
         .context("connection was not found in this Corp")
+}
+
+/// Call only after acquiring the Factory work-item row. Historical claim replay
+/// checks current authority, not whether its provider or runner is ready.
+pub(super) async fn assert_connection_operator_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    actor_id: Uuid,
+    connection_id: Uuid,
+) -> Result<()> {
+    assert_mission_operator_tx(tx, corp_id, actor_id).await?;
+    let row = connection_row_tx(tx, corp_id, connection_id, true).await?;
+    actor_role_tx(tx, corp_id, row.get("room_id"), actor_id).await?;
+    Ok(())
 }
 
 fn map_connection(row: &sqlx::postgres::PgRow) -> Result<WorkspaceConnection> {

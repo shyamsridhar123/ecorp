@@ -93,6 +93,10 @@ pub(super) fn routes() -> Router<AppState> {
             post(github),
         )
         .route(
+            "/api/corps/{corp_id}/connections/{connection_id}",
+            get(get_connection),
+        )
+        .route(
             "/api/corps/{corp_id}/connections/{connection_id}/check",
             post(check),
         )
@@ -136,6 +140,37 @@ async fn list(
             .is_some_and(|runner| runner.corp_id == corp_id && runner.dispatch_ready);
     }
     Ok(Json(result))
+}
+
+/// A trusted controller can reuse the checked source without requiring another
+/// local checkout. The private native configuration/report never leaves this read.
+async fn get_connection(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, connection_id)): Path<(Uuid, Uuid)>,
+    Query(viewer): Query<Viewer>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        viewer.actor_id,
+        Permission::Operate,
+    )
+    .await?;
+    let (mut connection, _) = state
+        .store
+        .workspace_connection_settings(corp_id, actor, connection_id)
+        .await
+        .map_err(map_store_error)?;
+    connection.runner_connected = state
+        .runners
+        .get(&connection.runner_id)
+        .is_some_and(|runner| runner.corp_id == corp_id && runner.dispatch_ready);
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(connection),
+    ))
 }
 
 async fn finish(

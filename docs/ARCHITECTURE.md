@@ -219,6 +219,16 @@ accepted pins without requiring a new provider sign-in. Native final setup
 receipts survive reconnect and wait for a server acknowledgement before provider
 readiness becomes dispatchable. See [project connections](PROJECT_CONNECTIONS.md).
 
+Factory can persist the same optional `workspace_connection_id` in its immutable
+claim policy. New bound controller intake reads the existing checked source
+through a scoped connection lookup rather than requiring a second local checkout.
+Preflight uses the connection-aware planner and current connection-room admission;
+materialization reads the binding together with the claimed source and repeats
+admission. Every task must match the policy's exact connection, including its
+absence for legacy work. Recovery cannot change that binding or borrow unbound
+capabilities. The lookup returns the shared connection DTO, not its private native
+configuration, setup reports or credentials.
+
 A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
 Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
 materialization leave the mission in that held state. The existing authenticated launch endpoint

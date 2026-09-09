@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 mod workspace_connections;
 pub use workspace_connections::*;
+mod factory_connection;
+pub use factory_connection::factory_workspace_connection_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

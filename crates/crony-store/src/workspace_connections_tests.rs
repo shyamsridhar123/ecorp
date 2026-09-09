@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "factory_connection_tests.rs"]
+mod factory_connections;
+
 const PRIVATE_DIRECTORY: &str = "/issue198-private-path/project";
 const PRIVATE_LOGIN: &str = "issue198-private-account";
 const PRIVATE_CODE: &str = "ISSUE198-DEVICE-CODE";

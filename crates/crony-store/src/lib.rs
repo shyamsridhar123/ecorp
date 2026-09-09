@@ -11,8 +11,8 @@ use crony_domain::{
     PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
-    VerificationRequest, VerifierCheck, repository_relative_path_is_valid, write_scope_allows_path,
-    write_scope_is_valid,
+    VerificationRequest, VerifierCheck, factory_workspace_connection_id,
+    repository_relative_path_is_valid, write_scope_allows_path, write_scope_is_valid,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -3006,7 +3006,17 @@ impl PgStore {
 
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
-        mission_room_for_actor_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        if workspace_connections::plan_room_tx(
+            &mut tx,
+            input.corp_id,
+            input.actor_id,
+            &constrained_plan,
+        )
+        .await?
+        .is_none()
+        {
+            mission_room_for_actor_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        }
         tx.commit().await?;
         Ok(constrained_plan)
     }
@@ -3019,6 +3029,8 @@ impl PgStore {
         let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
         let lease_seconds = validate_factory_lease_seconds(input.lease_seconds)?;
         let policy = normalize_factory_policy(input.policy)?;
+        let workspace_connection_id =
+            factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
         let operation_request = json!({
             "source_project_owner": &source.project_owner,
             "source_project_number": source.project_number,
@@ -3064,7 +3076,7 @@ impl PgStore {
                 &operation_request,
             )?;
             let (work_item, current_token) =
-                factory_work_item_tx(&mut tx, input.corp_id, operation.work_item_id, false)
+                factory_work_item_tx(&mut tx, input.corp_id, operation.work_item_id, true)
                     .await?
                     .context("idempotent factory claim references a missing work item")?;
             ensure_factory_source_matches(&work_item, &source)?;
@@ -3072,6 +3084,15 @@ impl PgStore {
                 return Err(anyhow!(
                     "factory idempotency key was reused with a different policy snapshot"
                 ));
+            }
+            if let Some(connection_id) = workspace_connection_id {
+                workspace_connections::assert_connection_operator_tx(
+                    &mut tx,
+                    input.corp_id,
+                    input.actor_id,
+                    connection_id,
+                )
+                .await?;
             }
             let claim_token =
                 replayable_factory_claim_token(&work_item, current_token, &operation, now);
@@ -3125,6 +3146,15 @@ impl PgStore {
                         return Err(anyhow!(
                             "factory recovery policy does not match the persisted policy snapshot"
                         ));
+                    }
+                    if let Some(connection_id) = workspace_connection_id {
+                        workspace_connections::assert_connection_operator_tx(
+                            &mut tx,
+                            input.corp_id,
+                            input.actor_id,
+                            connection_id,
+                        )
+                        .await?;
                     }
                     record_factory_operation_tx(
                         &mut tx,
@@ -3265,6 +3295,18 @@ impl PgStore {
             (map_factory_work_item(row)?, "factory.work_item_claimed")
         };
 
+        // Lock the Factory row before the connection, including new claims.
+        // An authorization failure rolls back the insert/reclaim before any
+        // operation or event can be committed.
+        if let Some(connection_id) = workspace_connection_id {
+            workspace_connections::assert_connection_operator_tx(
+                &mut tx,
+                input.corp_id,
+                input.actor_id,
+                connection_id,
+            )
+            .await?;
+        }
         record_factory_operation_tx(
             &mut tx,
             NewFactoryOperation {
@@ -5602,7 +5644,7 @@ impl PgStore {
             .mission_id
             .context("idempotent factory materialization has no mission linkage")?;
         let (ids, strategy) =
-            factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+            factory_mission_details_tx(&mut tx, input.corp_id, mission_id, input.actor_id).await?;
         tx.commit().await?;
         Ok(Some(FactoryMissionOutcome {
             work_item,
@@ -5657,7 +5699,8 @@ impl PgStore {
                 .mission_id
                 .context("idempotent factory materialization has no mission linkage")?;
             let (ids, strategy) =
-                factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+                factory_mission_details_tx(&mut tx, input.corp_id, mission_id, input.actor_id)
+                    .await?;
             tx.commit().await?;
             return Ok(FactoryMissionOutcome {
                 work_item,
@@ -11626,6 +11669,17 @@ fn validate_factory_plan_against_policy_parts(
     policy: &Value,
     plan: &TaskGraphPlan,
 ) -> Result<()> {
+    let connection_id = factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
+    if let Some(task) = plan
+        .tasks
+        .iter()
+        .find(|task| task.contract.workspace_connection_id != connection_id)
+    {
+        return Err(anyhow!(
+            "factory task {} must preserve the claimed workspace connection",
+            task.key
+        ));
+    }
     let policy = policy
         .as_object()
         .context("factory policy snapshot must be a JSON object")?;
@@ -12076,9 +12130,16 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         Value::Object(_) => policy,
         _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
     };
+    let connection_id = factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
     let policy_object = policy
         .as_object_mut()
         .context("factory policy snapshot must be a JSON object")?;
+    if let Some(connection_id) = connection_id {
+        policy_object.insert(
+            "workspace_connection_id".to_owned(),
+            Value::String(connection_id.to_string()),
+        );
+    }
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
     if let Some(publication) = policy_object.get("publication") {
@@ -13249,14 +13310,20 @@ async fn factory_mission_details_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     mission_id: Uuid,
+    actor_id: Uuid,
 ) -> Result<(MissionPlanIds, String)> {
-    let strategy: Option<String> =
-        sqlx::query_scalar("SELECT strategy FROM missions WHERE id = $1 AND corp_id = $2")
+    assert_mission_operator_tx(tx, corp_id, actor_id).await?;
+    let mission =
+        sqlx::query("SELECT strategy, room_id FROM missions WHERE id = $1 AND corp_id = $2")
             .bind(mission_id)
             .bind(corp_id)
             .fetch_optional(&mut **tx)
-            .await?;
-    let strategy = strategy.context("factory mission linkage references a missing mission")?;
+            .await?
+            .context("factory mission linkage references a missing mission")?;
+    // Both materialization replay paths are historical reads. Retain current
+    // human/room authority without depending on provider or runner readiness.
+    workspace_connections::actor_role_tx(tx, corp_id, mission.get("room_id"), actor_id).await?;
+    let strategy = mission.get("strategy");
     let task_ids = sqlx::query_scalar(
         "SELECT id FROM tasks WHERE mission_id = $1 AND corp_id = $2 ORDER BY created_at, id",
     )
@@ -16649,6 +16716,48 @@ mod tests {
             }],
         };
         (work_item, plan)
+    }
+
+    #[test]
+    fn issue204_factory_policy_rejects_missing_substituted_and_unclaimed_connections() {
+        let (mut item, mut plan) = factory_policy_plan(None, None);
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        let id = Uuid::new_v4();
+        item.policy["workspace_connection_id"] = json!(id);
+        assert!(
+            validate_factory_plan_against_policy(&item, &plan)
+                .unwrap_err()
+                .to_string()
+                .contains("claimed workspace connection")
+        );
+        plan.tasks[0].contract.workspace_connection_id = Some(id);
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        plan.tasks[0].contract.workspace_connection_id = Some(Uuid::new_v4());
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        item.policy
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_connection_id");
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+    }
+
+    #[test]
+    fn issue204_policy_normalization_rejects_bad_binding_and_canonicalizes_uuid() {
+        let (item, _) = factory_policy_plan(None, None);
+        let legacy = normalize_factory_policy(item.policy.clone()).unwrap();
+        assert!(legacy.get("workspace_connection_id").is_none());
+        let id = Uuid::new_v4();
+        let mut policy = item.policy.clone();
+        policy["workspace_connection_id"] = json!(id.to_string().to_uppercase());
+        assert_eq!(
+            normalize_factory_policy(policy).unwrap()["workspace_connection_id"],
+            json!(id)
+        );
+        for value in [json!("invalid"), json!(Uuid::nil()), json!(7), json!({})] {
+            let mut policy = item.policy.clone();
+            policy["workspace_connection_id"] = value;
+            assert!(normalize_factory_policy(policy).is_err());
+        }
     }
 
     #[test]
