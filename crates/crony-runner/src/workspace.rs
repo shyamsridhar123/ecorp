@@ -56,6 +56,27 @@ pub struct WorkspaceCleanup {
 
 impl WorkspaceManager {
     pub async fn initialize(root: PathBuf, repository: PathBuf, base_ref: String) -> Result<Self> {
+        Self::initialize_inner(root, repository, base_ref, None).await
+    }
+
+    /// Restore a source snapshot without resolving its symbolic ref's current tip.
+    /// Use `pinned` for additional snapshots that must share this manager's Git lock.
+    pub async fn initialize_pinned(
+        root: PathBuf,
+        repository: PathBuf,
+        base_ref: String,
+        base_commit: String,
+    ) -> Result<Self> {
+        validate_commit(&base_commit)?;
+        Self::initialize_inner(root, repository, base_ref, Some(base_commit)).await
+    }
+
+    async fn initialize_inner(
+        root: PathBuf,
+        repository: PathBuf,
+        base_ref: String,
+        base_commit: Option<String>,
+    ) -> Result<Self> {
         validate_ref(&base_ref)?;
         tokio::fs::create_dir_all(&root)
             .await
@@ -88,7 +109,10 @@ impl WorkspaceManager {
             .git_success(&manager.repository, &["rev-parse", "--git-dir"])
             .await
             .context("configured source path is not a Git repository")?;
-        manager.base_commit = manager.resolve_base_commit().await?;
+        manager.base_commit = match base_commit {
+            Some(commit) => manager.resolve_pinned_commit(&commit).await?,
+            None => manager.resolve_base_commit().await?,
+        };
         manager.repository_identity = manager
             .git_text(
                 &manager.repository,
@@ -99,6 +123,18 @@ impl WorkspaceManager {
             .and_then(|remote| parse_github_repository_identity(&remote))
             .or_else(|| Some(local_repository_identity(&manager.repository)));
         Ok(manager)
+    }
+
+    /// Select an exact source snapshot while sharing repository ownership and Git serialization.
+    /// Pass its commit to `prepare`; an unassigned prepare still follows the live base ref.
+    pub async fn pinned(&self, base_ref: &str, base_commit: &str) -> Result<Self> {
+        validate_ref(base_ref)?;
+        let base_commit = self.resolve_pinned_commit(base_commit).await?;
+        Ok(Self {
+            base_ref: base_ref.to_owned(),
+            base_commit,
+            ..self.clone()
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -608,6 +644,29 @@ impl WorkspaceManager {
         .await
         .map(|value| value.trim().to_owned())
         .with_context(|| format!("resolve base ref {}", self.base_ref))
+    }
+
+    async fn resolve_pinned_commit(&self, base_commit: &str) -> Result<String> {
+        validate_commit(base_commit)?;
+        let _guard = self.git_lock.lock().await;
+        let resolved = self
+            .git_text(
+                &self.repository,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{base_commit}^{{commit}}"),
+                ],
+            )
+            .await
+            .with_context(|| format!("resolve pinned base commit {base_commit}"))?;
+        let resolved = resolved.trim();
+        if !resolved.eq_ignore_ascii_case(base_commit) {
+            return Err(anyhow!(
+                "pinned base commit mismatch: expected {base_commit}, resolved {resolved}"
+            ));
+        }
+        Ok(resolved.to_ascii_lowercase())
     }
 
     async fn git_success(&self, cwd: &Path, args: &[&str]) -> Result<()> {
@@ -1354,6 +1413,15 @@ fn validate_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_commit(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "Git base commit must be a full hexadecimal object ID"
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_descendant(root: &Path, candidate: &Path) -> Result<()> {
     if candidate == root || !candidate.starts_with(root) {
         return Err(anyhow!(
@@ -1398,6 +1466,11 @@ fn preserved(detail: String) -> WorkspaceCleanup {
 
 async fn run_git(cwd: &Path, args: &[OsString]) -> Result<Output> {
     let mut command = Command::new("git");
+    // Git discovers worktree administrative paths before repository-local
+    // configuration is available. Apply native Windows long-path support to
+    // this invocation, without modifying user or source-repository settings.
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
     command
         .args(args)
         .current_dir(cwd)
@@ -2309,6 +2382,295 @@ mod tests {
         cleanup_fixture(&root, &repository);
     }
 
+    #[tokio::test]
+    async fn initialize_pinned_retains_commit_after_ref_advances_or_disappears() {
+        let (root, repository, managed) = fixture();
+        let original =
+            WorkspaceManager::initialize(managed.clone(), repository.clone(), "main".to_owned())
+                .await
+                .expect("initialize manager");
+        let original_commit = original.base_commit().to_owned();
+        std::fs::write(repository.join("README.md"), "# advanced source\n").unwrap();
+        command(&repository, &[OsStr::new("add"), OsStr::new("README.md")]);
+        command(
+            &repository,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("user.name=ECorp Test"),
+                OsStr::new("-c"),
+                OsStr::new("user.email=crony@example.invalid"),
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("advance saved branch"),
+            ],
+        );
+        let advanced_commit = original.resolve_base_commit().await.unwrap();
+        assert_ne!(advanced_commit, original_commit);
+        let worktrees_before = original
+            .git_text(&repository, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+
+        let pinned = WorkspaceManager::initialize_pinned(
+            managed.clone(),
+            repository.clone(),
+            "main".to_owned(),
+            original_commit.clone(),
+        )
+        .await
+        .expect("restore the original commit, not the current main tip");
+        assert_eq!(pinned.base_ref(), "main");
+        assert_eq!(pinned.base_commit(), original_commit);
+        assert_eq!(pinned.repository_identity(), original.repository_identity());
+        assert_eq!(
+            pinned
+                .git_text(&repository, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap(),
+            worktrees_before
+        );
+
+        command(
+            &repository,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("-m"),
+                OsStr::new("advanced-main"),
+            ],
+        );
+        let restored = WorkspaceManager::initialize_pinned(
+            managed,
+            repository.clone(),
+            "main".to_owned(),
+            original_commit.clone(),
+        )
+        .await
+        .expect("restoring a pin does not require its historical ref to exist");
+        let workspace = restored
+            .prepare(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(restored.base_commit()),
+                None,
+            )
+            .await
+            .expect("prepare on the exact restored commit");
+        assert_eq!(workspace.base_ref, "main");
+        assert_eq!(workspace.base_commit, original_commit);
+        assert_eq!(
+            restored.head_commit(&workspace).await.unwrap(),
+            original_commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("README.md"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "# source\n"
+        );
+        assert_eq!(
+            restored
+                .git_text(&repository, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim(),
+            advanced_commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("README.md")).unwrap(),
+            "# advanced source\n"
+        );
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn pinned_snapshots_share_identity_lock_and_preserved_dirty_worktrees() {
+        let (root, repository, managed) = fixture();
+        let original = WorkspaceManager::initialize(managed, repository.clone(), "main".to_owned())
+            .await
+            .expect("initialize manager");
+        let original_commit = original.base_commit().to_owned();
+        let task = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let workspace = original
+            .prepare(task, run, Some(&original_commit), None)
+            .await
+            .unwrap();
+        std::fs::write(workspace.path.join("README.md"), "unfinished work\n").unwrap();
+        std::fs::write(workspace.path.join("untracked.txt"), "retain untracked\n").unwrap();
+        std::fs::write(workspace.path.join("valuable.log"), "retain ignored\n").unwrap();
+        let fingerprint = original.fingerprint(&workspace).await.unwrap();
+        std::fs::write(repository.join("README.md"), "# advanced source\n").unwrap();
+        command(&repository, &[OsStr::new("add"), OsStr::new("README.md")]);
+        command(
+            &repository,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("user.name=ECorp Test"),
+                OsStr::new("-c"),
+                OsStr::new("user.email=crony@example.invalid"),
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("advance saved branch"),
+            ],
+        );
+        let advanced_commit = original.resolve_base_commit().await.unwrap();
+        command(
+            &repository,
+            &[
+                OsStr::new("remote"),
+                OsStr::new("set-url"),
+                OsStr::new("origin"),
+                OsStr::new("https://github.com/other/repository.git"),
+            ],
+        );
+        let worktrees_before = original
+            .git_text(&repository, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        let refreshed = original.pinned("main", &advanced_commit).await.unwrap();
+        let retained = refreshed.pinned("main", &original_commit).await.unwrap();
+        for snapshot in [&refreshed, &retained] {
+            assert_eq!(snapshot.root(), original.root());
+            assert_eq!(snapshot.repository(), original.repository());
+            assert_eq!(
+                snapshot.repository_identity(),
+                original.repository_identity()
+            );
+            assert_eq!(snapshot.worktrees_root, original.worktrees_root);
+            assert!(Arc::ptr_eq(&snapshot.git_lock, &original.git_lock));
+        }
+        let guard = original.git_lock.lock().await;
+        assert!(retained.git_lock.try_lock().is_err());
+        drop(guard);
+        assert!(retained.git_lock.try_lock().is_ok());
+        assert_eq!(original.base_commit(), original_commit);
+        assert_eq!(refreshed.base_commit(), advanced_commit);
+        retained
+            .verify_source_identity(
+                original.repository_identity(),
+                Some("main"),
+                Some(&original_commit),
+            )
+            .expect("the old run still resolves its original source");
+        assert!(
+            refreshed
+                .verify_source_identity(
+                    original.repository_identity(),
+                    Some("main"),
+                    Some(&original_commit),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            retained
+                .git_text(&repository, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap(),
+            worktrees_before
+        );
+        let resumed = retained
+            .prepare(task, run, Some(&original_commit), Some(&original_commit))
+            .await
+            .expect("resume the exact dirty worktree after connection refresh");
+        assert_eq!(resumed.path, workspace.path);
+        assert_eq!(resumed.branch, workspace.branch);
+        assert_eq!(resumed.base_commit, original_commit);
+        assert_eq!(retained.fingerprint(&resumed).await.unwrap(), fingerprint);
+        let cleanup = retained.finalize(&resumed).await.unwrap();
+        assert_eq!(cleanup.disposition, WorkspaceDisposition::Preserved);
+        assert_eq!(cleanup.dirty, Some(true));
+        assert_eq!(retained.fingerprint(&resumed).await.unwrap(), fingerprint);
+        assert_eq!(
+            std::fs::read_to_string(repository.join("README.md")).unwrap(),
+            "# advanced source\n"
+        );
+        cleanup_fixture(&root, &repository);
+    }
+
+    #[tokio::test]
+    async fn pinned_sources_reject_invalid_unavailable_and_non_commit_ids() {
+        let (root, repository, managed) = fixture();
+        let manager =
+            WorkspaceManager::initialize(managed.clone(), repository.clone(), "main".to_owned())
+                .await
+                .unwrap();
+        let original_commit = manager.base_commit().to_owned();
+        command(
+            &repository,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("user.name=ECorp Test"),
+                OsStr::new("-c"),
+                OsStr::new("user.email=crony@example.invalid"),
+                OsStr::new("-c"),
+                OsStr::new("tag.gpgSign=false"),
+                OsStr::new("tag"),
+                OsStr::new("-a"),
+                OsStr::new("commit-alias"),
+                OsStr::new("-m"),
+                OsStr::new("tag object is not the exact commit"),
+            ],
+        );
+        let tag = manager
+            .git_text(&repository, &["rev-parse", "refs/tags/commit-alias"])
+            .await
+            .unwrap();
+        let tree = manager
+            .git_text(&repository, &["rev-parse", "HEAD^{tree}"])
+            .await
+            .unwrap();
+        let worktrees_before = manager
+            .git_text(&repository, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        for commit in [
+            String::new(),
+            "HEAD".to_owned(),
+            original_commit[..12].to_owned(),
+            format!("{original_commit}^{{commit}}"),
+            "g".repeat(original_commit.len()),
+            "0".repeat(original_commit.len()),
+            tag.trim().to_owned(),
+            tree.trim().to_owned(),
+        ] {
+            assert!(manager.pinned("main", &commit).await.is_err(), "{commit}");
+            assert!(
+                WorkspaceManager::initialize_pinned(
+                    managed.clone(),
+                    repository.clone(),
+                    "main".to_owned(),
+                    commit.clone(),
+                )
+                .await
+                .is_err(),
+                "{commit}"
+            );
+        }
+        for base_ref in ["", "-main", "main:other", "main\n"] {
+            assert!(manager.pinned(base_ref, &original_commit).await.is_err());
+            assert!(
+                WorkspaceManager::initialize_pinned(
+                    managed.clone(),
+                    repository.clone(),
+                    base_ref.to_owned(),
+                    original_commit.clone(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(manager.base_ref(), "main");
+        assert_eq!(manager.base_commit(), original_commit);
+        assert_eq!(
+            manager
+                .git_text(&repository, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap(),
+            worktrees_before
+        );
+        cleanup_fixture(&root, &repository);
+    }
+
     #[test]
     fn github_remote_urls_normalize_to_repository_identity() {
         for remote in [
@@ -2349,6 +2711,10 @@ mod tests {
         assert!(validate_ref("release/2026-08-29").is_ok());
         assert!(validate_ref("-dangerous").is_err());
         assert!(validate_ref("main:evil").is_err());
+        assert!(validate_commit(&"a".repeat(40)).is_ok());
+        assert!(validate_commit(&"a".repeat(64)).is_ok());
+        assert!(validate_commit(&"a".repeat(39)).is_err());
+        assert!(validate_commit(&"a".repeat(63)).is_err());
         let root = PathBuf::from("safe").join("root");
         assert!(ensure_descendant(&root, &root.join("child")).is_ok());
         assert!(ensure_descendant(&root, &root).is_err());

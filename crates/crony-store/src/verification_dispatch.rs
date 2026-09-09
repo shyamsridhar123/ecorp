@@ -68,6 +68,7 @@ impl PgStore {
                  AND source.source_repository IS NOT DISTINCT FROM run.source_repository
                  AND source.source_base_ref IS NOT DISTINCT FROM run.source_base_ref
                  AND source.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
+                 AND source.workspace_connection_id IS NOT DISTINCT FROM run.workspace_connection_id
                 WHERE stored.id=$1 AND stored.corp_id=$2
                   AND stored.run_id=$3 AND stored.runner_id=$4
                   AND stored.command_kind='factory_verification_recovery'
@@ -99,12 +100,16 @@ impl PgStore {
                       IS NOT DISTINCT FROM run.source_base_ref
                   AND stored.payload->>'source_base_commit'
                       IS NOT DISTINCT FROM run.source_base_commit
+                  AND stored.payload->>'workspace_connection_id'
+                      IS NOT DISTINCT FROM run.workspace_connection_id::text
                   AND task.contract->>'source_repository'
                       IS NOT DISTINCT FROM run.source_repository
                   AND task.contract->>'source_base_ref'
                       IS NOT DISTINCT FROM run.source_base_ref
                   AND task.contract->>'source_base_commit'
                       IS NOT DISTINCT FROM run.source_base_commit
+                  AND task.contract->>'workspace_connection_id'
+                      IS NOT DISTINCT FROM run.workspace_connection_id::text
                   AND stored.payload->>'workspace_base_commit'=source.workspace_base_commit
                   AND stored.payload->>'expected_workspace_fingerprint'=source.workspace_fingerprint
                   AND stored.payload->>'expected_workspace_fingerprint'

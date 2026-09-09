@@ -30,11 +30,17 @@ mod publication;
 mod staffing;
 mod terminal_accounting;
 mod verification_dispatch;
+mod workspace_connections;
+pub use workspace_connections::{
+    CreateWorkspaceConnectionInput, WorkspaceSetupInput, WorkspaceSetupMutation,
+};
 
 #[cfg(test)]
 mod budget_checkpoint_tests;
 #[cfg(test)]
 mod factory_recovery_loss_tests;
+#[cfg(test)]
+mod workspace_connections_tests;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
@@ -467,6 +473,7 @@ pub struct LaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub verification_policy: VerificationPolicy,
     pub write_scope: Vec<String>,
     pub deliverable: Option<DeliverableSpec>,
@@ -483,6 +490,7 @@ pub struct SchedulableTask {
     pub required_source_repository: Option<String>,
     pub required_source_base_ref: Option<String>,
     pub required_source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +513,7 @@ pub struct ResumeLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_base_commit: String,
     pub verification_policy: VerificationPolicy,
     pub write_scope: Vec<String>,
@@ -1645,7 +1654,7 @@ impl PgStore {
                    r.input_tokens, r.output_tokens, r.cost_microusd,
                    r.budget_tokens_limit, r.budget_cost_microusd_limit, r.breaker_stage,
                    r.no_progress_events, r.repeated_tool_count,
-                   r.source_repository, r.source_base_ref, r.source_base_commit,
+                   r.workspace_connection_id, r.source_repository, r.source_base_ref, r.source_base_commit,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
                    r.workspace_fingerprint, r.execution_mode,
@@ -3862,7 +3871,8 @@ impl PgStore {
                    run.workspace_disposition,
                    run.workspace_base_commit, run.breaker_stage,
                    run.verification_status AS source_verification_status,
-                   run.source_repository, run.source_base_ref, run.source_base_commit
+                   run.source_repository, run.source_base_ref, run.source_base_commit,
+                   run.workspace_connection_id
             FROM missions mission
             JOIN tasks task ON task.mission_id = mission.id
             JOIN runs run ON run.task_id = task.id
@@ -3971,6 +3981,7 @@ impl PgStore {
             "source_repository": row.get::<Option<String>, _>("source_repository"),
             "source_base_ref": row.get::<Option<String>, _>("source_base_ref"),
             "source_base_commit": row.get::<Option<String>, _>("source_base_commit"),
+            "workspace_connection_id": row.get::<Option<Uuid>, _>("workspace_connection_id"),
             "workspace_base_commit": workspace_base_commit,
             "expected_head_commit": expected_head_commit,
         });
@@ -5028,6 +5039,8 @@ impl PgStore {
         .bind(&reused_artifact_media_type)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, input.corp_id, run_id).await?;
         let queued_messages = if input.mode == FactoryVerificationRecoveryMode::SourceCorrection {
             reserve_queued_messages_tx(&mut tx, input.corp_id, row.get("agent_id"), run_id).await?
         } else {
@@ -5191,6 +5204,7 @@ impl PgStore {
             "source_repository": contract.source_repository,
             "source_base_ref": contract.source_base_ref,
             "source_base_commit": contract.source_base_commit,
+            "workspace_connection_id": workspace_connection_id,
             "workspace_base_commit": workspace_base_commit,
             "expected_workspace_fingerprint": input.expected_workspace_fingerprint,
             "expected_head_commit": input.expected_head_commit,
@@ -5330,6 +5344,7 @@ impl PgStore {
             contract.source_repository.clone(),
             contract.source_base_ref.clone(),
             contract.source_base_commit.clone(),
+            workspace_connection_id,
             workspace_base_commit,
             input.expected_workspace_fingerprint,
             input.expected_head_commit,
@@ -5896,7 +5911,8 @@ impl PgStore {
                    t.contract->>'reasoning_effort' AS required_reasoning_effort,
                    t.contract->>'source_repository' AS required_source_repository,
                    t.contract->>'source_base_ref' AS required_source_base_ref,
-                   t.contract->>'source_base_commit' AS required_source_base_commit
+                   t.contract->>'source_base_commit' AS required_source_base_commit,
+                   (t.contract->>'workspace_connection_id')::uuid AS workspace_connection_id
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -5941,6 +5957,7 @@ impl PgStore {
                 required_source_repository: row.get("required_source_repository"),
                 required_source_base_ref: row.get("required_source_base_ref"),
                 required_source_base_commit: row.get("required_source_base_commit"),
+                workspace_connection_id: row.get("workspace_connection_id"),
             })
         })
         .collect()
@@ -6104,6 +6121,8 @@ impl PgStore {
         .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, corp_id, run_id).await?;
         let queued_messages =
             reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
         append_queued_messages(&mut task_prompt, &queued_messages);
@@ -6175,6 +6194,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
+                workspace_connection_id,
                 verification_policy,
                 write_scope: contract.write_scope,
                 deliverable: contract.deliverable,
@@ -6407,6 +6427,8 @@ impl PgStore {
         .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, corp_id, run_id).await?;
         let queued_messages =
             reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
@@ -6498,6 +6520,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
+                workspace_connection_id,
                 workspace_base_commit,
                 verification_policy,
                 write_scope: contract.write_scope,
@@ -11261,7 +11284,11 @@ async fn mission_creation_admission_tx(
     let description = normalize_mission_description(description)?;
     assert_mission_operator_tx(tx, corp_id, requested_by).await?;
     staffing::validate_staffing(plan)?;
-    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
+    let room_id = match workspace_connections::plan_room_tx(tx, corp_id, requested_by, plan).await?
+    {
+        Some(room_id) => room_id,
+        None => mission_room_for_actor_tx(tx, corp_id, requested_by).await?,
+    };
     Ok((title, description, room_id))
 }
 
@@ -12630,6 +12657,7 @@ fn factory_verification_recovery_launch_from_parts(
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    workspace_connection_id: Option<Uuid>,
     workspace_base_commit: String,
     expected_workspace_fingerprint: String,
     expected_head_commit: Option<String>,
@@ -12665,6 +12693,7 @@ fn factory_verification_recovery_launch_from_parts(
                 source_repository,
                 source_base_ref,
                 source_base_commit,
+                workspace_connection_id,
                 workspace_base_commit,
                 verification_policy,
                 write_scope,
@@ -12689,6 +12718,7 @@ fn factory_verification_recovery_launch_from_parts(
                 source_repository,
                 source_base_ref,
                 source_base_commit,
+                workspace_connection_id,
                 workspace_base_commit,
                 expected_workspace_fingerprint,
                 expected_head_commit,
@@ -12722,7 +12752,7 @@ async fn factory_verification_recovery_launch_tx(
                     AS provider_session_id,
                 run.workspace_run_id,
                run.model, run.reasoning_effort, run.source_repository,
-               run.source_base_ref, run.source_base_commit,
+               run.source_base_ref, run.source_base_commit, run.workspace_connection_id,
                source.workspace_base_commit,
                authorized.request->>'expected_workspace_fingerprint' AS workspace_fingerprint,
                source.artifact_path, source.artifact_sha256,
@@ -12825,6 +12855,7 @@ async fn factory_verification_recovery_launch_tx(
         row.get("source_repository"),
         row.get("source_base_ref"),
         row.get("source_base_commit"),
+        row.get("workspace_connection_id"),
         row.get::<Option<String>, _>("workspace_base_commit")
             .context("factory recovery replay source omitted workspace base commit")?,
         row.get::<Option<String>, _>("workspace_fingerprint")
@@ -13316,6 +13347,7 @@ pub struct VerifyLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_base_commit: String,
     pub expected_workspace_fingerprint: String,
     pub expected_head_commit: Option<String>,
@@ -14539,6 +14571,7 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         source_repository: row.get("source_repository"),
         source_base_ref: row.get("source_base_ref"),
         source_base_commit: row.get("source_base_commit"),
+        workspace_connection_id: row.get("workspace_connection_id"),
         workspace_path: row.get("workspace_path"),
         workspace_branch: row.get("workspace_branch"),
         workspace_base_ref: row.get("workspace_base_ref"),
@@ -16578,6 +16611,7 @@ mod tests {
                 key: "deliver".to_owned(),
                 title: "Deliver".to_owned(),
                 contract: TaskContract {
+                    workspace_connection_id: None,
                     objective: "Deliver the issue".to_owned(),
                     expected_output: "A verified change".to_owned(),
                     source_repository: Some("owner/repo".to_owned()),

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod workspace_connections;
+pub use workspace_connections::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
@@ -475,6 +478,8 @@ pub struct TaskContract {
     pub source_base_ref: Option<String>,
     #[serde(default)]
     pub source_base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
     pub acceptance_tests: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub prohibited_actions: Vec<String>,
@@ -795,6 +800,8 @@ pub struct Run {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
     pub workspace_base_ref: Option<String>,

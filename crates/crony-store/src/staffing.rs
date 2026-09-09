@@ -550,6 +550,7 @@ mod tests {
                     depth: i32::from(index == 3),
                     max_attempts: 2,
                     contract: TaskContract {
+                        workspace_connection_id: None,
                         objective: format!("Write {key}.md"),
                         expected_output: format!("{key}.md"),
                         source_repository: Some("issue171/isolated-source".to_owned()),

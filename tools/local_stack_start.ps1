@@ -111,6 +111,9 @@ $sourceRef = [string](Setting 'CRONY_SOURCE_BASE_REF' 'source_base_ref' 'HEAD')
 $runnerWorkspace = [IO.Path]::GetFullPath([string](Setting 'CRONY_RUNNER_WORKSPACE' 'runner_workspace' (Join-Path $output 'runner')))
 $copilotHome = [IO.Path]::GetFullPath([string](Setting 'CRONY_COPILOT_HOME' 'copilot_home' (Join-Path $runnerWorkspace 'copilot-home')))
 $runnerId = [string](Setting 'CRONY_RUNNER_ID' 'runner_id' 'runner-local')
+$connectionsDirectory = [string](Setting 'CRONY_CONNECTIONS_DIRECTORY' 'connections_directory' '')
+$repositoryRoots = [string](Setting 'CRONY_REPOSITORY_ROOTS' 'repository_roots' '')
+$githubCommand = [string](Setting 'CRONY_GITHUB_COMMAND' 'github_command' 'gh')
 $watchSetting = [string](Setting 'ECORP_FACTORY_WATCH' 'factory_enabled' '0')
 if ($watchSetting -notin @('0','1','False','True')) { throw 'ECORP_FACTORY_WATCH must be 0 or 1.' }
 $factoryEnabled = $watchSetting -in @('1','True')
@@ -147,6 +150,7 @@ $configuration = @{
     server_port=$serverPortValue; web_port=$webPortValue
     source_repository=$source; source_base_ref=$sourceRef; runner_workspace=$runnerWorkspace; runner_id=$runnerId
     copilot_home=$copilotHome
+    connections_directory=$connectionsDirectory; repository_roots=$repositoryRoots; github_command=$githubCommand
     factory_enabled=$factoryEnabled; factory_adapter=$factory.adapter
     factory_budget_tokens=$factory.budget_tokens; factory_budget_cost_microusd=$factory.budget_cost_microusd
 }
@@ -327,6 +331,9 @@ $runnerEnvironment = Explicit-Environment @('CRONY_COPILOT_CLI_PATH','CRONY_COPI
     'CRONY_COPILOT_USE_LOGGED_IN_USER','CRONY_COPILOT_FIXTURE','CRONY_COPILOT_LOG_LEVEL',
     'CRONY_CODEX_COMMAND','CRONY_CLAUDE_COMMAND','CRONY_OPENCODE_COMMAND','CRONY_PLAYWRIGHT_MODULE','RUST_LOG')
 $runnerEnvironment.CRONY_COPILOT_HOME = $copilotHome
+$runnerEnvironment.CRONY_GITHUB_COMMAND = $githubCommand
+if ($connectionsDirectory) { $runnerEnvironment.CRONY_CONNECTIONS_DIRECTORY = $connectionsDirectory }
+if ($repositoryRoots) { $runnerEnvironment.CRONY_REPOSITORY_ROOTS = $repositoryRoots }
 $runnerArguments = @('--server-ws',"$($serverUrl.Replace('http:','ws:'))/ws/runner",
     '--runner-id',$runnerId,'--corp-id',$state.corp_id,'--credential-file',$credential,
     '--enrollment-token-file',$enrollment,'--workspace',$runnerWorkspace,

@@ -1,4 +1,5 @@
 mod adapter;
+mod connections;
 mod deliverable;
 mod source_checkpoint;
 mod verifier;
@@ -151,6 +152,19 @@ struct Args {
 
     #[arg(long, env = "CRONY_COPILOT_FIXTURE", default_value_t = false)]
     copilot_fixture: bool,
+
+    #[arg(long, env = "CRONY_CONNECTIONS_DIRECTORY")]
+    connections_directory: Option<PathBuf>,
+
+    #[arg(
+        long = "repository-root",
+        env = "CRONY_REPOSITORY_ROOTS",
+        value_delimiter = ';'
+    )]
+    repository_roots: Vec<PathBuf>,
+
+    #[arg(long, env = "CRONY_GITHUB_COMMAND", default_value = "gh")]
+    github_command: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +185,7 @@ struct Assignment {
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    workspace_connection_id: Option<Uuid>,
     resume_workspace_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
     write_scope: Vec<String>,
@@ -327,6 +342,29 @@ fn default_provider_command(name: &str) -> PathBuf {
     }
 }
 
+fn connections_directory(args: &Args) -> Result<PathBuf> {
+    if let Some(directory) = &args.connections_directory {
+        return Ok(directory.clone());
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+    }
+    .context("configure CRONY_CONNECTIONS_DIRECTORY outside the source repositories")?;
+    let namespace = hex::encode(sha2::Sha256::digest(
+        format!("{}|{}|{}", args.server_ws, args.corp_id, args.runner_id).as_bytes(),
+    ));
+    Ok(base
+        .join("ECorp")
+        .join("connections")
+        .join(&namespace[..24]))
+}
+
 fn copilot_config(args: &Args) -> Result<CopilotSdkConfig> {
     if args.copilot_runtime_url.is_some() && args.copilot_cli_path.is_some() {
         return Err(anyhow!(
@@ -376,6 +414,17 @@ struct OutboundState {
 }
 
 impl OutboundBus {
+    fn send_live(&self, mut message: RunnerToServer) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let (Some(connection), Some(epoch)) = (&state.connection, state.connection_epoch) else {
+            return false;
+        };
+        bind_connection_epoch(&mut message, epoch);
+        connection.send(message).is_ok()
+    }
+
     fn attach(&self, connection: mpsc::UnboundedSender<RunnerToServer>, connection_epoch: Uuid) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -434,6 +483,18 @@ fn bind_connection_epoch(message: &mut RunnerToServer, connection_epoch: Uuid) {
         | RunnerToServer::CommandAck {
             connection_epoch: event_epoch,
             ..
+        }
+        | RunnerToServer::WorkspaceSetupReport {
+            connection_epoch: event_epoch,
+            ..
+        }
+        | RunnerToServer::WorkspaceSignInAck {
+            connection_epoch: event_epoch,
+            ..
+        }
+        | RunnerToServer::CapabilitiesUpdated {
+            connection_epoch: event_epoch,
+            ..
         } => *event_epoch = connection_epoch,
         _ => {}
     }
@@ -465,7 +526,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(default_codex_command);
     let copilot_config = copilot_config(&args)?;
-    let adapters = Arc::new(AdapterRegistry::new(AdapterRegistryConfig {
+    let adapter_config = AdapterRegistryConfig {
         fake_agent_script: args.fake_agent_script.clone(),
         codex_command,
         codex_prefix_args: args.codex_command_args.clone(),
@@ -480,7 +541,33 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| default_provider_command("opencode")),
         opencode_prefix_args: args.opencode_command_args.clone(),
         copilot: copilot_config,
-    }));
+    };
+    let adapters = Arc::new(AdapterRegistry::new(adapter_config.clone()));
+    let connection_root = connections_directory(&args)?;
+    let connection_manager = match connections::ConnectionManager::new(
+        connections::ConnectionManagerConfig {
+            root: connection_root,
+            corp_id: args.corp_id,
+            runner_id: args.runner_id.clone(),
+            default_workspaces: workspaces.clone(),
+            default_adapters: adapters.clone(),
+            adapter_config,
+            github_command: args.github_command.clone(),
+            allowed_local_roots: if args.repository_roots.is_empty() {
+                vec![args.source_repository.clone()]
+            } else {
+                args.repository_roots.clone()
+            },
+        },
+    )
+    .await
+    {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(error) => {
+            warn!(%error, "new project setup needs operator-private storage; existing runner work remains available");
+            None
+        }
+    };
     loop {
         let delay = match run_connection(
             args.clone(),
@@ -489,6 +576,7 @@ async fn main() -> Result<()> {
             outbound.clone(),
             adapters.clone(),
             workspaces.clone(),
+            connection_manager.clone(),
         )
         .await
         {
@@ -509,6 +597,7 @@ async fn run_connection(
     outbound: OutboundBus,
     adapters: Arc<AdapterRegistry>,
     workspaces: Arc<WorkspaceManager>,
+    connection_manager: Option<Arc<connections::ConnectionManager>>,
 ) -> Result<Duration> {
     let credential = load_runner_credential(&args).await?;
     let (socket, _) = connect_async(&args.server_ws)
@@ -574,6 +663,7 @@ async fn run_connection(
             Vec::new()
         };
         capabilities.push(RunnerCapability {
+            workspace_connection_id: None,
             name: adapter.id().to_owned(),
             available,
             detail: Some(detail),
@@ -584,6 +674,7 @@ async fn run_connection(
         });
     }
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "workspace-isolation".to_owned(),
         available: true,
         detail: Some(format!(
@@ -600,6 +691,7 @@ async fn run_connection(
         source_base_commit: Some(workspaces.base_commit().to_owned()),
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "durable-control-v1".to_owned(),
         available: true,
         detail: Some(
@@ -612,6 +704,7 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "verification-artifact-transfer-v1".to_owned(),
         available: true,
         detail: Some(
@@ -624,6 +717,7 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "checkpoint-verification-v1".to_owned(),
         available: true,
         detail: Some(
@@ -636,6 +730,7 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "secret-delivery".to_owned(),
         available: true,
         detail: Some(
@@ -647,6 +742,25 @@ async fn run_connection(
         source_base_ref: None,
         source_base_commit: None,
     });
+    capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
+        name: "workspace-setup-v1".to_owned(),
+        available: connection_manager.is_some(),
+        detail: Some(if connection_manager.is_some() {
+            "Native repository and coding-agent connections with runner-private state".to_owned()
+        } else {
+            "Configure an operator-private connections directory outside source repositories"
+                .to_owned()
+        }),
+        models: vec![],
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    });
+    let base_capabilities = Arc::new(capabilities.clone());
+    if let Some(manager) = &connection_manager {
+        capabilities.extend(manager.capabilities());
+    }
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
@@ -664,6 +778,9 @@ async fn run_connection(
     let heartbeat_tx = out_tx.clone();
     let heartbeat_runner_id = args.runner_id.clone();
     let heartbeat_runs = active_runs.clone();
+    let heartbeat_connections = connection_manager.clone();
+    let heartbeat_outbound = outbound.clone();
+    let heartbeat_corp = args.corp_id;
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -678,11 +795,23 @@ async fn run_connection(
             {
                 break;
             }
+            if let Some(manager) = &heartbeat_connections {
+                for (operation_id, report) in manager.pending_reports() {
+                    heartbeat_outbound.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id: heartbeat_runner_id.clone(),
+                        corp_id: heartbeat_corp,
+                        connection_epoch,
+                        operation_id,
+                        report,
+                    });
+                }
+            }
         }
     });
 
     info!(runner_id = %args.runner_id, %connection_epoch, server = %args.server_ws, "runner connected");
     let mut reconnect_delay = Duration::from_secs(2);
+    let mut registration_accepted = false;
     'read: while let Some(message) = socket_rx.next().await {
         let text = match message {
             Ok(Message::Text(text)) => text,
@@ -696,6 +825,100 @@ async fn run_connection(
         let command: ServerToRunner =
             serde_json::from_str(text.as_str()).context("decode server command")?;
         match command {
+            ServerToRunner::WorkspaceSetup { command } => {
+                if !registration_accepted
+                    || command.corp_id != args.corp_id
+                    || command.runner_id != args.runner_id
+                {
+                    warn!("rejected setup outside this registered runner");
+                    continue;
+                }
+                let Some(manager) = connection_manager.clone() else {
+                    continue;
+                };
+                let output = outbound.clone();
+                let runner_id = args.runner_id.clone();
+                let corp_id = args.corp_id;
+                tokio::spawn(async move {
+                    let operation_id = command.operation_id;
+                    let connection_id = command.action.connection_id();
+                    let progress_output = output.clone();
+                    let progress_runner = runner_id.clone();
+                    let progress: connections::SetupProgress = Arc::new(move |report| {
+                        progress_output.send_live(RunnerToServer::WorkspaceSetupReport {
+                            runner_id: progress_runner.clone(),
+                            corp_id,
+                            connection_epoch,
+                            operation_id,
+                            report,
+                        });
+                    });
+                    let report = match manager.execute(command, progress).await {
+                        Ok(report) => report,
+                        Err(error) => {
+                            warn!(%error, %operation_id, "native setup could not finish");
+                            crony_domain::WorkspaceSetupReport {
+                                status: crony_domain::WorkspaceSetupStatus::Failed,
+                                detail: "The native connection check could not finish. Review this machine's setup and try again.".to_owned(),
+                                connection_status: connection_id.map(|_|crony_domain::WorkspaceConnectionStatus::Failed),
+                                source: None, models: vec![], account_login: None, sign_in: None,
+                                repositories: vec![],
+                            }
+                        }
+                    };
+                    output.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id,
+                        corp_id,
+                        connection_epoch,
+                        operation_id,
+                        report,
+                    });
+                });
+            }
+            ServerToRunner::WorkspaceSetupAck {
+                operation_id,
+                accepted,
+            } => {
+                if !registration_accepted {
+                    continue;
+                }
+                if let Some(manager) = &connection_manager {
+                    if let Err(error) = manager.acknowledge(operation_id, accepted).await {
+                        warn!(%error, %operation_id, "setup acknowledgment could not be retained");
+                        continue;
+                    }
+                    let mut capabilities = (*base_capabilities).clone();
+                    capabilities.extend(manager.capabilities());
+                    outbound.send_live(RunnerToServer::CapabilitiesUpdated {
+                        runner_id: args.runner_id.clone(),
+                        corp_id: args.corp_id,
+                        connection_epoch,
+                        capabilities,
+                    });
+                }
+            }
+            ServerToRunner::WorkspaceSignInInput {
+                operation_id,
+                request_id,
+                response,
+            } => {
+                if !registration_accepted {
+                    continue;
+                }
+                let applied = if let Some(manager) = &connection_manager {
+                    manager.submit_sign_in(operation_id, response).await.is_ok()
+                } else {
+                    false
+                };
+                outbound.send_live(RunnerToServer::WorkspaceSignInAck {
+                    runner_id: args.runner_id.clone(),
+                    corp_id: args.corp_id,
+                    connection_epoch,
+                    operation_id,
+                    request_id,
+                    applied,
+                });
+            }
             ServerToRunner::Registered {
                 runner_id,
                 credential,
@@ -711,6 +934,7 @@ async fn run_connection(
                     },
                 )
                 .await?;
+                registration_accepted = runner_id == args.runner_id;
                 if let Some(enrollment_file) = &args.enrollment_token_file {
                     let _ = tokio::fs::remove_file(enrollment_file).await;
                 }
@@ -734,6 +958,7 @@ async fn run_connection(
                 }
             }
             ServerToRunner::StartRun {
+                workspace_connection_id,
                 corp_id,
                 room_id,
                 mission_id,
@@ -770,6 +995,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: None,
                     verification_policy,
                     write_scope,
@@ -781,7 +1007,9 @@ async fn run_connection(
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     send_run_event(
                         &outbound,
                         &args.runner_id,
@@ -836,8 +1064,9 @@ async fn run_connection(
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_assignment(
+                    if let Err(error) = execute_connected_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -848,6 +1077,7 @@ async fn run_connection(
                             artifact_acks: artifact_ack_rx,
                         },
                         None,
+                        task_connections,
                     )
                     .await
                     {
@@ -864,6 +1094,7 @@ async fn run_connection(
                 });
             }
             ServerToRunner::ResumeRun {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -917,6 +1148,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: workspace_base_commit,
                     verification_policy,
                     write_scope,
@@ -928,7 +1160,9 @@ async fn run_connection(
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     if let Some(command_id) = command_id {
                         seen_commands.remove(&command_id);
                     }
@@ -1024,8 +1258,9 @@ async fn run_connection(
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_assignment(
+                    if let Err(error) = execute_connected_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -1036,6 +1271,7 @@ async fn run_connection(
                             artifact_acks: artifact_ack_rx,
                         },
                         Some(provider_session_id),
+                        task_connections,
                     )
                     .await
                     {
@@ -1060,6 +1296,7 @@ async fn run_connection(
                 );
             }
             ServerToRunner::VerifyRun {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -1109,6 +1346,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: Some(workspace_base_commit),
                     verification_policy,
                     write_scope,
@@ -1120,7 +1358,9 @@ async fn run_connection(
                     checkpoint_verification,
                     hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     seen_commands.remove(&command_id);
                     send_run_event(
                         &outbound,
@@ -1166,8 +1406,9 @@ async fn run_connection(
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_verification_assignment(
+                    if let Err(error) = execute_connected_verification_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -1176,6 +1417,7 @@ async fn run_connection(
                             controls: control_rx,
                             artifact_acks: artifact_ack_rx,
                         },
+                        task_connections,
                     )
                     .await
                     {
@@ -1200,6 +1442,7 @@ async fn run_connection(
                 );
             }
             ServerToRunner::CheckpointWorkspace {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -1243,6 +1486,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: Some(workspace_base_commit),
                     verification_policy: VerificationPolicy {
                         checks: Vec::new(),
@@ -1257,11 +1501,12 @@ async fn run_connection(
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
-                match checkpoint_preserved_workspace(
+                match checkpoint_connected_workspace(
                     workspaces.clone(),
                     args.runner_id.clone(),
                     assignment,
                     outbound.clone(),
+                    connection_manager.clone(),
                 )
                 .await
                 {
@@ -1723,6 +1968,94 @@ fn schedule_secret_expiry(ttl: Option<Duration>, control: mpsc::UnboundedSender<
             reason: "task-scoped secret grant expired; provider stopped".to_owned(),
         });
     });
+}
+
+fn connection_source(assignment: &Assignment) -> Result<crony_domain::WorkspaceSourceIdentity> {
+    Ok(crony_domain::WorkspaceSourceIdentity {
+        repository: assignment
+            .source_repository
+            .clone()
+            .context("saved connection omitted its repository")?,
+        repository_id: None,
+        base_ref: assignment
+            .source_base_ref
+            .clone()
+            .context("saved connection omitted its source ref")?,
+        base_commit: assignment
+            .source_base_commit
+            .clone()
+            .context("saved connection omitted its pinned commit")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_connected_assignment(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    adapter: Arc<dyn AgentAdapter>,
+    outbound: OutboundBus,
+    channels: AssignmentChannels,
+    resume_session_id: Option<String>,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let (workspaces, adapter) = if let Some(id) = assignment.workspace_connection_id {
+        let manager =
+            connections.context("this runner cannot open the saved execution connection")?;
+        let runtime = manager
+            .resolve(id, &connection_source(&assignment)?, &assignment.adapter)
+            .await?;
+        (runtime.workspaces, runtime.adapter)
+    } else {
+        (workspaces, adapter)
+    };
+    execute_assignment(
+        workspaces,
+        runner_id,
+        assignment,
+        adapter,
+        outbound,
+        channels,
+        resume_session_id,
+    )
+    .await
+}
+
+async fn execute_connected_verification_assignment(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+    channels: AssignmentChannels,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let workspaces = if let Some(id) = assignment.workspace_connection_id {
+        connections
+            .context("this runner cannot open the saved workspace")?
+            .resolve_workspace(id, &connection_source(&assignment)?)
+            .await?
+    } else {
+        workspaces
+    };
+    execute_verification_assignment(workspaces, runner_id, assignment, outbound, channels).await
+}
+
+async fn checkpoint_connected_workspace(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let workspaces = if let Some(id) = assignment.workspace_connection_id {
+        connections
+            .context("this runner cannot open the saved workspace")?
+            .resolve_workspace(id, &connection_source(&assignment)?)
+            .await?
+    } else {
+        workspaces
+    };
+    checkpoint_preserved_workspace(workspaces, runner_id, assignment, outbound).await
 }
 
 async fn execute_assignment(
@@ -3354,6 +3687,7 @@ mod tests {
 
     fn verification_assignment(workspace: &WorkspaceLease, run_id: Uuid) -> Assignment {
         Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),
@@ -4692,6 +5026,7 @@ mod tests {
     #[test]
     fn teardown_fail_closed_preserves_workspace_without_false_terminal_claim() {
         let assignment = Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),
@@ -4811,6 +5146,7 @@ mod tests {
         );
         let base_commit = workspaces.base_commit().to_owned();
         let assignment = Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),

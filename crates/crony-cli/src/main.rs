@@ -245,6 +245,7 @@ async fn main() -> Result<()> {
                 Method::POST,
                 format!("{}/api/corps/{corp_id}/missions", args.server),
                 Some(serde_json::to_value(CreateMissionRequest {
+                    workspace_connection_id: None,
                     title,
                     description: String::new(),
                     requested_by: actor_id,
