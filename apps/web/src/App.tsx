@@ -10,6 +10,7 @@ import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
 import { FactoryPollingNotice } from './FactoryPollingNotice'
 import { factoryControllerState } from './factoryPolling'
+import { selectFactoryController } from './factoryControllerSelection'
 import type { FactoryPolling } from './factoryPolling'
 import { currentOfficeAgents, operatingOfficeAgents, selectOfficeAgent } from './office/officeModel'
 import type { OfficeAgent } from './office/officeModel'
@@ -438,6 +439,7 @@ type FactoryWorkItem = {
 
 type FactoryController = {
   id: string
+  corp_id: string
   service_actor_id: string
   configured_by: string
   source_project_owner: string
@@ -1632,7 +1634,9 @@ function FactoryPanel({
   const active = items.filter(
     (item) => !['published', 'failed', 'cancelled'].includes(item.state),
   )
-  const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
+  const selected = selectedItemId === null
+    ? items[0]
+    : items.find((item) => item.id === selectedItemId)
   const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
   const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
   const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
@@ -1671,7 +1675,9 @@ function FactoryPanel({
   const selectedAttempts = publicationAttempts
     .filter((attempt) => attempt.publication_id === selectedPublication?.id)
     .sort((left, right) => right.attempt - left.attempt)
-  const controller = controllers[0]
+  const controller = selectFactoryController(
+    controllers, selected, scope.corpId, selectedItemId,
+  )
   const controllerState = factoryControllerState(controller)
 
   return (
@@ -1706,7 +1712,11 @@ function FactoryPanel({
           <small>
             {controller
               ? `${controller.source_project_owner} / Project #${controller.source_project_number} · ${controller.source_repository_owner}/${controller.source_repository_name}`
-              : 'No trusted factory watcher has registered with this Corp.'}
+              : selected
+                ? 'No trusted Factory watcher matches the selected Project and repository.'
+                : selectedItemId
+                  ? 'The selected Factory item is unavailable. Choose an item to view its controller.'
+                  : 'No trusted factory watcher has registered with this Corp.'}
           </small>
         </div>
         {controller ? (
@@ -1758,7 +1768,9 @@ function FactoryPanel({
           </>
         ) : (
           <div className="factory-start-help">
-            <p>Automatic GitHub intake is off. Your runner is separate and can still execute direct missions.</p>
+            <p>{selected || selectedItemId
+              ? 'No controller is available for the selected Factory context. Existing missions can continue independently.'
+              : 'Automatic GitHub intake is off. Your runner is separate and can still execute direct missions.'}</p>
             <button type="button" className="button button-primary"
               disabled={!canOperate(selectedActor.role)} onClick={onNewMission}>
               Start a direct mission
