@@ -7,6 +7,8 @@ mod fake;
 mod permission;
 pub(crate) mod process_tree;
 
+#[cfg(test)]
+use std::path::Path;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
@@ -17,6 +19,15 @@ pub use codex::CodexAdapter;
 pub use copilot::{CopilotSdkAdapter, CopilotSdkConfig};
 pub use external::{ExternalCliAdapter, ExternalFlavor};
 pub use fake::FakeProcessAdapter;
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoppedSessionRead {
+    #[default]
+    EventLog,
+    Timeline,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeatureSupport {
@@ -272,6 +283,23 @@ pub trait AgentAdapter: Send + Sync {
     #[allow(dead_code)] // Contract surface for adapters that expose post-run usage.
     async fn collect_usage(&self, _session_id: &str) -> Result<UsageSnapshot, AdapterError> {
         Err(unsupported("usage", self.capabilities().usage.reason()))
+    }
+
+    /// Read already-persisted evidence, without creating, resuming, or sending
+    /// work to a provider session. The caller must authorize the exact stopped
+    /// checkpoint and saved account before invoking this optional capability.
+    #[cfg(test)]
+    async fn collect_stopped_session_evidence(
+        &self,
+        _workspace: &Path,
+        _session_id: &str,
+        _expected_account_sha256: &str,
+        _read: StoppedSessionRead,
+    ) -> Result<serde_json::Value, AdapterError> {
+        Err(unsupported(
+            "stopped-session evidence",
+            Some("this adapter has no verified inference-free history reader"),
+        ))
     }
 }
 

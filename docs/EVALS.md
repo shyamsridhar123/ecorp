@@ -81,6 +81,16 @@ it must not be run against the application database. A source-only check or an
 admitted correction does not establish artifact creation, successful browser
 behavior, authorized outcome review or publication.
 
+## Stopped-session native evidence compatibility
+
+The [#211 native-read report](evidence/2026-09-09-stopped-session-native-read.md)
+retains two real, separately selected missing-session failures for SDK 1.0.11 /
+CLI 1.0.79. The bounded reader and probe remain test-only, not a working
+production collector. Eleven pure/wire tests pass; real stopped-history
+retrieval, checkpoint artifact adoption, and application publication remain
+unproven. The established serial workspace gate passes, while the separately
+retained parallel runner failures are tracked in #213.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

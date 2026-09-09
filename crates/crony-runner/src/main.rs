@@ -2,6 +2,8 @@ mod adapter;
 mod connections;
 mod deliverable;
 mod source_checkpoint;
+#[cfg(test)]
+mod stopped_session_probe_tests;
 mod verifier;
 mod workspace;
 

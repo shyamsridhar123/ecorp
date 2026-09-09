@@ -38,6 +38,10 @@ use super::{
     permission::{path_is_inside, path_is_inside_workspace},
 };
 
+#[path = "copilot_evidence.rs"]
+#[cfg(test)]
+mod stopped_evidence;
+
 // Keep this aligned with the checked-in SDK/runtime pair and real conformance
 // evidence. The experimental filesystem contract is not safely version-agnostic.
 const SUPPORTED_COPILOT_RUNTIME: &str = "1.0.79";
@@ -744,6 +748,17 @@ impl AgentAdapter for CopilotSdkAdapter {
             self.sdk_run(request, Some(session_id), controls, sink)
                 .await
         }
+    }
+
+    #[cfg(test)]
+    async fn collect_stopped_session_evidence(
+        &self,
+        workspace: &Path,
+        session_id: &str,
+        expected_account_sha256: &str,
+        read: super::StoppedSessionRead,
+    ) -> Result<Value, AdapterError> {
+        stopped_evidence::collect(self, workspace, session_id, expected_account_sha256, read).await
     }
 }
 
