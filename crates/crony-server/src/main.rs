@@ -35,7 +35,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::{
     DeliverableSpec, DomainEvent, FactoryVerificationRecoveryMode, ManualVerificationGate,
-    TaskGraphPlan, TaskSecretReference, VerificationPolicy,
+    RetainedProviderReceiptGrant, TaskGraphPlan, TaskSecretReference, VerificationPolicy,
 };
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
@@ -1676,6 +1676,8 @@ struct FactoryRecoveryRunnerCommandPayload {
     #[serde(default)]
     secret_refs: Vec<TaskSecretReference>,
     provider_artifact: Option<VerificationArtifactReference>,
+    #[serde(default)]
+    retained_provider_receipt: Option<RetainedProviderReceiptGrant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1716,6 +1718,7 @@ async fn decode_recovery_runner_command(
                     "factory recovery runner command identity mismatch"
                 ));
             }
+            validate_retained_provider_receipt_command(command, &payload)?;
             match payload.mode {
                 FactoryVerificationRecoveryMode::SourceCorrection => {
                     if !source_correction_authority_is_current(state, command).await? {
@@ -1784,6 +1787,15 @@ async fn decode_recovery_runner_command(
                             "verifier-only recovery cannot receive provider secrets"
                         ));
                     }
+                    if payload.retained_provider_receipt.is_some()
+                        && !state.runners.get(&command.runner_id).is_some_and(|runner| {
+                            supports_retained_provider_receipt(&runner.capabilities)
+                        })
+                    {
+                        return Err(anyhow::anyhow!(
+                            "runner does not support historical receipt collection; update the connected runner"
+                        ));
+                    }
                     if !verification_recovery_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
@@ -1824,6 +1836,7 @@ async fn decode_recovery_runner_command(
                         write_scope: payload.write_scope,
                         deliverable: payload.deliverable,
                         provider_artifact: payload.provider_artifact,
+                        retained_provider_receipt: payload.retained_provider_receipt.map(Box::new),
                     }))
                 }
             }
@@ -1877,6 +1890,43 @@ fn supports_checkpoint_verification(capabilities: &[crony_protocol::RunnerCapabi
     capabilities
         .iter()
         .any(|capability| capability.name == "checkpoint-verification-v1" && capability.available)
+}
+
+fn supports_retained_provider_receipt(capabilities: &[crony_protocol::RunnerCapability]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.name == "retained-provider-receipt-v1" && capability.available)
+}
+
+fn validate_retained_provider_receipt_command(
+    command: &PendingRunnerCommand,
+    payload: &FactoryRecoveryRunnerCommandPayload,
+) -> anyhow::Result<()> {
+    let Some(grant) = payload.retained_provider_receipt.as_ref() else {
+        return Ok(());
+    };
+    grant.validate().map_err(anyhow::Error::msg)?;
+    if payload.mode != FactoryVerificationRecoveryMode::CheckpointVerification
+        || payload.provider_artifact.is_some()
+        || payload.provider_session_id.is_some()
+        || payload.model.is_some()
+        || payload.reasoning_effort.is_some()
+        || !payload.secret_refs.is_empty()
+        || command.id != grant.collection_id
+        || command.corp_id != grant.corp_id
+        || command.run_id != grant.run_id
+        || payload.corp_id != grant.corp_id
+        || payload.task_id != grant.task_id
+        || payload.run_id != grant.run_id
+        || payload.workspace_run_id != grant.workspace_run_id
+        || payload.expected_workspace_fingerprint != grant.expected_workspace_fingerprint
+        || payload.expected_head_commit.as_deref() != Some(grant.expected_head_commit.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "historical receipt collection does not match the exact provider-free checkpoint command"
+        ));
+    }
+    Ok(())
 }
 
 async fn verification_recovery_authority_is_current(
@@ -6237,10 +6287,9 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     );
                     continue;
                 }
-                let deliverable_ack_sha = (event_type == "run.deliverable_upload")
-                    .then(|| payload.get("sha256").and_then(serde_json::Value::as_str))
-                    .flatten()
-                    .map(str::to_owned);
+                let retained_receipt_upload = event_type == "run.artifact_upload"
+                    && payload.get("retained_provider_receipt").is_some();
+                let artifact_ack = artifact_upload_ack(&event_type, &payload);
                 let input = RunnerEventInput {
                     event_id,
                     runner_id: runner_id.clone(),
@@ -6259,6 +6308,11 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     "run.artifact_upload" | "run.deliverable_upload"
                 ) && let Err(error) = &result
                 {
+                    if retained_receipt_upload && retained_receipt_upload_error_is_retryable(error)
+                    {
+                        warn!(%error, %run_id, "historical receipt upload deferred for bounded retry");
+                        continue;
+                    }
                     let reason = format!("artifact upload rejected: {error}");
                     warn!(%error, %run_id, "artifact upload failed verification");
                     applied_event_type = "run.failed".to_owned();
@@ -6284,7 +6338,8 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             related_events,
                         } = outcome;
                         if let Some(event) = event {
-                            if event.event_type == "run.deliverable"
+                            if (event.event_type == "run.deliverable"
+                                || (retained_receipt_upload && event.event_type == "run.artifact"))
                                 && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
                                     event
                                         .payload
@@ -6397,30 +6452,33 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                                     }
                                 });
                             }
-                        } else {
-                            if let Some(sha256) = deliverable_ack_sha {
-                                match state
-                                    .store
-                                    .ready_artifact_for_run_role_digest(
-                                        corp_id,
+                        } else if applied_event_type == event_type
+                            && let Some((artifact_role, sha256)) = artifact_ack
+                        {
+                            // Only a successfully authorized duplicate upload
+                            // can acknowledge an existing object. A rejection
+                            // converted to run.failed must never reach this path.
+                            match state
+                                .store
+                                .ready_artifact_for_run_role_digest(
+                                    corp_id,
+                                    run_id,
+                                    artifact_role,
+                                    &sha256,
+                                )
+                                .await
+                            {
+                                Ok(Some(artifact)) => {
+                                    let _ = command_tx.send(ServerToRunner::ArtifactStored {
                                         run_id,
-                                        "source_deliverable",
-                                        &sha256,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(artifact)) => {
-                                        let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                            run_id,
-                                            artifact_id: artifact.id,
-                                            artifact_role: artifact.artifact_role,
-                                            sha256: artifact.sha256,
-                                        });
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
-                                    }
+                                        artifact_id: artifact.id,
+                                        artifact_role: artifact.artifact_role,
+                                        sha256: artifact.sha256,
+                                    });
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(%error, %run_id, "artifact acknowledgment lookup failed")
                                 }
                             }
                         }
@@ -6508,19 +6566,30 @@ async fn process_runner_event(
             input.assignment_token,
         )
         .await?;
+    let retained_receipt = state
+        .store
+        .retained_provider_receipt_grant_for_upload(&input)
+        .await?;
     let retention_until = Utc::now() + ChronoDuration::days(state.artifact_retention_days);
-    let staged = state.artifacts.prepare_staging(
-        ArtifactIdentity {
-            id: input.event_id,
-            corp_id: input.corp_id,
-            task_id: context.task_id,
-            run_id: input.run_id,
-            agent_id: input.agent_id,
-            runner_id: &input.runner_id,
-        },
-        &input.payload,
-        retention_until,
-    )?;
+    let identity = ArtifactIdentity {
+        id: input.event_id,
+        corp_id: input.corp_id,
+        task_id: context.task_id,
+        run_id: input.run_id,
+        agent_id: input.agent_id,
+        runner_id: &input.runner_id,
+    };
+    let staged = match retained_receipt.as_ref() {
+        Some(grant) => state.artifacts.prepare_retained_provider_receipt_staging(
+            identity,
+            &input.payload,
+            retention_until,
+            grant,
+        )?,
+        None => state
+            .artifacts
+            .prepare_staging(identity, &input.payload, retention_until)?,
+    };
     let prepared = state
         .store
         .prepare_artifact_upload(input, staged.artifact.clone(), &staged.staging_key)
@@ -6597,6 +6666,34 @@ async fn process_runner_event(
         }
         status => Err(anyhow::anyhow!("unknown prepared artifact status {status}")),
     }
+}
+
+fn artifact_upload_ack(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<(&'static str, String)> {
+    let role = match event_type {
+        "run.deliverable_upload" => "source_deliverable",
+        "run.artifact_upload"
+            if payload.get("retained_provider_receipt").is_some()
+                && payload
+                    .get("artifact_role")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("provider_evidence") =>
+        {
+            "provider_evidence"
+        }
+        _ => return None,
+    };
+    let digest = payload.get("sha256")?.as_str()?.to_ascii_lowercase();
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((role, digest))
+}
+
+fn retained_receipt_upload_error_is_retryable(error: &anyhow::Error) -> bool {
+    !artifact_error_is_permanent(error)
+        && (error.downcast_ref::<sqlx::Error>().is_some()
+            || error.downcast_ref::<object_store::Error>().is_some())
 }
 
 async fn recover_pending_artifacts(
@@ -6846,6 +6943,189 @@ mod tests {
         schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
         validate_verification_artifact_reference,
     };
+
+    fn retained_receipt_command_fixture() -> crony_store::PendingRunnerCommand {
+        let corp = Uuid::from_u128(1);
+        let task = Uuid::from_u128(2);
+        let run = Uuid::from_u128(3);
+        let workspace = Uuid::from_u128(4);
+        let command = Uuid::from_u128(5);
+        let grant = crony_domain::RetainedProviderReceiptGrant {
+            schema_version: 1,
+            collection_id: command,
+            corp_id: corp,
+            task_id: task,
+            run_id: run,
+            workspace_run_id: workspace,
+            source_run_id: Uuid::from_u128(10),
+            checkpoint_run_id: Uuid::from_u128(10),
+            provider_session_id: Uuid::from_u128(11).to_string(),
+            historical_run_id: workspace,
+            historical_termination_event_id: Uuid::from_u128(12),
+            historical_checkpoint_event_id: Uuid::from_u128(13),
+            source_checkpoint_event_id: Uuid::from_u128(14),
+            expected_workspace_fingerprint: "b".repeat(64),
+            expected_head_commit: "a".repeat(40),
+            historical_model: Some("test-model".to_owned()),
+            historical_reasoning_effort: None,
+        };
+        let mut payload = json!({
+            "mode": "checkpoint_verification",
+            "corp_id": corp,
+            "room_id": Uuid::from_u128(6),
+            "mission_id": Uuid::from_u128(7),
+            "task_id": task,
+            "run_id": run,
+            "workspace_run_id": workspace,
+            "agent_id": Uuid::from_u128(8),
+            "assignment_token": Uuid::from_u128(9),
+            "adapter": "github-copilot",
+            "provider_session_id": null,
+            "prompt": "",
+            "model": null,
+            "reasoning_effort": null,
+        });
+        let source = json!({
+            "source_repository": "owner/lab",
+            "source_base_ref": "main",
+            "source_base_commit": "a".repeat(40),
+            "workspace_base_commit": "a".repeat(40),
+            "expected_workspace_fingerprint": "b".repeat(64),
+            "expected_head_commit": "a".repeat(40),
+            "verification_policy": VerificationPolicy {
+                checks: Vec::new(),
+                manual_gate: None,
+            },
+            "write_scope": ["application/**"],
+            "deliverable": null,
+            "provider_artifact": null,
+            "retained_provider_receipt": grant,
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(source.as_object().unwrap().clone());
+        crony_store::PendingRunnerCommand {
+            id: command,
+            corp_id: corp,
+            run_id: run,
+            runner_id: "receipt-test".to_owned(),
+            command_kind: "factory_verification_recovery".to_owned(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_binds_exact_provider_free_command() {
+        let command = retained_receipt_command_fixture();
+        let decoded = serde_json::from_value(command.payload.clone()).unwrap();
+        super::validate_retained_provider_receipt_command(&command, &decoded).unwrap();
+        for (pointer, value) in [
+            ("/mode", json!("source_correction")),
+            ("/mode", json!("verifier_only")),
+            ("/model", json!("new-provider-model")),
+            ("/reasoning_effort", json!("high")),
+            ("/provider_session_id", json!(Uuid::new_v4())),
+            ("/run_id", json!(Uuid::new_v4())),
+            ("/corp_id", json!(Uuid::new_v4())),
+            ("/task_id", json!(Uuid::new_v4())),
+            ("/workspace_run_id", json!(Uuid::new_v4())),
+            ("/expected_head_commit", json!("c".repeat(40))),
+            ("/expected_workspace_fingerprint", json!("d".repeat(64))),
+            (
+                "/retained_provider_receipt/collection_id",
+                json!(Uuid::new_v4()),
+            ),
+        ] {
+            let mut candidate = retained_receipt_command_fixture();
+            *candidate.payload.pointer_mut(pointer).unwrap() = value;
+            let decoded = serde_json::from_value(candidate.payload.clone()).unwrap();
+            assert!(
+                super::validate_retained_provider_receipt_command(&candidate, &decoded).is_err(),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_does_not_send_private_upload_binding() {
+        let mut command = retained_receipt_command_fixture();
+        command.payload["retained_provider_receipt_upload"] =
+            json!({"sha256": "e".repeat(64), "bytes": 256});
+        let decoded: super::FactoryRecoveryRunnerCommandPayload =
+            serde_json::from_value(command.payload.clone()).unwrap();
+        super::validate_retained_provider_receipt_command(&command, &decoded).unwrap();
+        let receipt = decoded.retained_provider_receipt.unwrap();
+        let grant = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            serde_json::to_value(Box::new(receipt)).unwrap(),
+            grant,
+            "boxing the optional wire field must not change its JSON"
+        );
+        assert!(grant.get("retained_provider_receipt_upload").is_none());
+        assert!(grant.get("sha256").is_none());
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_requires_its_own_available_capability() {
+        let capability = |name: &str, available| RunnerCapability {
+            name: name.to_owned(),
+            available,
+            detail: None,
+            models: Vec::new(),
+            workspace_connection_id: None,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        };
+        assert!(!super::supports_retained_provider_receipt(&[]));
+        assert!(!super::supports_retained_provider_receipt(&[
+            capability("checkpoint-verification-v1", true),
+            capability("retained-provider-receipt-v1", false),
+        ]));
+        assert!(super::supports_retained_provider_receipt(&[capability(
+            "retained-provider-receipt-v1",
+            true
+        ),]));
+    }
+
+    #[test]
+    fn issue211_retained_receipt_ack_uses_exact_role_and_digest() {
+        let sha = "a".repeat(64);
+        let payload = json!({
+            "artifact_role": "provider_evidence",
+            "retained_provider_receipt": {"kind": "historical_copilot_receipt_v1"},
+            "sha256": sha
+        });
+        assert_eq!(
+            super::artifact_upload_ack("run.artifact_upload", &payload),
+            Some(("provider_evidence", sha.clone()))
+        );
+        assert_eq!(
+            super::artifact_upload_ack("run.deliverable_upload", &json!({"sha256": sha})),
+            Some(("source_deliverable", sha))
+        );
+        assert!(
+            super::artifact_upload_ack("run.artifact_upload", &json!({"sha256": "a".repeat(64)}))
+                .is_none()
+        );
+        let mut foreign = payload;
+        foreign["artifact_role"] = json!("source_deliverable");
+        assert!(super::artifact_upload_ack("run.artifact_upload", &foreign).is_none());
+        foreign["artifact_role"] = json!("provider_evidence");
+        foreign["sha256"] = json!("invalid");
+        assert!(super::artifact_upload_ack("run.artifact_upload", &foreign).is_none());
+    }
+
+    #[test]
+    fn issue211_retained_receipt_db_error_is_retryable_but_authority_denial_is_not() {
+        let database =
+            anyhow::Error::new(sqlx::Error::PoolTimedOut).context("receipt finalization");
+        assert!(super::retained_receipt_upload_error_is_retryable(&database));
+        assert!(!super::retained_receipt_upload_error_is_retryable(
+            &anyhow::anyhow!("retained provider receipt: authorization changed")
+        ));
+    }
 
     #[tokio::test]
     async fn checkpoint_denial_retires_only_the_command_and_store_errors_remain_retryable() {

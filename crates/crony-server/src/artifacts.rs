@@ -4,7 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use crony_domain::repository_relative_path_is_valid;
+use crony_domain::{
+    RETAINED_COPILOT_RECEIPT_FILE, RetainedProviderReceiptGrant, repository_relative_path_is_valid,
+    retained_provider_receipt_metadata, validate_retained_copilot_receipt,
+};
 use crony_store::StoredArtifact;
 use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
@@ -161,6 +164,33 @@ impl ArtifactStore {
         payload: &Value,
         retention_until: DateTime<Utc>,
     ) -> Result<StagedArtifact> {
+        self.prepare_staging_with_receipt(identity, payload, retention_until, None)
+    }
+
+    /// Only the server's current store-authorized collection path may sign a
+    /// historical receipt. Preparing bytes performs no object-store writes.
+    pub fn prepare_retained_provider_receipt_staging(
+        &self,
+        identity: ArtifactIdentity<'_>,
+        payload: &Value,
+        retention_until: DateTime<Utc>,
+        grant: &RetainedProviderReceiptGrant,
+    ) -> Result<StagedArtifact> {
+        self.prepare_staging_with_receipt(identity, payload, retention_until, Some(grant))
+    }
+
+    fn prepare_staging_with_receipt(
+        &self,
+        identity: ArtifactIdentity<'_>,
+        payload: &Value,
+        retention_until: DateTime<Utc>,
+        retained_receipt: Option<&RetainedProviderReceiptGrant>,
+    ) -> Result<StagedArtifact> {
+        if payload.get("retained_provider_receipt").is_some() && retained_receipt.is_none() {
+            return Err(anyhow!(
+                "retained provider receipt requires current collection authority"
+            ));
+        }
         let declared_bytes = payload
             .get("bytes")
             .and_then(Value::as_u64)
@@ -233,7 +263,26 @@ impl ArtifactStore {
         if !valid_artifact_file_name(file_name) {
             return Err(anyhow!("artifact file name is invalid"));
         }
-        let metadata = if artifact_role == "source_deliverable" {
+        let metadata = if let Some(grant) = retained_receipt {
+            validate_retained_copilot_receipt(&bytes, grant).map_err(anyhow::Error::msg)?;
+            let metadata = retained_provider_receipt_metadata(grant);
+            if identity.corp_id != grant.corp_id
+                || identity.task_id != grant.task_id
+                || identity.run_id != grant.run_id
+                || artifact_role != "provider_evidence"
+                || payload.get("artifact_role").and_then(Value::as_str) != Some("provider_evidence")
+                || file_name != RETAINED_COPILOT_RECEIPT_FILE
+                || media_type != "application/json"
+                || payload.get("workspace_relative_path") != metadata.get("workspace_relative_path")
+                || payload.get("retained_provider_receipt")
+                    != metadata.get("retained_provider_receipt")
+            {
+                return Err(anyhow!(
+                    "retained provider receipt upload does not match its authorized collection"
+                ));
+            }
+            metadata
+        } else if artifact_role == "source_deliverable" {
             source_deliverable_metadata(payload)?
         } else if let Some(path) = payload
             .get("workspace_relative_path")
@@ -439,6 +488,10 @@ impl ArtifactStore {
             .map_err(|_| anyhow!("artifact provenance signature is invalid"))
     }
 }
+
+#[cfg(test)]
+#[path = "artifact_receipt_tests.rs"]
+mod artifact_receipt_tests;
 
 async fn collect_bounded_artifact_bytes(result: GetResult, expected_bytes: usize) -> Result<Bytes> {
     let expected_size = u64::try_from(expected_bytes)?;

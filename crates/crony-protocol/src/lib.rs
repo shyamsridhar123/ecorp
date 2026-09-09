@@ -2,8 +2,8 @@ use crony_domain::{
     CorpSnapshot, DeliverableSpec, DomainEvent, EntityLink, FactoryController,
     FactoryVerificationRecovery, FactoryVerificationRecoveryMode, FactoryWorkItem,
     FactoryWorkItemState, MissionBudgetRevision, MissionContractRevision,
-    MissionContractRevisionAction, PullRequestPublication, SourceDeliverable, TaskContract,
-    TaskSecretReference, VerificationPolicy,
+    MissionContractRevisionAction, PullRequestPublication, RetainedProviderReceiptGrant,
+    SourceDeliverable, TaskContract, TaskSecretReference, VerificationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -204,6 +204,11 @@ pub enum ServerToRunner {
         write_scope: Vec<String>,
         deliverable: Option<DeliverableSpec>,
         provider_artifact: Option<VerificationArtifactReference>,
+        /// Optional, separately scoped collection of an existing historical
+        /// native receipt from this exact stopped-source checkpoint. No provider
+        /// session is created or resumed by this operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retained_provider_receipt: Option<Box<RetainedProviderReceiptGrant>>,
     },
     CheckpointWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]

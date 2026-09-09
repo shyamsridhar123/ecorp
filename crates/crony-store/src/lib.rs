@@ -31,6 +31,7 @@ mod factory_controller;
 mod factory_run_failure;
 mod mission_context;
 mod publication;
+mod retained_provider_receipt;
 mod staffing;
 mod terminal_accounting;
 mod verification_dispatch;
@@ -5097,6 +5098,24 @@ impl PgStore {
         let recovery_id = Uuid::new_v4();
         let command_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
+        let retained_receipt = if let Some(authority) = &checkpoint_authority {
+            retained_provider_receipt::derive_tx(
+                &mut tx,
+                retained_provider_receipt::Admission {
+                    item: &work_item,
+                    authority,
+                    source_run_id: input.source_run_id,
+                    run_id,
+                    command_id,
+                    actor_id: input.actor_id,
+                    fingerprint: &input.expected_workspace_fingerprint,
+                    head: input.expected_head_commit.as_deref(),
+                },
+            )
+            .await?
+        } else {
+            None
+        };
         let execution_mode = if input.mode.is_verifier_only() {
             "verification_only"
         } else {
@@ -5319,7 +5338,7 @@ impl PgStore {
         } else {
             Vec::new()
         };
-        let command_payload = json!({
+        let mut command_payload = json!({
             "mode": input.mode,
             "corp_id": input.corp_id,
             "room_id": room_id,
@@ -5348,6 +5367,9 @@ impl PgStore {
             "secret_refs": command_secret_refs,
             "provider_artifact": provider_artifact,
         });
+        if let Some(receipt) = retained_receipt {
+            command_payload["retained_provider_receipt"] = serde_json::to_value(receipt)?;
+        }
         sqlx::query(
             r#"
             INSERT INTO runner_commands
@@ -7121,32 +7143,21 @@ impl PgStore {
         artifact: StoredArtifact,
         staging_key: &str,
     ) -> Result<PreparedArtifactUpload> {
-        let RunnerEventInput {
-            event_id,
-            runner_id,
-            corp_id,
-            connection_epoch: _,
-            run_id,
-            agent_id,
-            assignment_token,
-            event_type,
-            ..
-        } = input;
-        let expected_role = match event_type.as_str() {
+        let expected_role = match input.event_type.as_str() {
             "run.artifact_upload" => "provider_evidence",
             "run.deliverable_upload" => "source_deliverable",
             _ => return Err(anyhow!("unsupported artifact upload event")),
         };
         if artifact.artifact_role != expected_role
-            || artifact.id != event_id
-            || artifact.corp_id != corp_id
-            || artifact.run_id != run_id
-            || artifact.producer_agent_id != agent_id
-            || artifact.producer_runner_id != runner_id
+            || artifact.id != input.event_id
+            || artifact.corp_id != input.corp_id
+            || artifact.run_id != input.run_id
+            || artifact.producer_agent_id != input.agent_id
+            || artifact.producer_runner_id != input.runner_id
         {
             return Err(anyhow!("artifact metadata does not match the runner event"));
         }
-        let expected_staging_key = format!("staging/corps/{corp_id}/{event_id}");
+        let expected_staging_key = format!("staging/corps/{}/{}", input.corp_id, input.event_id);
         if staging_key != expected_staging_key {
             return Err(anyhow!(
                 "artifact staging key does not match the runner event"
@@ -7154,6 +7165,16 @@ impl PgStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        let retained_upload =
+            retained_provider_receipt::prepare_tx(&mut tx, &input, &artifact).await?;
+        let RunnerEventInput {
+            runner_id,
+            corp_id,
+            run_id,
+            agent_id,
+            assignment_token,
+            ..
+        } = input;
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.breaker_stage, t.mission_id, m.room_id
@@ -7202,6 +7223,10 @@ impl PgStore {
         if let Some(row) = existing_by_id {
             let prepared = map_prepared_artifact(row)?;
             ensure_artifact_upload_matches(&prepared.artifact, &artifact, true)?;
+            if retained_upload {
+                retained_provider_receipt::validate_artifact_tx(&mut tx, &prepared.artifact, false)
+                    .await?;
+            }
             tx.commit().await?;
             return Ok(prepared);
         }
@@ -7226,6 +7251,10 @@ impl PgStore {
         if let Some(row) = existing_by_digest {
             let prepared = map_prepared_artifact(row)?;
             ensure_artifact_upload_matches(&prepared.artifact, &artifact, false)?;
+            if retained_upload {
+                retained_provider_receipt::validate_artifact_tx(&mut tx, &prepared.artifact, false)
+                    .await?;
+            }
             tx.commit().await?;
             return Ok(prepared);
         }
@@ -7276,13 +7305,33 @@ impl PgStore {
         artifact_id: Uuid,
     ) -> Result<Option<DomainEvent>> {
         let mut tx = self.pool.begin().await?;
-        let run_id: Uuid =
-            sqlx::query_scalar("SELECT run_id FROM artifacts WHERE id = $1 AND corp_id = $2")
-                .bind(artifact_id)
-                .bind(corp_id)
-                .fetch_one(&mut *tx)
-                .await
-                .context("staged artifact not found")?;
+        let scope = sqlx::query(
+            "SELECT run_id,artifact_role,metadata FROM artifacts WHERE id=$1 AND corp_id=$2",
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("staged artifact not found")?;
+        let run_id: Uuid = scope.get("run_id");
+        // Collector gates precede the existing run/task/mission/artifact rows.
+        let retained_upload = match retained_provider_receipt::fence_artifact_tx(
+            &mut tx,
+            corp_id,
+            run_id,
+            &scope.get::<String, _>("artifact_role"),
+            &scope.get::<Value, _>("metadata"),
+        )
+        .await
+        {
+            Ok(retained) => retained,
+            Err(error) if retained_provider_receipt::database_error(&error) => return Err(error),
+            Err(error) => {
+                retained_provider_receipt::reject_tx(&mut tx, corp_id, artifact_id, &error).await?;
+                tx.commit().await?;
+                return Err(error);
+            }
+        };
         sqlx::query("SELECT id FROM runs WHERE id = $1 AND corp_id = $2 FOR UPDATE")
             .bind(run_id)
             .bind(corp_id)
@@ -7315,11 +7364,7 @@ impl PgStore {
         .await
         .context("staged artifact not found")?;
         let status: String = row.get("status");
-        if status == "ready" {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        if status != "staged" {
+        if !matches!(status.as_str(), "staged" | "ready") {
             return Err(anyhow!("artifact cannot finalize from status {status}"));
         }
         let run_status: String = row.get("run_status");
@@ -7327,6 +7372,27 @@ impl PgStore {
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let artifact = map_stored_artifact(row);
+        let authority = if retained_upload {
+            retained_provider_receipt::validate_artifact_tx(&mut tx, &artifact, false).await
+        } else if artifact.metadata.get("retained_provider_receipt").is_some() {
+            Err(anyhow!(
+                "retained provider receipt artifact scope changed before finalization"
+            ))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = authority {
+            if retained_provider_receipt::database_error(&error) {
+                return Err(error);
+            }
+            retained_provider_receipt::reject_tx(&mut tx, corp_id, artifact_id, &error).await?;
+            tx.commit().await?;
+            return Err(error);
+        }
+        if status == "ready" {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let ready_event_type = if artifact.artifact_role == "source_deliverable" {
             "run.deliverable"
         } else {

@@ -1,6 +1,9 @@
 mod adapter;
 mod connections;
 mod deliverable;
+mod retained_provider_receipt;
+#[cfg(test)]
+mod retained_provider_receipt_tests;
 mod source_checkpoint;
 #[cfg(test)]
 mod stopped_session_probe_tests;
@@ -21,7 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use crony_domain::{DeliverableSpec, VerificationPolicy};
+use crony_domain::{DeliverableSpec, RetainedProviderReceiptGrant, VerificationPolicy};
 use crony_protocol::{
     ActiveRunClaim, MAX_VERIFICATION_ARTIFACT_BYTES, ResolvedSecret, RunnerCapability, RunnerModel,
     RunnerToServer, ServerToRunner, VerificationArtifactReference,
@@ -196,6 +199,8 @@ struct Assignment {
     expected_workspace_fingerprint: Option<String>,
     expected_head_commit: Option<String>,
     provider_artifact: Option<VerificationArtifactReference>,
+    verification_command_id: Option<Uuid>,
+    retained_provider_receipt: Option<RetainedProviderReceiptGrant>,
     checkpoint_verification: bool,
     hard_boundary_checkpoint: Arc<HardBoundaryControl>,
 }
@@ -297,6 +302,7 @@ impl ActiveRunControl {
 
 #[derive(Debug)]
 struct ArtifactAck {
+    run_id: Uuid,
     artifact_id: Uuid,
     artifact_role: String,
     sha256: String,
@@ -733,6 +739,19 @@ async fn run_connection(
     });
     capabilities.push(RunnerCapability {
         workspace_connection_id: None,
+        name: "retained-provider-receipt-v1".to_owned(),
+        available: true,
+        detail: Some(
+            "explicit historical receipt collection from sealed source with a new durable artifact acknowledgment"
+                .to_owned(),
+        ),
+        models: Vec::new(),
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    });
+    capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "secret-delivery".to_owned(),
         available: true,
         detail: Some(
@@ -953,6 +972,7 @@ async fn run_connection(
             } => {
                 if let Some(active) = active_runs.get(&run_id) {
                     let _ = active.artifact_ack.send(ArtifactAck {
+                        run_id,
                         artifact_id,
                         artifact_role,
                         sha256,
@@ -1006,6 +1026,8 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: None,
                     provider_artifact: None,
+                    verification_command_id: None,
+                    retained_provider_receipt: None,
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
@@ -1159,6 +1181,8 @@ async fn run_connection(
                     expected_workspace_fingerprint,
                     expected_head_commit,
                     provider_artifact: None,
+                    verification_command_id: None,
+                    retained_provider_receipt: None,
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
@@ -1319,6 +1343,7 @@ async fn run_connection(
                 write_scope,
                 deliverable,
                 provider_artifact,
+                retained_provider_receipt,
             } => {
                 if seen_commands.insert(command_id, ()).is_some() {
                     send_command_ack(
@@ -1357,9 +1382,30 @@ async fn run_connection(
                     expected_workspace_fingerprint: Some(expected_workspace_fingerprint),
                     expected_head_commit,
                     provider_artifact,
+                    verification_command_id: Some(command_id),
+                    retained_provider_receipt: retained_provider_receipt.map(|grant| *grant),
                     checkpoint_verification,
                     hard_boundary_checkpoint: Arc::default(),
                 };
+                if let Err(error) = retained_provider_receipt::validate_assignment(&assignment) {
+                    seen_commands.remove(&command_id);
+                    send_run_event(
+                        &outbound,
+                        &args.runner_id,
+                        &assignment,
+                        "run.failed",
+                        json!({"error": error.to_string()}),
+                    );
+                    send_command_ack(
+                        &outbound,
+                        &args.runner_id,
+                        connection_epoch,
+                        Some(command_id),
+                        false,
+                        "retained provider receipt collection scope was rejected",
+                    );
+                    continue;
+                }
                 if assignment.workspace_connection_id.is_none()
                     && let Err(error) = validate_assignment_source(&workspaces, &assignment)
                 {
@@ -1500,6 +1546,8 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: Some(expected_head_commit),
                     provider_artifact: None,
+                    verification_command_id: None,
+                    retained_provider_receipt: None,
                     checkpoint_verification: false,
                     hard_boundary_checkpoint: Arc::default(),
                 };
@@ -2357,6 +2405,7 @@ async fn execute_verification_assignment(
         mut controls,
         mut artifact_acks,
     } = channels;
+    retained_provider_receipt::validate_assignment(&assignment)?;
     validate_assignment_source(&workspaces, &assignment)?;
     let workspace = workspaces
         .prepare(
@@ -2418,7 +2467,7 @@ async fn execute_verification_assignment(
             ));
         }
         checkpoint_admitted = true;
-        let (artifacts, source_artifacts) = match assignment.provider_artifact.as_ref() {
+        let (artifacts, mut source_artifacts) = match assignment.provider_artifact.as_ref() {
             Some(reference) => {
                 artifact_snapshot =
                     Some(workspace::empty_verification_snapshot(assignment.run_id).await?);
@@ -2440,28 +2489,98 @@ async fn execute_verification_assignment(
         let artifacts = Arc::new(Mutex::new(artifacts));
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
         let mut interruption = None;
-        let verification = send_verification_events(
-            &outbound,
-            &runner_id,
-            &assignment,
-            &workspace,
-            &workspaces,
-            Some(baseline),
-            Some(&mut active_check_snapshot),
-            Some(&mut artifact_snapshot),
-            &artifacts,
-            Some(&source_artifacts),
-            &mut artifact_acks,
-            "Verifier-only recovery completed without starting a provider.",
-            Some(expected_fingerprint),
-            if assignment.checkpoint_verification {
-                None
+        let verification = async {
+            let summary = if assignment.retained_provider_receipt.is_some() {
+                artifact_snapshot = match workspace::empty_verification_snapshot(assignment.run_id).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        send_run_event(
+                            &outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": format!("retained receipt snapshot failed: {error:#}")}),
+                        );
+                        return VerificationRunOutcome::Failed;
+                    }
+                };
+                let collected = retained_provider_receipt::collect(
+                    &outbound,
+                    &runner_id,
+                    &assignment,
+                    &workspace,
+                    &workspaces,
+                    baseline,
+                    artifact_snapshot.as_ref().expect("receipt snapshot is owned"),
+                    &mut artifact_acks,
+                    &mut cancellation_rx,
+                )
+                .await;
+                let prepared = match collected {
+                    Ok(Some(prepared)) => prepared,
+                    Ok(None) => return VerificationRunOutcome::Cancelled,
+                    Err(error) => {
+                        send_run_event(
+                            &outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": format!("retained historical receipt collection failed: {error:#}")}),
+                        );
+                        return if retained_provider_receipt::is_integrity_failure(&error) {
+                            VerificationRunOutcome::IntegrityFailed
+                        } else {
+                            VerificationRunOutcome::Failed
+                        };
+                    }
+                };
+                // The artifact check only receives these bytes after the exact
+                // new-run provider_evidence digest has a durable server ACK.
+                match artifacts.lock() {
+                    Ok(mut artifacts) => artifacts.push(prepared.artifact),
+                    Err(_) => {
+                        send_run_event(
+                            &outbound,
+                            &runner_id,
+                            &assignment,
+                            "run.failed",
+                            json!({"error": "retained receipt artifact state is unavailable"}),
+                        );
+                        return VerificationRunOutcome::Failed;
+                    }
+                }
+                source_artifacts.extend(prepared.source_artifact);
+                retained_provider_receipt::COLLECTION_SUMMARY
             } else {
-                assignment.expected_head_commit.as_deref()
-            },
-            Some(&mut cleanup_head_commit),
-            Some(&mut cancellation_rx),
-        );
+                "Verifier-only recovery completed without starting a provider."
+            };
+            if *cancellation_rx.borrow() {
+                return VerificationRunOutcome::Cancelled;
+            }
+            send_verification_events(
+                &outbound,
+                &runner_id,
+                &assignment,
+                &workspace,
+                &workspaces,
+                Some(baseline),
+                Some(&mut active_check_snapshot),
+                Some(&mut artifact_snapshot),
+                &artifacts,
+                Some(&source_artifacts),
+                &mut artifact_acks,
+                summary,
+                Some(expected_fingerprint),
+                if assignment.checkpoint_verification {
+                    None
+                } else {
+                    assignment.expected_head_commit.as_deref()
+                },
+                Some(&mut cleanup_head_commit),
+                Some(&mut cancellation_rx),
+            )
+            .await
+        };
         tokio::pin!(verification);
         let outcome = loop {
             tokio::select! {
@@ -3290,7 +3409,8 @@ async fn send_verification_events(
                 }
                 match attempt {
                     Ok(Some(ack))
-                        if ack.artifact_role == "source_deliverable"
+                        if ack.run_id == assignment.run_id
+                            && ack.artifact_role == "source_deliverable"
                             && ack.sha256 == deliverable_sha256 =>
                     {
                         stored = Some(ack.artifact_id);
@@ -3717,12 +3837,14 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            verification_command_id: None,
+            retained_provider_receipt: None,
             checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         }
     }
 
-    async fn prepared_verification_fixture()
+    pub(super) async fn prepared_verification_fixture()
     -> (PathBuf, Arc<WorkspaceManager>, WorkspaceLease, Assignment) {
         let (root, repository, managed) = teardown_fixture();
         let workspaces = Arc::new(
@@ -3771,7 +3893,7 @@ mod tests {
         events
     }
 
-    fn assert_no_verification_snapshots(run_id: Uuid) {
+    pub(super) fn assert_no_verification_snapshots(run_id: Uuid) {
         let parent = std::env::temp_dir().join("ecorp-verification-snapshots");
         let entries = match std::fs::read_dir(parent) {
             Ok(entries) => entries,
@@ -4222,6 +4344,7 @@ mod tests {
             .expect("request cancellation");
         ack_tx
             .send(ArtifactAck {
+                run_id: assignment.run_id,
                 artifact_id: Uuid::new_v4(),
                 artifact_role: "source_deliverable".to_owned(),
                 sha256: upload_sha,
@@ -4405,6 +4528,7 @@ mod tests {
                                 .as_ref()
                                 .unwrap()
                                 .send(ArtifactAck {
+                                    run_id: assignment.run_id,
                                     artifact_id: Uuid::new_v4(),
                                     artifact_role: "source_deliverable".to_owned(),
                                     sha256: payload["sha256"].as_str().unwrap().to_owned(),
@@ -4623,6 +4747,7 @@ mod tests {
         } else {
             ack_tx
                 .send(ArtifactAck {
+                    run_id: assignment.run_id,
                     artifact_id: Uuid::new_v4(),
                     artifact_role: "source_deliverable".to_owned(),
                     sha256: upload_sha,
@@ -5056,6 +5181,8 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            verification_command_id: None,
+            retained_provider_receipt: None,
             checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };
@@ -5176,6 +5303,8 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            verification_command_id: None,
+            retained_provider_receipt: None,
             checkpoint_verification: false,
             hard_boundary_checkpoint: Arc::default(),
         };

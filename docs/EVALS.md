@@ -91,6 +91,12 @@ retrieval, checkpoint artifact adoption, and application publication remain
 unproven. The established serial workspace gate passes, while the separately
 retained parallel runner failures are tracked in #213.
 
+The later [retained-receipt collection contract](evidence/2026-09-09-retained-provider-receipt.md)
+describes a separate in-progress path for an existing historical adapter
+receipt in the sealed worktree. It does not change either native-read failure.
+New collection code and fixtures are not application acceptance; current
+checks, signed-object validation, and independent outcome review remain required.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

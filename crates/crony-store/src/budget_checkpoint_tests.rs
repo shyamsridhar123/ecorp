@@ -9,6 +9,9 @@ mod cancellation_reconciliation;
 #[path = "checkpoint_correction_tests.rs"]
 mod source_correction;
 
+#[path = "retained_provider_receipt_tests.rs"]
+mod retained_receipts;
+
 const CORP: Uuid = Uuid::from_u128(1);
 const MISSION: Uuid = Uuid::from_u128(2);
 const TASK: Uuid = Uuid::from_u128(3);
@@ -57,6 +60,9 @@ struct CheckpointFixtureProfile {
     workspace_connection_id: Option<Uuid>,
     rolling_limits: Option<CheckpointRollingLimits>,
     verification_failure: bool,
+    adapter: &'static str,
+    provider_session_id: &'static str,
+    native_outcome: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +87,9 @@ impl Default for CheckpointFixtureProfile {
             workspace_connection_id: None,
             rolling_limits: None,
             verification_failure: false,
+            adapter: "codex",
+            provider_session_id: "fixture-session",
+            native_outcome: None,
         }
     }
 }
@@ -151,6 +160,14 @@ async fn fixture_with_profile(
            '00000000-0000-0000-0000-000000000004','#123456');
         "#,
     ).execute(&pool).await.unwrap();
+    if profile.adapter != "codex" {
+        sqlx::query("UPDATE agents SET adapter=$1 WHERE id=$2")
+            .bind(profile.adapter)
+            .bind(AGENT)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     // Establish immutable original authority before any usage or native stop.
     sqlx::query(
         "INSERT INTO missions(id,corp_id,room_id,requested_by,title,status,budget_tokens,
@@ -182,7 +199,7 @@ async fn fixture_with_profile(
         sqlx::query(
             "INSERT INTO workspace_connections(id,corp_id,room_id,created_by,runner_id,
                label,agent,configuration,source_repository,source_base_ref,source_base_commit,status)
-             VALUES($1,$2,$3,$4,$5,'Synthetic checkpoint connection','codex','{}',
+             VALUES($1,$2,$3,$4,$5,'Synthetic checkpoint connection',$7,'{}',
                'fixture/source','main',$6,'ready')",
         )
         .bind(connection_id)
@@ -191,6 +208,7 @@ async fn fixture_with_profile(
         .bind(OWNER)
         .bind(RUNNER)
         .bind("a".repeat(40))
+        .bind(profile.adapter)
         .execute(&pool)
         .await
         .unwrap();
@@ -216,7 +234,7 @@ async fn fixture_with_profile(
     sqlx::query(
         "INSERT INTO tasks(id,corp_id,mission_id,title,objective,status,assigned_agent_id,
           required_adapter,plan_key,contract,verification_policy,attempt_count,max_attempts)
-         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,'codex','deliver',$5,$6,$7,2)",
+         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,$8,'deliver',$5,$6,$7,2)",
     )
     .bind(TASK)
     .bind(CORP)
@@ -225,6 +243,7 @@ async fn fixture_with_profile(
     .bind(serde_json::to_value(&contract).unwrap())
     .bind(serde_json::to_value(&policy).unwrap())
     .bind(profile.attempt_count)
+    .bind(profile.adapter)
     .execute(&pool)
     .await
     .unwrap();
@@ -234,7 +253,7 @@ async fn fixture_with_profile(
            workspace_base_ref,workspace_base_commit,workspace_disposition,
            source_repository,source_base_ref,source_base_commit,model,reasoning_effort,
            budget_tokens_limit,workspace_connection_id,budget_cost_microusd_limit)
-         VALUES($1,$2,$3,$4,$5,$6,'running',$1,'fixture-session','fixture-worktree',
+         VALUES($1,$2,$3,$4,$5,$6,'running',$1,$11,'fixture-worktree',
            'crony/fixture','main',$7,'active','fixture/source','main',$7,'fixture-model','medium',$8,$9,$10)",
     )
     .bind(SOURCE)
@@ -247,6 +266,7 @@ async fn fixture_with_profile(
     .bind(profile.run_tokens)
     .bind(profile.workspace_connection_id)
     .bind(profile.run_cost_microusd)
+    .bind(profile.provider_session_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -325,8 +345,9 @@ async fn fixture_with_profile(
             SOURCE,
             TOKEN,
             "run.session_terminated",
-            json!({"adapter":"codex",
-                "outcome":if profile.verification_failure { "completed" } else { "cancelled" },
+            json!({"adapter":profile.adapter,
+                "outcome":profile.native_outcome.unwrap_or(
+                    if profile.verification_failure { "completed" } else { "cancelled" }),
                 "provider_process_alive":false}),
         ))
         .await
