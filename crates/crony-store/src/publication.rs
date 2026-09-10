@@ -260,19 +260,35 @@ impl PgStore {
                 None,
                 &operation_request,
             )?;
-            let (publication, current_token) =
-                publication_by_id_tx(&mut tx, normalized.corp_id, operation.publication_id, false)
+            let (mut publication, mut current_token) =
+                publication_by_id_tx(&mut tx, normalized.corp_id, operation.publication_id, true)
                     .await?
                     .context("idempotent publication start references a missing publication")?;
             assert_publication_room_membership_tx(&mut tx, &publication, normalized.actor_id)
                 .await?;
+            // A live-token replay grants effect authority; a tokenless readback does not.
+            if replayable_publication_token(&publication, current_token, &operation, Utc::now())
+                .is_some()
+            {
+                revalidate_publication_authority_tx(&mut tx, &publication, normalized.actor_id)
+                    .await?;
+                (publication, current_token) = publication_by_id_tx(
+                    &mut tx,
+                    normalized.corp_id,
+                    operation.publication_id,
+                    false,
+                )
+                .await?
+                .context("publication disappeared after start replay revalidation")?;
+            }
+            let replay_now = Utc::now();
             let publisher_token =
-                replayable_publication_token(&publication, current_token, &operation, now);
+                replayable_publication_token(&publication, current_token, &operation, replay_now);
             let busy = publication.state != PullRequestPublicationState::Published
                 && publisher_token.is_none()
                 && publication
                     .publisher_lease_expires_at
-                    .is_some_and(|expiry| expiry > now);
+                    .is_some_and(|expiry| expiry > replay_now);
             tx.commit().await?;
             return Ok(PullRequestPublicationOutcome {
                 publication,
@@ -468,7 +484,7 @@ impl PgStore {
             "run_ids": prerequisites.run_ids,
             "verification_evidence_ids": prerequisites.evidence_ids,
             "verification_sha256": prerequisites.verification_sha256,
-            "checkpoint": prerequisites.checkpoint.as_ref().map(|checkpoint| &checkpoint.provenance),
+            "checkpoint": prerequisites.checkpoint.as_ref().map(|checkpoint| checkpoint.provenance()),
             "deliverable": {
                 "id": normalized.source_deliverable_id,
                 "artifact_id": prerequisites.artifact_id,
@@ -857,14 +873,33 @@ impl PgStore {
                 Some(input.publisher_token),
                 &operation_request,
             )?;
-            let (publication, current_token) =
-                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+            let (mut publication, mut current_token) =
+                publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, true)
                     .await?
                     .context(
                         "idempotent publication checkpoint references a missing publication",
                     )?;
-            let publisher_token =
-                replayable_publication_token(&publication, current_token, &existing_operation, now);
+            // Keep completed and failure-only readbacks non-authorizing.
+            if replayable_publication_token(
+                &publication,
+                current_token,
+                &existing_operation,
+                Utc::now(),
+            )
+            .is_some()
+            {
+                revalidate_publication_authority_tx(&mut tx, &publication, input.actor_id).await?;
+                (publication, current_token) =
+                    publication_by_id_tx(&mut tx, input.corp_id, input.publication_id, false)
+                        .await?
+                        .context("publication disappeared after checkpoint replay revalidation")?;
+            }
+            let publisher_token = replayable_publication_token(
+                &publication,
+                current_token,
+                &existing_operation,
+                Utc::now(),
+            );
             tx.commit().await?;
             return Ok(PullRequestPublicationOutcome {
                 publication,
@@ -1673,7 +1708,7 @@ async fn revalidate_publication_authority_tx(
         prerequisites
             .checkpoint
             .as_ref()
-            .map(|checkpoint| &checkpoint.provenance),
+            .map(|checkpoint| checkpoint.provenance()),
     )?;
     if upgraded != publication.provenance {
         let updated = sqlx::query(
@@ -1906,7 +1941,6 @@ async fn validate_publication_prerequisites(
         ));
     }
     let selected_run_id: Uuid = row.get("run_id");
-    checkpoint_correction::publication_authority_tx(tx, &work_item, selected_run_id).await?;
     ensure_run_not_hard_blocked_tx(
         tx,
         request.corp_id,
@@ -1960,6 +1994,13 @@ async fn validate_publication_prerequisites(
         &commit_sha,
     )
     .await?;
+    checkpoint_correction::publication_authority_with_checkpoint_tx(
+        tx,
+        &work_item,
+        selected_run_id,
+        checkpoint.as_ref(),
+    )
+    .await?;
     if run_rows.iter().any(|run| {
         selected_lineage.contains(&run.get::<Uuid, _>("id"))
             && run
@@ -2011,7 +2052,7 @@ async fn validate_publication_prerequisites(
         }
         if checkpoint
             .as_ref()
-            .is_some_and(|checkpoint| checkpoint.origin_run_id == run_id)
+            .is_some_and(|checkpoint| checkpoint.origin_run_id() == run_id)
         {
             // This exact measured budget stop produced the authorized checkpoint.
             // Publishing its reviewed bytes starts no model; loops are not waived.

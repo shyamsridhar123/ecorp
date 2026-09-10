@@ -9,6 +9,9 @@ mod cancellation_reconciliation;
 #[path = "checkpoint_correction_tests.rs"]
 mod source_correction;
 
+#[path = "checkpoint_correction_publication_tests.rs"]
+mod correction_publication;
+
 #[path = "retained_provider_receipt_tests.rs"]
 mod retained_receipts;
 
@@ -56,6 +59,7 @@ struct CheckpointFixtureProfile {
     used_tokens: i64,
     used_cost_microusd: i64,
     attempt_count: i32,
+    max_attempts: i32,
     expected_stage: &'static str,
     workspace_connection_id: Option<Uuid>,
     rolling_limits: Option<CheckpointRollingLimits>,
@@ -83,6 +87,7 @@ impl Default for CheckpointFixtureProfile {
             used_tokens: 6_000,
             used_cost_microusd: 0,
             attempt_count: 2,
+            max_attempts: 2,
             expected_stage: "stop",
             workspace_connection_id: None,
             rolling_limits: None,
@@ -234,7 +239,7 @@ async fn fixture_with_profile(
     sqlx::query(
         "INSERT INTO tasks(id,corp_id,mission_id,title,objective,status,assigned_agent_id,
           required_adapter,plan_key,contract,verification_policy,attempt_count,max_attempts)
-         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,$8,'deliver',$5,$6,$7,2)",
+         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,$8,'deliver',$5,$6,$7,$9)",
     )
     .bind(TASK)
     .bind(CORP)
@@ -244,6 +249,7 @@ async fn fixture_with_profile(
     .bind(serde_json::to_value(&policy).unwrap())
     .bind(profile.attempt_count)
     .bind(profile.adapter)
+    .bind(profile.max_attempts)
     .execute(&pool)
     .await
     .unwrap();
