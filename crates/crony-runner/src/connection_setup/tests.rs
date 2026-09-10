@@ -412,3 +412,327 @@ fn late_ack_recognizes_server_committed_history_without_reselecting_old_profile(
     assert!(connection.snapshots[&first_key].source_accepted);
     validate_registry(&state, first.corp_id, &first.runner_id).unwrap();
 }
+
+// Pure metadata cap regressions. Registry roundtrips model persisted restart;
+// these do not run a provider, Git, services, or reset any private directory.
+fn discovery(
+    template: &WorkspaceSetupCommand,
+    id: u128,
+    expires_at: DateTime<Utc>,
+) -> WorkspaceSetupCommand {
+    WorkspaceSetupCommand {
+        operation_id: Uuid::from_u128(id),
+        connection_owner_id: None,
+        expected_connection_version: None,
+        action: WorkspaceSetupAction::InspectGitHub {
+            account: GitHubAccountSource::Personal,
+        },
+        expires_at,
+        ..template.clone()
+    }
+}
+
+fn fill_receipt_capacity(
+    state: &mut Registry,
+    template: &WorkspaceSetupCommand,
+    expires_at: DateTime<Utc>,
+    acknowledged: bool,
+) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for index in 0..MAX_OPERATIONS - state.operations.len() {
+        let command = discovery(template, 1_000 + index as u128, expires_at);
+        begin_operation(state, &command).unwrap();
+        if acknowledged {
+            state
+                .operations
+                .get_mut(&command.operation_id)
+                .unwrap()
+                .report = Some(report(
+                WorkspaceSetupStatus::Succeeded,
+                None,
+                "Synthetic completed account check.",
+            ));
+            // Both final ACK decisions settle discovery without granting a pin.
+            acknowledge(state, command.operation_id, index % 2 == 0).unwrap();
+        }
+        ids.push(command.operation_id);
+    }
+    ids
+}
+
+#[test]
+fn receipt_cap_rollover_prunes_old_terminal_acknowledged_entries_without_reset() {
+    let now = Utc::now();
+    let (mut state, mut command, snapshot) = fixture();
+    command.expires_at = now - chrono::Duration::hours(1);
+    begin_operation(&mut state, &command).unwrap();
+    complete(&mut state, &command, snapshot);
+    acknowledge(&mut state, command.operation_id, true).unwrap();
+    state
+        .github_accounts
+        .insert(command.actor_id, "fixture-account".to_owned());
+    let ids = fill_receipt_capacity(&mut state, &command, command.expires_at, true);
+    let original = state.clone();
+    for (index, retired) in ids.iter().take(4).enumerate() {
+        let expired = state.operations[retired].command.clone();
+        let next = discovery(
+            &command,
+            100_000 + index as u128,
+            now + chrono::Duration::minutes(5),
+        );
+        reserve_operation(&mut state, &next, &HashSet::new(), now).unwrap();
+        assert_eq!(state.operations.len(), MAX_OPERATIONS);
+        assert!(!state.operations.contains_key(retired));
+        assert!(state.operations[&next.operation_id].report.is_none());
+        assert_eq!(state.operations[&next.operation_id].acknowledged, None);
+        let before_replay = json!(state);
+        assert!(
+            reserve_operation(&mut state, &expired, &HashSet::new(), now)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        assert!(acknowledge(&mut state, *retired, true).is_err());
+        assert_eq!(
+            json!(state),
+            before_replay,
+            "expired replay cannot create another effect"
+        );
+    }
+    let restored: Registry = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    validate_registry(&restored, command.corp_id, &command.runner_id).unwrap();
+    assert_eq!(json!(restored.connections), json!(original.connections));
+    assert_eq!(restored.github_accounts, original.github_accounts);
+    assert_eq!(restored.corp_id, original.corp_id);
+    assert_eq!(restored.runner_id, original.runner_id);
+    assert_eq!(restored.schema_version, original.schema_version);
+    let mut restarted = restored;
+    let before_replay = json!(restarted);
+    assert!(
+        reserve_operation(
+            &mut restarted,
+            &original.operations[&ids[0]].command,
+            &HashSet::new(),
+            now,
+        )
+        .is_err()
+    );
+    assert_eq!(json!(restarted), before_replay);
+}
+
+#[test]
+fn receipt_cap_restart_preserves_current_source_and_all_retained_receipts() {
+    let now = Utc::now();
+    let (mut state, mut first, source) = fixture();
+    first.expires_at = now - chrono::Duration::hours(2);
+    begin_operation(&mut state, &first).unwrap();
+    let first_key = complete(&mut state, &first, source.clone());
+    acknowledge(&mut state, first.operation_id, true).unwrap();
+    let mut second = first.clone();
+    second.operation_id = Uuid::from_u128(20);
+    second.expected_connection_version = Some(2);
+    begin_operation(&mut state, &second).unwrap();
+    let mut refreshed = source.clone();
+    refreshed.source.base_commit = "b".repeat(40);
+    complete(&mut state, &second, refreshed);
+    acknowledge(&mut state, second.operation_id, true).unwrap();
+    let mut source_only = second.clone();
+    source_only.operation_id = Uuid::from_u128(21);
+    source_only.expected_connection_version = Some(3);
+    begin_operation(&mut state, &source_only).unwrap();
+    let mut retained = source;
+    retained.models.clear();
+    let source_key = complete(&mut state, &source_only, retained);
+    state
+        .operations
+        .get_mut(&source_only.operation_id)
+        .unwrap()
+        .report
+        .as_mut()
+        .unwrap()
+        .connection_status = Some(WorkspaceConnectionStatus::NeedsSignIn);
+    acknowledge(&mut state, source_only.operation_id, true).unwrap();
+    let mut current = source_only.clone();
+    current.operation_id = Uuid::from_u128(22);
+    current.expected_connection_version = Some(4);
+    begin_operation(&mut state, &current).unwrap();
+    state
+        .operations
+        .get_mut(&current.operation_id)
+        .unwrap()
+        .report = Some(report(
+        WorkspaceSetupStatus::Failed,
+        Some(WorkspaceConnectionStatus::Failed),
+        "Synthetic failed refresh.",
+    ));
+    acknowledge(&mut state, current.operation_id, false).unwrap();
+    // Even redundant receipts pointing at a retained snapshot remain in scope.
+    let mut duplicate = state.operations[&first.operation_id].clone();
+    duplicate.command.operation_id = Uuid::from_u128(23);
+    duplicate.command.expires_at = now - chrono::Duration::hours(3);
+    state
+        .operations
+        .insert(duplicate.command.operation_id, duplicate.clone());
+    let ids = fill_receipt_capacity(&mut state, &first, now - chrono::Duration::hours(1), true);
+    validate_registry(&state, first.corp_id, &first.runner_id).unwrap();
+    let mut restored: Registry =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    let next = discovery(&first, 100_000, now + chrono::Duration::minutes(5));
+    reserve_operation(&mut restored, &next, &HashSet::new(), now).unwrap();
+    assert!(!restored.operations.contains_key(&ids[0]));
+    for id in [
+        first.operation_id,
+        second.operation_id,
+        source_only.operation_id,
+        current.operation_id,
+        duplicate.command.operation_id,
+    ] {
+        assert_eq!(
+            json!(restored.operations[&id]),
+            json!(state.operations[&id])
+        );
+    }
+    validate_registry(&restored, first.corp_id, &first.runner_id).unwrap();
+    assert_eq!(json!(restored.connections), json!(state.connections));
+    let connection = &restored.connections[&first.action.connection_id().unwrap()];
+    assert_eq!(connection.source_snapshot.as_ref(), Some(&source_key));
+    assert!(connection.active_snapshot.is_none());
+    assert!(connection.snapshots[&first_key].accepted);
+    assert!(!connection.snapshots[&source_key].accepted);
+    let before_ack = json!(restored);
+    acknowledge(&mut restored, first.operation_id, true).unwrap();
+    assert_eq!(json!(restored), before_ack, "old ACK cannot reselect a pin");
+    let mut missing_proof = restored.clone();
+    missing_proof.operations.remove(&first.operation_id);
+    missing_proof
+        .operations
+        .remove(&duplicate.command.operation_id);
+    assert!(validate_registry(&missing_proof, first.corp_id, &first.runner_id).is_err());
+}
+
+#[test]
+fn receipt_cap_preserves_live_unacked_unfinished_and_unexpired_operations() {
+    let now = Utc::now();
+    let (mut state, command, _) = fixture();
+    let ids = fill_receipt_capacity(
+        &mut state,
+        &command,
+        now - chrono::Duration::hours(1),
+        false,
+    );
+    state.operations.get_mut(&ids[0]).unwrap().report = Some(report(
+        WorkspaceSetupStatus::Succeeded,
+        None,
+        "Unacknowledged result.",
+    ));
+    state.operations.get_mut(&ids[1]).unwrap().login_started = true;
+    // A final result can be ACKed just before its real Flight is removed.
+    state.operations.get_mut(&ids[2]).unwrap().report = Some(report(
+        WorkspaceSetupStatus::Succeeded,
+        None,
+        "Flight finishing.",
+    ));
+    acknowledge(&mut state, ids[2], true).unwrap();
+    state.operations.get_mut(&ids[3]).unwrap().report = Some(report(
+        WorkspaceSetupStatus::Failed,
+        None,
+        "Recent rejected result.",
+    ));
+    state
+        .operations
+        .get_mut(&ids[3])
+        .unwrap()
+        .command
+        .expires_at = now + chrono::Duration::minutes(1);
+    acknowledge(&mut state, ids[3], false).unwrap();
+    let before = state.clone();
+    let next = discovery(&command, 100_000, now + chrono::Duration::minutes(5));
+    assert!(
+        reserve_operation(&mut state, &next, &HashSet::from([ids[2]]), now)
+            .unwrap_err()
+            .to_string()
+            .contains("retention bound")
+    );
+    assert_eq!(
+        json!(state),
+        json!(before),
+        "a full protected window fails closed"
+    );
+    reserve_operation(&mut state, &next, &HashSet::new(), now).unwrap();
+    assert!(!state.operations.contains_key(&ids[2]));
+    for protected in [ids[0], ids[1], ids[3]] {
+        assert_eq!(
+            json!(state.operations[&protected]),
+            json!(before.operations[&protected])
+        );
+    }
+    assert!(state.operations[&ids[1]].login_started);
+    assert_eq!(state.operations[&ids[0]].acknowledged, None);
+    validate_registry(&state, command.corp_id, &command.runner_id).unwrap();
+}
+
+#[test]
+fn receipt_cap_live_duplicate_and_conflicting_commands_do_not_compact_or_restart() {
+    let now = Utc::now();
+    let (mut state, command, _) = fixture();
+    let live_command = discovery(&command, 99, now + chrono::Duration::minutes(10));
+    begin_operation(&mut state, &live_command).unwrap();
+    state
+        .operations
+        .get_mut(&live_command.operation_id)
+        .unwrap()
+        .report = Some(report(
+        WorkspaceSetupStatus::Succeeded,
+        None,
+        "Still-valid completed receipt.",
+    ));
+    acknowledge(&mut state, live_command.operation_id, true).unwrap();
+    let ids = fill_receipt_capacity(
+        &mut state,
+        &command,
+        now + chrono::Duration::minutes(5),
+        true,
+    );
+    let before = json!(state);
+    let next = discovery(&command, 100_000, now + chrono::Duration::minutes(15));
+    assert!(reserve_operation(&mut state, &next, &HashSet::new(), now).is_err());
+    assert_eq!(
+        json!(state),
+        before,
+        "2048 still-valid receipts cannot be pruned"
+    );
+    reserve_operation(&mut state, &live_command, &HashSet::new(), now).unwrap();
+    acknowledge(&mut state, live_command.operation_id, true).unwrap();
+    assert_eq!(json!(state), before);
+    for field in ["actor", "owner", "room", "version", "expiry", "action"] {
+        let mut changed = live_command.clone();
+        match field {
+            "actor" => changed.actor_id = Uuid::new_v4(),
+            "owner" => changed.connection_owner_id = Some(Uuid::new_v4()),
+            "room" => changed.room_id = Uuid::new_v4(),
+            "version" => changed.expected_connection_version = Some(2),
+            "expiry" => changed.expires_at += chrono::Duration::minutes(1),
+            "action" => changed.action = WorkspaceSetupAction::SignInGitHub,
+            _ => unreachable!(),
+        }
+        assert!(
+            reserve_operation(&mut state, &changed, &HashSet::new(), now).is_err(),
+            "{field}"
+        );
+        assert_eq!(json!(state), before);
+    }
+    // Advance the admission clock, not any persisted command's immutable expiry.
+    reserve_operation(
+        &mut state,
+        &next,
+        &HashSet::new(),
+        now + chrono::Duration::minutes(6),
+    )
+    .unwrap();
+    assert!(state.operations.contains_key(&live_command.operation_id));
+    assert!(!state.operations.contains_key(&ids[0]));
+    assert_eq!(
+        json!(state.operations[&live_command.operation_id]),
+        before["operations"][live_command.operation_id.to_string()]
+    );
+}

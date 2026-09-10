@@ -258,7 +258,7 @@ async function stopScenario() {
 
 async function budgetStopScenario() {
   const demo = await post('/api/demo/reset', {})
-  const { launch } = await createCodexMission(
+  const { mission, launch } = await createCodexMission(
     demo,
     '[budget-stream] stream usage before attempting late completion',
     {
@@ -267,10 +267,28 @@ async function budgetStopScenario() {
     },
   )
   const terminal = await waitForRun(demo, launch.run_id, isSettled, 30_000)
-  assert.equal(terminal.run.status, 'failed')
+  // The native hard-boundary path suppresses late artifact upload, retains
+  // stopped source, and reports cancellation instead of an upload-induced
+  // failure. ADR 0016/0023 still fence stop and prohibit ordinary resume.
+  assert.equal(terminal.run.status, 'cancelled')
   assert.equal(terminal.run.breaker_stage, 'stop')
   assert.equal(terminal.run.artifact_id, null)
   assert.ok(terminal.run.input_tokens >= 6_000)
+  assert.equal(terminal.run.workspace_disposition, 'preserved')
+  assert.equal(terminal.run.workspace_run_id, launch.run_id)
+  assert.ok(terminal.run.workspace_path, 'budget stop omitted retained source')
+  assert.equal(
+    await readFile(path.join(terminal.run.workspace_path, 'base.txt'), 'utf8'),
+    'base\n',
+  )
+  assert.equal(
+    terminal.state.snapshot.tasks.find((task) => task.id === terminal.run.task_id)?.status,
+    'cancelled',
+  )
+  assert.equal(
+    terminal.state.snapshot.missions.find((candidate) => candidate.id === mission.mission_id)?.status,
+    'cancelled',
+  )
   const events = terminal.state.snapshot.events.filter(
     (event) => event.aggregate_id === launch.run_id,
   )
@@ -282,8 +300,43 @@ async function budgetStopScenario() {
   )
   assert.ok(usageIndex >= 0)
   assert.ok(breakerIndex > usageIndex)
+  const breakerCommand = events[breakerIndex].payload.command_id
+  assert.ok(breakerCommand, 'stop omitted its durable runner command')
+  assert.ok(
+    events.findIndex(
+      (event) =>
+        event.type === 'runner.command_acknowledged' &&
+        event.payload?.command_id === breakerCommand &&
+        event.payload?.command_kind === 'circuit_breaker',
+    ) > breakerIndex,
+    'stop command was not acknowledged after its breaker transition',
+  )
+  const terminationIndex = events.findIndex(
+    (event) => event.type === 'run.session_terminated',
+  )
+  const preservedIndex = events.findIndex(
+    (event) => event.type === 'run.workspace_preserved',
+  )
+  const cancelledIndex = events.findIndex(
+    (event) => event.type === 'run.cancelled',
+  )
+  assert.ok(terminationIndex > breakerIndex, 'stop must precede native termination')
+  assert.equal(events[terminationIndex].payload.adapter, 'codex')
+  assert.equal(events[terminationIndex].payload.provider_process_alive, false)
+  assert.ok(preservedIndex > terminationIndex, 'retention must follow native termination')
+  assert.ok(cancelledIndex > preservedIndex, 'cancellation must follow source retention')
+  assert.deepEqual(
+    events
+      .filter((event) => ['run.failed', 'run.cancelled', 'run.lost'].includes(event.type))
+      .map((event) => event.type),
+    ['run.cancelled'],
+  )
   assert.equal(
     events.filter((event) => event.type === 'run.completed').length,
+    0,
+  )
+  assert.equal(
+    events.filter((event) => event.type === 'run.verification_started').length,
     0,
   )
   assert.equal(
@@ -293,11 +346,17 @@ async function budgetStopScenario() {
     1,
   )
   return {
+    mission_id: mission.mission_id,
     run_id: launch.run_id,
     status: terminal.run.status,
     breaker_stage: terminal.run.breaker_stage,
     input_tokens: terminal.run.input_tokens,
     accepted_artifact: terminal.run.artifact_id,
+    workspace_disposition: terminal.run.workspace_disposition,
+    termination_event_id: events[terminationIndex].id,
+    preservation_event_id: events[preservedIndex].id,
+    cancellation_event_id: events[cancelledIndex].id,
+    breaker_command_id: breakerCommand,
     completed_events: 0,
   }
 }

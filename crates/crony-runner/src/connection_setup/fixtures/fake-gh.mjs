@@ -28,7 +28,8 @@ const audit = (method, extra = {}) => fs.appendFileSync(
 );
 const reply = value => fs.writeSync(1, JSON.stringify(value) + "\n");
 const repository = {
-  full_name: "team/repo",
+  // GitHub preserves display casing; native catalogue/setup must canonicalize it.
+  full_name: "TeAm/RePo",
   node_id: "R_fixture_repo",
   default_branch: "main",
   private: true,

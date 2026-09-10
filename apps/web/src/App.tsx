@@ -3539,7 +3539,28 @@ function MissionCard({
     : undefined
   const recoveryItem = recoveryContext?.work_item
   const recoveryModes = factoryRecoveryModes(recoveryContext)
-  const resumeRecoveryBlocked = factoryRecoveryBlocksProviderResume(Boolean(recoveryScope), recoveryContext)
+  // Looking for optional checkpoint recovery is not itself a reason to suppress
+  // ordinary interrupted-session resume. Snapshot history may require a governed
+  // path, but never supplies that path's source, checkpoint or authorization.
+  const resumeLineageRuns = runs.filter((run) => run.task_id === resumableRun?.task_id
+    && run.workspace_run_id === resumableRun?.workspace_run_id)
+  const requiresFactoryRecovery = Boolean(recoveryScope && (
+    ['verification_failed', 'cancelled'].includes(recoveryItemState ?? '') ||
+    tasks.some((task) => task.id === resumableRun?.task_id &&
+      (task.status === 'verification_failed' || task.verification_status === 'failed')) ||
+    resumeLineageRuns.some((run) => run.execution_mode === 'verification_only' ||
+      run.breaker_stage === 'suspend' || run.breaker_stage === 'stop') ||
+    factoryRecoveries.some((entry) =>
+      entry.factory_work_item_id === recoveryScope.itemId && entry.mission_id === mission.id &&
+      entry.task_id === resumableRun?.task_id &&
+      (['authorized', 'running'].includes(entry.status) || (entry.mode === 'checkpoint_verification' &&
+        resumeLineageRuns.some((run) => run.id === entry.source_run_id || run.id === entry.replacement_run_id)))) ||
+    recoveryContext?.recoveries.some((entry) => entry.task_id === resumableRun?.task_id &&
+      ['authorized', 'running'].includes(entry.status))
+  ))
+  const resumeRecoveryBlocked = requiresFactoryRecovery ||
+    factoryRecoveryBlocksProviderResume(Boolean(recoveryScope && recoveryContext &&
+      recoveryContext.task_id === resumableRun?.task_id), recoveryContext)
   const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
   const recoveryAgent = recoveryTask?.assigned_agent_id
     ? agents.find((agent) => agent.id === recoveryTask.assigned_agent_id)
@@ -4707,6 +4728,7 @@ function App() {
   const [connectionToken, setConnectionToken] = useState('')
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
+  const snapshotRefreshRef = useRef<ReturnType<typeof createSnapshotRefresher> | null>(null)
   const currentViewer = useRef<{ corpId: string; actorId: string } | null>(null)
   const currentComments = useRef<{
     snapshot: SnapshotResponse['snapshot']
@@ -4954,13 +4976,7 @@ function App() {
         if (!disposed) setError(caught instanceof Error ? caught.message : String(caught))
       },
     })
-    // Idle runner presence can change without a run event. Reuse the bounded
-    // snapshot refresher so an open console does not stay falsely online.
-    const refreshVisiblePresence = () => {
-      if (document.visibilityState === 'visible') snapshotRefresh.request()
-    }
-    const presenceTimer = window.setInterval(refreshVisiblePresence, 5_000)
-    document.addEventListener('visibilitychange', refreshVisiblePresence)
+    snapshotRefreshRef.current = snapshotRefresh
 
     const connect = async () => {
       if (disposed) return
@@ -5029,13 +5045,31 @@ function App() {
     void connect()
     return () => {
       disposed = true
-      window.clearInterval(presenceTimer)
-      document.removeEventListener('visibilitychange', refreshVisiblePresence)
+      if (snapshotRefreshRef.current === snapshotRefresh) snapshotRefreshRef.current = null
       snapshotRefresh.dispose()
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
       socket?.close()
     }
   }, [bootstrap, refresh, selectedActorId])
+
+  useEffect(() => {
+    if (!bootstrap || !selectedActorId || !(connectionsOpen || journeyOpen ||
+      (activeWorkspaceView === 'missions' && !missionComposerCollapsed))) return
+    const snapshotRefresh = snapshotRefreshRef.current
+    if (!snapshotRefresh) return
+    // Heartbeat-only readiness matters while choosing/configuring a connection,
+    // not in every idle client. Share the event coalescer; never restart its socket
+    // or overlap another full-Corp read when a connection-dependent view opens.
+    const refreshVisiblePresence = () => {
+      if (document.visibilityState === 'visible') snapshotRefresh.request()
+    }
+    const presenceTimer = window.setInterval(refreshVisiblePresence, 5_000)
+    document.addEventListener('visibilitychange', refreshVisiblePresence)
+    return () => {
+      window.clearInterval(presenceTimer)
+      document.removeEventListener('visibilitychange', refreshVisiblePresence)
+    }
+  }, [bootstrap, refresh, selectedActorId, connectionsOpen, journeyOpen, activeWorkspaceView, missionComposerCollapsed])
 
   const humans = useMemo(
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
