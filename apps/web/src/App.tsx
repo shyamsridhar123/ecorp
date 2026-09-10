@@ -34,7 +34,12 @@ import type { DiscussionScope } from './missionProjection'
 import { createSnapshotRefresher } from './snapshotRefresh'
 import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
 import { ConnectionsPanel } from './ConnectionsPanel'
-import { MissionOriginDetails } from './MissionOriginDetails'
+import { MissionOriginText } from './MissionOriginDetails'
+import { useMissionOriginContext } from './useMissionOriginContext'
+import { useMissionResultContext } from './useMissionResultContext'
+import { missionResultPresentation } from './missionResultContext'
+import { WorkResultCard } from './WorkResultCard'
+import { PublishedResultCard } from './PublishedResultCard'
 import {
   connectionLabel, connectionRunnerRevision, connectionScope, connectionStatusLabel,
   connectionTarget, connectionsNeedPresenceRefresh,
@@ -894,6 +899,13 @@ function shortId(value: string | null | undefined): string {
   return value ? value.slice(0, 8) : 'none'
 }
 
+function focusWorkSection(id: string) {
+  const section = document.getElementById(id)
+  if (!section) return
+  section.focus({ preventScroll: true })
+  section.scrollIntoView({ block: 'start', behavior: 'auto' })
+}
+
 function time(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     month: 'short',
@@ -1590,7 +1602,6 @@ function FactoryPanel({
   items,
   missions,
   publications,
-  publicationAttempts,
   controllers,
   tasks,
   runs,
@@ -1615,13 +1626,13 @@ function FactoryPanel({
   onOpenMission,
   onDiscussMission,
   onNewMission,
+  onDownloadDeliverable,
   selectedItemId,
   onSelectItem,
 }: {
   items: FactoryWorkItem[]
   missions: Mission[]
   publications: PullRequestPublication[]
-  publicationAttempts: PullRequestPublicationAttempt[]
   controllers: FactoryController[]
   tasks: Task[]
   runs: Run[]
@@ -1654,6 +1665,7 @@ function FactoryPanel({
   onOpenMission: (mission: Mission) => void
   onDiscussMission: (mission: Mission) => void
   onNewMission: () => void
+  onDownloadDeliverable: (deliverable: SourceDeliverable) => Promise<void>
   selectedItemId: string | null
   onSelectItem: (item: FactoryWorkItem) => void
 }) {
@@ -1705,12 +1717,18 @@ function FactoryPanel({
       factory_work_items: items, pull_request_publications: publications,
     }).kind === 'unknown',
   )
-  const selectedPublication = publications.find(
+  const publicationHint = publications.find(
     (candidate) => candidate.factory_work_item_id === selected?.id,
   )
-  const selectedAttempts = publicationAttempts
-    .filter((attempt) => attempt.publication_id === selectedPublication?.id)
-    .sort((left, right) => right.attempt - left.attempt)
+  const resultRead = useMissionResultContext({
+    corpId: scope.corpId, actorId: selectedActor.id, actorRole: selectedActor.role,
+    missionId: selected?.mission_id, roomId: selectedMission?.room_id ?? room?.id,
+    workItemId: selected?.mission_id ? selected.id : null,
+    sourceRepository: selected ? `${selected.source_repository_owner}/${selected.source_repository_name}` : null,
+    revision: `${selected?.version ?? ''}:${publicationHint?.id ?? ''}:${publicationHint?.version ?? ''}`,
+    api,
+  })
+  const selectedResult = missionResultPresentation(resultRead.scope, resultRead.current)
   const controller = selectFactoryController(
     controllers, selected, scope.corpId, selectedItemId,
   )
@@ -1822,7 +1840,15 @@ function FactoryPanel({
             </details>
           </div>
         )}
-        {controller ? <FactoryPollingNotice controller={controller} /> : null}
+        {controller ? (
+          <details className="factory-intake-details">
+            <summary>Intake diagnostics</summary>
+            <FactoryPollingNotice controller={controller} />
+          </details>
+        ) : null}
+        {controller && !canControlFactory ? (
+          <p className="factory-control-help">An owner, admin or manager can change intake. You can still inspect and discuss this work.</p>
+        ) : null}
         {controller?.last_error ? (
           <p className="factory-controller-error" role="alert">
             {controller.last_error}
@@ -1830,8 +1856,8 @@ function FactoryPanel({
         ) : null}
       </section>
       {otherMissions.length ? (
-        <section className="manual-work-links" aria-label="Other missions">
-          <strong>Other missions</strong>
+        <details className="manual-work-links" aria-label="Other missions">
+          <summary>Other missions ({otherMissions.length})</summary>
           <p>These missions are not linked in this Factory view. Their intake origin may be unavailable.</p>
           <div className="work-context-actions">
             {otherMissions.slice(0, 5).map((mission) => (
@@ -1841,11 +1867,25 @@ function FactoryPanel({
               </button>
             ))}
           </div>
-        </section>
+        </details>
       ) : null}
       <div className={`factory-console ${items.length ? '' : 'factory-console-empty'}`}>
         {items.length ? (
           <>
+            <div className="work-quick-switch">
+              <label htmlFor="factory-work-switch">Work item</label>
+              <select id="factory-work-switch" value={selected?.id ?? ''}
+                aria-controls="factory-workbench"
+                onChange={(event) => {
+                  const item = items.find((candidate) => candidate.id === event.target.value)
+                  if (item) onSelectItem(item)
+                }}>
+                {!selected ? <option value="">Choose a work item</option> : null}
+                {items.map((item) => <option key={item.id} value={item.id}>
+                  #{item.source_issue_number} · {statusLabel(item.state)} · {item.source_title}
+                </option>)}
+              </select>
+            </div>
             <nav className="factory-queue" aria-label="Factory work items">
               <div className="factory-queue-label">
                 <span>Issue queue</span>
@@ -1903,6 +1943,34 @@ function FactoryPanel({
                       {selected.source_title}
                     </a>
                   </h3>
+                  {selected.mission_id && selectedResult.state !== 'none' ? (
+                    <div data-testid="factory-publication">
+                      <PublishedResultCard
+                        result={selectedResult}
+                        busy={busy}
+                        onRefresh={resultRead.refresh}
+                        onDownload={(deliverable) => void onDownloadDeliverable(deliverable)}
+                      />
+                    </div>
+                  ) : (
+                    <WorkResultCard
+                      heading={pendingReviews.length || pendingActions.length ? 'This work needs a decision'
+                        : activeRun ? 'Your team is working'
+                          : selected.state === 'verified' ? 'Verified work is ready to review'
+                            : selectedMission ? 'Continue with this work' : 'Waiting for a mission'}
+                      status={statusLabel(selected.state)}
+                      tone={pendingReviews.length || pendingActions.length ? 'attention'
+                        : selected.state === 'verified' ? 'success' : activeRun ? 'working' : 'neutral'}
+                      description={selectedMission
+                        ? 'Open the same mission for its task owners, exact-run evidence and any required decisions. No pull request is recorded yet.'
+                        : 'Intake and its existing controller determine when a mission can start. This screen does not create a second execution path.'}
+                      actions={selectedMission ? (
+                        <button type="button" className="button button-primary" onClick={() => onOpenMission(selectedMission)}>
+                          {pendingReviews.length || pendingActions.length ? 'Review this work' : 'Open mission and results'}
+                        </button>
+                      ) : undefined}
+                    />
+                  )}
                   {selectedMission ? (
                     <nav className="work-context-actions" aria-label="This work item">
                       <button type="button" className="button button-secondary"
@@ -2208,107 +2276,6 @@ function FactoryPanel({
                       </section>
                     </div>
                   ) : null}
-
-                  {selectedPublication ? (
-                    <div className="publication-proof" data-testid="factory-publication">
-                      <div className="publication-proof-heading">
-                        <strong>Verified pull-request publication</strong>
-                        <span
-                          className={`status-chip status-chip-${
-                            selectedPublication.state === 'published'
-                              ? 'completed'
-                              : selectedPublication.failure_detail
-                                ? 'failed'
-                                : 'running'
-                          }`}
-                        >
-                          {statusLabel(selectedPublication.state)}
-                        </span>
-                      </div>
-                      <dl>
-                        <div>
-                          <dt>Target</dt>
-                          <dd>
-                            {selectedPublication.target_repository} · {selectedPublication.base_ref}
-                            {selectedPublication.pull_request_base_ref &&
-                            selectedPublication.pull_request_base_ref !== selectedPublication.base_ref
-                              ? ` → ${selectedPublication.pull_request_base_ref}`
-                              : ''}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Branch</dt>
-                          <dd>
-                            {selectedPublication.branch} @ {shortId(selectedPublication.commit_sha)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Authorization</dt>
-                          <dd>
-                            {selectedPublication.authorization_snapshot.actor_role ?? 'authorized'} ·{' '}
-                            {shortId(selectedPublication.actor_id)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Attempts</dt>
-                          <dd>
-                            {selectedPublication.attempt_count}
-                            {selectedAttempts[0]
-                              ? ` · latest ${statusLabel(selectedAttempts[0].state)}`
-                              : ''}
-                          </dd>
-                        </div>
-                      </dl>
-                      {selectedPublication.authorization_snapshot.reason ? (
-                        <p>{selectedPublication.authorization_snapshot.reason}</p>
-                      ) : null}
-                      {selectedPublication.pull_request_url ? (
-                        <>
-                          <a
-                            className="publication-link"
-                            href={selectedPublication.pull_request_url}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Pull request #{selectedPublication.pull_request_number} ·{' '}
-                            {selectedPublication.pull_request_draft ? 'draft' : 'open for review'}
-                          </a>
-                          <span className="publication-pending">
-                            Verified head {selectedPublication.pull_request_head_repository_owner} @{' '}
-                            {selectedPublication.pull_request_head_sha
-                              ? shortId(selectedPublication.pull_request_head_sha)
-                              : 'pending'}
-                            {selectedPublication.pull_request_is_cross_repository === false
-                              ? ' · same repository'
-                              : ''}
-                            {selectedPublication.pull_request_base_ref
-                              ? ` · PR base ${selectedPublication.pull_request_base_ref}`
-                              : ''}
-                          </span>
-                        </>
-                      ) : (
-                        <span className="publication-pending">Pull request not created yet</span>
-                      )}
-                      <footer>
-                        <span>
-                          Project {selectedPublication.project_status_before}
-                          {selectedPublication.project_status_after
-                            ? ` → ${selectedPublication.project_status_after}`
-                            : ''}
-                        </span>
-                        <span>auto-merge off · merge/deploy unauthorized</span>
-                      </footer>
-                      {selectedPublication.failure_detail ? (
-                        <p className="factory-failure">{selectedPublication.failure_detail}</p>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <div className="factory-publication-empty">
-                      <span>Publication bay</span>
-                      <strong>No pull request yet</strong>
-                      <p>Publication unlocks only after the mission and its evidence are verified.</p>
-                    </div>
-                  )}
 
                   <footer className="factory-dossier-footer">
                     <span>Source rev {selected.source_revision}</span>
@@ -3429,6 +3396,7 @@ function MissionCard({
   onDiscuss,
   onViewAgents,
   onOpenFactory,
+  publicationRevision = '',
 }: {
   corpId: string
   mission: Mission
@@ -3473,6 +3441,7 @@ function MissionCard({
   onDiscuss: (mission: Mission) => void
   onViewAgents: (mission: Mission) => void
   onOpenFactory: () => void
+  publicationRevision?: string
 }) {
   const [copiedRecoveryCommand, setCopiedRecoveryCommand] = useState<string | null>(null)
   const evidenceStorageKey = evidenceSelectionKey({ server: API_URL, corpId, actorId, missionId: mission.id })
@@ -3569,6 +3538,33 @@ function MissionCard({
   const runDeliverable = evidenceRun
     ? deliverables.find((deliverable) => deliverable.run_id === evidenceRun.id)
     : undefined
+  const originRead = useMissionOriginContext({
+    corpId, actorId, actorRole, missionId: mission.id, roomId: mission.room_id, api,
+  })
+  const exactOrigin = originRead.current?.status === 'ready'
+    ? originRead.current.context.origin : null
+  const originUnavailable = originRead.current?.status === 'unavailable'
+  const resultRead = useMissionResultContext({
+    corpId, actorId, actorRole, missionId: mission.id, roomId: mission.room_id,
+    workItemId: exactOrigin?.kind === 'factory' ? exactOrigin.work_item_id : null,
+    sourceRepository: exactOrigin?.kind === 'factory' ? exactOrigin.source_repository : null,
+    revision: `${publicationRevision}:${factoryItem?.version ?? ''}:${runDeliverable?.integration_state ?? ''}`,
+    api,
+  })
+  const deliveredResult = missionResultPresentation(
+    resultRead.scope, resultRead.current,
+    evidenceRun ?? (selectedEvidenceRunId !== null ? { id: selectedEvidenceRunId } : undefined),
+  )
+  const deliveredRun = deliveredResult.resultRunId && deliveredResult.resultRunId !== evidenceRun?.id
+    ? runs.find((run) => run.id === deliveredResult.resultRunId && taskById.has(run.task_id))
+    : undefined
+  const showPublicationResult = exactOrigin?.kind === 'factory' &&
+    deliveredResult.state !== 'none' &&
+    (mission.status === 'completed' || Boolean(resultRead.current?.status === 'ready' && resultRead.current.context.publication))
+  const refreshWorkContext = () => {
+    originRead.refresh()
+    window.requestAnimationFrame(() => focusWorkSection(`mission-result-${mission.id}`))
+  }
   const terminalSummary =
     evidenceRun && terminalRun(evidenceRun.status)
       ? evidenceRun.summary ?? evidenceRun.verification_summary
@@ -3669,6 +3665,7 @@ function MissionCard({
       data-testid={`mission-${mission.id}`}
       data-mission-id={mission.id}
       data-run-id={evidenceRun?.id}
+      id={`mission-detail-${mission.id}`}
       tabIndex={-1}
     >
       <div className="mission-card-top">
@@ -3676,16 +3673,81 @@ function MissionCard({
         <span className="mission-id">#{shortId(mission.id)}</span>
       </div>
       <h3>{mission.title}</h3>
-      <div className="mission-work-context">
-        <MissionOriginDetails
-          corpId={corpId}
-          actorId={actorId}
-          actorRole={actorRole}
-          missionId={mission.id}
-          roomId={mission.room_id}
-          api={api}
-          fallback={origin}
+      <div className="mission-result-surface" id={`mission-result-${mission.id}`} tabIndex={-1}>
+      {originUnavailable && mission.status === 'completed' && canOperate(actorRole) ? (
+        <WorkResultCard
+          heading="Work context is unavailable"
+          status="Refresh needed"
+          tone="attention"
+          description="Your work and selected evidence are still saved. Retry the work-item lookup to confirm its delivery record."
+          actions={<button type="button" className="button button-primary" onClick={refreshWorkContext}>Refresh work context</button>}
         />
+      ) : originRead.pending && mission.status === 'completed' ? (
+        <WorkResultCard heading="Finding the work item" status="Loading" pending
+          description="Checking the work item’s source and delivery context. Your selected evidence stays unchanged." />
+      ) : showPublicationResult ? (
+        <PublishedResultCard
+          result={deliveredResult}
+          busy={busy}
+          onRefresh={resultRead.refresh}
+          onDownload={(deliverable) => void onDownloadDeliverable(deliverable)}
+          onSelectDelivered={deliveredRun ? () => {
+            rememberEvidenceRun(deliveredRun.id)
+            window.requestAnimationFrame(() => focusWorkSection(`mission-result-${mission.id}`))
+          } : undefined}
+        />
+      ) : (
+        <WorkResultCard
+          heading={pendingRun ? 'Your review is needed'
+            : pendingActionApprovals.length ? 'A requested action needs a decision'
+              : mission.status === 'ready' ? 'Ready to start'
+                : mission.status === 'running' ? activeRuns ? 'Your team is working' : 'Work is in progress'
+                  : mission.status === 'completed' ? 'The mission is complete' : 'Inspect the saved work'}
+          status={pendingRun || pendingActionApprovals.length ? 'Needs attention' : missionStatusLabel(mission.status)}
+          tone={pendingRun || pendingActionApprovals.length || ['failed', 'cancelled'].includes(mission.status)
+            ? 'attention' : mission.status === 'completed' ? 'success' : mission.status === 'running' ? 'working' : 'neutral'}
+          description={pendingRun ? 'Review this exact run’s checks and source before making the existing outcome decision.'
+            : pendingActionApprovals.length ? 'Inspect the requested scope and consequence. Discussion alone does not approve an action.'
+              : mission.status === 'ready' ? 'Start the planned team in its isolated workspace. Any required decision stays attached to this work.'
+                : mission.status === 'running' ? `${activeRuns ? `${activeRuns} live agent${activeRuns === 1 ? '' : 's'}. ` : ''}Task owners and progress are available without following the office animation.`
+                  : mission.status === 'completed' ? `${exactOrigin?.kind === 'factory' && deliveredResult.state === 'none' ? 'No pull request is recorded yet. ' : ''}Inspect the selected run’s recorded evidence or download its output. A completed mission is not a deployed application.`
+                    : 'The recorded history remains available. Inspect the selected run and its existing recovery controls before choosing the next action.'}
+          actions={<>
+            {pendingRun ? (
+              <button type="button" className="button button-primary" onClick={() => focusWorkSection(`mission-review-${mission.id}`)}>Review outcome</button>
+            ) : pendingActionApprovals.length ? (
+              <button type="button" className="button button-primary" onClick={() => focusWorkSection(`mission-actions-${mission.id}`)}>Review requested actions</button>
+            ) : mission.status === 'ready' ? (
+              <button type="button" className="button button-primary" disabled={busy || !canOperate(actorRole)} onClick={() => void onLaunch(mission)}>Start mission</button>
+            ) : mission.status === 'running' ? (
+              <button type="button" className="button button-primary" onClick={() => onViewAgents(mission)}>View task owners</button>
+            ) : runDeliverable ? (
+              <button type="button" className="button button-primary" disabled={busy} onClick={() => void onDownloadDeliverable(runDeliverable)}>
+                {runDeliverable.form === 'review_only_report' ? 'Download review report' : 'Download source bundle'}
+              </button>
+            ) : (
+              <button type="button" className="button button-primary" onClick={() => focusWorkSection(`mission-evidence-panel-${mission.id}`)}>Inspect run evidence</button>
+            )}
+            <button type="button" className="button button-secondary" onClick={() => onDiscuss(mission)}>Discuss this work</button>
+          </>}
+          facts={[
+            { label: 'Task progress', value: `${completedTasks}/${tasks.length} complete` },
+            { label: 'Selected run checks', value: automated.score },
+            { label: 'Outcome review', value: runVerificationRequest?.status === 'approved'
+              ? `Approved${reviewer ? ` by ${reviewer.name}` : ''}`
+              : runVerificationRequest?.status === 'rejected' ? 'Changes requested'
+                : pendingRequest ? 'Waiting for review' : 'Review details unavailable' },
+          ]}
+        >
+          {mission.status === 'ready' && !canOperate(actorRole) ? (
+            <p className="work-result-notice">An operator can start this mission. You can inspect its plan and available evidence.</p>
+          ) : null}
+        </WorkResultCard>
+      )}
+      </div>
+      <div className="mission-work-context">
+        <MissionOriginText current={originRead.current} pending={originRead.pending} fallback={origin}
+          onRefresh={mission.status === 'completed' ? undefined : refreshWorkContext} />
         <nav className="work-context-actions" aria-label="Mission workspace">
           <button type="button" className="button button-secondary" onClick={() => onViewAgents(mission)}>
             {activeRuns ? 'View live agents' : 'View task owners'}
@@ -3874,6 +3936,8 @@ function MissionCard({
       {runs.length ? (
         <section
           className="mission-evidence-context"
+          id={`mission-evidence-panel-${mission.id}`}
+          tabIndex={-1}
           aria-label="Run evidence"
           data-evidence-run-id={evidenceRun?.id}
           data-evidence-task-id={evidenceRun?.task_id}
@@ -4206,16 +4270,15 @@ function MissionCard({
               ? `${runDeliverable.branch} @ ${shortId(runDeliverable.head_commit)}`
               : 'No publication or merge requested'}
           </strong>
-          <small>Pull-request publication and merge require separate authorization.</small>
+          <small>{runDeliverable.integration_state === 'published'
+            ? 'Publication is recorded for this artifact. Deployment is not implied.'
+            : runDeliverable.integration_state === 'integrated'
+              ? 'Integration is recorded for this artifact. Deployment remains separate.'
+              : 'Publication and integration are separate steps from source verification.'}</small>
         </div>
       ) : null}
-      {mission.status === 'ready' ? (
-        <button className="button button-primary mission-launch" type="button" disabled={busy} onClick={() => onLaunch(mission)}>
-          Dispatch mission
-        </button>
-      ) : null}
       {pendingActionApprovals.length ? (
-        <div className="mission-approval-list">
+        <div className="mission-approval-list" id={`mission-actions-${mission.id}`} tabIndex={-1}>
           <strong>
             {pendingActionApprovals.length} action
             {pendingActionApprovals.length === 1 ? '' : 's'} need your approval
@@ -4293,7 +4356,7 @@ function MissionCard({
         </>
       ) : null}
       {pendingRun && pendingRequest ? (
-        <div className="verification-actions" data-review-run-id={pendingRun.id} data-review-task-id={pendingRun.task_id}>
+        <div className="verification-actions" id={`mission-review-${mission.id}`} tabIndex={-1} data-review-run-id={pendingRun.id} data-review-task-id={pendingRun.task_id}>
           {(() => {
             const requiredRoles = pendingRequest.gate.roles
             const blockedReason = reviewBlockedReason(
@@ -6048,6 +6111,11 @@ function App() {
   const selectedMission =
     data.snapshot.missions.find((mission) => mission.id === selectedMissionId) ??
     latestMissions[0]
+  // Deep links may select older work outside the recent queue. Both pickers must
+  // keep that explicit work item visible without changing its pinned evidence.
+  const missionChoices = selectedMission && !latestMissions.some((mission) => mission.id === selectedMission.id)
+    ? [selectedMission, ...latestMissions]
+    : latestMissions
   const selectedMissionTasks = selectedMission
     ? data.snapshot.tasks.filter((task) => task.mission_id === selectedMission.id)
     : []
@@ -6357,7 +6425,6 @@ function App() {
           items={data.snapshot.factory_work_items}
           missions={data.snapshot.missions}
           publications={data.snapshot.pull_request_publications}
-          publicationAttempts={data.snapshot.pull_request_publication_attempts}
           controllers={data.snapshot.factory_controllers ?? []}
           tasks={data.snapshot.tasks}
           runs={data.snapshot.runs}
@@ -6377,6 +6444,7 @@ function App() {
           onPostComment={postRoomMessage}
           onActionDecision={decideActionApproval}
           onVerificationDecision={decideVerification}
+          onDownloadDeliverable={downloadDeliverable}
           onClaimLease={claimLease}
           onSteer={sendMessage}
           selectedItemId={selectedFactoryItemId}
@@ -6693,7 +6761,7 @@ function App() {
                       <select
                         id="mission-adapter"
                         value={effectiveMissionAdapter}
-                        disabled={deterministicHarness || studioTeam}
+                        disabled={!selectedMissionSource || deterministicHarness || studioTeam}
                         aria-describedby="mission-adapter-help"
                         onChange={(event) => {
                           setMissionAdapter(event.target.value)
@@ -6702,7 +6770,8 @@ function App() {
                         }}
                       >
                         {!effectiveMissionAdapter ? (
-                          <option value="">{studioTeam ? 'GitHub Copilot unavailable for this source' : 'No available runtime'}</option>
+                          <option value="">{!selectedMissionSource ? 'Choose a repository first'
+                            : studioTeam ? 'GitHub Copilot unavailable for this source' : 'No available coding agent'}</option>
                         ) : null}
                         {availableAdapters.filter((adapter) => !studioTeam || adapter.name === 'github-copilot').map((adapter) => (
                           <option key={adapter.name} value={adapter.name}>
@@ -7182,12 +7251,25 @@ function App() {
           {missionComposerCollapsed && (
           <div
             className={`mission-console ${
-              latestMissions.length ? '' : 'mission-console-empty'
+              missionChoices.length ? '' : 'mission-console-empty'
             }`}
           >
-            {latestMissions.length ? (
+            {missionChoices.length ? (
+              <div className="work-quick-switch">
+                <label htmlFor="mission-work-switch">Work item</label>
+                <select id="mission-work-switch" value={selectedMission?.id ?? ''}
+                  aria-controls={selectedMission ? `mission-detail-${selectedMission.id}` : undefined}
+                  onChange={(event) => setSelectedMissionId(event.target.value)}>
+                  {!selectedMission ? <option value="">Choose a mission</option> : null}
+                  {missionChoices.map((mission) => <option key={mission.id} value={mission.id}>
+                    {missionStatusLabel(mission.status)} · {mission.title}
+                  </option>)}
+                </select>
+              </div>
+            ) : null}
+            {missionChoices.length ? (
               <nav className="mission-selector" aria-label="Mission records">
-                {latestMissions.map((mission) => {
+                {missionChoices.map((mission) => {
                   const missionTasks = data.snapshot.tasks.filter(
                     (task) => task.mission_id === mission.id,
                   )
@@ -7200,7 +7282,7 @@ function App() {
                       }
                       aria-pressed={selectedMission?.id === mission.id}
                       data-status={mission.status}
-                      onClick={() => setSelectedMissionId(mission.id)}
+                      onClick={() => navigateToWorkspaceEntity('mission', mission.id)}
                     >
                       <span>{missionStatusLabel(mission.status)}</span>
                       <strong>{mission.title}</strong>
@@ -7241,6 +7323,9 @@ function App() {
                     (recovery) => recovery.mission_id === selectedMission.id,
                   )}
                   events={data.snapshot.events}
+                  publicationRevision={data.snapshot.pull_request_publications
+                    .filter((publication) => publication.mission_id === selectedMission.id)
+                    .map((publication) => `${publication.id}:${publication.version}`).join('|')}
                   actorId={selectedActor.id}
                   actorRole={selectedActor.role}
                   busy={busy}
