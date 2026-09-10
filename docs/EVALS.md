@@ -83,6 +83,12 @@ behavior, authorized outcome review or publication.
 
 ## Stopped-session native evidence compatibility
 
+The [correction-retry report](evidence/2026-09-10-checkpoint-correction-retry.md)
+records eleven new actual-store cases, four exact compatibility controls, CLI/UI checks
+and ordinary native/browser regression. Its initial three-attempt fixture is not proof
+of public planning reachability: #224 remains required for complete public repeated-correction
+acceptance. Earlier failed runs are retained and ignored tests are not counted as passes.
+
 The [#211 native-read report](evidence/2026-09-09-stopped-session-native-read.md)
 retains two real, separately selected missing-session failures for SDK 1.0.11 /
 CLI 1.0.79. The bounded reader and probe remain test-only, not a working

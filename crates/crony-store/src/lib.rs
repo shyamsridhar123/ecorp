@@ -4465,14 +4465,24 @@ impl PgStore {
         .context("factory recovery context source run was not found")?;
         let mut checkpoint =
             source_workspace_checkpoint_tx(&mut tx, corp_id, source_run_id).await?;
+        // A failed provider correction retains checkpoint-family ancestry, not
+        // permission to verify its old checkpoint or substitute that old HEAD.
+        let provider_correction = checkpoint.execution_mode == "provider"
+            && !matches!(
+                row.get::<String, _>("breaker_stage").as_str(),
+                "suspend" | "stop"
+            )
+            && checkpoint_correction::requires_authority_tx(&mut tx, &work_item, source_run_id)
+                .await?;
         let checkpoint_verification = matches!(
             row.get::<String, _>("breaker_stage").as_str(),
             "suspend" | "stop"
-        ) || row.get::<bool, _>("checkpoint_recovery");
+        ) || row.get::<bool, _>("checkpoint_recovery")
+            || provider_correction;
         let mut checkpoint_cancellation_event_id = None;
-        let mut checkpoint_verification_available = checkpoint_verification;
+        let mut checkpoint_verification_available = checkpoint_verification && !provider_correction;
         let mut revised_correction_authority = None;
-        if checkpoint_verification {
+        if checkpoint_verification && !provider_correction {
             let authority = match budget_checkpoint::source_authority_tx(
                 &mut tx,
                 corp_id,
@@ -4515,6 +4525,14 @@ impl PgStore {
             }
         } else {
             checkpoint.ensure_factory_terminal()?;
+            if provider_correction {
+                revised_correction_authority = checkpoint_correction::revised_context_authority_tx(
+                    &mut tx,
+                    &work_item,
+                    source_run_id,
+                )
+                .await?;
+            }
         }
         checkpoint.ensure_preserved()?;
         let (mission_tokens_used, mission_cost_used) =
@@ -4910,9 +4928,15 @@ impl PgStore {
         let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
         let source_correction_authority = if input.mode
             == FactoryVerificationRecoveryMode::SourceCorrection
-            && lineage
+            && (lineage
                 .iter()
                 .any(|candidate| candidate.get::<String, _>("breaker_stage") == "suspend")
+                || checkpoint_correction::requires_authority_tx(
+                    &mut tx,
+                    &work_item,
+                    input.source_run_id,
+                )
+                .await?)
         {
             Some(
                 checkpoint_correction::admit_tx(

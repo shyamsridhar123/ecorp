@@ -35,11 +35,18 @@ export function factoryRecoveryModes(context: NativeRecoveryContext | null): Fac
   if (context.checkpoint_cancellation_event_id != null
     && (context.checkpoint_verification !== true || context.work_item.state !== 'cancelled')) return []
   if (context.checkpoint_verification === true) {
+    const hasHead = typeof context.expected_head_commit === 'string'
+      && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(context.expected_head_commit)
+    // A failed provider correction may have no exported head. Only the server's
+    // explicit source-correction permission admits that null; missing/malformed heads
+    // and legacy checkpoint contexts still fail closed.
+    const correctionWithoutExportedHead = context.expected_head_commit === null
+      && context.checkpoint_verification_available === false
+      && context.checkpoint_source_correction === true
     const complete = uuid(context.task_id) && uuid(context.source_run_id)
       && typeof context.workspace_fingerprint === 'string'
       && /^[0-9a-f]{64}$/iu.test(context.workspace_fingerprint)
-      && typeof context.expected_head_commit === 'string'
-      && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(context.expected_head_commit)
+      && (hasHead || correctionWithoutExportedHead)
     const reconciliation = context.work_item.state !== 'cancelled'
       || uuid(context.checkpoint_cancellation_event_id)
     const active = context.recoveries.some((entry) => ['authorized', 'running'].includes(entry.status))
@@ -50,7 +57,7 @@ export function factoryRecoveryModes(context: NativeRecoveryContext | null): Fac
     const modes: FactoryRecoveryCommandMode[] = []
     // Missing availability retains the legacy checkpoint behavior. An explicit
     // denial never falls through to ordinary verifier/provider recovery.
-    if (context.checkpoint_verification_available !== false) modes.push('checkpoint-verification')
+    if (hasHead && context.checkpoint_verification_available !== false) modes.push('checkpoint-verification')
     if (context.checkpoint_source_correction === true && context.work_item.state !== 'cancelled') {
       modes.push('source-correction')
     }

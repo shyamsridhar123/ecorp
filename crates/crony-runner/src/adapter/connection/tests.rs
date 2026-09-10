@@ -9,17 +9,18 @@ use std::{
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
-use crony_domain::{
-    CodingAgent, NativeSignInInputKind, NativeSignInResponse, WorkspaceConnectionStatus,
-};
-use serde_json::{Value, json};
+#[cfg(windows)]
+use crony_domain::NativeSignInInputKind;
+use crony_domain::{CodingAgent, NativeSignInResponse, WorkspaceConnectionStatus};
+#[cfg(windows)]
+use serde_json::Value;
+use serde_json::json;
 use tokio::{io::BufReader, process::Command, sync::mpsc};
 use uuid::Uuid;
 
-use super::{
-    AgentProfile, NativeCodeReceiver, catalog,
-    environment::{NativeCommand, ProfileEnvironment},
-};
+#[cfg(windows)]
+use super::environment::NativeCommand;
+use super::{AgentProfile, NativeCodeReceiver, catalog, environment::ProfileEnvironment};
 use crate::adapter::{AdapterRegistryConfig, CopilotSdkAdapter, CopilotSdkConfig};
 
 struct Fixture {

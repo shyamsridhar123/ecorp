@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import * as jsxRuntime from 'react/jsx-runtime'
+import { renderToStaticMarkup } from 'react-dom/server'
 import vm from 'node:vm'
 import ts from 'typescript'
 import {
@@ -606,4 +608,259 @@ test('actual resume handler and rendered provider control respect native recover
     && node.expression.getText(app) === 'copyRecoveryCommand')
   assert.equal(copy.length, 1)
   assert.equal(copy[0].arguments[0].getText(app), 'mode')
+})
+
+test('actual App Resume control survives an ineligible ordinary Factory recovery lookup and uses the native actor-bound POST', async () => {
+  const loads = [], calls = [], remembered = []
+  const ordinaryRun = {
+    id: id(50), task_id: id(40), provider_session_id: 'native-session',
+    status: 'cancelled', execution_mode: 'provider', breaker_stage: null,
+    workspace_disposition: 'preserved', workspace_run_id: id(50),
+  }
+  const globals = {
+    AbortController, setTimeout: () => 1, clearTimeout: () => {},
+    api: async (path, init) => {
+      calls.push({ path, init })
+      if (init.method === 'GET') throw new Error('factory recovery context requires exactly one failed task; found 0')
+      return {}
+    },
+    bootstrap: { corp_id: scope.corpId }, selectedActor: { id: scope.actorId },
+    setBusy: () => {}, setError: () => {},
+    refresh: async () => ({ snapshot: { runs: [{
+      id: id(51), task_id: id(40), resumed_from_run_id: id(50),
+    }] } }),
+    factoryRecoveryBlocksProviderResume, recoveryScope: scope, recoveryContextLoad: null,
+    factoryItem: { ...context().work_item, state: 'running' }, recoveryItemState: 'running',
+    mission: { id: scope.missionId },
+    tasks: [{ id: id(40), mission_id: scope.missionId, status: 'cancelled', verification_status: 'pending' }],
+    runs: [ordinaryRun], factoryRecoveries: [], resumableRun: ordinaryRun, evidenceRun: ordinaryRun,
+    hasUnfinishedRuns: false, busy: false, resumeStopBlocked: false, resumeBudgetBlocked: false,
+    pendingBudgetRevision: null, rememberEvidenceRun: (runId) => remembered.push(runId),
+    formatTokens: String, formatUsd: String,
+  }
+  evaluate(`${functionNode('factoryRecoveryScopeKey').getText(app)}
+    ${functionNode('currentFactoryRecoveryLoad').getText(app)}
+    ${functionNode('requestFactoryRecoveryContext').getText(app)}`, globals)
+  const cleanup = globals.requestFactoryRecoveryContext(scope, (load) => loads.push(load))
+  await new Promise(setImmediate)
+  cleanup()
+  globals.recoveryContextLoad = loads.at(-1)
+  assert.equal(globals.recoveryContextLoad.status, 'error')
+  assert.equal(globals.recoveryContextLoad.data, null)
+  const guard = all(card, (node) => ts.isConditionalExpression(node)
+    && node.whenTrue.getText(app).includes('onClick={() => void resumeEvidence()}'))[0]
+  assert.ok(guard, 'use the actual MissionCard branch, disabled predicates and click callback')
+  const rendered = ts.transpileModule(`globalThis.renderResume = () => (${guard.getText(app)});`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  })
+  globals.require = (name) => {
+    assert.equal(name, 'react/jsx-runtime')
+    return jsxRuntime
+  }
+  globals.exports = {}
+  vm.runInNewContext(rendered.outputText, globals)
+  const refreshControls = () => {
+    for (const name of ['scopedRecoveryLoad', 'recoveryContext', 'resumeLineageRuns', 'requiresFactoryRecovery', 'resumeRecoveryBlocked']) {
+      // The pre-fix App has no separate mandatory-recovery predicate.
+      const declaration = all(card, (node) => ts.isVariableDeclaration(node)
+        && ts.isIdentifier(node.name) && node.name.text === name)
+      if (declaration.length) evaluate(`globalThis.${name} = ${initializer(name)};`, globals)
+    }
+    evaluate(`globalThis.resumeEvidence = ${initializer('resumeEvidence')};`, globals)
+    return globals.renderResume()
+  }
+  evaluate(`globalThis.onResume = ${initializer('resumeAgentRun', functionNode('App'))};`, globals)
+  const tree = refreshControls()
+  const html = renderToStaticMarkup(tree)
+  assert.match(html, /Resume agent session/)
+  assert.doesNotMatch(html, /disabled=/)
+  const resumeButton = tree.props.children.find((node) => node?.type === 'button')
+  assert.ok(resumeButton)
+  resumeButton.props.onClick()
+  await new Promise(setImmediate)
+  assert.equal(calls.length, 2, 'one failed read and one explicit native resume, not a recovery mutation')
+  assert.equal(calls[1].path, `/api/corps/${scope.corpId}/runs/${ordinaryRun.id}/resume`)
+  assert.equal(calls[1].init.method, 'POST')
+  const body = JSON.parse(calls[1].init.body)
+  assert.equal(body.requested_by, scope.actorId)
+  assert.deepEqual(Object.keys(body).sort(), ['prompt', 'requested_by'])
+  assert.deepEqual(remembered, [id(51)])
+  // A sibling task's recovered history, or another workspace for this same
+  // task, must not hide the selected ordinary session's native resume.
+  for (const historical of [
+    { id: id(70), task_id: id(41), workspace_run_id: id(70) },
+    { id: id(71), task_id: ordinaryRun.task_id, workspace_run_id: id(71) },
+  ]) {
+    globals.runs = [ordinaryRun, { ...historical, execution_mode: 'verification_only', breaker_stage: 'stop' }]
+    globals.tasks.push({ id: id(41), mission_id: scope.missionId, status: 'verification_failed', verification_status: 'failed' })
+    globals.factoryRecoveries = [{
+      factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: historical.task_id, source_run_id: historical.id,
+      mode: 'checkpoint_verification', status: 'completed',
+    }]
+    assert.match(renderToStaticMarkup(refreshControls()), /Resume agent session/)
+    globals.tasks.pop()
+  }
+  globals.runs = [ordinaryRun]
+  globals.factoryRecoveries = []
+  for (const changes of [
+    { recoveryItemState: 'verification_failed', factoryItem: { ...globals.factoryItem, state: 'verification_failed' } },
+    { recoveryItemState: 'cancelled', factoryItem: { ...globals.factoryItem, state: 'cancelled' } },
+    { tasks: [{ ...globals.tasks[0], status: 'verification_failed' }] },
+    { runs: [{ ...ordinaryRun, breaker_stage: 'suspend' }] },
+    { runs: [{ ...ordinaryRun, breaker_stage: 'stop' }] },
+    { runs: [{ ...ordinaryRun, execution_mode: 'verification_only' }] },
+    { factoryRecoveries: [{ factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: ordinaryRun.task_id, source_run_id: ordinaryRun.id,
+      mode: 'checkpoint_verification', status: 'completed' }] },
+    { factoryRecoveries: [{ factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: ordinaryRun.task_id, source_run_id: id(80), mode: 'source_correction', status: 'authorized' }] },
+  ]) {
+    const original = Object.fromEntries(Object.keys(changes).map((key) => [key, globals[key]]))
+    Object.assign(globals, changes)
+    assert.equal(refreshControls(), null, 'unavailable governed recovery must remain fail-closed')
+    await globals.resumeEvidence()
+    assert.equal(calls.length, 2)
+    Object.assign(globals, original)
+  }
+  globals.recoveryContextLoad = {
+    scopeKey: JSON.stringify([scope.corpId, scope.actorId, scope.missionId, scope.itemId, scope.version, scope.reload]),
+    status: 'ready', error: null, data: { ...context(),
+      work_item: { ...globals.factoryItem }, checkpoint_cancellation_event_id: null },
+  }
+  globals.recoveryContextLoad.data.task_id = id(41)
+  assert.match(renderToStaticMarkup(refreshControls()), /Resume agent session/,
+    'another task native checkpoint context is not a block on this session')
+  globals.recoveryContextLoad.data.task_id = ordinaryRun.task_id
+  assert.equal(refreshControls(), null, 'positive native checkpoint context is never generic-resume authority')
+  await globals.resumeEvidence()
+  assert.equal(calls.length, 2)
+})
+
+function failedProviderCorrectionContext() {
+  return {
+    ...correctionContext(),
+    source_run_id: id(51),
+    workspace_fingerprint: 'c'.repeat(64),
+    expected_head_commit: null,
+    checkpoint_verification_available: false,
+    checkpoint_source_correction: true,
+    recoveries: [{
+      status: 'failed', mode: 'source_correction', task_id: id(40),
+      source_run_id: id(50), replacement_run_id: id(51),
+    }],
+  }
+}
+
+test('issue221 explicit provider-correction permission permits null head without granting checkpoint or generic resume', () => {
+  const value = failedProviderCorrectionContext()
+  const original = structuredClone(value)
+  assert.deepEqual(factoryRecoveryModes(value), ['source-correction'])
+  assert.equal(factoryContractRevisionSource(value, scope, id(40)), id(51),
+    'the latest failed provider, not its earlier verifier, remains the exact revision source')
+  assert.equal(factoryRecoveryBlocksProviderResume(true, value), true)
+  for (const changes of [
+    { expected_head_commit: undefined }, { expected_head_commit: '' },
+    { expected_head_commit: 'short' }, { expected_head_commit: 'g'.repeat(40) },
+    { expected_head_commit: 40 }, { workspace_fingerprint: null },
+    { workspace_fingerprint: 'c'.repeat(63) }, { source_run_id: nil },
+    { task_id: nil }, { checkpoint_verification: false },
+    { checkpoint_source_correction: false }, { checkpoint_source_correction: undefined },
+    { checkpoint_verification_available: true }, { checkpoint_verification_available: undefined },
+    { recoveries: [{ status: 'authorized' }] }, { recoveries: [{ status: 'running' }] },
+  ]) {
+    const denied = { ...value, ...changes }
+    assert.deepEqual(factoryRecoveryModes(denied), [])
+    assert.equal(factoryContractRevisionSource(denied, scope, id(40)), null)
+  }
+  assert.deepEqual(factoryRecoveryModes({
+    ...value, work_item: { ...value.work_item, state: 'cancelled' },
+    checkpoint_cancellation_event_id: id(60),
+  }), [], 'source-correction permission cannot override cancelled Factory intent')
+  for (const expected_head_commit of ['a'.repeat(40), 'd'.repeat(64)]) {
+    assert.deepEqual(factoryRecoveryModes({ ...value, expected_head_commit }), ['source-correction'])
+    assert.deepEqual(factoryRecoveryModes({
+      ...value, expected_head_commit, checkpoint_verification_available: true,
+    }), ['checkpoint-verification', 'source-correction'])
+    assert.deepEqual(factoryRecoveryModes({
+      ...value, expected_head_commit, checkpoint_source_correction: false,
+    }), [], 'a head by itself does not override an explicit checkpoint denial')
+  }
+  assert.deepEqual(value, original, 'mode selection cannot rewrite native history or current source proof')
+})
+
+test('issue221 actual context reader retains null head/current provider proof and malformed heads remain non-actionable', async () => {
+  const value = failedProviderCorrectionContext()
+  const { requests, published } = await requestContext(value)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0][1].method, 'GET')
+  const current = published.at(-1)
+  assert.equal(current.status, 'ready')
+  assert.equal(current.data.source_run_id, id(51))
+  assert.equal(current.data.workspace_fingerprint, 'c'.repeat(64))
+  assert.equal(current.data.expected_head_commit, null)
+  assert.deepEqual(current.data.recoveries, value.recoveries)
+  assert.deepEqual(factoryRecoveryModes(current.data), ['source-correction'])
+  assert.equal(presentation(current.data).heading, 'Fix saved work')
+  for (const expected_head_commit of [undefined, false, {}, '', 'short', 'g'.repeat(40)]) {
+    const { published: rejected } = await requestContext({ ...value, expected_head_commit })
+    const load = rejected.at(-1)
+    // The App DTO reader rejects missing/non-string fields. String shape is
+    // checked at the mode boundary; neither path can expose a copy action.
+    assert.equal(load.status, typeof expected_head_commit === 'string' ? 'ready' : 'error')
+    assert.deepEqual(factoryRecoveryModes(load.data), [])
+    const denied = commandHarness(load.data)
+    assert.equal(denied.globals.recoveryCommandAvailable, false)
+    for (const mode of ['checkpoint-verification', 'verifier-only', 'source-correction']) {
+      await denied.globals.copyRecoveryCommand(mode)
+    }
+    assert.equal(denied.writes.length, 0)
+  }
+  for (const changes of [
+    { work_item: { ...value.work_item, version: value.work_item.version + 1 } },
+    { source_run_id: '' }, { checkpoint_source_correction: 'true' },
+  ]) {
+    const { published: rejected } = await requestContext({ ...value, ...changes })
+    assert.equal(rejected.at(-1).status, 'error')
+    assert.equal(rejected.at(-1).data, null)
+  }
+})
+
+test('issue221 actual copy/revision actions use only source correction for the latest failed provider with null head', async () => {
+  const { published } = await requestContext(failedProviderCorrectionContext())
+  const current = published.at(-1).data
+  assert.ok(current)
+  for (const role of ['owner', 'admin', 'manager']) {
+    const { globals, writes } = commandHarness(current, role)
+    assert.equal(globals.recoveryContext.source_run_id, id(51))
+    assert.equal(globals.recoveryCommandAvailable, true)
+    assert.equal(writes.length, 0, 'reading context does not copy or execute anything')
+    await globals.copyRecoveryCommand('checkpoint-verification')
+    await globals.copyRecoveryCommand('verifier-only')
+    assert.equal(writes.length, 0)
+    await globals.copyRecoveryCommand('source-correction')
+    assert.equal(writes.length, 1)
+    assert.match(writes[0], /--verification-recovery source-correction/)
+    assert.match(writes[0], /--repository 'owner\/lab'/)
+    assert.match(writes[0], /--source-base-ref 'main'/)
+    assert.ok(writes[0].includes(`--workspace-connection-id '${id(198)}'`))
+    assert.ok(globals.recoveryCopyKey('source-correction').includes(`:${id(51)}:`))
+    assert.doesNotMatch(writes[0], /--expected-head-commit|--max-attempts|resume-run|source-repository-path/)
+  }
+  const revision = revisionHarness({ value: current })
+  assert.equal(revision.globals.sourceRunId, id(51), 'no fallback to visible provider/verifier ancestors')
+  await revision.globals.submit({ preventDefault() {} })
+  assert.equal(revision.requests.length, 1)
+  assert.equal(revision.requests[0][2].source_run_id, id(51))
+  assert.equal(revision.requests[0][2].next_action, 'resume')
+  for (const role of ['member', 'guest', 'spectator']) {
+    const denied = commandHarness(current, role)
+    await denied.globals.copyRecoveryCommand('source-correction')
+    assert.equal(denied.writes.length, 0)
+  }
+  for (const checkpoint_source_correction of [false, undefined]) {
+    const denied = commandHarness({ ...current, checkpoint_source_correction })
+    await denied.globals.copyRecoveryCommand('source-correction')
+    assert.equal(denied.writes.length, 0)
+  }
 })

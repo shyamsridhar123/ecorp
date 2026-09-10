@@ -591,6 +591,13 @@ through the generic transition endpoint.
   metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
   deliverable authority, or widen tools and write scope.
 
+For a valid stored policy with remaining attempts, a failed checkpoint-derived correction can
+continue through another current revision. Bounded historical reconstruction validates every
+native correction and revision edge without rewriting old schema-1 grants. Historical policy
+is not current execution authority. The latest provider's fingerprint and nullable exported
+head remain current; family membership alone grants no checkpoint operation. The public
+pre-execution attempt-policy gap remains #224; see the [scoped validation](evidence/2026-09-10-checkpoint-correction-retry.md).
+
 Recovery authorization and its runner command are idempotent and durable. The operation stores the
 reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and
 replacement run IDs, actor, reason, and contract revision. Runner command acknowledgment prevents

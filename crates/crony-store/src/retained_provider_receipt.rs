@@ -219,10 +219,8 @@ fn same_lineage(source: &PgRow, candidate: &PgRow) -> bool {
         })
 }
 
-/// Reconstruct only a persisted #210 historical transition. This does not
-/// reauthorize its provider or waive the current checkpoint's budget boundary.
-/// The original immutable revision supplies the older proof's policy, while the
-/// caller continues to validate today's collection policy independently.
+/// The original private historical reconstruction is shared with correction
+/// retry admission. Collection still validates its own current source and grant.
 async fn previous_correction_context_tx(
     tx: &mut Transaction<'_, Postgres>,
     item: &FactoryWorkItem,
@@ -230,179 +228,15 @@ async fn previous_correction_context_tx(
     contract: &TaskContract,
     policy: &VerificationPolicy,
 ) -> Result<Option<(TaskContract, VerificationPolicy, Uuid)>> {
-    let correction = sqlx::query(
-        "SELECT factory_work_item_id,mission_id,task_id,source_run_id,authorized_by,
-                contract_revision_id,status,previous_verification_policy,
-                replacement_verification_policy,source_correction_authority
-         FROM factory_verification_recoveries
-         WHERE corp_id=$1 AND replacement_run_id=$2 AND mode='source_correction'",
-    )
-    .bind(item.corp_id)
-    .bind(replacement.get::<Uuid, _>("id"))
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some(correction) = correction else {
-        return Ok(None);
-    };
-    let Some(saved) = correction.get::<Option<Value>, _>("source_correction_authority") else {
-        // An ordinary correction grants no exception for an older suspension.
-        return Ok(None);
-    };
-    let authority: checkpoint_correction::Authority = serde_json::from_value(saved.clone())
-        .context("historical source-correction authority is malformed")?;
-    let source_id: Uuid = correction.get("source_run_id");
-    if correction.get::<Uuid, _>("factory_work_item_id") != item.id
-        || Some(correction.get::<Uuid, _>("mission_id")) != item.mission_id
-        || correction.get::<Uuid, _>("task_id") != replacement.get::<Uuid, _>("task_id")
-        || correction.get::<String, _>("status") != "failed"
-        || Some(source_id) != replacement.get::<Option<Uuid>, _>("resumed_from_run_id")
-        || correction.get::<Option<Uuid>, _>("contract_revision_id")
-            != Some(authority.contract_revision_id)
-        || replacement.get::<Option<Uuid>, _>("workspace_connection_id")
-            != authority.workspace_connection_id
-        || replacement
-            .get::<Option<String>, _>("provider_session_id")
-            .as_ref()
-            != Some(&authority.provider_session_id)
-        || replacement.get::<Option<String>, _>("model") != contract.model
-        || replacement.get::<Option<String>, _>("reasoning_effort") != contract.reasoning_effort
-    {
-        return Err(denied(
-            "historical correction does not match its exact replacement",
-        ));
-    }
-    let revision = sqlx::query(
-        "SELECT revision.previous_contract,revision.replacement_contract,
-                revision.previous_verification_policy,revision.replacement_verification_policy,
-                checkpoint.id AS checkpoint_id,checkpoint.checkpoint_authority
-         FROM mission_contract_revisions revision
-         JOIN factory_verification_recoveries checkpoint
-           ON checkpoint.replacement_run_id=revision.source_run_id
-          AND checkpoint.corp_id=revision.corp_id AND checkpoint.task_id=revision.task_id
-          AND checkpoint.mission_id=revision.mission_id
-          AND checkpoint.factory_work_item_id=$4
-          AND checkpoint.mode='checkpoint_verification' AND checkpoint.status='failed'
-         JOIN runs source ON source.id=revision.source_run_id AND source.corp_id=revision.corp_id
-          AND source.task_id=revision.task_id AND source.execution_mode='verification_only'
-          AND source.status='failed' AND source.verification_status='failed'
-         WHERE revision.corp_id=$1 AND revision.id=$2 AND revision.source_run_id=$3
-           AND revision.revised_by=$5 AND revision.task_id=$6 AND revision.mission_id=$7
-           AND revision.next_action='resume'",
-    )
-    .bind(item.corp_id)
-    .bind(authority.contract_revision_id)
-    .bind(source_id)
-    .bind(item.id)
-    .bind(correction.get::<Uuid, _>("authorized_by"))
-    .bind(replacement.get::<Uuid, _>("task_id"))
-    .bind(item.mission_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .context("historical correction has no exact immutable Resume revision")?;
-    let previous_contract: TaskContract =
-        serde_json::from_value(revision.get("previous_contract"))?;
-    let previous_policy: VerificationPolicy =
-        serde_json::from_value(revision.get("previous_verification_policy"))?;
-    if revision.get::<Value, _>("replacement_contract") != serde_json::to_value(contract)?
-        || revision.get::<Value, _>("replacement_verification_policy")
-            != serde_json::to_value(policy)?
-        || correction.get::<Value, _>("previous_verification_policy")
-            != serde_json::to_value(&previous_policy)?
-        || correction.get::<Value, _>("replacement_verification_policy")
-            != serde_json::to_value(policy)?
-        || previous_contract.workspace_connection_id != authority.workspace_connection_id
-        || contract.workspace_connection_id != authority.workspace_connection_id
-    {
-        return Err(denied(
-            "historical correction contract or policy chain changed",
-        ));
-    }
-    ensure_factory_recovery_verification_policy_not_weakened(&previous_policy, policy)?;
-    let proof = budget_checkpoint::source_authority_with_contract_tx(
+    checkpoint_correction::previous_correction_context_tx(
         tx,
-        item.corp_id,
-        item.id,
-        source_id,
-        Some((&previous_contract, &previous_policy)),
+        item,
+        replacement.get("id"),
+        contract,
+        policy,
     )
-    .await?;
-    if revision.get::<Option<Value>, _>("checkpoint_authority")
-        != Some(serde_json::to_value(&proof)?)
-    {
-        return Err(denied("historical failed checkpoint proof changed"));
-    }
-    budget_checkpoint::validate_lineage_until_tx(
-        tx,
-        item.corp_id,
-        item.id,
-        proof.checkpoint.workspace_run_id,
-        &proof,
-        source_id,
-    )
-    .await?;
-    let origin = sqlx::query(
-        "SELECT incident.id,incident.input,origin.workspace_connection_id,origin.provider_session_id
-         FROM runs origin JOIN circuit_breaker_incidents incident
-           ON incident.run_id=origin.id AND incident.corp_id=origin.corp_id AND incident.stage='suspend'
-         WHERE origin.corp_id=$1 AND origin.id=$2 AND origin.breaker_stage='suspend'",
-    ).bind(item.corp_id).bind(proof.checkpoint.run_id).fetch_optional(&mut **tx).await?
-        .context("historical correction no longer has its native suspension")?;
-    let prefix = sqlx::query(
-        "SELECT run.id,run.breaker_stage,run.workspace_disposition
-         FROM runs run JOIN runs boundary ON boundary.id=$3 AND boundary.corp_id=run.corp_id
-         WHERE run.corp_id=$1 AND run.workspace_run_id=$2
-           AND (run.created_at,run.id)<=(boundary.created_at,boundary.id)
-         ORDER BY run.created_at,run.id LIMIT 65",
-    )
-    .bind(item.corp_id)
-    .bind(proof.checkpoint.workspace_run_id)
-    .bind(source_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let prefix_ids: Vec<Uuid> = prefix.iter().map(|row| row.get("id")).collect();
-    if prefix_ids.is_empty()
-        || prefix_ids.len() > 64
-        || prefix_ids.last() != Some(&source_id)
-        || prefix.iter().any(|row| {
-            row.get::<Option<String>, _>("workspace_disposition")
-                .as_deref()
-                == Some("quarantined")
-                || row.get::<String, _>("breaker_stage") == "stop"
-                || (row.get::<String, _>("breaker_stage") == "suspend"
-                    && row.get::<Uuid, _>("id") != proof.checkpoint.run_id)
-        })
-    {
-        return Err(denied(
-            "historical correction prefix has unrelated protected work",
-        ));
-    }
-    let origin_id = proof.checkpoint.run_id;
-    let reconstructed = checkpoint_correction::Authority {
-        schema_version: 1,
-        checkpoint_recovery_id: revision.get("checkpoint_id"),
-        checkpoint: proof,
-        suspension_incident_id: origin.get("id"),
-        suspension_input_sha256: digest(&origin.get::<Value, _>("input"))?,
-        contract_revision_id: authority.contract_revision_id,
-        previous_contract_sha256: digest(&previous_contract)?,
-        replacement_contract_sha256: digest(contract)?,
-        previous_policy_sha256: digest(&previous_policy)?,
-        replacement_policy_sha256: digest(policy)?,
-        factory_policy_sha256: digest(&item.policy)?,
-        workspace_connection_id: origin.get("workspace_connection_id"),
-        provider_session_id: origin
-            .get::<Option<String>, _>("provider_session_id")
-            .context("historical correction origin lost its provider session")?,
-        prefix_run_ids: prefix_ids,
-    };
-    if serde_json::to_value(reconstructed)? != saved {
-        return Err(denied(
-            "historical correction no longer matches its persisted authority",
-        ));
-    }
-    Ok(Some((previous_contract, previous_policy, origin_id)))
+    .await
 }
-
 pub(super) async fn derive_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: Admission<'_>,

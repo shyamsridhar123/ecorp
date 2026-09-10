@@ -105,9 +105,9 @@ export function availableRunnerAdapters(
       .flatMap((runner) => runner.capabilities)
       .filter(
         (capability) => capability.available && MISSION_RUNTIMES.includes(capability.name) &&
-          (target?.workspaceConnectionId
+          (!target || (target.workspaceConnectionId
             ? capability.workspace_connection_id === target.workspaceConnectionId
-            : !capability.workspace_connection_id),
+            : !capability.workspace_connection_id)),
       )
       .reduce((adapters, capability) => {
         const existing = adapters.get(capability.name)

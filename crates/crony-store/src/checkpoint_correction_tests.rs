@@ -3,6 +3,9 @@
 //! source verification, signed artifact bytes, browser acceptance or publication.
 use super::*;
 
+#[path = "checkpoint_correction_retry_tests.rs"]
+mod correction_retry;
+
 const CONNECTION: Uuid = Uuid::from_u128(210);
 
 fn correction_profile() -> CheckpointFixtureProfile {

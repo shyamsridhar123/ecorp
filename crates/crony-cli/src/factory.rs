@@ -287,6 +287,63 @@ struct FactoryRecoverySnapshot {
     active_recovery: Option<Value>,
 }
 
+struct FactoryRecoveryCapabilities {
+    checkpoint_family: bool,
+    checkpoint_verification_available: Option<bool>,
+    checkpoint_source_correction: bool,
+}
+
+impl FactoryRecoveryCapabilities {
+    fn from_value(context: &Value) -> Result<Self> {
+        let flag = |name: &str| -> Result<Option<bool>> {
+            context
+                .get(name)
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .with_context(|| format!("native recovery flag {name} must be a boolean"))
+                })
+                .transpose()
+        };
+        Ok(Self {
+            checkpoint_family: flag("checkpoint_verification")?.unwrap_or(false),
+            checkpoint_verification_available: flag("checkpoint_verification_available")?,
+            checkpoint_source_correction: flag("checkpoint_source_correction")?.unwrap_or(false),
+        })
+    }
+
+    fn from_context(context: &FactoryVerificationRecoveryContextResponse) -> Self {
+        Self {
+            checkpoint_family: context.checkpoint_verification,
+            checkpoint_verification_available: context.checkpoint_verification_available,
+            checkpoint_source_correction: context.checkpoint_source_correction,
+        }
+    }
+
+    fn can_verify_checkpoint(&self) -> bool {
+        self.checkpoint_family && self.checkpoint_verification_available.unwrap_or(true)
+    }
+
+    fn validate_mode(&self, mode: FactoryVerificationRecoveryMode) -> Result<()> {
+        match mode {
+            FactoryVerificationRecoveryMode::CheckpointVerification
+                if !self.can_verify_checkpoint() =>
+            {
+                bail!("native stopped-source checkpoint verification is not currently available");
+            }
+            FactoryVerificationRecoveryMode::SourceCorrection
+                if self.checkpoint_family && !self.checkpoint_source_correction =>
+            {
+                bail!("native checkpoint-family source correction is not currently available");
+            }
+            FactoryVerificationRecoveryMode::VerifierOnly if self.checkpoint_family => {
+                bail!("checkpoint-family work does not support ordinary verifier-only recovery");
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct EvaluatedItem {
     project_item: ProjectItem,
@@ -367,6 +424,21 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     load_checkpoint_cancellations(client, server, &args, &mut existing).await?;
     let mut issue_cache = HashMap::new();
     let mut evaluated = evaluate_items(&args, project_items.items, &existing, &mut issue_cache)?;
+    if args.verification_recovery.is_some() {
+        for selected in &evaluated {
+            if let Some(item) = existing.get(&selected.project_item.id) {
+                preflight_factory_recovery_mode(
+                    client,
+                    server,
+                    &args,
+                    selected,
+                    item,
+                    requested_verification_policy.as_ref(),
+                )
+                .await?;
+            }
+        }
+    }
     evaluated.sort_by(|left, right| {
         right
             .recovery
@@ -497,7 +569,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             "checkpoint_reconciliation": selected_index.and_then(|index| {
                 existing.get(&evaluated[index].project_item.id)
                     .and_then(|item| item.checkpoint_cancellation.as_ref())
-                    .map(checkpoint_next_action)
+                    .and_then(checkpoint_next_action)
             }),
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
@@ -514,6 +586,17 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     })?;
     let selected = evaluated.swap_remove(selected_index);
     let (mut refreshed, mut persisted) = refresh_selected(client, server, &args, &selected).await?;
+    if let Some(item) = persisted.as_ref() {
+        preflight_factory_recovery_mode(
+            client,
+            server,
+            &args,
+            &refreshed,
+            item,
+            requested_verification_policy.as_ref(),
+        )
+        .await?;
+    }
     let checkpoint_reconciliation = if let Some(original) =
         persisted.as_ref().filter(|item| item.state == "cancelled")
     {
@@ -2129,7 +2212,78 @@ async fn read_checkpoint_context(
     )
     .await
     .context("read native checkpoint recovery context; no terminal projection was inferred")?;
+    decode_checkpoint_context(value)
+}
+
+fn decode_checkpoint_context(value: Value) -> Result<FactoryVerificationRecoveryContextResponse> {
+    // Option<bool> alone would deserialize both an absent flag and explicit null
+    // as None. Only absence may retain legacy checkpoint availability.
+    FactoryRecoveryCapabilities::from_value(&value)?;
     serde_json::from_value(value).map_err(|_| anyhow!("invalid native checkpoint recovery context"))
+}
+
+async fn preflight_factory_recovery_mode(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    item: &ExistingFactoryItem,
+    requested_verification_policy: Option<&VerificationPolicy>,
+) -> Result<()> {
+    let Some(mode) = args.verification_recovery else {
+        return Ok(());
+    };
+    let mission_id = item
+        .mission_id
+        .context("verification recovery requires an existing Factory mission")?;
+    let context = read_checkpoint_context(client, server, args, item.id).await?;
+    if context.work_item.id != item.id
+        || context.work_item.corp_id != args.corp_id
+        || context.work_item.version != item.version
+        || context.work_item.mission_id != Some(mission_id)
+        || context.mission_id != mission_id
+    {
+        bail!(
+            "native recovery context does not match the selected Factory item/version and mission"
+        );
+    }
+    let has_active_recovery = context
+        .recoveries
+        .iter()
+        .any(|recovery| matches!(recovery.status.as_str(), "authorized" | "running"));
+    if !has_active_recovery || mode != VerificationRecoveryModeArg::SourceCorrection {
+        FactoryRecoveryCapabilities::from_context(&context).validate_mode(mode.into())?;
+    }
+    if has_active_recovery {
+        // An active generation disables admission of new corrections. Validate
+        // the exact actor/mode/source/request replay instead, without repairing
+        // a workspace or revising a contract in this read-only preflight.
+        let reason = args
+            .verification_recovery_reason
+            .as_deref()
+            .context("factory verification recovery reason is missing")?;
+        let snapshot = load_factory_recovery_snapshot(
+            client,
+            server,
+            args,
+            mission_id,
+            item.id,
+            mode.into(),
+            reason,
+        )
+        .await?;
+        if let Some(active) = snapshot.active_recovery.as_ref() {
+            let requested =
+                resolve_explicit_recovery_verification_policy(item, requested_verification_policy)?;
+            active_recovery_contract_revision(
+                active,
+                mode.into(),
+                &reviewed_recovery_source(args, selected),
+                requested.as_ref().unwrap_or(&snapshot.verification_policy),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_checkpoint_context(
@@ -2150,7 +2304,7 @@ fn validate_checkpoint_context(
             "native checkpoint context does not match the current Factory item/version and mission"
         );
     }
-    if !context.checkpoint_verification {
+    if !FactoryRecoveryCapabilities::from_context(context).can_verify_checkpoint() {
         return Ok(false);
     }
     let fingerprint = context.workspace_fingerprint.as_deref().unwrap_or_default();
@@ -2250,8 +2404,11 @@ fn checkpoint_cancellation_selected(args: &FactoryArgs, item: &ExistingFactoryIt
             })
 }
 
-fn checkpoint_next_action(context: &FactoryVerificationRecoveryContextResponse) -> Value {
-    json!({
+fn checkpoint_next_action(context: &FactoryVerificationRecoveryContextResponse) -> Option<Value> {
+    if !FactoryRecoveryCapabilities::from_context(context).can_verify_checkpoint() {
+        return None;
+    }
+    Some(json!({
         "mode": "checkpoint-verification",
         "requires_explicit_authorization": true,
         "factory_work_item_id": context.work_item.id,
@@ -2260,7 +2417,7 @@ fn checkpoint_next_action(context: &FactoryVerificationRecoveryContextResponse) 
         "task_id": context.task_id,
         "source_run_id": context.source_run_id,
         "checkpoint_reconciliation_needed": context.checkpoint_cancellation_event_id.is_some(),
-    })
+    }))
 }
 
 fn checkpoint_catch_up(
@@ -2277,7 +2434,9 @@ fn checkpoint_catch_up(
     }
     // This path only keeps an existing running projection recoverable. It cannot
     // reopen a cancelled item, remove another block, or authorize a provider.
-    Ok((ready && current_state == "running").then(|| checkpoint_next_action(context)))
+    Ok((ready && current_state == "running")
+        .then(|| checkpoint_next_action(context))
+        .flatten())
 }
 
 fn checkpoint_reconciliation_request(
@@ -3018,14 +3177,7 @@ async fn load_factory_recovery_snapshot(
     {
         bail!("factory recovery context does not match the selected work item");
     }
-    if mode == FactoryVerificationRecoveryMode::CheckpointVerification
-        && context
-            .get("checkpoint_verification")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        bail!("the server did not authorize native stopped-source checkpoint verification");
-    }
+    let capabilities = FactoryRecoveryCapabilities::from_value(&context)?;
     let recoveries = context
         .get("recoveries")
         .and_then(Value::as_array)
@@ -3072,6 +3224,12 @@ async fn load_factory_recovery_snapshot(
     {
         bail!("active factory recovery does not match the selected source lineage");
     }
+    if active_recoveries.is_empty() || mode != FactoryVerificationRecoveryMode::SourceCorrection {
+        capabilities.validate_mode(mode)?;
+    }
+    // Only a matching active source correction can bypass new-work availability.
+    // Callers still check its reviewed source, policy and revision before effects;
+    // the native idempotent POST rechecks the stored request and current authority.
     let snapshot = server_json(
         client,
         Method::GET,
@@ -4665,12 +4823,24 @@ mod tests {
     async fn issue206_http_fixture(
         responses: Vec<Value>,
     ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        factory_http_fixture_with_status(
+            responses
+                .into_iter()
+                .map(|response| (reqwest::StatusCode::OK, response))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn factory_http_fixture_with_status(
+        responses: Vec<(reqwest::StatusCode, Value)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for response in responses {
+            for (status, response) in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let (header_end, length) = loop {
@@ -4706,8 +4876,8 @@ mod tests {
                 requests.push((first, body));
                 let body = response.to_string();
                 socket.write_all(format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status.as_u16(), status.canonical_reason().unwrap_or("Fixture"), body.len(), body,
                 ).as_bytes()).await.unwrap();
             }
             requests
@@ -4822,6 +4992,681 @@ mod tests {
         let marker = run.find("checkpoint_catch_up(").unwrap();
         let mirror = run.find("let mission_terminal_state =").unwrap();
         assert!(marker < mirror);
+    }
+
+    fn issue221_provider_correction_fixture() -> (
+        RecoveryFixture,
+        ExistingFactoryItem,
+        super::FactoryVerificationRecoveryContextResponse,
+    ) {
+        let (mut f, mut item, mut context) = issue206_checkpoint_fixture();
+        f.args.verification_recovery = Some(VerificationRecoveryModeArg::SourceCorrection);
+        f.snapshot.source_run_id = Uuid::from_u128(221);
+        f.snapshot.contract_version = 2;
+        f.snapshot.workspace_fingerprint = Some("d".repeat(64));
+        f.snapshot.expected_head_commit = None;
+        item.state = "verification_failed".to_owned();
+        item.checkpoint_cancellation = None;
+        context.work_item.state = crony_domain::FactoryWorkItemState::VerificationFailed;
+        context.checkpoint_cancellation_event_id = None;
+        context.checkpoint_verification_available = Some(false);
+        context.checkpoint_source_correction = true;
+        context.source_run_id = f.snapshot.source_run_id;
+        context.workspace_fingerprint = f.snapshot.workspace_fingerprint.clone();
+        context.expected_head_commit = None;
+        context.remaining_attempts = 1;
+        context.remaining_mission_tokens = f.args.budget_tokens;
+        context.remaining_mission_cost_microusd = f.args.budget_cost_microusd;
+        (f, item, context)
+    }
+
+    fn issue221_active_replay_fixture() -> (
+        RecoveryFixture,
+        ExistingFactoryItem,
+        super::FactoryVerificationRecoveryContextResponse,
+    ) {
+        let (mut f, mut item, mut context) = issue221_provider_correction_fixture();
+        f.cache_revision();
+        item.state = "running".to_owned();
+        item.version += 1;
+        context.work_item.state = crony_domain::FactoryWorkItemState::Running;
+        context.work_item.version = item.version;
+        context.checkpoint_source_correction = false;
+        context.remaining_attempts = 0;
+        let active = json!({
+            "id": Uuid::from_u128(223), "corp_id": f.args.corp_id,
+            "factory_work_item_id": item.id, "mission_id": f.mission_id,
+            "task_id": f.snapshot.task_id, "source_run_id": context.source_run_id,
+            "replacement_run_id": Uuid::from_u128(224),
+            "mode": "source_correction", "status": "authorized",
+            "authorized_by": f.args.actor_id,
+            "reason": f.args.verification_recovery_reason,
+            "observed_source_revision": f.selected.issue.updated_at,
+            "reviewed_source_snapshot": f.reviewed_source(),
+            "contract_revision_id": f.revision_id,
+            "previous_verification_policy": f.snapshot.verification_policy,
+            "replacement_verification_policy": f.snapshot.verification_policy,
+            "created_at": Utc::now(), "updated_at": Utc::now(),
+        });
+        context.recoveries = vec![serde_json::from_value(active.clone()).unwrap()];
+        f.snapshot.active_recovery = Some(active);
+        (f, item, context)
+    }
+
+    fn issue221_snapshot_response(f: &RecoveryFixture) -> Value {
+        json!({"snapshot": {
+            "tasks": [{
+                "id": f.snapshot.task_id, "corp_id": f.args.corp_id,
+                "mission_id": f.mission_id, "contract_version": f.snapshot.contract_version,
+                "contract": f.snapshot.contract,
+                "verification_policy": f.snapshot.verification_policy,
+            }],
+            "runs": [{
+                "id": f.snapshot.source_run_id, "corp_id": f.args.corp_id,
+                "task_id": f.snapshot.task_id,
+            }],
+            "mission_contract_revisions": f.snapshot.contract_revisions,
+        }})
+    }
+
+    #[test]
+    fn issue221_native_mode_flags_are_mode_specific_and_preserve_legacy_defaults() {
+        for family in [false, true] {
+            for available in [None, Some(false), Some(true)] {
+                for correction in [None, Some(false), Some(true)] {
+                    let mut value = json!({"checkpoint_verification": family});
+                    if let Some(available) = available {
+                        value["checkpoint_verification_available"] = json!(available);
+                    }
+                    if let Some(correction) = correction {
+                        value["checkpoint_source_correction"] = json!(correction);
+                    }
+                    let flags = super::FactoryRecoveryCapabilities::from_value(&value).unwrap();
+                    assert_eq!(
+                        flags
+                            .validate_mode(FactoryVerificationRecoveryMode::CheckpointVerification)
+                            .is_ok(),
+                        family && available != Some(false),
+                        "{value}"
+                    );
+                    assert_eq!(
+                        flags
+                            .validate_mode(FactoryVerificationRecoveryMode::SourceCorrection)
+                            .is_ok(),
+                        !family || correction == Some(true),
+                        "{value}"
+                    );
+                    assert_eq!(
+                        flags
+                            .validate_mode(FactoryVerificationRecoveryMode::VerifierOnly)
+                            .is_ok(),
+                        !family,
+                        "{value}"
+                    );
+                }
+            }
+        }
+        let legacy = super::FactoryRecoveryCapabilities::from_value(&json!({})).unwrap();
+        assert!(
+            legacy
+                .validate_mode(FactoryVerificationRecoveryMode::SourceCorrection)
+                .is_ok()
+        );
+        assert!(!legacy.can_verify_checkpoint());
+    }
+
+    #[test]
+    fn issue221_present_malformed_flags_fail_closed_in_both_context_decoders() {
+        let (_, _, context) = issue206_checkpoint_fixture();
+        for flag in [
+            "checkpoint_verification",
+            "checkpoint_verification_available",
+            "checkpoint_source_correction",
+        ] {
+            for invalid in [Value::Null, json!("true"), json!(1), json!([]), json!({})] {
+                let mut value = json!(context);
+                value[flag] = invalid;
+                assert!(super::FactoryRecoveryCapabilities::from_value(&value).is_err());
+                let error = super::decode_checkpoint_context(value).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("native recovery flag {flag} must be a boolean")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue221_checkpoint_actions_honor_availability_without_weakening_cancelled_proof() {
+        let (f, mut item, context) = issue206_checkpoint_fixture();
+        let legacy = super::decode_checkpoint_context(json!(context)).unwrap();
+        assert_eq!(legacy.checkpoint_verification_available, None);
+        assert!(
+            super::validate_checkpoint_context(
+                &legacy,
+                f.args.corp_id,
+                item.id,
+                f.mission_id,
+                item.version,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::checkpoint_next_action(&legacy).unwrap()["mode"],
+            "checkpoint-verification"
+        );
+
+        let mut unavailable = legacy.clone();
+        unavailable.checkpoint_verification_available = Some(false);
+        unavailable.checkpoint_source_correction = true;
+        unavailable.expected_head_commit = None;
+        item.checkpoint_cancellation = Some(unavailable.clone());
+        assert!(super::checkpoint_next_action(&unavailable).is_none());
+        assert!(!super::checkpoint_cancellation_selected(&f.args, &item));
+        assert!(
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &unavailable)
+                .is_err()
+        );
+        for state in [
+            crony_domain::FactoryWorkItemState::Cancelled,
+            crony_domain::FactoryWorkItemState::Running,
+        ] {
+            unavailable.work_item.state = state;
+            unavailable.checkpoint_cancellation_event_id = None;
+            assert!(
+                super::checkpoint_catch_up(
+                    &unavailable,
+                    f.args.corp_id,
+                    item.id,
+                    f.mission_id,
+                    item.version,
+                    state.as_str(),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        // A real checkpoint still needs its head; provider eligibility cannot
+        // substitute for it or reopen a cancelled projection in another mode.
+        let mut missing_head = legacy;
+        missing_head.checkpoint_verification_available = Some(true);
+        missing_head.checkpoint_source_correction = true;
+        missing_head.expected_head_commit = None;
+        assert!(
+            super::checkpoint_catch_up(
+                &missing_head,
+                f.args.corp_id,
+                item.id,
+                f.mission_id,
+                item.version,
+                "cancelled",
+            )
+            .is_err()
+        );
+        let mut args = f.args.clone();
+        args.verification_recovery = Some(VerificationRecoveryModeArg::SourceCorrection);
+        item.checkpoint_cancellation = Some(context);
+        item.checkpoint_cancellation
+            .as_mut()
+            .unwrap()
+            .checkpoint_source_correction = true;
+        assert!(!super::checkpoint_cancellation_selected(&args, &item));
+        let mut cache = HashMap::from([(f.selected.issue.number, f.selected.issue.clone())]);
+        let evaluated = evaluate_items(
+            &args,
+            vec![f.selected.project_item.clone()],
+            &HashMap::from([(item.source_project_item_id.clone(), item)]),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(!evaluated[0].eligible());
+    }
+
+    #[tokio::test]
+    async fn issue221_mode_preflight_denies_unavailable_or_malformed_flags_even_in_dry_run() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for dry_run in [false, true] {
+            for (mode, flag, value, detail) in [
+                (
+                    VerificationRecoveryModeArg::CheckpointVerification,
+                    "checkpoint_verification_available",
+                    json!(false),
+                    "checkpoint verification is not currently available",
+                ),
+                (
+                    VerificationRecoveryModeArg::SourceCorrection,
+                    "checkpoint_source_correction",
+                    json!(false),
+                    "source correction is not currently available",
+                ),
+                (
+                    VerificationRecoveryModeArg::VerifierOnly,
+                    "checkpoint_verification",
+                    json!(true),
+                    "does not support ordinary verifier-only recovery",
+                ),
+                (
+                    VerificationRecoveryModeArg::SourceCorrection,
+                    "checkpoint_verification_available",
+                    Value::Null,
+                    "must be a boolean",
+                ),
+            ] {
+                let (mut f, item, context) = issue221_provider_correction_fixture();
+                f.args.dry_run = dry_run;
+                f.args.verification_recovery = Some(mode);
+                let mut response = json!(context);
+                response[flag] = value;
+                let (server, requests) = issue206_http_fixture(vec![response]).await;
+                let error = super::preflight_factory_recovery_mode(
+                    &client,
+                    &server,
+                    &f.args,
+                    &f.selected,
+                    &item,
+                    None,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains(detail), "{error}");
+                let requests = requests.await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0].0.starts_with(&format!(
+                    "GET /api/corps/{}/factory/work-items/{}/verification-recoveries?",
+                    f.args.corp_id, item.id,
+                )));
+                assert!(requests[0].1.is_null());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue221_fresh_recovery_context_denies_before_revision_or_recovery_mutation() {
+        let (f, item, mut context) = issue221_provider_correction_fixture();
+        context.checkpoint_source_correction = false;
+        let (server, requests) = issue206_http_fixture(vec![json!(context)]).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let error = super::recover_factory_verification(
+            &client,
+            &server,
+            &f.args,
+            &f.selected,
+            &item,
+            item.id,
+            Uuid::from_u128(222),
+            item.version,
+            f.mission_id,
+            "issue221-unit",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source correction is not currently available")
+        );
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.starts_with("GET "));
+    }
+
+    #[tokio::test]
+    async fn issue221_current_provider_correction_retains_null_head_and_current_revision() {
+        let (f, item, context) = issue221_provider_correction_fixture();
+        let (server, requests) = issue206_http_fixture(vec![
+            json!(context),
+            json!(context),
+            issue221_snapshot_response(&f),
+            json!({"revision": {"id": f.revision_id}}),
+            json!({
+                "recovery": {"id": Uuid::from_u128(223), "status": "authorized"},
+                "work_item": {"state": "running", "version": item.version + 1},
+                "run_id": Uuid::from_u128(224),
+            }),
+        ])
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        super::preflight_factory_recovery_mode(&client, &server, &f.args, &f.selected, &item, None)
+            .await
+            .unwrap();
+        let result = super::recover_factory_verification(
+            &client,
+            &server,
+            &f.args,
+            &f.selected,
+            &item,
+            item.id,
+            Uuid::from_u128(222),
+            item.version,
+            f.mission_id,
+            "issue221-unit",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["legacy_workspace_checkpointed"], false);
+        assert_eq!(result["recovery_mode"], "source_correction");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests[..3]
+                .iter()
+                .all(|(line, _)| line.starts_with("GET "))
+        );
+        assert!(requests[3].0.starts_with(&format!(
+            "POST /api/corps/{}/missions/{}/contract-revisions ",
+            f.args.corp_id, f.mission_id,
+        )));
+        assert_eq!(requests[3].1["source_run_id"], json!(context.source_run_id));
+        assert_eq!(
+            requests[3].1["expected_contract_version"],
+            json!(f.snapshot.contract_version)
+        );
+        assert_eq!(requests[3].1["next_action"], "resume");
+        assert!(requests[4].0.starts_with(&format!(
+            "POST /api/corps/{}/factory/work-items/{}/verification-recoveries ",
+            f.args.corp_id, item.id,
+        )));
+        assert_eq!(requests[4].1["source_run_id"], json!(context.source_run_id));
+        assert_eq!(requests[4].1["mode"], "source_correction");
+        assert_eq!(requests[4].1["contract_revision_id"], json!(f.revision_id));
+        assert_eq!(
+            requests[4].1["expected_workspace_fingerprint"],
+            json!(context.workspace_fingerprint)
+        );
+        assert_eq!(
+            requests[4].1.get("expected_head_commit"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn issue221_active_correction_replays_only_the_same_native_request_without_new_work() {
+        let (f, item, mut context) = issue221_active_replay_fixture();
+        let mut responses = Vec::new();
+        for status in ["authorized", "running"] {
+            context.recoveries[0].status = status.to_owned();
+            responses.extend([
+                json!(context),
+                json!(context),
+                issue221_snapshot_response(&f),
+                json!(context),
+                issue221_snapshot_response(&f),
+                json!({
+                    "recovery": context.recoveries[0], "work_item": context.work_item,
+                    "run_id": context.recoveries[0].replacement_run_id, "replayed": true,
+                }),
+            ]);
+        }
+        let (server, requests) = issue206_http_fixture(responses).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            super::preflight_factory_recovery_mode(
+                &client,
+                &server,
+                &f.args,
+                &f.selected,
+                &item,
+                None,
+            )
+            .await
+            .unwrap();
+            let result = super::recover_factory_verification(
+                &client,
+                &server,
+                &f.args,
+                &f.selected,
+                &item,
+                item.id,
+                Uuid::from_u128(222),
+                item.version,
+                f.mission_id,
+                "issue221-active-replay",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["recovered"], true);
+            assert_eq!(result["recovery_id"], json!(context.recoveries[0].id));
+            assert_eq!(
+                result["run_id"],
+                json!(context.recoveries[0].replacement_run_id)
+            );
+            assert_eq!(result["contract_revision_id"], json!(f.revision_id));
+            assert_eq!(result["legacy_workspace_checkpointed"], false);
+        }
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 12);
+        let posts = requests
+            .iter()
+            .filter(|(line, _)| line.starts_with("POST "))
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 2);
+        for (line, body) in &posts {
+            assert!(line.starts_with(&format!(
+                "POST /api/corps/{}/factory/work-items/{}/verification-recoveries ",
+                f.args.corp_id, item.id,
+            )));
+            assert_eq!(body["mode"], "source_correction");
+            assert_eq!(body["source_run_id"], json!(context.source_run_id));
+            assert_eq!(body["contract_revision_id"], json!(f.revision_id));
+            assert_eq!(body.get("expected_head_commit"), Some(&Value::Null));
+        }
+        // No revision, checkpoint, new run request, or changed idempotency key.
+        // The existing native POST, not this context, decides replay authority.
+        assert_eq!(posts[0].1, posts[1].1);
+        assert!(
+            requests
+                .iter()
+                .all(|(line, _)| !line.contains("/contract-revisions")
+                    && !line.contains("/workspace-checkpoint"))
+        );
+    }
+
+    #[tokio::test]
+    async fn issue221_active_replay_dry_run_matches_existing_request_without_mutations() {
+        let (mut f, item, context) = issue221_active_replay_fixture();
+        f.args.dry_run = true;
+        let (server, requests) = issue206_http_fixture(vec![
+            json!(context),
+            json!(context),
+            issue221_snapshot_response(&f),
+        ])
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        super::preflight_factory_recovery_mode(&client, &server, &f.args, &f.selected, &item, None)
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|(line, _)| line.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn issue221_active_replay_rejects_mismatched_mode_actor_source_revision_and_request() {
+        let (f, item, context) = issue221_active_replay_fixture();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (pointer, changed, detail, needs_snapshot) in [
+            (
+                "/mode",
+                json!("verifier_only"),
+                "already has an active",
+                false,
+            ),
+            (
+                "/authorized_by",
+                json!(Uuid::from_u128(999)),
+                "another authorizing actor",
+                false,
+            ),
+            (
+                "/source_run_id",
+                json!(Uuid::from_u128(999)),
+                "selected source lineage",
+                false,
+            ),
+            (
+                "/corp_id",
+                json!(Uuid::from_u128(999)),
+                "selected source lineage",
+                false,
+            ),
+            (
+                "/reason",
+                json!("different request"),
+                "reason does not match",
+                false,
+            ),
+            (
+                "/reviewed_source_snapshot/body_sha256",
+                json!("changed"),
+                "reviewed source does not match",
+                true,
+            ),
+            (
+                "/observed_source_revision",
+                json!("changed"),
+                "reviewed source does not match",
+                true,
+            ),
+            (
+                "/replacement_verification_policy/checks/0/path",
+                json!("src/other.rs"),
+                "replacement verification policy does not match",
+                true,
+            ),
+            (
+                "/contract_revision_id",
+                Value::Null,
+                "has no contract revision",
+                true,
+            ),
+        ] {
+            let mut response = json!(context);
+            *response["recoveries"][0].pointer_mut(pointer).unwrap() = changed;
+            let mut responses = vec![response.clone(), response];
+            if needs_snapshot {
+                responses.push(issue221_snapshot_response(&f));
+            }
+            let (server, requests) = issue206_http_fixture(responses).await;
+            let error = super::preflight_factory_recovery_mode(
+                &client,
+                &server,
+                &f.args,
+                &f.selected,
+                &item,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(detail), "{pointer}: {error}");
+            let requests = requests.await.unwrap();
+            assert_eq!(requests.len(), if needs_snapshot { 3 } else { 2 });
+            assert!(requests.iter().all(|(line, _)| line.starts_with("GET ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn issue221_active_replay_still_requires_current_native_authority() {
+        let (f, item, context) = issue221_active_replay_fixture();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for deny_context in [true, false] {
+            let mut responses = Vec::new();
+            if !deny_context {
+                responses.extend([
+                    (reqwest::StatusCode::OK, json!(context)),
+                    (reqwest::StatusCode::OK, issue221_snapshot_response(&f)),
+                ]);
+            }
+            responses.push((
+                reqwest::StatusCode::FORBIDDEN,
+                json!({"error": "current native recovery authority denied"}),
+            ));
+            let (server, requests) = factory_http_fixture_with_status(responses).await;
+            let error = super::recover_factory_verification(
+                &client,
+                &server,
+                &f.args,
+                &f.selected,
+                &item,
+                item.id,
+                Uuid::from_u128(222),
+                item.version,
+                f.mission_id,
+                "issue221-active-replay",
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("403"), "{error:#}");
+            let requests = requests.await.unwrap();
+            assert_eq!(requests.len(), if deny_context { 1 } else { 3 });
+            if !deny_context {
+                assert!(requests[2].0.starts_with(&format!(
+                    "POST /api/corps/{}/factory/work-items/{}/verification-recoveries ",
+                    f.args.corp_id, item.id,
+                )));
+                assert_eq!(requests[2].1["contract_revision_id"], json!(f.revision_id));
+            }
+            assert!(
+                requests
+                    .iter()
+                    .all(|(line, _)| !line.contains("/contract-revisions")
+                        && !line.contains("/workspace-checkpoint"))
+            );
+        }
+    }
+
+    #[test]
+    fn issue221_production_mode_preflight_precedes_dry_run_and_rechecks_before_claim() {
+        let source = include_str!("factory.rs");
+        let run = source
+            .split("pub async fn run(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn watch(")
+            .next()
+            .unwrap();
+        let first_gate = run.find("preflight_factory_recovery_mode(").unwrap();
+        let dry_run = run.find("if args.dry_run").unwrap();
+        let refresh = run.find("let (mut refreshed, mut persisted)").unwrap();
+        let second_gate = refresh
+            + run[refresh..]
+                .find("preflight_factory_recovery_mode(")
+                .unwrap();
+        let reconcile = run.find("reconcile_checkpoint_cancellation(").unwrap();
+        let claim = run.find("let claim_generation =").unwrap();
+        assert!(first_gate < dry_run && dry_run < refresh);
+        assert!(refresh < second_gate && second_gate < reconcile && reconcile < claim);
     }
 
     #[test]

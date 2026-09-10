@@ -3,6 +3,9 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+#[path = "checkpoint_correction_history.rs"]
+mod history;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Authority {
@@ -24,6 +27,24 @@ pub(super) struct Authority {
 
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+pub(super) async fn requires_authority_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    item: &FactoryWorkItem,
+    run_id: Uuid,
+) -> Result<bool> {
+    history::requires_authority_tx(tx, item, run_id).await
+}
+
+pub(super) async fn previous_correction_context_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    item: &FactoryWorkItem,
+    replacement_id: Uuid,
+    contract: &TaskContract,
+    policy: &VerificationPolicy,
+) -> Result<Option<(TaskContract, VerificationPolicy, Uuid)>> {
+    history::previous_context_tx(tx, item, replacement_id, contract, policy).await
 }
 
 async fn lock_authorizer_tx(
@@ -83,139 +104,25 @@ async fn origin_with_publication_tx(
     publication: Option<&checkpoint_publication::CheckpointPublication>,
 ) -> Result<Authority> {
     lock_authorizer_tx(tx, item, actor_id).await?;
-    let row = sqlx::query(
-        r#"
-        SELECT checkpoint.id AS checkpoint_id, checkpoint.checkpoint_authority,
-               source.task_id, source.workspace_run_id, source.workspace_connection_id,
-               revision.previous_contract, revision.replacement_contract,
-               revision.previous_verification_policy, revision.replacement_verification_policy,
-               task.contract, task.verification_policy
-        FROM factory_verification_recoveries checkpoint
-        JOIN runs source
-          ON source.id=checkpoint.replacement_run_id AND source.corp_id=checkpoint.corp_id
-         AND source.task_id=checkpoint.task_id
-         AND source.resumed_from_run_id=checkpoint.source_run_id
-        JOIN tasks task ON task.id=source.task_id AND task.corp_id=source.corp_id
-        JOIN mission_contract_revisions revision
-          ON revision.id=$4 AND revision.corp_id=source.corp_id
-         AND revision.task_id=task.id AND revision.mission_id=task.mission_id
-         AND revision.source_run_id=source.id AND revision.revised_by=$5
-         AND revision.next_action='resume' AND revision.version=task.contract_version
-        WHERE checkpoint.corp_id=$1 AND checkpoint.factory_work_item_id=$2
-          AND checkpoint.mission_id=$6 AND task.mission_id=$6
-          AND checkpoint.replacement_run_id=$3
-          AND checkpoint.mode='checkpoint_verification' AND checkpoint.status='failed'
-          AND source.execution_mode='verification_only' AND source.status='failed'
-          AND source.verification_status='failed'
-          AND source.workspace_disposition='preserved'
-          AND source.provider_session_id IS NULL
-        "#,
-    )
-    .bind(item.corp_id)
-    .bind(item.id)
-    .bind(source_run_id)
-    .bind(revision_id)
-    .bind(actor_id)
-    .bind(
-        item.mission_id
-            .context("source correction has no mission")?,
-    )
-    .fetch_optional(&mut **tx)
-    .await?
-    .context("source correction requires the exact failed checkpoint and current revision")?;
-    let previous_contract: TaskContract = serde_json::from_value(row.get("previous_contract"))?;
-    let replacement_contract: TaskContract =
-        serde_json::from_value(row.get("replacement_contract"))?;
-    let previous_policy: VerificationPolicy =
-        serde_json::from_value(row.get("previous_verification_policy"))?;
-    let replacement_policy: VerificationPolicy =
-        serde_json::from_value(row.get("replacement_verification_policy"))?;
-    if row.get::<Value, _>("contract") != serde_json::to_value(&replacement_contract)?
-        || row.get::<Value, _>("verification_policy") != serde_json::to_value(&replacement_policy)?
-    {
-        return Err(anyhow!("source correction revision was superseded"));
+    let authority =
+        history::current_authority_tx(tx, item, source_run_id, revision_id, actor_id).await?;
+    if !has_replacement {
+        history::validate_admission_suffix_tx(tx, item, source_run_id).await?;
     }
-    ensure_factory_recovery_verification_policy_not_weakened(
-        &previous_policy,
-        &replacement_policy,
-    )?;
-    ensure_factory_recovery_policy(item, &replacement_contract, &replacement_policy)?;
-    let proof = budget_checkpoint::source_authority_with_contract_tx(
-        tx,
-        item.corp_id,
-        item.id,
-        source_run_id,
-        Some((&previous_contract, &previous_policy)),
-    )
-    .await?;
-    if row.get::<Option<Value>, _>("checkpoint_authority") != Some(serde_json::to_value(&proof)?) {
-        return Err(anyhow!("source correction checkpoint authority changed"));
-    }
-    let origin = sqlx::query(
-        r#"
-        SELECT origin.breaker_stage, origin.workspace_connection_id, origin.provider_session_id,
-               incident.id AS incident_id, incident.input
-        FROM runs origin
-        JOIN circuit_breaker_incidents incident
-          ON incident.corp_id=origin.corp_id AND incident.run_id=origin.id
-         AND incident.stage='suspend'
-        WHERE origin.id=$1 AND origin.corp_id=$2
-        "#,
-    )
-    .bind(proof.checkpoint.run_id)
-    .bind(item.corp_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .context("source correction has no native suspension incident")?;
-    if origin.get::<String, _>("breaker_stage") != "suspend" {
-        return Err(anyhow!("source correction cannot override stop-stage work"));
-    }
-    let connection: Option<Uuid> = row.get("workspace_connection_id");
-    if origin.get::<Option<Uuid>, _>("workspace_connection_id") != connection
-        || replacement_contract.workspace_connection_id != connection
-        || previous_contract.workspace_connection_id != connection
-        || factory_workspace_connection_id(&item.policy).map_err(anyhow::Error::msg)? != connection
-    {
-        return Err(anyhow!("source correction execution connection changed"));
-    }
-    if has_replacement {
-        budget_checkpoint::validate_lineage_until_tx(
-            tx,
-            item.corp_id,
-            item.id,
-            row.get("workspace_run_id"),
-            &proof,
-            source_run_id,
-        )
-        .await?;
-    } else {
-        budget_checkpoint::validate_lineage_tx(
-            tx,
-            item.corp_id,
-            item.id,
-            row.get("workspace_run_id"),
-            &proof,
-        )
-        .await?;
-    }
-    // Only the exact reviewed checkpoint origin may pass the breaker predicate
-    // during publication. Quarantine is an independent veto, including there.
-    // With None, IS DISTINCT FROM NULL preserves the original strict predicate.
+    // Historical reconstruction never grants a stop exemption. Only the native
+    // publication receipt supplied by the existing suffix verifier may do so.
     let invalid_lineage: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM runs run
-            WHERE run.corp_id=$1 AND run.workspace_run_id=$2
+        "SELECT EXISTS (
+            SELECT 1 FROM runs run WHERE run.corp_id=$1 AND run.workspace_run_id=$2
               AND (run.workspace_disposition='quarantined'
                    OR ((run.breaker_stage='stop'
                         OR (run.breaker_stage='suspend' AND run.id<>$3))
                        AND run.id IS DISTINCT FROM $4))
-        )
-        "#,
+        )",
     )
     .bind(item.corp_id)
-    .bind(row.get::<Uuid, _>("workspace_run_id"))
-    .bind(proof.checkpoint.run_id)
+    .bind(authority.checkpoint.checkpoint.workspace_run_id)
+    .bind(authority.checkpoint.checkpoint.run_id)
     .bind(publication.map(checkpoint_publication::CheckpointPublication::origin_run_id))
     .fetch_one(&mut **tx)
     .await?;
@@ -224,47 +131,8 @@ async fn origin_with_publication_tx(
             "source correction lineage has another stop, suspension or quarantine"
         ));
     }
-    let prefix_run_ids: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT run.id FROM runs run
-        JOIN runs boundary ON boundary.id=$3 AND boundary.corp_id=run.corp_id
-        WHERE run.corp_id=$1 AND run.workspace_run_id=$2
-          AND (run.created_at,run.id)<=(boundary.created_at,boundary.id)
-        ORDER BY run.created_at,run.id LIMIT 65
-        "#,
-    )
-    .bind(item.corp_id)
-    .bind(row.get::<Uuid, _>("workspace_run_id"))
-    .bind(source_run_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if prefix_run_ids.is_empty()
-        || prefix_run_ids.len() > 64
-        || prefix_run_ids.last() != Some(&source_run_id)
-    {
-        return Err(anyhow!("source correction checkpoint prefix is invalid"));
-    }
-    Ok(Authority {
-        schema_version: 1,
-        checkpoint_recovery_id: row.get("checkpoint_id"),
-        checkpoint: proof,
-        suspension_incident_id: origin.get("incident_id"),
-        suspension_input_sha256: digest(&origin.get::<Value, _>("input"))?,
-        contract_revision_id: revision_id,
-        previous_contract_sha256: digest(&previous_contract)?,
-        replacement_contract_sha256: digest(&replacement_contract)?,
-        previous_policy_sha256: digest(&previous_policy)?,
-        replacement_policy_sha256: digest(&replacement_policy)?,
-        factory_policy_sha256: digest(&item.policy)?,
-        workspace_connection_id: connection,
-        provider_session_id: origin
-            .get::<Option<String>, _>("provider_session_id")
-            .filter(|session| !session.is_empty())
-            .context("source correction origin has no provider session")?,
-        prefix_run_ids,
-    })
+    Ok(authority)
 }
-
 pub(super) async fn admit_tx(
     tx: &mut Transaction<'_, Postgres>,
     item: &FactoryWorkItem,
@@ -309,9 +177,11 @@ pub(super) async fn context_eligible_tx(
              AND recovery.task_id=task.id AND recovery.mission_id=mission.id
              AND recovery.factory_work_item_id=$3
             WHERE source.id=$2 AND source.corp_id=$1
-              AND recovery.mode='checkpoint_verification' AND recovery.status='failed'
-              AND source.execution_mode='verification_only' AND source.status='failed'
-              AND source.verification_status='failed' AND task.attempt_count<task.max_attempts
+               AND recovery.status='failed'
+               AND ((recovery.mode='checkpoint_verification' AND source.execution_mode='verification_only')
+                    OR (recovery.mode='source_correction' AND source.execution_mode='provider'))
+               AND source.status IN ('failed','cancelled','lost')
+               AND source.verification_status='failed' AND task.attempt_count<task.max_attempts
         )
         "#,
     )
@@ -323,8 +193,20 @@ pub(super) async fn context_eligible_tx(
     if !eligible {
         return Ok(false);
     }
+    let provider_source: bool =
+        sqlx::query_scalar("SELECT execution_mode='provider' FROM runs WHERE corp_id=$1 AND id=$2")
+            .bind(item.corp_id)
+            .bind(source_run_id)
+            .fetch_one(&mut **tx)
+            .await?;
     let proof = if let Some(revised) = revised {
         revised.checkpoint.clone()
+    } else if provider_source {
+        match history::source_context_tx(tx, item, source_run_id).await {
+            Ok(Some(authority)) => authority.checkpoint,
+            Ok(None) => return Ok(false),
+            Err(error) => return deny_or_retry(error),
+        }
     } else {
         match budget_checkpoint::source_authority_tx(tx, item.corp_id, item.id, source_run_id).await
         {
@@ -368,14 +250,16 @@ pub(super) async fn context_eligible_tx(
     if !origin_ready {
         return Ok(false);
     }
-    if let Err(error) = budget_checkpoint::validate_lineage_tx(
-        tx,
-        item.corp_id,
-        item.id,
-        proof.checkpoint.workspace_run_id,
-        &proof,
-    )
-    .await
+    if revised.is_none()
+        && !provider_source
+        && let Err(error) = budget_checkpoint::validate_lineage_tx(
+            tx,
+            item.corp_id,
+            item.id,
+            proof.checkpoint.workspace_run_id,
+            &proof,
+        )
+        .await
     {
         return deny_or_retry(error);
     }
@@ -670,6 +554,9 @@ impl PgStore {
                 return Ok(false);
             }
         } else {
+            if history::requires_authority_tx(&mut tx, &item, command.run_id).await? {
+                return Ok(false);
+            }
             let denied: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM runs WHERE corp_id=$1 AND workspace_run_id=$2
                  AND (breaker_stage IN ('suspend','stop') OR workspace_disposition='quarantined'))",
@@ -729,8 +616,17 @@ pub(super) async fn replay_authority_tx(
     .fetch_one(&mut **tx)
     .await?;
     let encoded: Option<Value> = row.get("source_correction_authority");
+    let (item, _) =
+        factory_work_item_tx(tx, recovery.corp_id, recovery.factory_work_item_id, false)
+            .await?
+            .context("source-correction work item is missing")?;
+    let replacement_id = recovery
+        .replacement_run_id
+        .context("source correction has no native replacement")?;
+    let requires_origin = row.get::<bool, _>("requires_origin")
+        || history::requires_authority_tx(tx, &item, replacement_id).await?;
     let Some(encoded) = encoded else {
-        if row.get::<bool, _>("requires_origin") {
+        if requires_origin {
             return Err(anyhow!(
                 "checkpoint source-correction provenance is missing"
             ));
@@ -738,10 +634,6 @@ pub(super) async fn replay_authority_tx(
         return Ok(());
     };
     let expected: Authority = serde_json::from_value(encoded)?;
-    let (item, _) =
-        factory_work_item_tx(tx, recovery.corp_id, recovery.factory_work_item_id, false)
-            .await?
-            .context("source-correction work item is missing")?;
     let current = origin_tx(
         tx,
         &item,
@@ -784,24 +676,27 @@ pub(super) async fn publication_authority_tx(
         FROM lineage JOIN factory_verification_recoveries recovery
           ON recovery.replacement_run_id=lineage.id AND recovery.corp_id=$1
          AND recovery.factory_work_item_id=$3 AND recovery.mode='source_correction'
-        WHERE recovery.source_correction_authority IS NOT NULL OR EXISTS (
-            SELECT 1 FROM factory_verification_recoveries checkpoint
-            WHERE checkpoint.corp_id=recovery.corp_id
-              AND checkpoint.factory_work_item_id=recovery.factory_work_item_id
-              AND checkpoint.replacement_run_id=recovery.source_run_id
-              AND checkpoint.mode='checkpoint_verification'
-        )
         ORDER BY lineage.depth LIMIT 1
         "#,
     ).bind(item.corp_id).bind(selected_run_id).bind(item.id).fetch_optional(&mut **tx).await?;
     let Some(row) = row else {
+        if history::requires_authority_tx(tx, item, selected_run_id).await? {
+            return Err(anyhow!(
+                "source-correction publication provenance is missing"
+            ));
+        }
         return Ok(());
     };
-    let expected: Authority = serde_json::from_value(
-        row.get::<Option<Value>, _>("source_correction_authority")
-            .context("source-correction publication provenance is missing")?,
-    )
-    .context("invalid source-correction publication provenance")?;
+    let Some(encoded) = row.get::<Option<Value>, _>("source_correction_authority") else {
+        if history::requires_authority_tx(tx, item, selected_run_id).await? {
+            return Err(anyhow!(
+                "source-correction publication provenance is missing"
+            ));
+        }
+        return Ok(());
+    };
+    let expected: Authority = serde_json::from_value(encoded)
+        .context("invalid source-correction publication provenance")?;
     let current = origin_tx(
         tx,
         item,
