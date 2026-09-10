@@ -87,6 +87,7 @@ pub struct ExternalCliAdapter {
     prefix_args: Vec<OsString>,
     platform_supported: bool,
     availability_probe_active: Arc<AtomicBool>,
+    profile: Option<super::connection::ProfileEnvironment>,
     #[cfg(test)]
     probe_verification_failures: usize,
     #[cfg(test)]
@@ -123,6 +124,7 @@ impl ExternalCliAdapter {
             prefix_args,
             platform_supported: cfg!(windows),
             availability_probe_active: Arc::new(AtomicBool::new(false)),
+            profile: None,
             #[cfg(test)]
             probe_verification_failures: 0,
             #[cfg(test)]
@@ -133,7 +135,23 @@ impl ExternalCliAdapter {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.command);
         command.args(&self.prefix_args);
+        if let Some(profile) = &self.profile {
+            profile.apply(&mut command);
+        }
         command
+    }
+
+    pub(crate) fn for_connection(
+        flavor: ExternalFlavor,
+        command: Option<PathBuf>,
+        prefix_args: Vec<OsString>,
+        profile: super::connection::ProfileEnvironment,
+    ) -> Self {
+        let available = command.as_ref().is_some_and(|path| path.is_file());
+        let mut adapter = Self::with_prefix_args(flavor, command.unwrap_or_default(), prefix_args);
+        adapter.platform_supported &= available;
+        adapter.profile = Some(profile);
+        adapter
     }
 
     fn append_run_args(
@@ -144,23 +162,7 @@ impl ExternalCliAdapter {
     ) {
         match self.flavor {
             ExternalFlavor::ClaudeCode => {
-                command
-                    .arg("--safe-mode")
-                    .arg("--no-chrome")
-                    .arg("--disable-slash-commands")
-                    .arg("--strict-mcp-config")
-                    .arg("--mcp-config")
-                    .arg(r#"{"mcpServers":{}}"#)
-                    .arg("--print")
-                    .arg("--verbose")
-                    .arg("--input-format")
-                    .arg("stream-json")
-                    .arg("--output-format")
-                    .arg("stream-json")
-                    .arg("--permission-mode")
-                    .arg("manual")
-                    .arg("--permission-prompt-tool")
-                    .arg("stdio");
+                append_claude_control_args(command);
                 if let Some(session_id) = resume_session_id {
                     command.arg(format!("--resume={session_id}"));
                 }
@@ -298,6 +300,9 @@ impl ExternalCliAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(profile) = &self.profile {
+            profile.apply_request(&mut command, &request.environment)?;
+        }
         let spawn = OwnedProcessTree::spawn(&mut command)
             .with_context(|| format!("spawn {}", self.display_name()))?;
         let mut tree =
@@ -949,6 +954,27 @@ impl ExternalCliAdapter {
         });
         Ok(AdapterExit::Completed)
     }
+}
+
+pub(crate) fn append_claude_control_args(command: &mut Command) {
+    command.args([
+        "--safe-mode",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        r#"{"mcpServers":{}}"#,
+        "--print",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "manual",
+        "--permission-prompt-tool",
+        "stdio",
+    ]);
 }
 
 #[async_trait]

@@ -10,7 +10,13 @@ import { OfficeFloor, OfficePortrait } from './OfficeFloor'
 import { OfficeInspector } from './OfficeInspector'
 import { FactoryPollingNotice } from './FactoryPollingNotice'
 import { factoryControllerState } from './factoryPolling'
+import { selectFactoryController } from './factoryControllerSelection'
 import type { FactoryPolling } from './factoryPolling'
+import {
+  factoryRecoveryBlocksProviderResume, factoryRecoveryConnection,
+  factoryRecoveryModes, needsFactoryRecoveryContext,
+} from './factoryCheckpointRecovery'
+import type { FactoryRecoveryCommandMode } from './factoryCheckpointRecovery'
 import { currentOfficeAgents, operatingOfficeAgents, selectOfficeAgent } from './office/officeModel'
 import type { OfficeAgent } from './office/officeModel'
 import {
@@ -27,6 +33,13 @@ import { canPostRoomMessage, discussionScopeKey, missionOrigin, resolveDiscussio
 import type { DiscussionScope } from './missionProjection'
 import { createSnapshotRefresher } from './snapshotRefresh'
 import { evidenceSelectionKey, readEvidenceSelection, rememberEvidenceSelection } from './evidenceSelection'
+import { ConnectionsPanel } from './ConnectionsPanel'
+import { MissionOriginDetails } from './MissionOriginDetails'
+import {
+  connectionLabel, connectionRunnerRevision, connectionScope, connectionStatusLabel,
+  connectionTarget, connectionsNeedPresenceRefresh,
+} from './workspaceConnections'
+import type { WorkspaceConnection, WorkspaceConnections } from './workspaceConnections'
 
 type Actor = {
   id: string
@@ -431,6 +444,7 @@ type FactoryWorkItem = {
 
 type FactoryController = {
   id: string
+  corp_id: string
   service_actor_id: string
   configured_by: string
   source_project_owner: string
@@ -458,7 +472,7 @@ type FactoryVerificationRecovery = {
   task_id: string
   source_run_id: string
   replacement_run_id: string | null
-  mode: 'source_correction' | 'verifier_only'
+  mode: 'source_correction' | 'verifier_only' | 'checkpoint_verification'
   status: 'authorized' | 'running' | 'completed' | 'failed'
   authorized_by: string
   reason: string
@@ -481,6 +495,8 @@ type FactoryVerificationRecoveryContextResponse = {
   remaining_mission_cost_microusd: number
   workspace_fingerprint: string | null
   expected_head_commit: string | null
+  checkpoint_verification?: boolean
+  checkpoint_cancellation_event_id?: string | null
 }
 
 type FactoryRecoveryContextScope = {
@@ -1625,7 +1641,9 @@ function FactoryPanel({
   const active = items.filter(
     (item) => !['published', 'failed', 'cancelled'].includes(item.state),
   )
-  const selected = items.find((item) => item.id === selectedItemId) ?? items[0]
+  const selected = selectedItemId === null
+    ? items[0]
+    : items.find((item) => item.id === selectedItemId)
   const selectedMission = missions.find((candidate) => candidate.id === selected?.mission_id)
   const selectedTasks = tasks.filter((task) => task.mission_id === selectedMission?.id)
   const selectedTaskIds = new Set(selectedTasks.map((task) => task.id))
@@ -1664,7 +1682,9 @@ function FactoryPanel({
   const selectedAttempts = publicationAttempts
     .filter((attempt) => attempt.publication_id === selectedPublication?.id)
     .sort((left, right) => right.attempt - left.attempt)
-  const controller = controllers[0]
+  const controller = selectFactoryController(
+    controllers, selected, scope.corpId, selectedItemId,
+  )
   const controllerState = factoryControllerState(controller)
 
   return (
@@ -1699,7 +1719,11 @@ function FactoryPanel({
           <small>
             {controller
               ? `${controller.source_project_owner} / Project #${controller.source_project_number} · ${controller.source_repository_owner}/${controller.source_repository_name}`
-              : 'No trusted factory watcher has registered with this Corp.'}
+              : selected
+                ? 'No trusted Factory watcher matches the selected Project and repository.'
+                : selectedItemId
+                  ? 'The selected Factory item is unavailable. Choose an item to view its controller.'
+                  : 'No trusted factory watcher has registered with this Corp.'}
           </small>
         </div>
         {controller ? (
@@ -1751,7 +1775,9 @@ function FactoryPanel({
           </>
         ) : (
           <div className="factory-start-help">
-            <p>Automatic GitHub intake is off. Your runner is separate and can still execute direct missions.</p>
+            <p>{selected || selectedItemId
+              ? 'No controller is available for the selected Factory context. Existing missions can continue independently.'
+              : 'Automatic GitHub intake is off. Your runner is separate and can still execute direct missions.'}</p>
             <button type="button" className="button button-primary"
               disabled={!canOperate(selectedActor.role)} onClick={onNewMission}>
               Start a direct mission
@@ -3256,7 +3282,10 @@ function requestFactoryRecoveryContext(
     if (typeof data.task_id !== 'string' || !data.task_id ||
       typeof data.source_run_id !== 'string' || !data.source_run_id ||
       !Array.isArray(data.recoveries) ||
-      !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+       !(data.workspace_fingerprint === null || typeof data.workspace_fingerprint === 'string') ||
+       !(data.expected_head_commit === null || typeof data.expected_head_commit === 'string') ||
+       !(data.checkpoint_verification === undefined || typeof data.checkpoint_verification === 'boolean') ||
+       !(data.checkpoint_cancellation_event_id == null || typeof data.checkpoint_cancellation_event_id === 'string') ||
       ![data.remaining_attempts, data.remaining_mission_tokens, data.remaining_mission_cost_microusd].every(Number.isFinite)) {
       throw new Error('Recovery context is missing required source, checkpoint or remaining-budget fields. No snapshot fallback is used.')
     }
@@ -3292,13 +3321,19 @@ function factoryRecoveryPresentation(
   const active = context.recoveries.find((recovery) =>
     recovery.status === 'authorized' || recovery.status === 'running',
   )
+  const checkpointVerification = factoryRecoveryModes(context).includes('checkpoint-verification')
+  const cancelledBlocked = context.work_item.state === 'cancelled' && !checkpointVerification
   const state = quarantined ? 'quarantined' : active ? 'active'
+    : cancelledBlocked ? 'unavailable'
+      : checkpointVerification && context.checkpoint_cancellation_event_id ? 'reconciliation_required'
     : context.workspace_fingerprint ? 'ready' : 'checkpoint_required'
   return {
     run,
     state,
     heading: quarantined ? 'Quarantine warning — inspect controller context'
       : active ? 'Recovery already authorized'
+        : cancelledBlocked ? 'Cancelled Factory intent remains protected'
+          : checkpointVerification ? 'Verify retained checkpoint'
         : context.workspace_fingerprint ? 'Recover preserved work' : 'Checkpoint and recheck',
     detail: quarantined
       ? run
@@ -3306,10 +3341,16 @@ function factoryRecoveryPresentation(
         : 'A visible mission workspace is quarantined, but this endpoint does not include source-workspace lineage details. The checkpoint hash is withheld until the native controller can resolve that warning.'
       : active
         ? 'An existing recovery is authorized or running. Inspect that operation through the controller; do not create a duplicate grant. Copied templates are not a new authorization.'
+        : cancelledBlocked
+          ? 'The current server context does not authorize checkpoint reconciliation for this cancellation. User stops and unrelated cancellations cannot be overridden here.'
+          : checkpointVerification
+            ? context.checkpoint_cancellation_event_id
+              ? 'The server validated this retained checkpoint. Explicit checkpoint verification first reconciles the controller cancellation, then rechecks the same source without a provider. Original spend and history remain unchanged.'
+              : 'Recheck this server-validated retained checkpoint without starting a provider. Original spend, source and verification requirements remain unchanged.'
         : context.workspace_fingerprint
           ? 'Recheck saved work without a model call, or request a focused correction in the same session. The controller rechecks authorization before running.'
           : 'The controller can ask the owning runner to seal this older workspace before rechecking it. The original work stays in place; copying a command executes nothing.',
-    checkpoint: quarantined || active ? null : context.workspace_fingerprint,
+    checkpoint: quarantined || active || cancelledBlocked ? null : context.workspace_fingerprint,
     recoveryCount: context.recoveries.length,
   }
 }
@@ -3406,7 +3447,7 @@ function MissionCard({
   const recoveryItemVersion = factoryItem?.version
   const recoveryItemState = factoryItem?.state
   const recoveryScope = useMemo<FactoryRecoveryContextScope | null>(() =>
-    recoveryItemId && recoveryItemVersion !== undefined && recoveryItemState === 'verification_failed'
+    recoveryItemId && recoveryItemVersion !== undefined && needsFactoryRecoveryContext(recoveryItemState)
       ? { corpId, actorId, missionId: mission.id, itemId: recoveryItemId, version: recoveryItemVersion, reload: recoveryReload }
       : null,
   [corpId, actorId, mission.id, recoveryItemId, recoveryItemVersion, recoveryItemState, recoveryReload])
@@ -3497,6 +3538,29 @@ function MissionCard({
     ? tasks.find((task) => task.id === recoveryContext.task_id && task.mission_id === recoveryContext.mission_id)
     : undefined
   const recoveryItem = recoveryContext?.work_item
+  const recoveryModes = factoryRecoveryModes(recoveryContext)
+  // Looking for optional checkpoint recovery is not itself a reason to suppress
+  // ordinary interrupted-session resume. Snapshot history may require a governed
+  // path, but never supplies that path's source, checkpoint or authorization.
+  const resumeLineageRuns = runs.filter((run) => run.task_id === resumableRun?.task_id
+    && run.workspace_run_id === resumableRun?.workspace_run_id)
+  const requiresFactoryRecovery = Boolean(recoveryScope && (
+    ['verification_failed', 'cancelled'].includes(recoveryItemState ?? '') ||
+    tasks.some((task) => task.id === resumableRun?.task_id &&
+      (task.status === 'verification_failed' || task.verification_status === 'failed')) ||
+    resumeLineageRuns.some((run) => run.execution_mode === 'verification_only' ||
+      run.breaker_stage === 'suspend' || run.breaker_stage === 'stop') ||
+    factoryRecoveries.some((entry) =>
+      entry.factory_work_item_id === recoveryScope.itemId && entry.mission_id === mission.id &&
+      entry.task_id === resumableRun?.task_id &&
+      (['authorized', 'running'].includes(entry.status) || (entry.mode === 'checkpoint_verification' &&
+        resumeLineageRuns.some((run) => run.id === entry.source_run_id || run.id === entry.replacement_run_id)))) ||
+    recoveryContext?.recoveries.some((entry) => entry.task_id === resumableRun?.task_id &&
+      ['authorized', 'running'].includes(entry.status))
+  ))
+  const resumeRecoveryBlocked = requiresFactoryRecovery ||
+    factoryRecoveryBlocksProviderResume(Boolean(recoveryScope && recoveryContext &&
+      recoveryContext.task_id === resumableRun?.task_id), recoveryContext)
   const canAuthorizeRecovery = ['owner', 'admin', 'manager'].includes(actorRole)
   const recoveryAgent = recoveryTask?.assigned_agent_id
     ? agents.find((agent) => agent.id === recoveryTask.assigned_agent_id)
@@ -3504,12 +3568,20 @@ function MissionCard({
   const recoveryAdapter = recoveryTask?.required_adapter ?? recoveryAgent?.adapter ?? ''
   const recoverySourceBase = typeof recoveryItem?.policy.source_base_ref === 'string'
     ? recoveryItem.policy.source_base_ref : recoveryTask?.contract.source_base_ref
-  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase)
-  const recoveryCommand = (mode: 'verifier-only' | 'source-correction') => {
-    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase) return ''
+  const recoveryConnectionId = recoveryItem ? factoryRecoveryConnection(recoveryItem.policy) : undefined
+  const recoveryCommandAvailable = Boolean(recoveryContext && recoveryTask && recoveryAdapter && recoverySourceBase
+    && recoveryConnectionId !== undefined && recoveryModes.length
+    && recovery?.state !== 'quarantined')
+  const recoveryCommand = (mode: FactoryRecoveryCommandMode) => {
+    if (!recoveryItem || !recoveryTask || !recoveryAdapter || !recoverySourceBase
+      || recoveryConnectionId === undefined || !recoveryModes.includes(mode)
+      || recovery?.state === 'quarantined') return ''
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
     const command = [
-      'crony factory',
+      'crony',
+      '--server',
+      quote(API_URL),
+      'factory',
       quote(corpId),
       quote(actorId),
       '--owner',
@@ -3533,6 +3605,9 @@ function MissionCard({
       '--verification-recovery-reason',
       quote('Explain why this bounded recovery is authorized.'),
     ]
+    if (recoveryConnectionId) {
+      command.push('--workspace-connection-id', quote(recoveryConnectionId))
+    }
     if (recoveryTask.contract.model) {
       command.push('--model', quote(recoveryTask.contract.model))
     }
@@ -3541,10 +3616,10 @@ function MissionCard({
     }
     return command.join(' ')
   }
-  const recoveryCopyKey = (mode: 'verifier-only' | 'source-correction') =>
+  const recoveryCopyKey = (mode: FactoryRecoveryCommandMode) =>
     `${scopedRecoveryLoad?.scopeKey}:${recoveryContext?.source_run_id}:${recoveryCommand(mode)}`
   const copyRecoveryCommand = async (
-    mode: 'verifier-only' | 'source-correction',
+    mode: FactoryRecoveryCommandMode,
   ) => {
     const command = recoveryCommand(mode)
     if (!command || !canAuthorizeRecovery) return
@@ -3563,7 +3638,7 @@ function MissionCard({
     void onVerificationDecision(pendingRun, approved)
   }
   const resumeEvidence = async () => {
-    if (!resumableRun) return
+    if (!resumableRun || resumeRecoveryBlocked) return
     const resumedRunId = await onResume(resumableRun)
     if (resumedRunId) rememberEvidenceRun(resumedRunId)
   }
@@ -3581,11 +3656,15 @@ function MissionCard({
       </div>
       <h3>{mission.title}</h3>
       <div className="mission-work-context">
-        <p>
-          <strong>{origin.label}</strong>
-          {' · '}
-          {origin.detail}
-        </p>
+        <MissionOriginDetails
+          corpId={corpId}
+          actorId={actorId}
+          actorRole={actorRole}
+          missionId={mission.id}
+          roomId={mission.room_id}
+          api={api}
+          fallback={origin}
+        />
         <nav className="work-context-actions" aria-label="Mission workspace">
           <button type="button" className="button button-secondary" onClick={() => onViewAgents(mission)}>
             {activeRuns ? 'View live agents' : 'View task owners'}
@@ -3931,7 +4010,11 @@ function MissionCard({
           </p>
         </section>
       ) : null}
-      {factoryItem && recoveryScope ? (
+      {factoryItem && recoveryScope && (
+        ['verification_failed', 'cancelled'].includes(factoryItem.state)
+        || recoveryContext?.checkpoint_verification
+        || (resumableRun && !hasUnfinishedRuns)
+      ) ? (
         <section
           className="factory-recovery-callout"
           aria-labelledby={`factory-recovery-${factoryItem.id}`}
@@ -3941,6 +4024,7 @@ function MissionCard({
           data-recovery-run-id={recoveryContext?.source_run_id}
           data-recovery-task-id={recoveryContext?.task_id}
           data-recovery-item-version={recoveryContext?.work_item.version}
+          data-checkpoint-reconciliation-needed={recoveryContext?.checkpoint_cancellation_event_id ? 'true' : 'false'}
           aria-busy={!scopedRecoveryLoad || scopedRecoveryLoad.status === 'loading'}
         >
           <div className="factory-recovery-heading">
@@ -4007,35 +4091,33 @@ function MissionCard({
           </p>
           {recoveryCommandAvailable && canAuthorizeRecovery ? (
             <div className="factory-recovery-actions">
+              {recoveryModes.map((mode) => (
               <button
+                key={mode}
                 className="button button-secondary"
                 type="button"
-                onClick={() => void copyRecoveryCommand('verifier-only')}
+                onClick={() => void copyRecoveryCommand(mode)}
               >
-                {copiedRecoveryCommand === recoveryCopyKey('verifier-only')
-                  ? 'Verifier command copied'
-                  : 'Copy verifier-only command'}
+                {copiedRecoveryCommand === recoveryCopyKey(mode)
+                  ? mode === 'checkpoint-verification' ? 'Checkpoint command copied'
+                    : mode === 'verifier-only' ? 'Verifier command copied' : 'Correction command copied'
+                  : mode === 'checkpoint-verification' ? 'Copy checkpoint-verification command'
+                    : mode === 'verifier-only' ? 'Copy verifier-only command' : 'Copy source-correction command'}
               </button>
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => void copyRecoveryCommand('source-correction')}
-              >
-                {copiedRecoveryCommand === recoveryCopyKey('source-correction')
-                  ? 'Correction command copied'
-                  : 'Copy source-correction command'}
-              </button>
+              ))}
             </div>
           ) : (
             <p className="factory-recovery-role-note">
               {canAuthorizeRecovery
-                ? 'The exact endpoint returns task/source IDs, not the task contract or adapter. Selected-task command metadata is missing in this snapshot; inspect the native controller. No substitute is inferred.'
+                ? recoveryModes.length === 0
+                  ? 'No new recovery command is available in this current context. Inspect or refresh the native controller context; no replacement work is inferred.'
+                  : 'Exact source/connection command metadata is missing or quarantined; inspect the native controller. No substitute is inferred.'
                 : 'An owner, admin, or manager must authorize the recovery.'}
             </p>
           )}
           {recoveryCommandAvailable && canAuthorizeRecovery ? <details>
             <summary>Show trusted controller command</summary>
-            <code>{recoveryCommand('verifier-only')}</code>
+            <code>{recoveryCommand(recoveryModes[0] ?? 'verifier-only')}</code>
           </details> : null}
           </> : null}
         </section>
@@ -4149,7 +4231,7 @@ function MissionCard({
           })}
         </div>
       ) : null}
-      {resumableRun && resumableRun.id === evidenceRun?.id && !hasUnfinishedRuns && factoryItem?.state !== 'verification_failed' ? (
+      {resumableRun && resumableRun.id === evidenceRun?.id && !hasUnfinishedRuns && !resumeRecoveryBlocked && factoryItem?.state !== 'verification_failed' ? (
         <>
           <button
             className="button button-secondary mission-launch"
@@ -4610,6 +4692,11 @@ function App() {
   const [missionStrategy, setMissionStrategy] = useState('single')
   const [missionSourceKey, setMissionSourceKey] = useState('')
   const [missionSourceConfirmed, setMissionSourceConfirmed] = useState(false)
+  const [connectionsOpen, setConnectionsOpen] = useState(false)
+  const [savedConnectionLoad, setSavedConnectionLoad] = useState<{
+    scope: string; data: WorkspaceConnections
+  } | null>(null)
+  const restoredConnectionScope = useRef('')
   const [missionBudgetTokens, setMissionBudgetTokens] = useState(1_000_000)
   const [missionDeliverable, setMissionDeliverable] =
     useState<NonNullable<TaskContract['deliverable']>['form']>('archive')
@@ -4641,6 +4728,7 @@ function App() {
   const [connectionToken, setConnectionToken] = useState('')
   const [leaseTokens, setLeaseTokens] = useState<Record<string, string>>({})
   const reconnectTimer = useRef<number | null>(null)
+  const snapshotRefreshRef = useRef<ReturnType<typeof createSnapshotRefresher> | null>(null)
   const currentViewer = useRef<{ corpId: string; actorId: string } | null>(null)
   const currentComments = useRef<{
     snapshot: SnapshotResponse['snapshot']
@@ -4888,6 +4976,7 @@ function App() {
         if (!disposed) setError(caught instanceof Error ? caught.message : String(caught))
       },
     })
+    snapshotRefreshRef.current = snapshotRefresh
 
     const connect = async () => {
       if (disposed) return
@@ -4956,11 +5045,31 @@ function App() {
     void connect()
     return () => {
       disposed = true
+      if (snapshotRefreshRef.current === snapshotRefresh) snapshotRefreshRef.current = null
       snapshotRefresh.dispose()
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
       socket?.close()
     }
   }, [bootstrap, refresh, selectedActorId])
+
+  useEffect(() => {
+    if (!bootstrap || !selectedActorId || !(connectionsOpen || journeyOpen ||
+      (activeWorkspaceView === 'missions' && !missionComposerCollapsed))) return
+    const snapshotRefresh = snapshotRefreshRef.current
+    if (!snapshotRefresh) return
+    // Heartbeat-only readiness matters while choosing/configuring a connection,
+    // not in every idle client. Share the event coalescer; never restart its socket
+    // or overlap another full-Corp read when a connection-dependent view opens.
+    const refreshVisiblePresence = () => {
+      if (document.visibilityState === 'visible') snapshotRefresh.request()
+    }
+    const presenceTimer = window.setInterval(refreshVisiblePresence, 5_000)
+    document.addEventListener('visibilitychange', refreshVisiblePresence)
+    return () => {
+      window.clearInterval(presenceTimer)
+      document.removeEventListener('visibilitychange', refreshVisiblePresence)
+    }
+  }, [bootstrap, refresh, selectedActorId, connectionsOpen, journeyOpen, activeWorkspaceView, missionComposerCollapsed])
 
   const humans = useMemo(
     () => data?.snapshot.actors.filter((actor) => actor.kind === 'human') ?? [],
@@ -4970,7 +5079,72 @@ function App() {
     () => currentOfficeAgents(data?.snapshot.agents ?? []),
     [data],
   )
-  const missionRepositoryTargets = useMemo(() => repositoryTargets(data), [data])
+  const connectionRoom = data
+    ? resolveDiscussionRoom(data.snapshot.rooms, data.snapshot.missions, roomMissionId, selectedRoomId)
+    : undefined
+  const savedConnectionScope = bootstrap?.corp_id && selectedActorId && connectionRoom
+    ? connectionScope(bootstrap.corp_id, connectionRoom.id, selectedActorId) : ''
+  const savedConnectionCorpId = bootstrap?.corp_id
+  const savedConnectionRoomId = connectionRoom?.id
+  const canUseSavedConnections = humans.some((actor) => actor.id === selectedActorId && canOperate(actor.role))
+  const savedConnections = savedConnectionLoad?.scope === savedConnectionScope
+    ? savedConnectionLoad.data : null
+  const savedConnectionRunners = useRef<RunnerNode[]>([])
+  useLayoutEffect(() => { savedConnectionRunners.current = data?.runners ?? [] }, [data?.runners])
+  const savedRunnerRevision = connectionRunnerRevision(data?.runners ?? [])
+  const connectionRevision = data?.snapshot.events.reduce((last, event) =>
+    event.type.startsWith('workspace.connection') ||
+      ['runner.capabilities_updated', 'runner.credential_rotated', 'runner.enrolled',
+        'runner.grace_started', 'runner.revoked'].includes(event.type)
+      ? Math.max(last, event.seq) : last, 0) ?? 0
+  useEffect(() => {
+    if (!savedConnectionScope || !savedConnectionCorpId || !selectedActorId || !savedConnectionRoomId ||
+      !canUseSavedConnections) return
+    let current = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let attempts = 0
+    const load = async () => {
+      attempts += 1
+      try {
+        const response = await api<WorkspaceConnections>(
+          `/api/corps/${savedConnectionCorpId}/rooms/${savedConnectionRoomId}/connections?actor_id=${selectedActorId}`,
+        )
+        if (!current) return
+        setSavedConnectionLoad({ scope: savedConnectionScope, data: response })
+        if (restoredConnectionScope.current !== savedConnectionScope) {
+          restoredConnectionScope.current = savedConnectionScope
+          const selected = response.connections.find((connection) => connection.id === response.selected_connection_id)
+          if (selected) {
+            setMissionSourceKey(`connection:${selected.id}`)
+            setMissionAdapter(selected.agent)
+            setMissionSourceConfirmed(Boolean(selected.source && !selected.source.repository.toLowerCase().endsWith('/ecorp')))
+          }
+        }
+        // Registration presence can precede live dispatch readiness. Re-read
+        // the authoritative endpoint briefly; never manufacture a Ready state.
+        if (attempts < 5 && connectionsNeedPresenceRefresh(response.connections, savedConnectionRunners.current)) {
+          timer = setTimeout(() => void load(), 1000)
+        }
+      } catch {
+        // Older nodes keep the existing mission path; a missing setup API must
+        // not erase a draft or silently replace a saved source.
+      }
+    }
+    void load()
+    return () => {
+      current = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [savedConnectionCorpId, selectedActorId, savedConnectionRoomId, savedConnectionScope, connectionRevision, savedRunnerRevision, canUseSavedConnections])
+  const missionRepositoryTargets = useMemo(() => {
+    const saved = (savedConnections?.connections ?? [])
+      .map((connection) => connectionTarget(connection, data?.runners ?? []))
+      .filter((target): target is RepositoryTarget => Boolean(target))
+    return [...saved, ...repositoryTargets(data)]
+  }, [data, savedConnections])
+  const selectedMissionConnection = missionSourceKey.startsWith('connection:')
+    ? savedConnections?.connections.find((connection) => `connection:${connection.id}` === missionSourceKey)
+    : undefined
   const selectedMissionSource = useMemo(
     () =>
       missionRepositoryTargets.find((target) => target.key === missionSourceKey),
@@ -5075,6 +5249,12 @@ function App() {
     currentViewer.current = bootstrap ? { corpId: bootstrap.corp_id, actorId: actor.id } : null
     currentComments.current = null
     setSelectedActorId(actor.id)
+    setConnectionsOpen(false)
+    setSavedConnectionLoad(null)
+    setMissionSourceKey('')
+    setMissionSourceConfirmed(false)
+    setMissionAdapter('')
+    setMissionModel('')
     setAnnouncement(`Switching operations view to ${actor.name}.`)
     const url = new URL(window.location.href)
     url.searchParams.set('actor', actor.name.toLowerCase())
@@ -5133,8 +5313,8 @@ function App() {
       setMissionProhibitedActions('')
       setMissionReferences('')
       setMissionWriteScope('')
-      setMissionSourceKey('')
-      setMissionSourceConfirmed(false)
+      if (!selectedMissionSource.workspaceConnectionId) setMissionSourceKey('')
+      setMissionSourceConfirmed(Boolean(selectedMissionSource.workspaceConnectionId && !isEcorpRepository(selectedMissionSource)))
       setCustomVerification(false)
       setMissionVerificationPolicy({
         checks: [defaultVerifierCheck('artifact')],
@@ -6407,31 +6587,52 @@ function App() {
                   <div className="loadout-grid">
                     <div className="mission-field repository-target-field">
                       <label htmlFor="mission-repository">Target repository</label>
+                      <button className="button button-secondary" type="button"
+                        onClick={() => setConnectionsOpen(true)}>
+                        Connect a repository or coding agent
+                      </button>
                       <select
                         id="mission-repository"
                         value={missionSourceKey}
                         aria-describedby="mission-repository-help"
                         onChange={(event) => {
                           setMissionSourceKey(event.target.value)
-                          setMissionSourceConfirmed(false)
-                          setMissionAdapter('')
+                          const saved = savedConnections?.connections.find((connection) =>
+                            `connection:${connection.id}` === event.target.value)
+                          setMissionSourceConfirmed(Boolean(saved?.source && !saved.source.repository.toLowerCase().endsWith('/ecorp')))
+                          setMissionAdapter(saved?.agent ?? '')
                           setMissionModel('')
                           setMissionReasoningEffort('')
                         }}
                       >
-                        <option value="">Select a connected repository</option>
-                        {missionRepositoryTargets.map((target) => (
-                          <option key={target.key} value={target.key}>
-                            {target.repository} · {target.baseRef} ·{' '}
-                            {target.baseCommit.slice(0, 12)}
-                          </option>
-                        ))}
+                        <option value="">Choose a repository</option>
+                        {(savedConnections?.connections ?? []).filter((connection) => !connection.source).map((connection) =>
+                          <option key={connection.id} value={`connection:${connection.id}`}>
+                            {connection.label} · {connectionStatusLabel(connection)}
+                          </option>)}
+                        {missionRepositoryTargets.map((target) => {
+                          const saved = savedConnections?.connections.find(
+                            (connection) => connection.id === target.workspaceConnectionId,
+                          )
+                          return (
+                            <option key={target.key} value={target.key}>
+                              {saved
+                                ? `${saved.label} · ${connectionLabel(saved.agent)} · ${connectionStatusLabel(saved)}`
+                                : `${target.repository} · ${target.baseRef} · ${target.baseCommit.slice(0, 12)}`}
+                            </option>
+                          )
+                        })}
                       </select>
                       <small id="mission-repository-help">
                         {missionRepositoryTargets.length
                           ? 'The exact repository, ref, and commit are persisted in every task.'
-                          : 'Connect a runner configured for the repository you want to change.'}
+                          : 'Connect your repository and coding agent above. You will not need to configure them for every mission.'}
                       </small>
+                      {selectedMissionConnection && !selectedMissionConnection.runner_connected && (
+                        <p className="field-warning" role="status">
+                          This saved machine is offline. Your repository choice is kept; reconnect it or choose another connection.
+                        </p>
+                      )}
                       {selectedMissionSource ? (
                         <div className="repository-target-summary">
                           <strong>{selectedMissionSource.repository}</strong>
@@ -6458,7 +6659,7 @@ function App() {
                               repository for disposable applications and acceptance probes.
                             </p>
                           ) : null}
-                          <label className="repository-confirmation">
+                          {(!selectedMissionSource.workspaceConnectionId || isEcorpRepository(selectedMissionSource)) ? <label className="repository-confirmation">
                             <input
                               type="checkbox"
                               checked={missionSourceConfirmed}
@@ -6473,7 +6674,7 @@ function App() {
                                 immutable commit.
                               </small>
                             </span>
-                          </label>
+                          </label> : <p className="connections-help">Using your saved connection. ECorp rechecks this exact source before starting.</p>}
                         </div>
                       ) : null}
                     </div>
@@ -7133,6 +7334,44 @@ function App() {
           ))}
         </ol>
       </section>
+      {connectionsOpen && bootstrap && selectedActor && connectionRoom && (
+        <ConnectionsPanel
+          key={savedConnectionScope}
+          corpId={bootstrap.corp_id}
+          roomId={connectionRoom.id}
+          actorId={selectedActor.id}
+          actorRole={selectedActor.role}
+          runners={data.runners}
+          initialSource={selectedMissionSource}
+          api={api}
+          refreshRevision={connectionRevision}
+          onClose={() => setConnectionsOpen(false)}
+          onSelect={(connection: WorkspaceConnection) => {
+            const viewer = currentViewer.current
+            if (viewer?.corpId !== connection.corp_id || viewer.actorId !== selectedActor.id ||
+              connection.room_id !== connectionRoom.id) return
+            setSavedConnectionLoad((previous) => ({
+              scope: savedConnectionScope,
+              data: {
+                connections: [
+                  ...(previous?.scope === savedConnectionScope ? previous.data.connections : [])
+                    .filter((candidate) => candidate.id !== connection.id),
+                  connection,
+                ],
+                operations: previous?.scope === savedConnectionScope ? previous.data.operations : [],
+                selected_connection_id: connection.id,
+              },
+            }))
+            setMissionSourceKey(`connection:${connection.id}`)
+            setMissionAdapter(connection.agent)
+            setMissionModel('')
+            setMissionReasoningEffort('')
+            setMissionSourceConfirmed(Boolean(connection.source && !connection.source.repository.toLowerCase().endsWith('/ecorp')))
+            setConnectionsOpen(false)
+            setAnnouncement('Connection selected. Describe what you want ECorp to build.')
+          }}
+        />
+      )}
     </main>
   )
 }

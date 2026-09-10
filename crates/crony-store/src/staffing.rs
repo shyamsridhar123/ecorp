@@ -334,7 +334,7 @@ impl PgStore {
         corp_id: Uuid,
         work_item_id: Uuid,
         actor_id: Uuid,
-    ) -> Result<(String, String, String)> {
+    ) -> Result<(String, String, String, Option<Uuid>)> {
         let mut tx = self.pool.begin().await?;
         assert_mission_operator_tx(&mut tx, corp_id, actor_id).await?;
         let row = sqlx::query(
@@ -359,6 +359,8 @@ impl PgStore {
             mission_room_for_actor_tx(&mut tx, corp_id, actor_id).await?;
         }
         let policy: Value = row.get("policy");
+        let workspace_connection_id =
+            factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
         let base_ref = policy["source_base_ref"]
             .as_str()
             .context("factory source ref missing")?;
@@ -373,6 +375,7 @@ impl PgStore {
             ),
             base_ref.to_owned(),
             base_commit.to_owned(),
+            workspace_connection_id,
         );
         tx.commit().await?;
         Ok(result)
@@ -550,6 +553,7 @@ mod tests {
                     depth: i32::from(index == 3),
                     max_attempts: 2,
                     contract: TaskContract {
+                        workspace_connection_id: None,
                         objective: format!("Write {key}.md"),
                         expected_output: format!("{key}.md"),
                         source_repository: Some("issue171/isolated-source".to_owned()),

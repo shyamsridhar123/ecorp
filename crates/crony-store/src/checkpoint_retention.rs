@@ -152,7 +152,7 @@ pub(super) async fn request_review_checkpoint_tx(
         r#"
         SELECT mission.room_id, run.task_id, run.runner_id, run.agent_id, run.assignment_token,
                run.workspace_run_id, run.workspace_base_commit,
-               run.source_repository, run.source_base_ref, run.source_base_commit
+               run.source_repository, run.source_base_ref, run.source_base_commit, run.workspace_connection_id
         FROM runs run
         JOIN tasks task ON task.id=run.task_id AND task.corp_id=run.corp_id
         JOIN missions mission ON mission.id=task.mission_id AND mission.corp_id=run.corp_id
@@ -223,6 +223,7 @@ pub(super) async fn request_review_checkpoint_tx(
         "source_repository":row.get::<String,_>("source_repository"),
         "source_base_ref":row.get::<String,_>("source_base_ref"),
         "source_base_commit":row.get::<String,_>("source_base_commit"),
+        "workspace_connection_id":row.get::<Option<Uuid>,_>("workspace_connection_id"),
         "workspace_base_commit":row.get::<String,_>("workspace_base_commit"),
         "expected_head_commit":expected_head, "review_re_attestation":true,
         "authorized_by":input.actor_id, "factory_work_item_id":input.work_item_id,

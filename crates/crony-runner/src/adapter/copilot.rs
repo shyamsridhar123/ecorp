@@ -60,6 +60,7 @@ pub struct CopilotSdkConfig {
 pub struct CopilotSdkAdapter {
     config: CopilotSdkConfig,
     models: Arc<OnceCell<Vec<AdapterModel>>>,
+    profile: Option<super::connection::ProfileEnvironment>,
 }
 
 #[derive(Debug)]
@@ -188,7 +189,59 @@ impl CopilotSdkAdapter {
         Self {
             config,
             models: Arc::new(OnceCell::new()),
+            profile: None,
         }
+    }
+
+    pub(crate) fn for_connection(
+        mut config: CopilotSdkConfig,
+        profile: super::connection::ProfileEnvironment,
+    ) -> Self {
+        config.base_directory = profile.session_root();
+        if !profile.is_system() {
+            // Native login owns the personal profile. Never read/copy the
+            // operator's token files into it or silently adopt machine auth.
+            config.github_token_file = None;
+            config.connection_token_file = None;
+            config.use_logged_in_user = true;
+        }
+        Self {
+            config,
+            models: Arc::new(OnceCell::new()),
+            profile: Some(profile),
+        }
+    }
+
+    pub(crate) fn connection_command(&self) -> Result<(PathBuf, Vec<OsString>), AdapterError> {
+        if self.config.external_host.is_some() {
+            return Err(AdapterError::Runtime(anyhow!(
+                "an external Copilot runtime has no local sign-in command"
+            )));
+        }
+        if let Some(path) = &self.config.cli_path {
+            if !path.is_absolute() || !path.is_file() {
+                return Err(AdapterError::Runtime(anyhow!(
+                    "the configured pinned Copilot runtime is not installed"
+                )));
+            }
+            return Ok((path.clone(), self.config.cli_prefix_args.clone()));
+        }
+        // Resolve the actual pinned bundle, bypassing COPILOT_CLI_PATH and
+        // PATH entirely. Lazy SDK extraction occurs only during an authorized
+        // operation, not AgentProfile construction; no network install.
+        let path = github_copilot_sdk::install_bundled_cli().ok_or_else(|| {
+            AdapterError::Runtime(anyhow!("the pinned Copilot SDK bundle is unavailable"))
+        })?;
+        Ok((path, Vec::new()))
+    }
+
+    pub(crate) async fn connection_options(
+        &self,
+        workspace: &Path,
+    ) -> Result<ClientOptions, AdapterError> {
+        let state_directory = self.state_directory(workspace);
+        tokio::fs::create_dir_all(&state_directory).await?;
+        self.client_options(workspace).await
     }
 
     fn installed(&self) -> bool {
@@ -221,6 +274,25 @@ impl CopilotSdkAdapter {
             .with_env_remove(copilot_sensitive_environment_names())
             .with_log_level(parse_log_level(&self.config.log_level)?);
 
+        if let Some(profile) = &self.profile {
+            options.base_directory = if profile.is_system() {
+                // Explicit system-account use keeps its existing native home.
+                // Empty still disables keytar; a keychain-only machine identity
+                // cannot be made Ready by copying its token into task state.
+                std::env::var_os("COPILOT_HOME").map(PathBuf::from)
+            } else {
+                Some(profile.native_home())
+            };
+            if !profile.is_system() {
+                let mut removed = profile.sdk_environment_removals();
+                removed.extend(copilot_sensitive_environment_names().map(OsString::from));
+                options = options
+                    .with_env(profile.values())
+                    .with_env_remove(removed)
+                    .with_log_level(LogLevel::Error);
+            }
+        }
+
         if let Some(host) = &self.config.external_host {
             let port = self
                 .config
@@ -243,7 +315,12 @@ impl CopilotSdkAdapter {
                 "--sandbox",
                 "--disallow-temp-dir",
             ]);
-            if let Some(path) = &self.config.cli_path {
+            if self.profile.is_some() {
+                let (path, prefix) = self.connection_command()?;
+                options = options
+                    .with_program(CliProgram::Path(path))
+                    .with_prefix_args(prefix);
+            } else if let Some(path) = &self.config.cli_path {
                 options = options
                     .with_program(CliProgram::Path(path.clone()))
                     .with_prefix_args(self.config.cli_prefix_args.clone());
@@ -601,7 +678,7 @@ impl CopilotSdkAdapter {
     }
 }
 
-fn runtime_version_is_supported(version: &str) -> bool {
+pub(crate) fn runtime_version_is_supported(version: &str) -> bool {
     version == SUPPORTED_COPILOT_RUNTIME
 }
 
@@ -891,7 +968,7 @@ fn copilot_sensitive_environment_names() -> [&'static str; 20] {
     ]
 }
 
-fn model_from_sdk(model: github_copilot_sdk::Model) -> AdapterModel {
+pub(crate) fn model_from_sdk(model: github_copilot_sdk::Model) -> AdapterModel {
     let value = serde_json::to_value(&model).unwrap_or_else(|_| json!({}));
     AdapterModel {
         id: model.id,
