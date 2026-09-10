@@ -27,12 +27,14 @@ mod checkpoint_publication;
 mod checkpoint_retention;
 pub use checkpoint_cancellation::ReconcileCheckpointCancellationInput;
 mod contract_revision;
+mod factory_attempt_policy;
 mod factory_controller;
 mod factory_run_failure;
 mod mission_context;
 mod publication;
 mod retained_provider_receipt;
 mod staffing;
+pub use staffing::FactoryPlanningSource;
 mod terminal_accounting;
 mod verification_dispatch;
 mod workspace_connections;
@@ -3003,7 +3005,8 @@ impl PgStore {
     ) -> Result<TaskGraphPlan> {
         normalize_mission_title(&input.title)?;
         normalize_mission_description(&input.description)?;
-        normalize_factory_operation_request(input.request)?;
+        let operation_request = normalize_factory_operation_request(input.request)?;
+        factory_attempt_policy::validate_request(&input.policy, &operation_request)?;
         let constrained_plan = preflight_factory_plan(
             &input.source_repository_owner,
             &input.source_repository_name,
@@ -5777,6 +5780,7 @@ impl PgStore {
             factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
                 .await?
                 .context("idempotent factory materialization references a missing work item")?;
+        factory_attempt_policy::validate_request(&work_item.policy, &operation_request)?;
         let mission_id = work_item
             .mission_id
             .context("idempotent factory materialization has no mission linkage")?;
@@ -5832,6 +5836,7 @@ impl PgStore {
                 factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
                     .await?
                     .context("idempotent factory materialization references a missing work item")?;
+            factory_attempt_policy::validate_request(&work_item.policy, &operation_request)?;
             let mission_id = work_item
                 .mission_id
                 .context("idempotent factory materialization has no mission linkage")?;
@@ -5861,6 +5866,7 @@ impl PgStore {
             now,
         )?;
         let mut constrained_plan = plan.clone();
+        factory_attempt_policy::validate_request(&current.policy, &operation_request)?;
         apply_factory_source_constraints(&current, &mut constrained_plan)?;
         validate_factory_plan_against_policy(&current, &constrained_plan)?;
 
@@ -11850,6 +11856,7 @@ fn validate_factory_plan_against_policy_parts(
     policy: &Value,
     plan: &TaskGraphPlan,
 ) -> Result<()> {
+    factory_attempt_policy::validate_plan(policy, plan)?;
     let connection_id = factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
     if let Some(task) = plan
         .tasks
@@ -12312,6 +12319,7 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
     };
     let connection_id = factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
+    crony_domain::factory_max_task_attempts(&policy).map_err(anyhow::Error::msg)?;
     let policy_object = policy
         .as_object_mut()
         .context("factory policy snapshot must be a JSON object")?;
@@ -12416,6 +12424,7 @@ fn normalize_factory_operation_request(request: Value) -> Result<Value> {
             "factory operation request snapshot must be a JSON object"
         ));
     }
+    crony_domain::factory_max_task_attempts(&request).map_err(anyhow::Error::msg)?;
     if serde_json::to_vec(&request)?.len() > 65_536 {
         return Err(anyhow!(
             "factory operation request snapshot cannot exceed 65536 bytes"
@@ -16897,6 +16906,41 @@ mod tests {
             }],
         };
         (work_item, plan)
+    }
+
+    #[test]
+    fn issue224_factory_plan_preserves_legacy_and_explicit_attempt_limits() {
+        let (mut item, mut plan) = factory_policy_plan(None, None);
+        for attempts in 1..=2 {
+            plan.tasks[0].max_attempts = attempts;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        }
+        plan.tasks[0].max_attempts = 3;
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        for attempts in 1..=crony_domain::MAX_TASK_ATTEMPTS {
+            item.policy["max_task_attempts"] = json!(attempts);
+            plan.tasks[0].max_attempts = attempts;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+            plan.tasks[0].max_attempts = attempts % 3 + 1;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        }
+    }
+
+    #[test]
+    fn issue224_factory_policy_rejects_invalid_attempts_before_claiming() {
+        let (item, _) = factory_policy_plan(None, None);
+        let original = item.policy;
+        assert!(
+            normalize_factory_policy(original.clone())
+                .unwrap()
+                .get("max_task_attempts")
+                .is_none()
+        );
+        for value in [json!(0), json!(-1), json!(4), json!("3"), json!(3.0)] {
+            let mut policy = original.clone();
+            policy["max_task_attempts"] = value;
+            assert!(normalize_factory_policy(policy).is_err());
+        }
     }
 
     #[test]

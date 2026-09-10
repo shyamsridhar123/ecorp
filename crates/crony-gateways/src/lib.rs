@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use crony_domain::{MAX_TASK_ATTEMPTS, factory_max_task_attempts};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,6 +75,32 @@ pub fn failure(id: Option<Value>, code: i64, message: impl Into<String>) -> Valu
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message.into()}})
 }
 
+/// Add only an explicit planning choice. Absent/null input preserves the old body.
+pub fn with_max_task_attempts(mut body: Value, params: &Value) -> Result<Value> {
+    if params.get("max_attempts").is_some() {
+        return Err(anyhow!(
+            "use max_task_attempts only when creating a mission"
+        ));
+    }
+    let max_task_attempts = factory_max_task_attempts(params).map_err(anyhow::Error::msg)?;
+    if let Some(max_task_attempts) = max_task_attempts {
+        body.as_object_mut()
+            .context("mission request must be an object")?
+            .insert("max_task_attempts".to_owned(), json!(max_task_attempts));
+    }
+    Ok(body)
+}
+
+/// Other actions must not silently discard an attempted planning-policy change.
+pub fn reject_max_task_attempts(params: &Value) -> Result<()> {
+    if params.get("max_task_attempts").is_some() || params.get("max_attempts").is_some() {
+        return Err(anyhow!(
+            "task attempts can only be chosen when creating a mission"
+        ));
+    }
+    Ok(())
+}
+
 pub fn mcp_capabilities() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -99,7 +126,13 @@ pub fn mcp_tools() -> Value {
                     "properties":{
                         "title":{"type":"string"},
                         "adapter":{"type":"string"},
-                        "strategy":{"type":"string"}
+                        "strategy":{"type":"string"},
+                        "max_task_attempts":{
+                            "type":["integer","null"],
+                            "minimum":1,
+                            "maximum":MAX_TASK_ATTEMPTS,
+                            "description":"Total attempts per task chosen before execution, not additional retries. Omission retains planner defaults."
+                        }
                     },
                     "additionalProperties":false
                 }
@@ -145,6 +178,9 @@ async fn handle_mcp_tool(client: &GatewayClient, params: &Value) -> Result<Value
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name != "crony_create_mission" {
+        reject_max_task_attempts(&arguments)?;
+    }
     let value = match name {
         "crony_snapshot" => {
             client
@@ -159,20 +195,11 @@ async fn handle_mcp_tool(client: &GatewayClient, params: &Value) -> Result<Value
                 .await?
         }
         "crony_create_mission" => {
-            let title = arguments
-                .get("title")
-                .and_then(Value::as_str)
-                .context("mission tool omitted title")?;
             client
                 .request(
                     Method::POST,
                     &format!("/api/corps/{}/missions", client.corp_id),
-                    Some(json!({
-                        "requested_by":client.actor_id,
-                        "title":title,
-                        "preferred_adapter":arguments.get("adapter"),
-                        "strategy":arguments.get("strategy")
-                    })),
+                    Some(mcp_mission_request(client.actor_id, &arguments)?),
                 )
                 .await?
         }
@@ -202,6 +229,22 @@ async fn handle_mcp_tool(client: &GatewayClient, params: &Value) -> Result<Value
         _ => return Err(anyhow!("unknown ECorp MCP tool {name}")),
     };
     Ok(json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}))
+}
+
+fn mcp_mission_request(actor_id: Uuid, arguments: &Value) -> Result<Value> {
+    let title = arguments
+        .get("title")
+        .and_then(Value::as_str)
+        .context("mission tool omitted title")?;
+    with_max_task_attempts(
+        json!({
+            "requested_by":actor_id,
+            "title":title,
+            "preferred_adapter":arguments.get("adapter"),
+            "strategy":arguments.get("strategy")
+        }),
+        arguments,
+    )
 }
 
 pub fn negotiate_version(requested: &str, supported: &[&str]) -> Result<String> {
@@ -274,5 +317,103 @@ mod tests {
         let card = a2a_agent_card("https://example.test").to_string();
         assert!(!card.contains("verification_requests"));
         assert!(card.contains("\"streaming\":true"));
+    }
+
+    #[test]
+    fn issue224_mcp_schema_exposes_optional_native_attempt_bounds() {
+        let tools = mcp_tools();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "crony_create_mission")
+            .unwrap();
+        let field = &tool["inputSchema"]["properties"]["max_task_attempts"];
+        assert_eq!(field["type"], json!(["integer", "null"]));
+        assert_eq!(field["minimum"], 1);
+        assert_eq!(field["maximum"], MAX_TASK_ATTEMPTS);
+        assert!(field.get("default").is_none());
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("max_task_attempts"))
+        );
+    }
+
+    #[test]
+    fn issue224_mcp_creation_preserves_omission_and_forwards_explicit_attempts() {
+        let actor = Uuid::from_u128(1);
+        let mut arguments = json!({
+            "title": "Bounded planning", "adapter": "fake-process",
+            "strategy": "parallel-specialists",
+        });
+        let legacy = mcp_mission_request(actor, &arguments).unwrap();
+        assert!(legacy.get("max_task_attempts").is_none());
+        arguments["max_task_attempts"] = Value::Null;
+        assert_eq!(mcp_mission_request(actor, &arguments).unwrap(), legacy);
+        for value in 1..=MAX_TASK_ATTEMPTS {
+            arguments["max_task_attempts"] = json!(value);
+            let mut body = mcp_mission_request(actor, &arguments).unwrap();
+            assert_eq!(body["max_task_attempts"], value);
+            assert_eq!(body["requested_by"], json!(actor));
+            body.as_object_mut().unwrap().remove("max_task_attempts");
+            assert_eq!(body, legacy);
+        }
+    }
+
+    #[test]
+    fn issue224_gateway_planning_rejects_malformed_attempts_without_defaulting() {
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(MAX_TASK_ATTEMPTS + 1),
+            json!(i64::MAX),
+            json!("3"),
+            json!(3.0),
+            json!(false),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(
+                mcp_mission_request(
+                    Uuid::from_u128(1),
+                    &json!({"title": "Bounded planning", "max_task_attempts": value}),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            mcp_mission_request(
+                Uuid::from_u128(1),
+                &json!({"title": "Bounded planning", "max_attempts": MAX_TASK_ATTEMPTS}),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn issue224_nonplanning_mcp_actions_reject_attempt_fields_before_api_calls() {
+        let client = GatewayClient::new(
+            "invalid-unused-server".to_owned(),
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            None,
+        );
+        for name in ["crony_snapshot", "crony_post_room_message"] {
+            for value in [Value::Null, json!(MAX_TASK_ATTEMPTS)] {
+                let error = handle_mcp_tool(
+                    &client,
+                    &json!({"name": name, "arguments": {"max_task_attempts": value}}),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("only be chosen when creating a mission")
+                );
+            }
+        }
     }
 }

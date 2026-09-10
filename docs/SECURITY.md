@@ -60,6 +60,14 @@ The persisted factory policy is enforced again during mission materialization. A
 cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
 prohibitions, write scope, token budget, or cost budget. Factory `verified` state requires
 authoritative completed mission and passing task-verification records.
+An explicit `max_task_attempts` is also prospective, immutable Factory policy.
+The shared ceiling remains three; omitted legacy policy cannot newly authorize
+a third planned attempt. Preflight/materialization requests must preserve the
+recorded choice, including omission. Existing launch, resume, recovery and
+revision endpoints reject unsupported attempt settings. Contract revision
+decoding specifically rejects nested `contract.max_task_attempts`, including
+null, while preserving unrelated `TaskContract` decoding compatibility.
+No request resets attempts, spend, historical outcomes, or protected stops.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
 An optional saved execution-connection ID is part of the immutable Factory policy.

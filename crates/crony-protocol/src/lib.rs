@@ -403,6 +403,8 @@ pub struct CreateMissionRequest {
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_task_attempts: Option<i32>,
     #[serde(default)]
     pub source: Option<MissionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,6 +709,7 @@ pub struct ReconcileFactoryCheckpointCancellationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateFactoryVerificationRecoveryRequest {
     pub actor_id: Uuid,
     pub claim_token: Uuid,
@@ -772,6 +775,8 @@ pub struct MaterializeFactoryMissionRequest {
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_task_attempts: Option<i32>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
@@ -798,6 +803,8 @@ pub struct PreflightFactoryMissionRequest {
     pub preferred_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_task_attempts: Option<i32>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
@@ -817,6 +824,8 @@ pub struct PreflightFactoryMissionResponse {
     pub task_count: usize,
     pub budget_tokens: i64,
     pub budget_cost_microusd: i64,
+    #[serde(default)]
+    pub tasks: Vec<PreviewMissionTask>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,6 +959,7 @@ pub struct PullRequestPublicationResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchMissionRequest {
     pub requested_by: Uuid,
 }
@@ -965,6 +975,7 @@ pub struct LaunchMissionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeRunRequest {
     pub requested_by: Uuid,
     pub prompt: String,
@@ -978,6 +989,7 @@ pub struct ResumeRunResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateMissionContractRevisionRequest {
     pub actor_id: Uuid,
     pub task_id: Uuid,
@@ -987,8 +999,27 @@ pub struct CreateMissionContractRevisionRequest {
     pub reason: String,
     pub idempotency_key: Uuid,
     pub description: String,
+    #[serde(deserialize_with = "deserialize_revision_task_contract")]
     pub contract: TaskContract,
     pub verification_policy: VerificationPolicy,
+}
+
+fn deserialize_revision_task_contract<'de, D>(deserializer: D) -> Result<TaskContract, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value
+        .as_object()
+        .is_some_and(|contract| contract.contains_key("max_task_attempts"))
+    {
+        return Err(serde::de::Error::custom(
+            "max_task_attempts is a creation-only planning option, not a contract revision field",
+        ));
+    }
+    // Preserve ordinary TaskContract compatibility; only the newly exposed
+    // planning option needs explicit rejection at this mutation boundary.
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -998,6 +1029,7 @@ pub struct MissionContractRevisionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MissionFinishScopeRevision {
     pub task_id: Uuid,
     pub objective: String,
@@ -1010,6 +1042,7 @@ pub struct MissionFinishScopeRevision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProposeMissionBudgetRevisionRequest {
     pub actor_id: Uuid,
     pub expected_budget_tokens: i64,
@@ -1154,6 +1187,83 @@ pub struct SetBudgetPolicyRequest {
 
 #[cfg(test)]
 mod tests {
+    fn assert_issue224_attempt_policy_roundtrip<T>(legacy: serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        for attempts in [None, Some(1), Some(3)] {
+            let mut input = legacy.clone();
+            if let Some(attempts) = attempts {
+                input["max_task_attempts"] = serde_json::json!(attempts);
+            }
+            let request: T = serde_json::from_value(input).expect("planning request");
+            let wire = serde_json::to_value(request).expect("serialize planning request");
+            let expected = attempts.map(serde_json::Value::from);
+            assert_eq!(wire.get("max_task_attempts"), expected.as_ref());
+            let decoded: T = serde_json::from_value(wire.clone()).expect("request roundtrip");
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn issue224_planning_requests_preserve_omitted_and_explicit_attempt_policy() {
+        let actor_id = uuid::Uuid::from_u128(1);
+        assert_issue224_attempt_policy_roundtrip::<super::CreateMissionRequest>(
+            serde_json::json!({
+                "title": "Bounded mission",
+                "requested_by": actor_id
+            }),
+        );
+        assert_issue224_attempt_policy_roundtrip::<super::PreflightFactoryMissionRequest>(
+            serde_json::json!({
+                "actor_id": actor_id,
+                "source_repository_owner": "fixture",
+                "source_repository_name": "bounded-source",
+                "title": "Bounded factory mission"
+            }),
+        );
+        assert_issue224_attempt_policy_roundtrip::<super::MaterializeFactoryMissionRequest>(
+            serde_json::json!({
+                "actor_id": actor_id,
+                "claim_token": uuid::Uuid::from_u128(2),
+                "expected_version": 1,
+                "idempotency_key": "issue224-materialize",
+                "title": "Bounded factory mission"
+            }),
+        );
+    }
+
+    #[test]
+    fn issue224_factory_preflight_tasks_preserve_legacy_reads_and_attempt_values() {
+        let legacy: super::PreflightFactoryMissionResponse =
+            serde_json::from_value(serde_json::json!({
+                "valid": true,
+                "strategy": "single",
+                "task_count": 1,
+                "budget_tokens": 10_000,
+                "budget_cost_microusd": 10_000
+            }))
+            .expect("preflight response from an older server");
+        assert!(legacy.tasks.is_empty());
+        let tasks = vec![super::PreviewMissionTask {
+            key: "deliver".to_owned(),
+            title: "Produce the mission outcome".to_owned(),
+            budget_tokens: 10_000,
+            budget_cost_microusd: 10_000,
+            depends_on: Vec::new(),
+            max_attempts: 3,
+        }];
+        let response = super::PreflightFactoryMissionResponse {
+            tasks: tasks.clone(),
+            ..legacy
+        };
+        let wire = serde_json::to_value(response).expect("serialize preflight tasks");
+        assert_eq!(wire["tasks"], serde_json::to_value(&tasks).unwrap());
+        let decoded: super::PreflightFactoryMissionResponse =
+            serde_json::from_value(wire).expect("preflight tasks roundtrip");
+        assert_eq!(decoded.tasks, tasks);
+    }
+
     #[test]
     fn mission_preview_wire_shape_is_only_the_public_graph_summary() {
         let response = super::PreviewMissionResponse {
@@ -1210,6 +1320,98 @@ mod tests {
             serde_json::from_value::<super::PreviewMissionResponse>(wire)
                 .expect("deserialize preview"),
             response
+        );
+    }
+
+    #[test]
+    fn issue224_existing_execution_commands_reject_attempt_changes() {
+        fn check<T: serde::de::DeserializeOwned>(baseline: serde_json::Value) {
+            assert!(serde_json::from_value::<T>(baseline.clone()).is_ok());
+            for value in [serde_json::json!(3), serde_json::Value::Null] {
+                let mut changed = baseline.clone();
+                changed["max_task_attempts"] = value;
+                let error = serde_json::from_value::<T>(changed)
+                    .err()
+                    .expect("execution commands cannot change the planned allowance");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("unknown field `max_task_attempts`")
+                );
+            }
+        }
+        let actor = uuid::Uuid::from_u128(1);
+        check::<super::LaunchMissionRequest>(serde_json::json!({"requested_by": actor}));
+        check::<super::ResumeRunRequest>(serde_json::json!({
+            "requested_by": actor, "prompt": "Continue the same work"
+        }));
+        check::<super::CreateFactoryVerificationRecoveryRequest>(serde_json::json!({
+            "actor_id": actor,
+            "claim_token": uuid::Uuid::from_u128(2),
+            "expected_factory_version": 1,
+            "idempotency_key": uuid::Uuid::from_u128(3),
+            "source_run_id": uuid::Uuid::from_u128(4),
+            "mode": "source_correction",
+            "reason": "Complete the same mission",
+            "observed_source_revision": "reviewed-revision",
+            "reviewed_source_snapshot": {},
+            "contract_revision_id": uuid::Uuid::from_u128(5),
+            "expected_workspace_fingerprint": "a".repeat(64),
+            "expected_head_commit": null
+        }));
+    }
+
+    #[test]
+    fn issue224_contract_revisions_reject_nested_attempt_settings() {
+        let baseline = serde_json::json!({
+            "actor_id": uuid::Uuid::from_u128(1),
+            "task_id": uuid::Uuid::from_u128(2),
+            "expected_contract_version": 1,
+            "next_action": "resume",
+            "source_run_id": uuid::Uuid::from_u128(3),
+            "reason": "Continue the existing task",
+            "idempotency_key": uuid::Uuid::from_u128(4),
+            "description": "Preserve the original execution policy",
+            "contract": {
+                "objective": "Finish the original outcome",
+                "expected_output": "A verified result",
+                "acceptance_tests": ["Existing checks pass"],
+                "allowed_tools": ["filesystem"],
+                "prohibited_actions": ["Do not publish"],
+                "references": [],
+                "write_scope": ["result.md"],
+                "budget_tokens": 1000,
+                "budget_cost_microusd": 1000,
+                "deadline_at": null,
+                "escalation": "Ask the operator",
+                "secret_refs": [],
+                "model": null,
+                "reasoning_effort": null,
+                "deliverable": null,
+                "source_repository": null,
+                "source_base_ref": null,
+                "source_base_commit": null
+            },
+            "verification_policy": {
+                "checks": [{"type": "artifact", "min_bytes": 1}],
+                "manual_gate": null
+            }
+        });
+        serde_json::from_value::<super::CreateMissionContractRevisionRequest>(baseline.clone())
+            .expect("unchanged revision payload remains valid");
+        for value in [serde_json::json!(3), serde_json::Value::Null] {
+            let mut changed = baseline.clone();
+            changed["contract"]["max_task_attempts"] = value;
+            let error =
+                serde_json::from_value::<super::CreateMissionContractRevisionRequest>(changed)
+                    .unwrap_err();
+            assert!(error.to_string().contains("creation-only planning option"));
+        }
+        let mut compatible = baseline;
+        compatible["contract"]["future_client_annotation"] = serde_json::json!("informational");
+        assert!(
+            serde_json::from_value::<super::CreateMissionContractRevisionRequest>(compatible)
+                .is_ok()
         );
     }
 

@@ -2371,6 +2371,7 @@ struct MissionPlanInput<'a> {
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
+    max_task_attempts: Option<i32>,
     deliverable: Option<&'a crony_domain::DeliverableSpec>,
     contract: Option<&'a FactoryMissionContract>,
     verification_policy: Option<&'a VerificationPolicy>,
@@ -2392,6 +2393,7 @@ impl<'a> MissionPlanInput<'a> {
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: request.contract.as_ref(),
             verification_policy: request.verification_policy.as_ref(),
@@ -2542,6 +2544,7 @@ async fn plan_mission(
                 secret_refs: input.secret_refs,
                 budget_tokens: input.budget_tokens,
                 budget_cost_microusd: input.budget_cost_microusd,
+                max_task_attempts: input.max_task_attempts,
                 deliverable: input.deliverable,
                 handoff_root: handoff_root.as_deref(),
             },
@@ -3458,6 +3461,7 @@ fn factory_materialization_operation_request(
     preferred_model: Option<&str>,
     reasoning_effort: Option<&str>,
     strategy: Option<&str>,
+    max_task_attempts: Option<i32>,
     secret_refs: &[TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
@@ -3465,7 +3469,7 @@ fn factory_materialization_operation_request(
     contract: &FactoryMissionContract,
     verification_policy: Option<&VerificationPolicy>,
 ) -> serde_json::Value {
-    json!({
+    let mut request = json!({
         "title": title,
         "description": description,
         "preferred_adapter": preferred_adapter,
@@ -3478,7 +3482,31 @@ fn factory_materialization_operation_request(
         "deliverable": deliverable,
         "contract": contract,
         "verification_policy": verification_policy
-    })
+    });
+    // Keep old operation snapshots byte-equivalent when this optional planning
+    // choice is absent; adding a null field would break existing replay.
+    if let Some(max_task_attempts) = max_task_attempts {
+        request["max_task_attempts"] = json!(max_task_attempts);
+    }
+    request
+}
+
+fn validate_factory_requested_attempts(
+    allowed: Option<i32>,
+    requested: Option<i32>,
+) -> Result<(), ApiError> {
+    if requested.is_some_and(|value| !(1..=planning::MAX_TASK_ATTEMPTS).contains(&value)) {
+        return Err(ApiError::bad_request(format!(
+            "max_task_attempts must be between 1 and {}",
+            planning::MAX_TASK_ATTEMPTS
+        )));
+    }
+    if allowed != requested {
+        return Err(ApiError::bad_request(
+            "max_task_attempts must match the claimed planning policy; choose it before claiming work",
+        ));
+    }
+    Ok(())
 }
 
 fn factory_materialization_failure_detail(rejection: &str) -> String {
@@ -3557,6 +3585,10 @@ async fn preflight_factory_mission(
         Permission::Operate,
     )
     .await?;
+    validate_factory_requested_attempts(
+        crony_domain::factory_max_task_attempts(&request.policy).map_err(ApiError::bad_request)?,
+        request.max_task_attempts,
+    )?;
     let workspace_connection_id = crony_domain::factory_workspace_connection_id(&request.policy)
         .map_err(ApiError::bad_request)?;
     let staffing_source = if workspace_connection_id.is_some()
@@ -3597,6 +3629,7 @@ async fn preflight_factory_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: Some(&request.contract),
             verification_policy: request.verification_policy.as_ref(),
@@ -3611,6 +3644,7 @@ async fn preflight_factory_mission(
         request.preferred_model.as_deref(),
         request.reasoning_effort.as_deref(),
         request.strategy.as_deref(),
+        request.max_task_attempts,
         &request.secret_refs,
         request.budget_tokens,
         request.budget_cost_microusd,
@@ -3635,12 +3669,14 @@ async fn preflight_factory_mission(
         )
         .await
         .map_err(map_store_error)?;
+    let preview = mission_preview_response(&constrained_plan);
     Ok(Json(PreflightFactoryMissionResponse {
         valid: true,
-        strategy: constrained_plan.strategy,
-        task_count: constrained_plan.tasks.len(),
-        budget_tokens: constrained_plan.budget_tokens,
-        budget_cost_microusd: constrained_plan.budget_cost_microusd,
+        strategy: preview.strategy,
+        task_count: preview.tasks.len(),
+        budget_tokens: preview.budget_tokens,
+        budget_cost_microusd: preview.budget_cost_microusd,
+        tasks: preview.tasks,
     }))
 }
 
@@ -3666,6 +3702,21 @@ async fn materialize_factory_mission(
         Permission::Operate,
     )
     .await?;
+    // A new planning option cannot mutate an existing claim as a side effect
+    // of rejection. Read the same authorized source/policy projection before
+    // the generic post-claim failure-compensation path. Old requests retain
+    // their existing replay order and representation.
+    let explicit_planning_source = if request.max_task_attempts.is_some() {
+        let source = state
+            .store
+            .factory_planning_source(corp_id, work_item_id, actor_id)
+            .await
+            .map_err(map_store_error)?;
+        validate_factory_requested_attempts(source.max_task_attempts, request.max_task_attempts)?;
+        Some(source)
+    } else {
+        None
+    };
     let operation_request = factory_materialization_operation_request(
         &request.title,
         &request.description,
@@ -3673,6 +3724,7 @@ async fn materialize_factory_mission(
         request.preferred_model.as_deref(),
         request.reasoning_effort.as_deref(),
         request.strategy.as_deref(),
+        request.max_task_attempts,
         &request.secret_refs,
         request.budget_tokens,
         request.budget_cost_microusd,
@@ -3716,30 +3768,35 @@ async fn materialize_factory_mission(
     }
     // Read the source and connection together from the immutable claimed policy.
     // A materialization request cannot substitute its own account or machine.
-    let (repository, base_ref, base_commit, workspace_connection_id) = match state
-        .store
-        .factory_staffing_source(corp_id, work_item_id, actor_id)
-        .await
-    {
-        Ok(source) => source,
-        Err(error) => {
-            return Err(reject_factory_materialization_error(
-                &state,
-                &materialize_input,
-                map_store_error(error),
-            )
-            .await);
-        }
+    let source = match explicit_planning_source {
+        Some(source) => source,
+        None => match state
+            .store
+            .factory_planning_source(corp_id, work_item_id, actor_id)
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                return Err(reject_factory_materialization_error(
+                    &state,
+                    &materialize_input,
+                    map_store_error(error),
+                )
+                .await);
+            }
+        },
     };
+    validate_factory_requested_attempts(source.max_task_attempts, request.max_task_attempts)?;
+    let workspace_connection_id = source.workspace_connection_id;
     let staffing_source = (workspace_connection_id.is_some()
         || needs_factory_staffing_source(
             request.strategy.as_deref(),
             request.preferred_adapter.as_deref(),
         ))
     .then_some(MissionSource {
-        repository,
-        base_ref,
-        base_commit,
+        repository: source.repository,
+        base_ref: source.base_ref,
+        base_commit: source.base_commit,
     });
     let plan = match plan_mission(
         &state,
@@ -3757,6 +3814,7 @@ async fn materialize_factory_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: Some(&request.contract),
             verification_policy: request.verification_policy.as_ref(),
@@ -7265,6 +7323,7 @@ mod tests {
         assert_eq!(input.secret_refs, request.secret_refs.as_slice());
         assert_eq!(input.budget_tokens, request.budget_tokens);
         assert_eq!(input.budget_cost_microusd, request.budget_cost_microusd);
+        assert_eq!(input.max_task_attempts, request.max_task_attempts);
         assert!(std::ptr::eq(
             input.deliverable.unwrap(),
             request.deliverable.as_ref().unwrap()
@@ -7299,10 +7358,71 @@ mod tests {
         assert!(input.secret_refs.is_empty());
         assert!(input.budget_tokens.is_none());
         assert!(input.budget_cost_microusd.is_none());
+        assert!(input.max_task_attempts.is_none());
         assert!(input.deliverable.is_none());
         assert!(input.contract.is_none());
         assert!(input.verification_policy.is_none());
         assert!(!input.require_factory_manual_gate);
+    }
+
+    #[test]
+    fn issue224_attempt_request_must_match_the_pre_execution_factory_policy() {
+        assert!(super::validate_factory_requested_attempts(None, None).is_ok());
+        for value in 1..=super::planning::MAX_TASK_ATTEMPTS {
+            assert!(super::validate_factory_requested_attempts(Some(value), Some(value)).is_ok());
+        }
+        for (allowed, requested) in [
+            (None, Some(3)),
+            (Some(3), None),
+            (Some(3), Some(2)),
+            (Some(2), Some(3)),
+            (Some(0), Some(0)),
+            (Some(4), Some(4)),
+        ] {
+            assert!(super::validate_factory_requested_attempts(allowed, requested).is_err());
+        }
+    }
+
+    #[test]
+    fn issue224_factory_operation_snapshots_keep_legacy_omission() {
+        let contract = FactoryMissionContract::default();
+        let operation = |attempts| {
+            super::factory_materialization_operation_request(
+                "Legacy materialization",
+                "",
+                Some("codex"),
+                None,
+                None,
+                Some("single"),
+                attempts,
+                &[],
+                Some(10_000),
+                Some(1_000_000),
+                None,
+                &contract,
+                None,
+            )
+        };
+        let legacy = operation(None);
+        assert!(legacy.get("max_task_attempts").is_none());
+        let explicit = operation(Some(3));
+        assert_eq!(explicit["max_task_attempts"], json!(3));
+        let mut without_option = explicit;
+        without_option
+            .as_object_mut()
+            .unwrap()
+            .remove("max_task_attempts");
+        assert_eq!(without_option, legacy);
+    }
+
+    #[test]
+    fn issue224_planning_input_keeps_the_exact_requested_attempt_allowance() {
+        for attempts in [None, Some(1), Some(3)] {
+            let mut request = mission_preview_test_request();
+            request.max_task_attempts = attempts;
+            let input = MissionPlanInput::from_create_request(&request, request.requested_by);
+            assert_eq!(input.max_task_attempts, attempts);
+        }
     }
 
     #[test]
@@ -7327,6 +7447,7 @@ mod tests {
                         secret_refs: &[],
                         budget_tokens: request.budget_tokens,
                         budget_cost_microusd: request.budget_cost_microusd,
+                        max_task_attempts: request.max_task_attempts,
                         deliverable: request.deliverable.as_ref(),
                         handoff_root: Some("handoffs"),
                     },

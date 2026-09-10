@@ -7,6 +7,8 @@ mod workspace_connections;
 pub use workspace_connections::*;
 mod factory_connection;
 pub use factory_connection::factory_workspace_connection_id;
+mod planned_attempts;
+pub use planned_attempts::{MAX_TASK_ATTEMPTS, factory_max_task_attempts};
 mod retained_provider_receipt;
 pub use retained_provider_receipt::{
     MAX_RETAINED_PROVIDER_RECEIPT_BYTES, RETAINED_COPILOT_RECEIPT_FILE,

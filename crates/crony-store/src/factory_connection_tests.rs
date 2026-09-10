@@ -833,3 +833,6 @@ async fn issue204_legacy_unbound_factory_materialization_remains_compatible(
     assert_eq!(candidates[0].workspace_connection_id, None);
     Ok(())
 }
+
+#[path = "factory_attempt_policy_tests.rs"]
+mod attempt_policy;

@@ -488,6 +488,23 @@ tests, allowed tools, prohibited actions, references, write scope, token budget,
 escalation path. Validation rejects unknown agents, adapter mismatches, missing contract fields,
 cycles, excessive depth, node fan-out, retry counts, and budgets.
 
+The optional creation-time `max_task_attempts` request selects a total allowance
+from the existing 1-3 planner range. The registry applies it to every task before
+the existing graph validation. Omission preserves each strategy's prior default;
+there is no separate retry engine or provider-session behavior. Direct preview,
+creation, CLI, MCP, ACP and A2A use the same choice.
+
+Factory policy records an explicit choice before the claim. Preflight and
+materialization must agree with that immutable policy, and persistence repeats
+the comparison under the existing claim gates. The actual constrained task
+allowances are returned in Factory preflight as well as direct mission preview.
+The HTTP materializer checks a conflicting explicit setting through the current
+authorized planning-source read before generic claim-failure compensation.
+Legacy omission does not add a null field to durable operation snapshots.
+Continuation reuses the recorded policy; no post-creation endpoint changes
+`tasks.max_attempts` or `attempt_count`. Verifier-only recovery keeps its existing
+separate attempt-accounting rules.
+
 Interactive mission creation presents the structured workspace identities advertised by connected
 runners. The operator must select and confirm one exact repository, symbolic ref, and immutable
 commit before launch. The server matches that tuple to a connected runner, copies it into every

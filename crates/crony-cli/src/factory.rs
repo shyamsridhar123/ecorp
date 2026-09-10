@@ -16,7 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use crony_domain::{
-    FactoryVerificationRecoveryMode, TaskContract, VerificationPolicy, write_scope_is_valid,
+    FactoryVerificationRecoveryMode, MAX_TASK_ATTEMPTS, TaskContract, VerificationPolicy,
+    factory_max_task_attempts, write_scope_is_valid,
 };
 use crony_protocol::FactoryVerificationRecoveryContextResponse;
 use reqwest::{Client, Method, StatusCode};
@@ -80,6 +81,10 @@ pub struct FactoryArgs {
 
     #[arg(long, default_value = "single")]
     pub strategy: String,
+
+    /// Total attempts per task at planning time; existing work retains its recorded policy.
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..=i64::from(MAX_TASK_ATTEMPTS)))]
+    pub max_task_attempts: Option<i32>,
 
     #[arg(long)]
     pub model: Option<String>,
@@ -451,6 +456,21 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         args.active_issue
             .store(evaluated[index].issue.number, Ordering::Relaxed);
     }
+    let preview_max_task_attempts = selected_index
+        .map(|index| {
+            if evaluated[index].recovery {
+                resolve_recovery_max_task_attempts(
+                    &args,
+                    existing.get(&evaluated[index].project_item.id).context(
+                        "recoverable factory item disappeared from the selected-item lookup",
+                    )?,
+                )
+            } else {
+                Ok(args.max_task_attempts)
+            }
+        })
+        .transpose()?
+        .flatten();
     let selected_source_base_commit = if let Some(index) = selected_index {
         Some(if evaluated[index].recovery {
             resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)?
@@ -540,6 +560,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                     &args,
                     &selected.issue,
                     preview_verification_policy.as_ref(),
+                    preview_max_task_attempts,
                 );
                 Some(preflight_factory_mission(client, server, &args, policy, mission_body).await?)
             }
@@ -586,6 +607,10 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     })?;
     let selected = evaluated.swap_remove(selected_index);
     let (mut refreshed, mut persisted) = refresh_selected(client, server, &args, &selected).await?;
+    let max_task_attempts = match persisted.as_ref() {
+        Some(item) => resolve_recovery_max_task_attempts(&args, item)?,
+        None => args.max_task_attempts,
+    };
     if let Some(item) = persisted.as_ref() {
         preflight_factory_recovery_mode(
             client,
@@ -691,7 +716,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             &adapter_allowlist,
         )
     };
-    let mission_body = factory_mission_body(&args, &refreshed.issue, verification_policy.as_ref());
+    let mission_body = factory_mission_body(
+        &args,
+        &refreshed.issue,
+        verification_policy.as_ref(),
+        max_task_attempts,
+    );
     let preflight = if persisted
         .as_ref()
         .and_then(|item| item.mission_id)
@@ -1462,7 +1492,24 @@ fn new_factory_policy(
     if let Some(connection_id) = args.workspace_connection_id {
         policy["workspace_connection_id"] = json!(connection_id);
     }
+    if let Some(max_task_attempts) = args.max_task_attempts {
+        policy["max_task_attempts"] = json!(max_task_attempts);
+    }
     policy
+}
+
+fn resolve_recovery_max_task_attempts(
+    args: &FactoryArgs,
+    item: &ExistingFactoryItem,
+) -> Result<Option<i32>> {
+    let recorded = factory_max_task_attempts(&item.policy).map_err(anyhow::Error::msg)?;
+    if args.max_task_attempts.is_some() && args.max_task_attempts != recorded {
+        bail!(
+            "factory max-task-attempts differs from the recorded policy; existing work cannot acquire or revise attempts"
+        );
+    }
+    // Omission reuses the immutable choice, not a new default or retry grant.
+    Ok(recorded)
 }
 
 fn preflight_policy(policy: &Value, source_base_commit: &str) -> Result<Value> {
@@ -1485,8 +1532,9 @@ fn factory_mission_body(
     args: &FactoryArgs,
     issue: &IssueView,
     verification_policy: Option<&VerificationPolicy>,
+    max_task_attempts: Option<i32>,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "actor_id": args.actor_id,
         "title": bounded_title(issue.number, &issue.title),
         "description": issue.body,
@@ -1524,7 +1572,11 @@ fn factory_mission_body(
             "write_scope": args.write_scope,
         },
         "verification_policy": verification_policy,
-    })
+    });
+    if let Some(max_task_attempts) = max_task_attempts {
+        body["max_task_attempts"] = json!(max_task_attempts);
+    }
+    body
 }
 
 fn factory_preflight_body(
@@ -1532,6 +1584,11 @@ fn factory_preflight_body(
     policy: Value,
     mut mission_body: Value,
 ) -> Result<Value> {
+    if factory_max_task_attempts(&policy).map_err(anyhow::Error::msg)?
+        != factory_max_task_attempts(&mission_body).map_err(anyhow::Error::msg)?
+    {
+        bail!("factory preflight attempt choice must match its immutable policy");
+    }
     let (source_repository_owner, source_repository_name) = repository_parts(&args.repository)?;
     let fields = mission_body
         .as_object_mut()
@@ -1567,6 +1624,12 @@ async fn preflight_factory_mission(
 
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
+    if args
+        .max_task_attempts
+        .is_some_and(|value| !(1..=MAX_TASK_ATTEMPTS).contains(&value))
+    {
+        bail!("max-task-attempts must be between 1 and {MAX_TASK_ATTEMPTS}");
+    }
     if args.workspace_connection_id.is_some_and(|id| id.is_nil()) {
         bail!("factory workspace_connection_id must be a non-nil UUID");
     }
@@ -4438,6 +4501,7 @@ mod tests {
                 adapter: "github-copilot".to_owned(),
                 allowed_adapters: Vec::new(),
                 strategy: "single".to_owned(),
+                max_task_attempts: None,
                 model: Some("reviewed-model".to_owned()),
                 reasoning_effort: Some("high".to_owned()),
                 budget_tokens: 10_000,
@@ -5670,6 +5734,138 @@ mod tests {
     }
 
     #[test]
+    fn issue224_factory_policy_and_bodies_share_only_the_explicit_planning_choice() {
+        let mut f = RecoveryFixture::new();
+        for expected in std::iter::once(None).chain((1..=super::MAX_TASK_ATTEMPTS).map(Some)) {
+            f.args.max_task_attempts = expected;
+            let policy = new_factory_policy(
+                &f.args,
+                &f.selected,
+                &"a".repeat(40),
+                "main",
+                Some(&f.snapshot.verification_policy),
+                &[f.args.adapter.clone()],
+            );
+            let body = super::factory_mission_body(
+                &f.args,
+                &f.selected.issue,
+                Some(&f.snapshot.verification_policy),
+                expected,
+            );
+            let preflight =
+                super::factory_preflight_body(&f.args, policy.clone(), body.clone()).unwrap();
+            let expected = expected.map(|value| json!(value));
+            assert_eq!(policy.get("max_task_attempts"), expected.as_ref());
+            assert_eq!(body.get("max_task_attempts"), expected.as_ref());
+            assert_eq!(preflight.get("max_task_attempts"), expected.as_ref());
+            assert_eq!(preflight["policy"], policy);
+            if expected.is_none() {
+                assert!(!body.to_string().contains("max_task_attempts"));
+                assert!(!preflight.to_string().contains("max_task_attempts"));
+            }
+        }
+    }
+
+    #[test]
+    fn issue224_existing_factory_policy_is_reused_and_never_revised_by_an_override() {
+        let mut f = RecoveryFixture::new();
+        for recorded in std::iter::once(None).chain((1..=super::MAX_TASK_ATTEMPTS).map(Some)) {
+            for requested in std::iter::once(None).chain((1..=super::MAX_TASK_ATTEMPTS).map(Some)) {
+                f.args.max_task_attempts = requested;
+                for state in ["claimed", "running", "verification_failed", "cancelled"] {
+                    let mut item = f.persisted_item();
+                    item.state = state.to_owned();
+                    if let Some(value) = recorded {
+                        item.policy["max_task_attempts"] = json!(value);
+                    }
+                    let before = item.policy.clone();
+                    let result = super::resolve_recovery_max_task_attempts(&f.args, &item);
+                    if requested.is_none() || requested == recorded {
+                        assert_eq!(result.unwrap(), recorded);
+                    } else {
+                        assert!(result.is_err());
+                    }
+                    assert_eq!(item.policy, before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue224_legacy_null_policy_is_read_without_inserting_a_request_key() {
+        let f = RecoveryFixture::new();
+        let mut item = f.persisted_item();
+        item.policy["max_task_attempts"] = Value::Null;
+        let before = item.policy.clone();
+        let max_task_attempts = super::resolve_recovery_max_task_attempts(&f.args, &item).unwrap();
+        assert_eq!(max_task_attempts, None);
+        let body = super::factory_mission_body(&f.args, &f.selected.issue, None, max_task_attempts);
+        assert!(body.get("max_task_attempts").is_none());
+        let preflight = super::factory_preflight_body(&f.args, item.policy.clone(), body).unwrap();
+        assert!(preflight.get("max_task_attempts").is_none());
+        assert_eq!(preflight["policy"], before);
+        assert_eq!(item.policy, before);
+    }
+
+    #[test]
+    fn issue224_invalid_or_incongruent_attempt_choices_fail_before_preflight() {
+        let mut f = RecoveryFixture::new();
+        for value in [0, -1, super::MAX_TASK_ATTEMPTS + 1] {
+            f.args.max_task_attempts = Some(value);
+            let error = validate_args(&f.args).unwrap_err();
+            assert!(error.to_string().starts_with("max-task-attempts"));
+        }
+        f.args.max_task_attempts = None;
+        let body = super::factory_mission_body(&f.args, &f.selected.issue, None, None);
+        assert!(
+            super::factory_preflight_body(
+                &f.args,
+                json!({"max_task_attempts": super::MAX_TASK_ATTEMPTS}),
+                body.clone(),
+            )
+            .is_err()
+        );
+        for invalid in [json!(0), json!("3"), json!(3.0), json!(false), json!([])] {
+            let mut item = f.persisted_item();
+            item.policy["max_task_attempts"] = invalid;
+            let before = item.policy.clone();
+            assert!(super::resolve_recovery_max_task_attempts(&f.args, &item).is_err());
+            assert!(super::factory_preflight_body(&f.args, before.clone(), body.clone()).is_err());
+            assert_eq!(item.policy, before);
+        }
+    }
+
+    #[test]
+    fn issue224_recovery_revision_requests_do_not_carry_an_attempt_setter() {
+        let mut f = RecoveryFixture::new();
+        f.args.max_task_attempts = Some(super::MAX_TASK_ATTEMPTS);
+        let request = f.request();
+        assert!(request.get("max_task_attempts").is_none());
+        assert!(request["contract"].get("max_task_attempts").is_none());
+        assert!(request["contract"].get("max_attempts").is_none());
+    }
+
+    #[test]
+    fn issue224_recovery_attempt_congruence_precedes_dry_run_and_remote_mutations() {
+        let source = include_str!("factory.rs");
+        let run = source
+            .split("pub async fn run(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn watch(")
+            .next()
+            .unwrap();
+        let preview = run.find("let preview_max_task_attempts =").unwrap();
+        let dry_run = run.find("if args.dry_run").unwrap();
+        let refreshed = run.find("let (mut refreshed, mut persisted)").unwrap();
+        let checked = run.find("let max_task_attempts = match persisted").unwrap();
+        let reconcile = run.find("reconcile_checkpoint_cancellation(").unwrap();
+        let claim = run.find("let claim_generation =").unwrap();
+        assert!(preview < dry_run && dry_run < refreshed);
+        assert!(refreshed < checked && checked < reconcile && reconcile < claim);
+    }
+
+    #[test]
     fn recovery_completion_preserves_catch_up_states_and_cleanup_gate() {
         for state in ["mission_created", "running", "awaiting_approval", "blocked"] {
             assert!(factory_completion_is_ready(true, false, state));
@@ -6226,6 +6422,7 @@ Blocked by #999 outside the section.
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
+            max_task_attempts: None,
             model: None,
             reasoning_effort: None,
             budget_tokens: 1,
@@ -6286,6 +6483,7 @@ Blocked by #999 outside the section.
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
+            max_task_attempts: None,
             model: None,
             reasoning_effort: None,
             budget_tokens: 1,

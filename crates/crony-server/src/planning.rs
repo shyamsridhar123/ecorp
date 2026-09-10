@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+pub use crony_domain::MAX_TASK_ATTEMPTS;
 use crony_domain::{
     Agent, AgentStatus, DeliverableForm, DeliverableSpec, ManualVerificationGate, PlannedTask,
     TaskContract, TaskGraphPlan, TaskSecretReference, VerificationPolicy, VerifierCheck,
@@ -12,7 +13,6 @@ use crony_domain::{
 
 pub const MAX_GRAPH_NODES: usize = 8;
 pub const MAX_GRAPH_DEPTH: i32 = 4;
-pub const MAX_TASK_ATTEMPTS: i32 = 3;
 pub const MAX_TASK_BUDGET_TOKENS: i64 = 2_000_000;
 pub const MAX_GRAPH_BUDGET_TOKENS: i64 = 2_000_000;
 const DEFAULT_SINGLE_TASK_BUDGET_TOKENS: i64 = 1_000_000;
@@ -32,6 +32,7 @@ pub struct PlanningRequest<'a> {
     pub secret_refs: &'a [TaskSecretReference],
     pub budget_tokens: Option<i64>,
     pub budget_cost_microusd: Option<i64>,
+    pub max_task_attempts: Option<i32>,
     pub deliverable: Option<&'a DeliverableSpec>,
     pub handoff_root: Option<&'a str>,
 }
@@ -84,7 +85,12 @@ impl StrategyRegistry {
             .strategies
             .get(strategy_id)
             .with_context(|| format!("unknown manager strategy {strategy_id}"))?;
-        let plan = strategy.plan(request, agents)?;
+        let mut plan = strategy.plan(request, agents)?;
+        if let Some(max_attempts) = request.max_task_attempts {
+            for task in &mut plan.tasks {
+                task.max_attempts = max_attempts;
+            }
+        }
         validate_plan(&plan, agents)?;
         Ok(plan)
     }
@@ -1204,8 +1210,104 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            max_task_attempts: None,
             deliverable: None,
             handoff_root: None,
+        }
+    }
+
+    #[test]
+    fn issue224_ordinary_strategies_preserve_default_two_attempts() {
+        let registry = StrategyRegistry::new();
+        let mut roster = agents();
+        roster.extend(copilot_workers());
+        for (strategy, task_count) in [
+            ("single", 1),
+            ("parallel-specialists", 3),
+            ("studio-swarm", 4),
+        ] {
+            let plan = registry
+                .plan(strategy, &studio_request(), &roster)
+                .expect("ordinary default plan");
+            assert_eq!(plan.tasks.len(), task_count, "{strategy}");
+            assert_eq!(
+                plan.tasks
+                    .iter()
+                    .map(|task| task.max_attempts)
+                    .collect::<Vec<_>>(),
+                vec![2; task_count],
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue224_attempt_override_sets_every_task_without_changing_other_plan_fields() {
+        let registry = StrategyRegistry::new();
+        let mut roster = agents();
+        roster.extend(copilot_workers());
+        for strategy in registry.ids() {
+            let default = registry
+                .plan(&strategy, &studio_request(), &roster)
+                .expect("default plan");
+            for max_attempts in [1, 3] {
+                let request = PlanningRequest {
+                    max_task_attempts: Some(max_attempts),
+                    ..studio_request()
+                };
+                let plan = registry
+                    .plan(&strategy, &request, &roster)
+                    .expect("explicit bounded attempt plan");
+                let mut expected = default.clone();
+                for task in &mut expected.tasks {
+                    task.max_attempts = max_attempts;
+                }
+                assert_eq!(
+                    serde_json::to_value(&plan).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                    "{strategy}, max_task_attempts={max_attempts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue224_fixture_strategies_preserve_default_one_attempt() {
+        let registry = StrategyRegistry::new();
+        let roster = agents();
+        for strategy in [
+            "verification-matrix",
+            "verification-failure",
+            "human-approval",
+            "independent-review",
+        ] {
+            let plan = registry
+                .plan(strategy, &studio_request(), &roster)
+                .expect("fixture default plan");
+            assert_eq!(plan.tasks.len(), 1, "{strategy}");
+            assert_eq!(plan.tasks[0].max_attempts, 1, "{strategy}");
+        }
+    }
+
+    #[test]
+    fn issue224_attempt_override_rejects_out_of_bounds_values() {
+        let registry = StrategyRegistry::new();
+        let mut roster = agents();
+        roster.extend(copilot_workers());
+        for strategy in registry.ids() {
+            for max_attempts in [0, -1, 4] {
+                let request = PlanningRequest {
+                    max_task_attempts: Some(max_attempts),
+                    ..studio_request()
+                };
+                let error = registry
+                    .plan(&strategy, &request, &roster)
+                    .expect_err("invalid attempt allowance must not produce a plan");
+                assert!(
+                    error.to_string().contains("retry limit is invalid"),
+                    "{strategy}, max_task_attempts={max_attempts}: {error}"
+                );
+            }
         }
     }
 
@@ -1736,6 +1838,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            max_task_attempts: None,
             deliverable: None,
             handoff_root: None,
         };
@@ -1774,6 +1877,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            max_task_attempts: None,
             deliverable: None,
             handoff_root: None,
         };
@@ -1851,6 +1955,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    max_task_attempts: None,
                     deliverable: None,
                     handoff_root: None,
                 },
@@ -1884,6 +1989,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    max_task_attempts: None,
                     deliverable: Some(&requested),
                     handoff_root: None,
                 },
@@ -1908,6 +2014,7 @@ mod tests {
                         secret_refs: &[],
                         budget_tokens: None,
                         budget_cost_microusd: None,
+                        max_task_attempts: None,
                         deliverable: Some(&unsafe_requested),
                         handoff_root: None,
                     },
@@ -1932,6 +2039,7 @@ mod tests {
                         secret_refs: &[],
                         budget_tokens: None,
                         budget_cost_microusd: None,
+                        max_task_attempts: None,
                         deliverable: Some(&magic_requested),
                         handoff_root: None,
                     },
@@ -1960,6 +2068,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    max_task_attempts: None,
                     deliverable: None,
                     handoff_root: None,
                 },
@@ -1998,6 +2107,7 @@ mod tests {
                     secret_refs: &[],
                     budget_tokens: None,
                     budget_cost_microusd: None,
+                    max_task_attempts: None,
                     deliverable: None,
                     handoff_root: None,
                 },
@@ -2022,6 +2132,7 @@ mod tests {
             secret_refs: &[],
             budget_tokens: None,
             budget_cost_microusd: None,
+            max_task_attempts: None,
             deliverable: None,
             handoff_root: None,
         };

@@ -83,6 +83,16 @@ behavior, authorized outcome review or publication.
 
 ## Stopped-session native evidence compatibility
 
+The [planned-attempt policy report](evidence/2026-09-10-planned-attempt-policy.md)
+records the prospective public option, 35 distinct focused unit cases, three
+actual-store SQLx cases, and a passing 538-test serial workspace gate.
+`tools/e2e_planned_attempts.mjs` describes the native public 1 -> 1 -> 2 -> 3
+sequence with unchanged checks, retained history and independent review.
+That drill has not executed: the host tool denied the isolated QA startup
+before process creation. No runtime, browser, vendor-persistence or final
+application-acceptance claim follows from these offline results; #224 and #221
+remain open.
+
 The [correction-retry report](evidence/2026-09-10-checkpoint-correction-retry.md)
 records eleven new actual-store cases, four exact compatibility controls, CLI/UI checks
 and ordinary native/browser regression. Its initial three-attempt fixture is not proof
