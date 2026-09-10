@@ -634,12 +634,7 @@ async fn validate_native_edge_tx(
             .get("workspace_quarantined")
             .and_then(Value::as_bool)
             == Some(true)
-        || checkpoint
-            .expected_head_commit
-            .as_deref()
-            .is_some_and(|head| {
-                seal_payload.get("head_commit").and_then(Value::as_str) != Some(head)
-            })
+        || !source_seal_head_matches(&checkpoint, &seal_payload)
     {
         return Err(anyhow!(
             "historical request no longer matches its native source seal"
@@ -670,6 +665,29 @@ async fn validate_native_edge_tx(
         }
     }
     Ok(())
+}
+
+fn source_seal_head_matches(checkpoint: &SourceWorkspaceCheckpoint, seal: &Value) -> bool {
+    let Some(expected_head) = checkpoint.expected_head_commit.as_deref() else {
+        return true;
+    };
+    match seal.get("head_commit") {
+        Some(Value::String(head)) => head == expected_head,
+        // Native verifier cleanup reports this exact authorized fingerprint only
+        // after checking both the fingerprint and assigned HEAD. Its existing
+        // preservation event omits the redundant head field. The source helper
+        // retains that HEAD from the exact verifier recovery, and historical
+        // authority is independently reconstructed and compared after this edge.
+        // Only absence is compatible: null, malformed or contradictory explicit
+        // heads, unbound verifiers and provider sources receive no exception.
+        None if checkpoint.execution_mode == "verification_only" => checkpoint
+            .expected_verifier_fingerprint
+            .as_deref()
+            .is_some_and(|expected| {
+                valid_sha256(expected) && checkpoint.fingerprint.as_deref() == Some(expected)
+            }),
+        _ => false,
+    }
 }
 
 fn pre_dispatch_failure(run: &PgRow) -> bool {
@@ -925,4 +943,62 @@ pub(super) async fn previous_context_tx(
         previous.previous_policy,
         origin,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verifier_checkpoint() -> SourceWorkspaceCheckpoint {
+        SourceWorkspaceCheckpoint {
+            status: "failed".to_owned(),
+            execution_mode: "verification_only".to_owned(),
+            source_correction_recovery: false,
+            verification_status: "failed".to_owned(),
+            workspace_path: Some("owned-fixture".to_owned()),
+            disposition: Some("preserved".to_owned()),
+            fingerprint: Some("b".repeat(64)),
+            expected_verifier_fingerprint: Some("b".repeat(64)),
+            expected_head_commit: Some("a".repeat(40)),
+        }
+    }
+
+    #[test]
+    fn issue224_legacy_verifier_seal_distinguishes_absence_from_invalid_explicit_head() {
+        let checkpoint = verifier_checkpoint();
+        assert!(source_seal_head_matches(&checkpoint, &json!({})));
+        assert!(source_seal_head_matches(
+            &checkpoint,
+            &json!({"head_commit":"a".repeat(40)})
+        ));
+        for head in [Value::Null, json!("c".repeat(40)), json!(42), json!([])] {
+            assert!(!source_seal_head_matches(
+                &checkpoint,
+                &json!({"head_commit":head})
+            ));
+        }
+        assert_eq!(checkpoint.expected_head_commit, Some("a".repeat(40)));
+    }
+
+    #[test]
+    fn issue224_legacy_verifier_seal_requires_verifier_mode_and_exact_guard() {
+        let mut checkpoint = verifier_checkpoint();
+        checkpoint.execution_mode = "provider".to_owned();
+        assert!(!source_seal_head_matches(&checkpoint, &json!({})));
+        checkpoint.execution_mode = "verification_only".to_owned();
+        for fingerprint in [None, Some(String::new()), Some("c".repeat(64))] {
+            checkpoint.expected_verifier_fingerprint = fingerprint;
+            assert!(!source_seal_head_matches(&checkpoint, &json!({})));
+        }
+        checkpoint.expected_verifier_fingerprint = Some("b".repeat(64));
+        checkpoint.fingerprint = None;
+        assert!(!source_seal_head_matches(&checkpoint, &json!({})));
+
+        // An ordinary failed provider with no authorized/exported HEAD keeps
+        // its existing nullable-head behavior; this adds no new requirement.
+        checkpoint.execution_mode = "provider".to_owned();
+        checkpoint.expected_verifier_fingerprint = None;
+        checkpoint.expected_head_commit = None;
+        assert!(source_seal_head_matches(&checkpoint, &json!({})));
+    }
 }

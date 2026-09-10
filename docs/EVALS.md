@@ -81,23 +81,30 @@ it must not be run against the application database. A source-only check or an
 admitted correction does not establish artifact creation, successful browser
 behavior, authorized outcome review or publication.
 
-## Stopped-session native evidence compatibility
+## Planned task attempts and correction retry
 
 The [planned-attempt policy report](evidence/2026-09-10-planned-attempt-policy.md)
-records the prospective public option, 35 distinct focused unit cases, three
-actual-store SQLx cases, and a passing 538-test serial workspace gate.
+records the prospective public option, 35 initial focused unit cases, three
+initial actual-store SQLx cases, and the later native-seal compatibility fix.
+That follow-up adds two pure guard cases and three actual-store regressions;
+its serial workspace gate passes 540 tests with 323 intentionally ignored.
 `tools/e2e_planned_attempts.mjs` describes the native public 1 -> 1 -> 2 -> 3
 sequence with unchanged checks, retained history and independent review.
-That drill has not executed: the host tool denied the isolated QA startup
-before process creation. No runtime, browser, vendor-persistence or final
-application-acceptance claim follows from these offline results; #224 and #221
-remain open.
+After explicit approval, the isolated QA stack started and three diagnostic
+drills ran. They found an omitted native controller step in the driver and an
+actual historical-verifier-seal mismatch in repeated correction. The native
+failure and browser observation remain retained. The corrected source passes
+its local gates, but the host denied the subsequent QA-only restart before
+process creation; patched runtime and final application acceptance remain
+unproven. #224 and #221 remain open.
 
 The [correction-retry report](evidence/2026-09-10-checkpoint-correction-retry.md)
 records eleven new actual-store cases, four exact compatibility controls, CLI/UI checks
 and ordinary native/browser regression. Its initial three-attempt fixture is not proof
 of public planning reachability: #224 remains required for complete public repeated-correction
 acceptance. Earlier failed runs are retained and ignored tests are not counted as passes.
+
+## Stopped-session native evidence compatibility
 
 The [#211 native-read report](evidence/2026-09-09-stopped-session-native-read.md)
 retains two real, separately selected missing-session failures for SDK 1.0.11 /

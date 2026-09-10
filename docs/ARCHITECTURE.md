@@ -613,7 +613,16 @@ continue through another current revision. Bounded historical reconstruction val
 native correction and revision edge without rewriting old schema-1 grants. Historical policy
 is not current execution authority. The latest provider's fingerprint and nullable exported
 head remain current; family membership alone grants no checkpoint operation. The public
-pre-execution attempt-policy gap remains #224; see the [scoped validation](evidence/2026-09-10-checkpoint-correction-retry.md).
+pre-execution attempt option and its remaining runtime acceptance are tracked in
+#224; see the [planned-attempt report](evidence/2026-09-10-planned-attempt-policy.md).
+
+Native verifier cleanup emits its exact authorized fingerprint only after checking
+both fingerprint and assigned HEAD, but its preservation event can omit the
+redundant `head_commit` field. Historical correction validation accepts that
+omission only for an exactly bound verification-only checkpoint. The authorized
+HEAD is retained, explicit invalid or conflicting heads still fail, and the
+native origin authority is independently reconstructed afterward. A provider with
+a required HEAD receives no such omission exception.
 
 Recovery authorization and its runner command are idempotent and durable. The operation stores the
 reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and

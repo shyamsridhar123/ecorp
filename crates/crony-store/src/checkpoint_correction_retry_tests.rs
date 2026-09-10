@@ -352,6 +352,14 @@ async fn retry_admit(store: &PgStore, input: &CreateFactoryVerificationRecoveryI
 }
 
 async fn retry_allocated_first(pool: PgPool, profile: CheckpointFixtureProfile) -> RetryFixture {
+    retry_allocated_first_with_verifier_seal(pool, profile, false).await
+}
+
+async fn retry_allocated_first_with_verifier_seal(
+    pool: PgPool,
+    profile: CheckpointFixtureProfile,
+    omit_verifier_seal_head: bool,
+) -> RetryFixture {
     assert_eq!(profile.max_attempts, 3);
     assert_eq!(profile.attempt_count, 1);
     let store = fixture_with_profile(pool, true, false, None, false, profile).await;
@@ -360,6 +368,46 @@ async fn retry_allocated_first(pool: PgPool, profile: CheckpointFixtureProfile) 
     assert_eq!(original["source"]["input_tokens"], 5_300);
     assert_eq!(original["mission"]["original_budget_tokens"], 10_000);
     let verifier = failed_checkpoint(&store).await;
+    if omit_verifier_seal_head {
+        // Shape only this setup event, before any correction authorization.
+        // Native verifier teardown reports its checked fingerprint without a
+        // top-level head_commit; retain the existing helper's headed default.
+        let mut expected = correction_state(&store).await;
+        let request = retry_recovery(&expected, verifier)["request"].clone();
+        let seal = expected["events"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| {
+                row["aggregate_id"] == json!(verifier) && row["type"] == "run.workspace_preserved"
+            })
+            .unwrap();
+        assert_eq!(
+            seal["payload"]["workspace_fingerprint"],
+            request["expected_workspace_fingerprint"]
+        );
+        assert_eq!(
+            seal["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("head_commit"),
+            Some(request["expected_head_commit"].clone())
+        );
+        assert_eq!(request["expected_head_commit"], "a".repeat(40));
+        let changed = sqlx::query(
+            "UPDATE events SET payload=$3 WHERE corp_id=$1 AND id=$2
+             AND aggregate_id=$4 AND aggregate_type='run' AND type='run.workspace_preserved'",
+        )
+        .bind(CORP)
+        .bind(Uuid::parse_str(seal["id"].as_str().unwrap()).unwrap())
+        .bind(seal["payload"].clone())
+        .bind(verifier)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        assert_eq!(correction_state(&store).await, expected);
+    }
     let first_input = correction_request(&store, verifier).await;
     let first = retry_admit(&store, &first_input).await;
     assert_eq!(first.launch.source_run_id, verifier);
@@ -1613,4 +1661,199 @@ async fn issue221_retry_does_not_reset_exhausted_token_spend(pool: PgPool) {
 #[ignore = "requires explicitly owned SQLx maintenance database"]
 async fn issue221_retry_does_not_reset_exhausted_cost_spend(pool: PgPool) {
     retry_exhausted_spend(pool, true).await;
+}
+
+async fn legacy_verifier_seal_failed_correction(pool: PgPool) -> RetryFixture {
+    let fixture = retry_allocated_first_with_verifier_seal(pool, retry_profile(), true).await;
+    retry_fail_provider(
+        &fixture.store,
+        &fixture.first,
+        RetryFailure::Verification,
+        100,
+        1_000,
+        &"c".repeat(64),
+    )
+    .await;
+    fixture
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue224_legacy_verifier_seal_allows_context_revision_retry_and_exact_replay(
+    pool: PgPool,
+) {
+    let fixture = legacy_verifier_seal_failed_correction(pool).await;
+    let store = &fixture.store;
+    let failed = correction_state(store).await;
+    let seal = retry_event(&failed, fixture.verifier, "run.workspace_preserved");
+    assert!(seal["payload"].get("head_commit").is_none());
+    assert_eq!(seal["payload"]["workspace_fingerprint"], "b".repeat(64));
+    assert_eq!(failed["task"]["attempt_count"], 2);
+
+    let mut tx = store.pool.begin().await.unwrap();
+    let checkpoint =
+        source_workspace_checkpoint_with_lock_tx(&mut tx, CORP, fixture.verifier, false)
+            .await
+            .unwrap();
+    checkpoint.ensure_preserved().unwrap();
+    assert_eq!(checkpoint.execution_mode, "verification_only");
+    assert_eq!(
+        checkpoint.expected_verifier_fingerprint,
+        Some("b".repeat(64))
+    );
+    assert_eq!(checkpoint.expected_head_commit, Some("a".repeat(40)));
+    tx.rollback().await.unwrap();
+    assert_eq!(correction_state(store).await, failed);
+
+    let before_revision = retry_context(store).await;
+    assert_retry_provider_context(
+        &before_revision,
+        fixture.first.launch.run_id,
+        &"c".repeat(64),
+        1,
+    );
+    assert!(before_revision.checkpoint_source_correction);
+    assert_eq!(before_revision.remaining_mission_tokens, 4_600);
+
+    // Availability describes this family, not a substitute for a new
+    // source-bound Resume revision. Neither absence nor the old revision admits.
+    let mut unrevised = fixture.first_input.clone();
+    unrevised.idempotency_key = Uuid::new_v4();
+    unrevised.source_run_id = fixture.first.launch.run_id;
+    unrevised.expected_factory_version = before_revision.work_item.version;
+    unrevised.expected_workspace_fingerprint =
+        before_revision.workspace_fingerprint.clone().unwrap();
+    unrevised.expected_head_commit = before_revision.expected_head_commit.clone();
+    for revision_id in [None, fixture.first_input.contract_revision_id] {
+        unrevised.contract_revision_id = revision_id;
+        reject_correction_without_changes(store, unrevised.clone()).await;
+    }
+    assert_eq!(correction_state(store).await, failed);
+
+    let input = retry_revise(store, fixture.first.launch.run_id).await;
+    let revised = retry_context(store).await;
+    assert_retry_provider_context(&revised, fixture.first.launch.run_id, &"c".repeat(64), 1);
+    assert!(revised.checkpoint_source_correction);
+    assert_eq!(revised.remaining_mission_tokens, 4_600);
+    let before_admission = correction_state(store).await;
+    let second = retry_admit(store, &input).await;
+    let allocated = correction_state(store).await;
+    assert_eq!(allocated["task"]["attempt_count"], 3);
+    assert_retry_preserves_history(&before_admission, &allocated);
+    assert_eq!(second.launch.source_run_id, fixture.first.launch.run_id);
+    assert_eq!(second.launch.workspace_run_id, SOURCE);
+    assert_eq!(second.launch.workspace_connection_id, Some(CONNECTION));
+    assert_eq!(second.launch.provider_session_id, "fixture-session");
+    assert_eq!(
+        retained_run(&allocated, second.launch.run_id)["budget_tokens_limit"],
+        4_600
+    );
+
+    let replay = store
+        .create_factory_verification_recovery(input)
+        .await
+        .expect("the exact current correction must replay with the legacy verifier seal");
+    assert!(replay.replayed);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.recovery.id, second.recovery_id);
+    let FactoryVerificationRecoveryLaunch::SourceCorrection(launch) = replay.launch else {
+        panic!("replay must retain provider correction mode");
+    };
+    assert_eq!(launch.run_id, second.launch.run_id);
+    assert_eq!(launch.assignment_token, second.launch.assignment_token);
+    assert_eq!(launch.source_run_id, fixture.first.launch.run_id);
+    assert_eq!(launch.workspace_run_id, SOURCE);
+    assert_eq!(
+        launch.provider_session_id,
+        second.launch.provider_session_id
+    );
+    assert_correction_dispatch(store, &second.command, true).await;
+    assert_eq!(correction_state(store).await, allocated);
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue224_legacy_verifier_seal_rejects_contradictory_head_without_mutation(pool: PgPool) {
+    let fixture = legacy_verifier_seal_failed_correction(pool).await;
+    let store = &fixture.store;
+    let input = retry_revise(store, fixture.first.launch.run_id).await;
+    let snapshot = correction_state(store).await;
+    let seal = retry_event(&snapshot, fixture.verifier, "run.workspace_preserved");
+    let fault = retry_json_fault(
+        "contradictory explicit verifier seal head",
+        "UPDATE events SET payload=$3 WHERE corp_id=$1 AND id=$2",
+        Uuid::parse_str(seal["id"].as_str().unwrap()).unwrap(),
+        &seal["payload"],
+        "head_commit",
+        json!("e".repeat(40)),
+    );
+    retry_fault_denied(store, Some(&input), None, &fault).await;
+    let second = retry_admit(store, &input).await;
+    retry_fault_denied(store, Some(&input), Some(&second.command), &fault).await;
+}
+
+#[sqlx::test(migrations = "../../db/migrations")]
+#[ignore = "requires explicitly owned SQLx maintenance database"]
+async fn issue224_legacy_verifier_seal_requires_matching_fingerprint_and_verifier_grant(
+    pool: PgPool,
+) {
+    let fixture = legacy_verifier_seal_failed_correction(pool).await;
+    let store = &fixture.store;
+    let input = retry_revise(store, fixture.first.launch.run_id).await;
+    let snapshot = correction_state(store).await;
+    let seal = retry_event(&snapshot, fixture.verifier, "run.workspace_preserved");
+    let seal_id = Uuid::parse_str(seal["id"].as_str().unwrap()).unwrap();
+    let mut missing_fingerprint = seal["payload"].clone();
+    assert_eq!(
+        missing_fingerprint
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_fingerprint"),
+        Some(json!("b".repeat(64)))
+    );
+    let verifier = retry_recovery(&snapshot, fixture.verifier);
+    let verifier_id = Uuid::parse_str(verifier["id"].as_str().unwrap()).unwrap();
+    let mut missing_authorized_fingerprint = verifier["request"].clone();
+    assert_eq!(
+        missing_authorized_fingerprint
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_workspace_fingerprint"),
+        Some(json!("b".repeat(64)))
+    );
+    let faults = [
+        retry_column_fault(
+            "missing verifier seal fingerprint",
+            "UPDATE events SET payload=$3 WHERE corp_id=$1 AND id=$2",
+            seal_id,
+            &seal["payload"],
+            Some(missing_fingerprint),
+        ),
+        retry_json_fault(
+            "changed verifier seal fingerprint",
+            "UPDATE events SET payload=$3 WHERE corp_id=$1 AND id=$2",
+            seal_id,
+            &seal["payload"],
+            "workspace_fingerprint",
+            json!("e".repeat(64)),
+        ),
+        retry_column_fault(
+            "missing verifier authorization fingerprint",
+            "UPDATE factory_verification_recoveries SET request=$3 WHERE corp_id=$1 AND id=$2",
+            verifier_id,
+            &verifier["request"],
+            Some(missing_authorized_fingerprint),
+        ),
+        retry_json_fault(
+            "broken verifier checkpoint grant",
+            "UPDATE factory_verification_recoveries SET checkpoint_authority=$3 WHERE corp_id=$1 AND id=$2",
+            verifier_id,
+            &verifier["checkpoint_authority"],
+            "checkpoint_event_id",
+            json!(Uuid::new_v4()),
+        ),
+    ];
+    for fault in &faults {
+        retry_fault_denied(store, Some(&input), None, fault).await;
+    }
 }

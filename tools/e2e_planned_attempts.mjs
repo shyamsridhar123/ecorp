@@ -247,7 +247,7 @@ class Harness {
     const id = '[0-9a-fA-F-]{36}'
     const permitted = new RegExp(
       `^(?:/snapshot|/missions/preview|/factory/preflight|/factory/work-items/claim|` +
-      `/factory/work-items/${id}/(?:renew|materialize|verification-recoveries)|` +
+      `/factory/work-items/${id}/(?:renew|materialize|transition|verification-recoveries)|` +
       `/missions/${id}/(?:launch|contract-revisions)|/runs/${id}/verification-decision|/artifacts/${id})$`, 'u')
     requireThat(url.pathname.startsWith(prefix) && permitted.test(tail), 'route_outside_public_acceptance_scope', { route })
     return url
@@ -700,13 +700,28 @@ async function lifecycle(h) {
     'launch-unknown-attempt-option', [400, 422])
 
   h.phase = 'native-initial-provider-attempt'
+  equal(item(held).state, 'mission_created', 'initial_factory_not_ready_for_native_launch')
   const launched = await h.post(launchRoute, { requested_by: c.alice_actor_id }, 'launch-original')
   h.ids.original = uuid(launched.run_id)
+  // Match the native Factory controller: mission launch does not itself advance
+  // the linked Factory item from mission_created to running. Do not synthesize
+  // checkpoint eligibility or loosen the recovery guard to cover a skipped step.
+  const running = await h.post(`${prefix}/factory/work-items/${h.ids.item}/transition`, {
+    actor_id: c.alice_actor_id, claim_token: claimToken,
+    expected_version: item(held).version,
+    idempotency_key: `issue224-${h.tag}:transition:running:${item(held).version}`,
+    state: 'running', failure_detail: null,
+  }, 'factory-native-running')
+  equal(running.work_item.id, h.ids.item, 'native_running_transition_item_changed')
+  equal(running.work_item.mission_id, h.ids.mission, 'native_running_transition_mission_changed')
+  equal(running.work_item.state, 'running', 'native_factory_launch_transition_missing')
+  equal(running.work_item.version, item(held).version + 1, 'native_factory_launch_version_wrong')
   let sourceState = await h.wait('original-suspended-and-preserved', (s) => {
     const current = s.runs.find((row) => row.id === h.ids.original)
     return current?.status === 'cancelled' && current.workspace_disposition === 'preserved' &&
       typeof current.workspace_fingerprint === 'string'
   })
+  equal(item(sourceState).state, 'running', 'suspended_source_lost_native_factory_context')
   const original = clone(run(sourceState, h.ids.original))
   equal(task(sourceState).attempt_count, 1, 'original_provider_did_not_consume_attempt_one')
   equal(missionRuns(sourceState).length, 1, 'original_launch_created_multiple_runs')
@@ -887,7 +902,11 @@ async function lifecycle(h) {
   await recoveryReplay(firstInput.body, first.id, 'first-exact-replay')
   await h.denied(recoveryRoute, { ...clone(firstInput.body), reason: 'Different same-key correction authorization.' },
     'first-changed-payload')
-  checkProviderContext(await h.recoveryContext('latest-failed-provider-context'), first, 1, true)
+  // Availability advertises that a new latest-source revision can authorize a
+  // correction; it does not replace that separately required revision/admission.
+  const unrevisedContext = await h.unchanged('latest-failed-provider-context-read',
+    () => h.recoveryContext('latest-failed-provider-context'))
+  checkProviderContext(unrevisedContext, first, 1, true)
 
   h.phase = 'second-current-revision-and-correction'
   const beforeSecond = await h.observe()

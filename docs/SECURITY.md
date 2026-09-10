@@ -334,6 +334,13 @@ commit. Unavailable database reads do not turn into a failed provider attempt. M
 changed correction-origin provenance denies replay and publication through ordinary errors;
 it does not authorize a fresh provider, artifact, merge or deployment.
 
+Historical native verifier seals may omit a redundant `head_commit` only when
+the source is verification-only and its fingerprint exactly matches the valid
+authorized verifier guard. The retained authorized HEAD and independently
+reconstructed checkpoint authority remain mandatory. When a HEAD is required,
+explicit null, malformed or contradictory values still fail; provider sources
+cannot use this compatibility exception. No historical event or grant is rewritten.
+
 Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
 verification commit. Ready-artifact joins bind the new head to its run, producer, source,
 policy and verification digest; these relational checks are not fresh signature/byte validation.
