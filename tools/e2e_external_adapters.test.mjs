@@ -9,12 +9,13 @@ import {
 } from './e2e_external_adapters.mjs'
 
 const env = { CRONY_EXTERNAL_ADAPTER_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18437' }
-const reason = 'external CLI providers require a non-escapable process boundary'
+const disabledSummary = 'spawn=no, stream=no, steer=no, interrupt=no, stop=no, resume=no, usage=no, artifacts=no'
+const enabledSummary = 'spawn=yes, stream=yes, steer=no, interrupt=yes, stop=yes, resume=yes, usage=yes, artifacts=yes'
 const providers = ['claude-code', 'opencode']
 const runner = (os, available = os === 'windows') => ({
   id: 'fixture-runner', os, connected: true,
   capabilities: [
-    ...providers.map(name => ({ name, available, detail: available ? 'fixture' : reason })),
+    ...providers.map(name => ({ name, available, detail: name + '; ' + (os === 'windows' ? enabledSummary : disabledSummary) })),
     { name: 'workspace-isolation', available: true, source_repository: 'local/fixture-123',
       source_base_ref: 'HEAD', source_base_commit: 'a'.repeat(40) },
   ],
@@ -44,12 +45,12 @@ test('manual, remote, credential-bearing and non-origin endpoints are rejected',
 })
 
 for (const os of ['linux', 'macos']) {
-  test(os + ' requires explicit unavailable capabilities with the containment reason', () => {
+  test(os + ' requires explicit unavailability and native disabled-feature flags', () => {
     assert.equal(assertExternalRunner({ runners: [runner(os)] }, 'unix').os, os)
     assert.throws(() => assertExternalRunner({ runners: [runner(os, true)] }, 'unix'), /availability/)
     const unrelatedFailure = runner(os)
-    unrelatedFailure.capabilities[0].detail = 'command not found'
-    assert.throws(() => assertExternalRunner({ runners: [unrelatedFailure] }, 'unix'), /containment restriction/)
+    unrelatedFailure.capabilities[0].detail = enabledSummary + '; model discovery failed: command not found'
+    assert.throws(() => assertExternalRunner({ runners: [unrelatedFailure] }, 'unix'), /disabled execution features/)
   })
 }
 

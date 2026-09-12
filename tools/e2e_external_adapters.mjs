@@ -6,7 +6,7 @@ import { downloadVerifiedArtifact } from './artifact_client.mjs'
 
 const root = path.resolve(import.meta.dirname, '..')
 const adapters = ['claude-code', 'opencode']
-const unsupportedReason = 'non-escapable process boundary'
+const executionFeatures = ['spawn', 'stream', 'interrupt', 'stop', 'resume', 'usage', 'artifacts']
 
 export function externalAdapterConfig(args, env) {
   assert.ok(args.every(arg => ['--expect-windows', '--expect-unix', '--dry-run'].includes(arg)),
@@ -46,8 +46,11 @@ export function assertExternalRunner(state, expectedPlatform) {
     assert.equal(matches[0].available, expectedPlatform === 'windows',
       `${adapter} availability contradicts the expected platform contract`)
     if (expectedPlatform === 'unix') {
-      assert.ok(matches[0].detail?.includes(unsupportedReason),
-        `${adapter} must report the process-containment restriction, not an unrelated probe failure`)
+      // RunnerCapability exposes AdapterCapabilities.summary(), not the internal
+      // FeatureSupport::Unsupported reason. A failed probe still has spawn=yes.
+      const summary = new Set((matches[0].detail ?? '').split(/[;,]\s*/u))
+      assert.ok(executionFeatures.every(feature => summary.has(`${feature}=no`)),
+        `${adapter} must advertise disabled execution features, not an unrelated probe failure`)
     }
   }
   return runner

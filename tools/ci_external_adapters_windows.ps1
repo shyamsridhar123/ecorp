@@ -19,6 +19,10 @@ Import-Module (Join-Path $PSScriptRoot 'local_stack.psm1') -Force
 if (![IO.Path]::IsPathFullyQualified($FixtureRoot) -or !$PgBin -or
     ![IO.Path]::IsPathFullyQualified($PgBin)) { throw 'Explicit absolute fixture and PostgreSQL binary paths are required.' }
 $fixture = Get-LocalFullPath $FixtureRoot
+if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($fixture) -or
+    [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($PgBin)) {
+    throw 'Use literal CI fixture and PostgreSQL paths without wildcard metacharacters.'
+}
 if (!(Split-Path -Leaf $fixture).StartsWith('ecorp-external-adapters-') -or
     (Test-LocalPathEqual $fixture $repo) -or
     $fixture.StartsWith($repo + '\', [StringComparison]::OrdinalIgnoreCase) -or
@@ -147,6 +151,65 @@ function Start-FixtureProcess {
     Save-FixtureReceipts
 }
 
+function Start-FixturePostgres {
+    # PostgreSQL 17 pg_ctl uses CreateRestrictedProcess on Windows. Hosted runners
+    # are elevated; directly spawning postgres.exe is intentionally rejected.
+    $startedAfter = [DateTimeOffset]::UtcNow
+    $log = Join-Path $evidence 'postgres.log'
+    $startError = $null
+    $report.postgres_start_unverified = $true
+    $pgControl = $null
+    try {
+        # The background postmaster can inherit a captured pipe even with -l.
+        # File-backed stdio avoids waiting forever for that pipe's EOF.
+        $arguments = @('-D', $data, '-l', $log, '-o', "-p $PostgresPort -h 127.0.0.1", '-w', '-t', '30', 'start')
+        $parameters = @{
+            FilePath = $pg.pg_ctl; WorkingDirectory = $fixture; WindowStyle = 'Hidden'; PassThru = $true
+            ArgumentList = @($arguments | ForEach-Object { ConvertTo-LocalProcessArgument $_ })
+            Environment = (New-LocalProcessEnvironment -Environment $childEnv)
+            RedirectStandardOutput = (Join-Path $evidence 'pg-start.stdout.log')
+            RedirectStandardError = (Join-Path $evidence 'pg-start.stderr.log')
+        }
+        $pgControl = Start-Process @parameters
+        [void]$pgControl.Handle
+        if (!$pgControl.WaitForExit(45000)) {
+            $pgControl.Kill()
+            [void]$pgControl.WaitForExit(15000)
+            throw 'pg_ctl exceeded its bounded startup deadline; inspect its retained logs.'
+        }
+        if ($pgControl.ExitCode -ne 0) { throw 'pg_ctl startup failed; inspect its retained logs.' }
+    } catch { $startError = $_ }
+    finally { if ($pgControl) { $pgControl.Dispose() } }
+
+    # pg_ctl's Windows process handle is the launcher shell, not the postmaster.
+    # Combine its fresh private PID/data receipt with executable, creation-time
+    # for cleanup, followed by listener/SQL identity checks before test admission.
+    $pidFile = Join-Path $data 'postmaster.pid'
+    if (Test-Path -LiteralPath $pidFile) {
+        $receipt = @(Get-Content -LiteralPath $pidFile -First 2)
+        $postgresId = 0
+        if ($receipt.Count -ne 2 -or ![int]::TryParse($receipt[0], [ref]$postgresId) -or
+            $postgresId -le 0 -or !(Test-LocalPathEqual $receipt[1] $data)) {
+            throw 'The new PostgreSQL startup receipt is invalid; no PID was adopted.'
+        }
+        $identity = Get-LocalProcessIdentity -ProcessId $postgresId
+        if (!$identity -or !(Test-LocalPathEqual $identity.executable $pg.postgres) -or
+            [DateTimeOffset]$identity.started_utc -lt $startedAfter -or
+            [DateTimeOffset]$identity.started_utc -gt [DateTimeOffset]::UtcNow) {
+            throw 'The PostgreSQL executable or startup time is unverifiable; retain the fixture.'
+        }
+        $state.processes.postgres = @{
+            role = 'postgres'; workspace = $fixture; pid = $postgresId
+            executable = $identity.executable; started_utc = $identity.started_utc
+            stdout = $log; stderr = $log; launcher = 'pg_ctl restricted process'
+        }
+        Save-FixtureReceipts
+        $report.postgres_start_unverified = $false
+    }
+    if ($startError) { throw $startError }
+    if ($report.postgres_start_unverified) { throw 'pg_ctl returned without a verifiable postmaster receipt.' }
+}
+
 function Wait-FixtureReady {
     param([string]$Role, [scriptblock]$Check)
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
@@ -174,7 +237,7 @@ try {
         'user.email=ci@example.invalid', 'commit', '-m', 'Synthetic external-adapter fixture') | Out-Null
     $report.fixture_source_commit = Invoke-FixtureCommand 'source-before' $git @('-C', $source, 'rev-parse', 'HEAD')
     Invoke-FixtureCommand 'initdb' $pg.initdb @('-D', $data, '-U', 'ecorp_external_ci', '-A', 'trust', '--encoding=UTF8', '--locale=C') | Out-Null
-    Start-FixtureProcess 'postgres' $pg.postgres @('-D', $data, '-p', [string]$PostgresPort, '-h', '127.0.0.1')
+    Start-FixturePostgres
     Wait-FixtureReady 'postgres' {
         @(Get-NetTCPConnection -State Listen -LocalPort $PostgresPort -ErrorAction SilentlyContinue |
             Where-Object OwningProcess -eq $state.processes.postgres.pid).Count -eq 1
@@ -241,7 +304,7 @@ try {
     $report.failure = $_.Exception.Message
     throw
 } finally {
-    $cleanupFailed = $false
+    $cleanupFailed = $report.ContainsKey('postgres_start_unverified') -and $report.postgres_start_unverified
     foreach ($role in @('runner', 'server', 'postgres')) {
         if (!$state.processes.ContainsKey($role)) { continue }
         $record = $state.processes[$role]

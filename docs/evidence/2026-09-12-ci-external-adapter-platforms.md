@@ -19,7 +19,7 @@ and original sample were unchanged from base
 ## Approved correction
 
 - Ubuntu runs the common sample as an explicit unsupported-admission contract.
-  Both capabilities must advertise the containment restriction. Both launch
+  Both capabilities must advertise unavailable execution and disabled feature flags. Both launch
   requests must return the exact unavailable-adapter conflict, allocate zero
   runs, retain held missions and leave task state unchanged. Unrelated HTTP
   failures or fallback execution fail the test.
@@ -27,6 +27,8 @@ and original sample were unchanged from base
   through the real server, runner, managed worktrees and signed artifact download.
   Windows unavailability remains a failure.
 - The test checks the connected runner's OS, not the HTTP client's OS.
+  The capability DTO carries the native summary flags (such as `spawn=no`), not
+  the internal unsupported-reason string; the test verifies the actual wire contract.
 - Positive execution waits through the existing source-bound, read-only mission
   preview while native reconnect reconciliation is incomplete. It does not retry
   launches. Preview failures are narrowly classified and bounded to 60 seconds.
@@ -38,6 +40,9 @@ and original sample were unchanged from base
 - The hosted Windows image supplies PostgreSQL through `PGBIN`. The test initializes
   its own loopback-only cluster instead of starting the image's installed database
   service. Only `evidence/` is uploaded, excluding credentials, database and worktrees.
+  Native `pg_ctl` starts its restricted Windows process; the fixture validates the
+  fresh private PID/data receipt, executable, creation time, listener and SQL identity.
+  PostgreSQL's own administrative-user restriction remains intact.
 
 No production Rust, UI, migration, lockfile, runtime platform guard, live factory
 configuration, merge policy or account setting is changed.
@@ -101,6 +106,47 @@ paths being combined; `c` exposed the native reconciliation/readiness race.
 The final harness uses an actual empty private Git config, selects one Node
 executable and uses native read-only readiness previews. All started QA processes
 were stopped; no historical worktree or database was deleted.
+
+## Hosted follow-up and native-launcher verification
+
+The first hosted follow-up (`8d4356b`, run `34678881288`) passed quality, all three
+runner-platform jobs and Windows desktop. It exposed two fixture defects:
+
+- The Unix assertion expected the internal unsupported-reason text, which the
+  capability DTO does not transmit. The corrected test requires the actual
+  unavailable flag and every native execution feature to be disabled.
+- The hosted Windows account is elevated, so direct `postgres.exe` startup was
+  correctly rejected. PostgreSQL 17's native `pg_ctl` uses `CreateRestrictedProcess`
+  on Windows; the test now uses that launcher with a fresh owned data directory.
+
+Reference checked: https://github.com/postgres/postgres/blob/REL_17_STABLE/src/bin/pg_ctl/pg_ctl.c
+
+The native launcher also needs file-backed stdout/stderr: its background process
+can retain a captured pipe even when PostgreSQL's own log file is configured.
+Local attempt `e` exposed that wait. Its exact PostgreSQL PID, executable, creation
+time, listener and SQL data-directory identity were verified before a graceful
+stop; `verified-pipe-cleanup.json` preserves that independent cleanup receipt.
+No live-factory process or data was used.
+
+The final local repetition, `ecorp-external-adapters-ci-20260912f`, ran the updated
+code on parent `8d4356b` with the CI-only follow-up. It passed from
+`2026-09-12T06:59:39.1420696Z` to `2026-09-12T06:59:59.9095769Z`.
+Its synthetic source commit was `8c71cb43c843dcce0a41abe9a1255b87270ad808`.
+
+- Claude Code run `e45303a4-fd15-45f2-b35a-16768a693fe3`, artifact SHA-256
+  `b9869291d4623110cca3fa5274eecf7f5f819987b82e6e841dc511c5e6ed6b02`.
+- OpenCode run `edda6691-12cb-4d1e-82d7-69f8eda443f6`, artifact SHA-256
+  `c3d75798ac6b053395f91dcfa0a0d74a30ff3aa9dd3a7d9b3b00f1033fb36421`.
+- `e2e-external-adapters.json` SHA-256:
+  `a8d48c08a6bc31a08d3a7976d035213be943a615bc57d4adf031394cd1a53dc6`.
+- `fixture-report.json` SHA-256:
+  `ba1f6ead4c4972e6625d9e4efda7943c3750f091ebb60f004e5e1313208494eb`.
+
+Both providers completed with verified artifacts and prior termination events.
+The report confirms unchanged source and verified shutdown of all three owned
+processes; neither test port remained listening. All 14 contract regressions
+passed again. This does not itself prove the elevated hosted-image case; the
+replacement hosted run remains the next gate.
 
 ## Remaining boundary
 
