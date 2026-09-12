@@ -21,6 +21,9 @@
  * bob_actor_id, runner_id, source { repository, base_ref, base_commit }.
  * An optional guest_actor_id selects an existing guest; otherwise discover one
  * from the authorized public snapshot. A missing guest fails before creation.
+ * Optional allow_fixture_publication: true records review-only publication policy
+ * before claim so a separate owned publisher drill can continue the accepted case.
+ * This driver never publishes; omitted/false retains the original policy.
  *
  * No automatic POST retries and no cleanup/reset on failure. Intent, observations,
  * failed HTTP responses and the final result are retained for parent inspection.
@@ -168,9 +171,11 @@ async function configuration() {
   requireThat(Buffer.byteLength(encoded) <= 65_536, 'context_size_bound')
   const context = JSON.parse(encoded.replace(/^\uFEFF/u, ''))
   requireThat(context && typeof context === 'object' && !Array.isArray(context), 'context_object_required')
-  const allowed = new Set(['test_owned', 'workspace', 'server', 'corp_id', 'alice_actor_id', 'bob_actor_id', 'guest_actor_id', 'runner_id', 'source'])
+  const allowed = new Set(['test_owned', 'workspace', 'server', 'corp_id', 'alice_actor_id', 'bob_actor_id', 'guest_actor_id', 'runner_id', 'source', 'allow_fixture_publication'])
   requireThat(Object.keys(context).every((key) => allowed.has(key)), 'unexpected_context_fields')
   requireThat(context.test_owned === true && context.server === SERVER, 'owned_context_server_mismatch')
+  requireThat(context.allow_fixture_publication === undefined || typeof context.allow_fixture_publication === 'boolean',
+    'fixture_publication_option_must_be_boolean')
   requireThat(typeof context.workspace === 'string' && pathKey(context.workspace) === pathKey(WORKSPACE),
     'assigned_worktree_context_required')
   // Do not resolve/read an arbitrary context-supplied workspace before checking it.
@@ -225,6 +230,7 @@ class Harness {
         history: 'public_rows_native_journal_and_source_bindings_not_private_DB_row_audit',
         independent_signature_verification_by_client: false,
         SQL_or_counter_repairs: false,
+        publication_policy_declared_before_claim: config.context.allow_fixture_publication === true,
       },
       checks: this.checks,
       ids: this.ids,
@@ -529,6 +535,14 @@ async function lifecycle(h) {
     secret_ids: [], verification_required: true, verification_policy: verification,
     budget_tokens: MISSION_TOKENS, budget_cost_microusd: COST_LIMIT,
     max_task_attempts: ATTEMPTS, auto_merge: false,
+    ...(c.allow_fixture_publication === true ? {
+      deliverable_form: 'commit_branch',
+      publication: {
+        allowed: true, repository_allowlist: [REPOSITORY], base_ref: c.source.base_ref,
+        branch_prefix: 'ecorp/', status_before: 'Todo', review_status: 'In Review',
+        auto_merge: false, merge: false, deploy: false,
+      },
+    } : {}),
   }
   const task = (s) => one(s.tasks, (row) => row.id === h.ids.task, 'owned_task_not_unique')
   const mission = (s) => one(s.missions, (row) => row.id === h.ids.mission, 'owned_mission_not_unique')

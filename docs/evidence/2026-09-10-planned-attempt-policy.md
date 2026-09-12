@@ -1,5 +1,9 @@
 # Prospective task-attempt policy
 
+> September 12 follow-up: the patched public recovery sequence and publication
+> acceptance now pass. See [current stack acceptance](2026-09-12-pr-stack-acceptance.md).
+> The dated failures below remain historical evidence.
+
 September 10, 2026. Implementation and local validation for #224, on top of
 the #221 correction-retry candidate. The public drill now reproduces a native
 compatibility defect and the focused fix passes store tests.
