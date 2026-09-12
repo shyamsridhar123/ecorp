@@ -79,3 +79,27 @@ attribute these additional changes to the producing agent.
 
 No merge, auto-merge, branch-protection change, deployment, or issue completion
 is asserted by this report.
+
+## Fresh hosted follow-up
+
+Run `34669990108` on maintainer head
+`32282e8266caea9dd11e34e3a9425bb346dcecc3` passed quality and the Linux,
+Windows, and macOS runner jobs. Its real integration stack passed the repaired
+external-adapter refusal check, plus Codex, Copilot, gateways, artifact,
+portable-deliverable, and isolated-worktree checks.
+
+The next step exposed another old fixture assumption: the legacy mixed-provider
+demo graph assigned a Claude worker that Unix deliberately cannot dispatch.
+The retained log reports one dispatched root and a 409 for the unavailable
+second adapter. This is retained as a failed integration run, not a green suite.
+
+The graph E2E now exercises the existing source-selected staffing path with the
+deterministic runtime. It reads the runner's actual source tuple, requires three
+distinct mission-owned agents, binds every task to that exact source/runtime,
+and preserves concurrency, isolated worktrees, completion ordering, signed
+synthesis containing both verified root outputs, and native retry-exhaustion
+assertions. Windows additionally retains the original heterogeneous roster case.
+No production planner or adapter behavior is changed.
+
+This second test follow-up requires fresh native integration validation. Its
+JavaScript syntax and source review do not substitute for that result.
