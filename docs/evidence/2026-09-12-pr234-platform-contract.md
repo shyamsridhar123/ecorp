@@ -131,3 +131,17 @@ model-routing contract without executing Codex or another provider. The
 readiness loop retries only the exact native reconciliation-not-ready error;
 other policy errors fail immediately. The production fake-process restriction
 is unchanged. This correction still requires native CI acceptance.
+
+Run `34676242517` on `4a2630bb9283cd53e0053a5798e4a69b7b135d62` passed
+the complete controlled storage/staging/restart step. Factory-claims readiness
+then correctly rejected the old hardcoded `shyamsridhar123/ecorp` identity:
+the actual checkout now advertises `all-the-vibes/ecorp`.
+
+Claims, controller and publication fixtures now derive the literal repository
+namespace from the selected source checkout's Git origin. They do not rewrite
+the checkout's origin, resolve redirects, or weaken source matching. Project
+owners remain separate, and deliberate wrong-repository/mixed-case checks are
+preserved. The shared parser rejects credential-bearing, malformed, and
+non-GitHub origins without printing them. All 41 parser/read-boundary cases and
+the previous 10 adapter-driver cases pass; native Factory acceptance must still
+be checked on the resulting head.

@@ -1,3 +1,4 @@
+import { readFixtureSourceIdentity } from './fixture_source_identity.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import {
@@ -11,10 +12,12 @@ import path from 'node:path'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
+const sourceRoot = path.resolve(process.env.ECORP_TEST_SOURCE_REPOSITORY ?? root)
+const fixtureSource = readFixtureSourceIdentity(sourceRoot)
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
 const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-  cwd: root,
+  cwd: sourceRoot,
   encoding: 'utf8',
 }).trim()
 
@@ -144,7 +147,7 @@ async function restartLocalServer(demo) {
               budget_tokens: 20_000,
               budget_cost_microusd: 1_000_000,
               source: {
-                repository: 'shyamsridhar123/ecorp',
+                repository: fixtureSource.repository,
                 base_ref: 'HEAD',
                 base_commit: sourceBaseCommit,
               },
@@ -174,11 +177,11 @@ const claimRequest = {
   source_project_owner: 'shyamsridhar123',
   source_project_number: 3,
   source_project_item_id: `PVTI_FACTORY_E2E_${nonce}`,
-  source_repository_owner: 'shyamsridhar123',
-  source_repository_name: 'ecorp',
+  source_repository_owner: fixtureSource.owner,
+  source_repository_name: fixtureSource.name,
   source_issue_number: 59,
   source_issue_node_id: `I_FACTORY_E2E_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/59',
+  source_issue_url: `${fixtureSource.url}/issues/59`,
   source_title: 'Persist and fence dark-factory issue claims before mission dispatch',
   source_revision: '2026-09-01T00:00:00Z',
   idempotency_key: `factory-e2e-claim-${nonce}`,
@@ -187,7 +190,7 @@ const claimRequest = {
     schema_version: 1,
     source_of_truth: 'github_project',
     project_status: 'Todo',
-    repository_allowlist: ['shyamsridhar123/ecorp'],
+    repository_allowlist: [fixtureSource.repository],
     source_base_ref: 'HEAD',
     source_base_commit: sourceBaseCommit,
     adapter_allowlist: ['fake-process'],
@@ -226,16 +229,16 @@ assert.ok(claim.claim_token)
 const mixedCaseReplay = await postOk(claimPath, {
   ...claimRequest,
   source_project_owner: 'ShYaMsRiDhAr123',
-  source_repository_owner: 'SHYAMSRIDHAR123',
-  source_repository_name: 'ECorp',
-  source_issue_url: 'https://github.com/SHYAMSRIDHAR123/ECorp/issues/59',
+  source_repository_owner: fixtureSource.owner.toUpperCase(),
+  source_repository_name: fixtureSource.name.toUpperCase(),
+  source_issue_url: `https://github.com/${fixtureSource.repository.toUpperCase()}/issues/59`,
   idempotency_key: `factory-e2e-mixed-case-${nonce}`,
 })
 assert.equal(mixedCaseReplay.work_item.id, claim.work_item.id)
 assert.equal(mixedCaseReplay.claim_token, claim.claim_token)
 assert.equal(mixedCaseReplay.work_item.source_project_owner, 'shyamsridhar123')
-assert.equal(mixedCaseReplay.work_item.source_repository_owner, 'shyamsridhar123')
-assert.equal(mixedCaseReplay.work_item.source_repository_name, 'ecorp')
+assert.equal(mixedCaseReplay.work_item.source_repository_owner, fixtureSource.owner)
+assert.equal(mixedCaseReplay.work_item.source_repository_name, fixtureSource.name)
 
 const unauthorized = await post(claimPath, {
   ...claimRequest,
@@ -346,7 +349,7 @@ const materializeRequest = {
     ],
     allowed_tools: ['filesystem', 'shell'],
     prohibited_actions: ['merge or deploy without a separate current authorization'],
-    references: ['https://github.com/shyamsridhar123/ecorp/issues/59'],
+    references: [`${fixtureSource.url}/issues/59`],
     write_scope: ['crates/**', 'db/migrations/**', 'tools/**', 'docs/**'],
   },
 }
@@ -357,7 +360,7 @@ async function assertRejectedMaterialization(suffix, patch) {
     source_project_item_id: `PVTI_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
     source_issue_number: issueNumber,
     source_issue_node_id: `I_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
-    source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${issueNumber}`,
+    source_issue_url: `${fixtureSource.url}/issues/${issueNumber}`,
     source_title: `Reject invalid factory materialization ${suffix}`,
     source_revision: `2026-09-03T19:${String(30 + suffix).padStart(2, '0')}:00Z`,
     idempotency_key: `factory-e2e-rejected-claim-${suffix}-${nonce}`,
@@ -441,13 +444,13 @@ const linkedTask = afterMaterialize.snapshot.tasks.find(
   (task) => task.id === materialized[0].task_id,
 )
 assert.match(linkedTask.contract.objective, /linked GitHub issue/)
-assert.equal(linkedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(linkedTask.contract.source_repository, fixtureSource.repository)
 assert.equal(linkedTask.contract.source_base_ref, 'HEAD')
 assert.equal(linkedTask.contract.source_base_commit, sourceBaseCommit)
 assert.deepEqual(linkedTask.contract.write_scope, materializeRequest.contract.write_scope)
 assert.ok(
   linkedTask.contract.references.includes(
-    'https://github.com/shyamsridhar123/ecorp/issues/59',
+    `${fixtureSource.url}/issues/59`,
   ),
 )
 
@@ -619,7 +622,7 @@ const blockedClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_BLOCKED_${nonce}`,
   source_issue_number: 60,
   source_issue_node_id: `I_FACTORY_BLOCKED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/60',
+  source_issue_url: `${fixtureSource.url}/issues/60`,
   source_title: 'Consume eligible ECorp Build issues into governed missions',
   source_revision: '2026-09-01T00:01:00Z',
   idempotency_key: `factory-e2e-blocked-claim-${nonce}`,
@@ -643,7 +646,7 @@ const expiredClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_EXPIRED_CLAIMED_${nonce}`,
   source_issue_number: 61,
   source_issue_node_id: `I_FACTORY_EXPIRED_CLAIMED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/61',
+  source_issue_url: `${fixtureSource.url}/issues/61`,
   source_title: 'Recover an expired claimed factory item',
   source_revision: '2026-09-01T00:01:30Z',
   idempotency_key: `factory-e2e-expired-claimed-${nonce}`,
@@ -761,7 +764,7 @@ const failoverMaterialize = await postOk(
       acceptance_tests: ['the original work item is reused'],
       allowed_tools: ['filesystem', 'shell'],
       prohibited_actions: ['merge or deploy without a separate current authorization'],
-      references: ['https://github.com/shyamsridhar123/ecorp/issues/60'],
+      references: [`${fixtureSource.url}/issues/60`],
       write_scope: claimRequest.policy.write_scope,
     },
   },

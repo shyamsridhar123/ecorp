@@ -27,7 +27,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: node tools/check_migrations.mjs
       - name: Verify external-adapter E2E expectations cannot hide runtime failures
-        run: node --test tools/e2e_external_adapters.test.mjs
+        run: node --test tools/e2e_external_adapters.test.mjs tools/fixture_source_identity.test.mjs
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
