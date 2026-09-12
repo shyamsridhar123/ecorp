@@ -63,7 +63,7 @@ async function waitForMission(demo, missionId, timeoutMs = 30_000) {
   throw new Error(`timed out waiting for factory mission ${missionId}`)
 }
 
-async function restartLocalServer() {
+async function restartLocalServer(demo) {
   if (process.env.CRONY_SKIP_SERVER_RESTART === '1') return false
   const pidPath =
     process.env.CRONY_TEST_SERVER_PID_FILE ??
@@ -120,18 +120,50 @@ async function restartLocalServer() {
   child.unref()
 
   const deadline = Date.now() + 30_000
+  let lastReadinessError = 'server or runner is unavailable'
   while (Date.now() < deadline) {
     try {
-      const health = await fetch(`${server}/health`).then((response) =>
+      const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()))
+      const health = await fetch(`${server}/health`, { signal }).then((response) =>
         response.json(),
       )
-      if (health.status === 'ok' && health.runners >= 1) return true
-    } catch {
+      if (health.status === 'ok' && health.runners >= 1) {
+        // Connected runners may still be reconciling. A read-only preview checks
+        // dispatch readiness for the same adapter and immutable source tuple.
+        const preview = await fetch(
+          `${server}/api/corps/${demo.corp_id}/missions/preview`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              requested_by: demo.alice_actor_id,
+              title: 'Factory restart dispatch readiness',
+              preferred_adapter: 'fake-process',
+              strategy: 'single',
+              budget_tokens: 20_000,
+              budget_cost_microusd: 1_000_000,
+              source: {
+                repository: 'shyamsridhar123/ecorp',
+                base_ref: 'HEAD',
+                base_commit: sourceBaseCommit,
+              },
+            }),
+          },
+        )
+        const previewBody = await preview.json()
+        if (preview.ok) return true
+        lastReadinessError = `${preview.status}: ${JSON.stringify(previewBody)}`
+      }
+    } catch (error) {
       // The server is restarting or the runner has not reconnected yet.
+      lastReadinessError = error.message
     }
     await new Promise((resolve) => setTimeout(resolve, 200))
   }
-  throw new Error('server or runner did not recover after factory restart')
+  throw new Error(
+    `server or runner did not recover after factory restart: ${lastReadinessError}`,
+  )
 }
 
 const demo = await postOk('/api/demo/reset', {})
@@ -255,7 +287,7 @@ const duplicateActive = await post(claimPath, {
 })
 assert.equal(duplicateActive.response.status, 409)
 
-const restarted = await restartLocalServer()
+const restarted = await restartLocalServer(demo)
 
 const renewPath = `/api/corps/${demo.corp_id}/factory/work-items/${claim.work_item.id}/renew`
 const renewRequest = {
@@ -479,24 +511,57 @@ const forgedVerified = await post(transitionPath, {
   state: 'verified',
 })
 assert.equal(forgedVerified.response.status, 409)
+assert.match(
+  JSON.stringify(forgedVerified.body),
+  /cannot enter verified before its mission and task verification pass/,
+)
 
 const completed = await waitForMission(demo, materialized[0].mission_id)
 assert.equal(completed.mission.status, 'completed')
 const run = completed.state.snapshot.runs.find((item) => item.id === launch.run_id)
 assert.equal(run.status, 'completed')
-const verified = await postOk(transitionPath, {
+assert.equal(run.verification_status, 'passed')
+const completedTask = completed.state.snapshot.tasks.find(
+  (item) => item.id === materialized[0].task_id,
+)
+assert.equal(completedTask.status, 'completed')
+assert.equal(completedTask.verification_status, 'passed')
+// Accepted completion reconciles Factory in the same transaction. Read that
+// result before testing stale controller requests; do not verify it a second time.
+const verified = completed.state.snapshot.factory_work_items.find(
+  (item) => item.id === claim.work_item.id,
+)
+assert.ok(verified, 'completed mission is missing its factory work item')
+assert.equal(verified.state, 'verified')
+assert.equal(verified.version, 5)
+assert.equal(verified.mission_id, materialized[0].mission_id)
+assert.equal(verified.failure_detail, null)
+const verifiedEvents = completed.state.snapshot.events.filter(
+  (event) => event.aggregate_id === verified.id && event.type === 'factory.verified',
+)
+assert.equal(verifiedEvents.length, 1)
+assert.equal(verifiedEvents[0].aggregate_version, verified.version)
+assert.equal(verifiedEvents[0].correlation_id, materialized[0].mission_id)
+assert.equal(verifiedEvents[0].causation_id, launch.run_id)
+assert.deepEqual(verifiedEvents[0].payload, {
+  previous_state: 'running',
+  state: 'verified',
+  mission_id: materialized[0].mission_id,
+  run_id: launch.run_id,
+})
+const staleVerified = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
   expected_version: running.work_item.version,
-  idempotency_key: `factory-e2e-verified-${nonce}`,
+  idempotency_key: `factory-e2e-stale-verified-${nonce}`,
   state: 'verified',
 })
-assert.equal(verified.work_item.state, 'verified')
-assert.equal(verified.work_item.version, 5)
+assert.equal(staleVerified.response.status, 409)
+assert.match(JSON.stringify(staleVerified.body), /factory work item version is 5, not 4/)
 const forgedPublished = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-forged-published-${nonce}`,
   state: 'published',
 })
@@ -504,7 +569,7 @@ assert.equal(forgedPublished.response.status, 400)
 const invalidRegression = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-invalid-regression-${nonce}`,
   state: 'running',
 })
@@ -513,7 +578,7 @@ const finalState = await snapshot(demo)
 const finalFactoryItem = finalState.snapshot.factory_work_items.find(
   (item) => item.id === claim.work_item.id,
 )
-assert.equal(finalFactoryItem.state, 'verified')
+assert.deepEqual(finalFactoryItem, verified)
 const finalFactoryEvents = finalState.snapshot.events.filter(
   (event) => event.aggregate_id === claim.work_item.id,
 )
@@ -524,8 +589,13 @@ assert.deepEqual(
     'factory.claim_renewed',
     'factory.mission_linked',
     'factory.state_changed',
-    'factory.state_changed',
+    'factory.verified',
   ],
+)
+assert.ok(
+  finalFactoryEvents.every(
+    (event) => !JSON.stringify(event.payload).includes(claim.claim_token),
+  ),
 )
 const finalGuestSnapshot = await request(
   `/api/corps/${demo.corp_id}/snapshot?actor_id=${demo.eve_actor_id}`,
@@ -720,6 +790,8 @@ const report = {
   policy_widening_rejected: true,
   tool_and_secret_widening_rejected: true,
   pre_verification_transition_rejected: true,
+  completion_automatically_verified_factory: true,
+  stale_post_completion_transition_rejected: true,
   publication_state_requires_dedicated_operation: true,
   invalid_state_regression_rejected: true,
   expired_reclaim_policy_widening_rejected: true,
