@@ -145,3 +145,25 @@ preserved. The shared parser rejects credential-bearing, malformed, and
 non-GitHub origins without printing them. All 41 parser/read-boundary cases and
 the previous 10 adapter-driver cases pass; native Factory acceptance must still
 be checked on the resulting head.
+
+Run `34676728024` passed native Factory claims and controller execution. The
+next publication-recovery step exposed obsolete CI restart wiring: a numeric
+PID file, no explicit binary, a manual-session port, and a Windows-only helper.
+These are retained failures, not a reason to waive process ownership.
+
+The integration job now uses a dedicated loopback port18791 and captures a
+JSON ownership manifest after initial health readiness. Linux receipts bind
+the PID, boot ID, start ticks, executable inode/path, process root/cwd and owned
+listening socket. PID replacement, missing evidence, wrong binaries/ports and
+protected manual ports fail closed. Windows timestamp/listener verification
+and its existing direct-caller identity shape remain supported.
+
+All job restart paths share this checked helper and refresh the manifest.
+Storage recovery's original zero-grace/one-second-interval settings are
+preserved as bounded child-only environment overrides. Database credentials
+stay in the server's environment rather than restart arguments. No local
+Windows QA restart or alternate route around a previous denial was executed.
+
+The combined fixture guards pass **65/65** Node tests; JavaScript and workflow
+YAML checks pass. This is parser/ownership-guard evidence, not a live Linux
+restart. Native acceptance is still required on the new CI head.

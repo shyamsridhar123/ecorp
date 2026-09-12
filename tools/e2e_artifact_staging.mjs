@@ -4,8 +4,6 @@ import { createHash } from 'node:crypto'
 import {
   copyFile,
   mkdir,
-  open,
-  readFile,
   rm,
   stat,
   writeFile,
@@ -16,6 +14,7 @@ import { promisify } from 'node:util'
 import {
   downloadVerifiedArtifact,
 } from './artifact_client.mjs'
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 
 const execFile = promisify(execFileCallback)
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
@@ -24,9 +23,6 @@ const databaseUrl =
 const root = path.resolve(import.meta.dirname, '..')
 const composeFile = path.join(root, 'deploy', 'compose', 'docker-compose.yml')
 const artifactRoot = path.join(root, 'output', 'artifact-objects')
-const pidPath =
-  process.env.CRONY_TEST_SERVER_PID_FILE ??
-  path.join(root, 'output', 'local-pids.json')
 let psqlMode
 
 async function request(pathname, init) {
@@ -592,85 +588,13 @@ async function removeArtifactFinalizeFailure() {
 }
 
 async function restartLocalServer() {
-  const pidText = (await readFile(pidPath, 'utf8')).trim()
-  const jsonPidFile = pidText.startsWith('{')
-  const pidState = jsonPidFile
-    ? JSON.parse(pidText)
-    : { server: Number(pidText) }
-  const serverPid = Number(pidState.server)
-  assert.ok(Number.isSafeInteger(serverPid) && serverPid > 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const binary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const recoveryStdout = path.join(
-    root,
-    'output',
-    'artifact-recovery-server.stdout.log',
-  )
-  const recoveryStderr = path.join(
-    root,
-    'output',
-    'artifact-recovery-server.stderr.log',
-  )
-  await writeFile(recoveryStdout, '')
-  await writeFile(recoveryStderr, '')
-  const stdout = await open(recoveryStdout, 'a')
-  const stderr = await open(recoveryStderr, 'a')
-  const child = spawn(
-    binary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-      '--artifact-recovery-grace-secs',
-      '0',
-      '--artifact-recovery-interval-secs',
-      '1',
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout.fd, stderr.fd],
+  return restartOwnedTestServer({
+    root, server, databaseUrl, logPrefix: 'artifact-recovery-server',
+    environment: {
+      CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0',
+      CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1',
     },
-  )
-  await writeFile(
-    pidPath,
-    jsonPidFile
-      ? `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`
-      : `${child.pid}\n`,
-  )
-  child.unref()
-  await stdout.close()
-  await stderr.close()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return
-    } catch {
-      // Server recovery is still running.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  const recoveryError = await readFile(
-    recoveryStderr,
-    'utf8',
-  ).catch(() => '')
-  throw new Error(`server did not recover staged artifacts: ${recoveryError}`)
+  })
 }
 
 const demo = await post('/api/demo/reset', {})
