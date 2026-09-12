@@ -477,6 +477,88 @@ diagnostic lead, not yet a verified fix; the identity fixture and production
 authentication/authorization code are unchanged. OIDC, secret, approval, budget
 and later integration results must not be inferred from publication success.
 
+## Identity probe readiness and Windows native-test scheduling
+
+Run `34701158006` on `2d26ee5132a896ec151caffc4f41e04f6ea260a0`
+passed the Windows ownership/CRLF checks and complete external-adapter job.
+Integration still timed out waiting for `e2e_identity.mjs`'s lifecycle assignment.
+The native Windows runner-test job also timed out opening `ConnectionManager`
+in two mock-only connection fixtures (`integration_tests.rs:143`).
+
+The identity fixture treated `registered` as dispatch readiness. The server's
+`select_ready_runner` requires `dispatch_ready`, matching capabilities and Corp,
+then sorts compatible runner IDs. The fixture now reuses the already tested
+native read-only preview barrier with a unique per-connection synthetic marker.
+Its early-sorting probe ID must be the first compatible fixture candidate;
+launch must explicitly name that probe before the test awaits its socket frame.
+The frame must match run, mission, Corp and fake adapter and contain the native
+assignment fence, without brokered secrets or a promoted source marker.
+
+The synthetic marker is preview-only. The real lifecycle mission remains
+source-unbound as before, preserving its staffing and revocation expectations;
+this is not evidence of a real repository checkout. There is one mission and
+one launch, with no launch retries. Assignment waiting observes its rejection
+while HTTP is pending and removes its timer/listeners on every exit path.
+HTTP requests are bounded and refuse redirects. Enrollment rotation/replay,
+superseded-epoch rejection, wrong-assignment-token rejection and active
+revocation checks remain in place.
+
+The fixture now requires explicit owned configuration and has a non-mutating
+`--dry-run`. The full OIDC/RBAC suite remains the default Linux integration lane,
+using explicit test API/issuer ports `18473`/`18472`. The fixture's database and
+synthetic master key are passed in its process environment rather than arguments;
+environment delivery remains reduced assurance. Windows adds a clearly labeled
+`--lifecycle-only` proof that exits before starting an issuer or production-mode
+server and reports `oidc_executed: false`. It does not replace Linux OIDC coverage.
+
+The Windows setup timeout was traced to `PrivateRoot::open`'s native PowerShell
+ACL establishment operation, which has a ten-second deadline. No login/provider
+operation had begun at the failing constructor. Neither that ACL procedure nor
+its deadline, process ownership, cleanup or runtime code is changed. The Windows
+CI test executable runs all its tests with native libtest `--test-threads=1` to
+remove inter-test process contention. Linux/macOS keep their existing scheduling;
+no tests are filtered or ignored by this change. This is a CI contention
+mitigation to verify on hosted Windows, not a claim that the precise timing
+cause has already been reproduced there.
+
+Observed local evidence on parent `2d26ee5` plus this CI-only correction:
+
+- The two previously failing Windows fixtures passed the targeted serialized
+  diagnostic in 64.78 seconds. Its 188 filtered tests are not claimed as executed
+  by that targeted command.
+- Eight Node regression files passed all 70 tests, with zero skips. These cover
+  explicit scope, preview-only markers, readiness, candidate order, exact
+  assignment, wrong scope/source, error/timeout cleanup, retained full OIDC
+  assertions and Windows-only unfiltered serialization.
+- New isolated fixture `ecorp-external-adapters-ci-20260912i` passed between
+  `2026-09-12T16:32:08.6458350Z` and `2026-09-12T16:32:52.7879785Z`, using only
+  test API `18449` and PostgreSQL `55449`. All existing adapter, graph and
+  controlled-artifact checks passed alongside the new lifecycle proof.
+- Probe `aaa-identity-probe-5ebb0986-2290-483e-8cd4-fd795f9fdfe9` needed eight
+  native readiness previews and received the exact assignment. Both credential
+  rotations, enrollment/revocation replay rejection, stale-epoch fencing and
+  wrong-token rejection passed. Active revocation produced run `lost`, task
+  `blocked`, mission `failed`, and agent `idle`, matching the original contract.
+- Synthetic source `0e85384033b9827cf6ccbaaee9b60acb6d40fc7e` remained unchanged.
+  The wrapper verified shutdown of its runner, server and PostgreSQL, and a
+  separate listener check found zero listeners on the two test ports. All data
+  and evidence were retained. Real provider and GitHub effects were zero.
+- `e2e-identity-lifecycle.json` SHA-256:
+  `926cdab975872bbc15171c24ea287607971ad1617fdebf8b5758a48dfd344264`.
+- `fixture-report.json` SHA-256:
+  `42163589131196cf5f31d9728293382856f0e025372c7b2d67d5183ebd474809`.
+- Node syntax, PowerShell AST, workflow YAML, diff hygiene, web build and web lint
+  passed. The full required migration/Rust gates also passed: 40 immutable
+  migrations, format, Clippy and `cargo test --workspace -- --test-threads=1`.
+  This ran 452 passing tests, including all 190 runner tests (261.97 seconds),
+  with 200 existing opt-in database cases explicitly ignored and ambient
+  `DATABASE_URL` removed. No application or Rust source changed. Hosted results
+  for the updated full identity/OIDC and serialized Windows lanes remain pending.
+
+The live factory/database/runner credentials and four pending recovery files
+were not used or modified. No merge, deployment or real factory dispatch is
+authorized by these test results.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence, native ownership-unit
@@ -485,8 +567,9 @@ or browser acceptance. Hosted runs have proved both external-adapter lanes,
 Linux roster SQL, both graph variants, artifact staging/restart, factory claims
 with native automatic verification, and the full Project-controller suite.
 The ownership-manifest startup/restart chain and publication recovery are now
-hosted-verified. The next run must verify the Windows CRLF assertion correction;
-the identity lifecycle failure and later integration steps remain unresolved.
+hosted-verified. The Windows CRLF correction is hosted-verified. The next run must
+verify the updated full identity/OIDC fixture and serialized Windows native
+fixtures; later integration steps remain unverified at this checkpoint.
 The local readiness smoke does not claim SQL fault injection or artifact
 restart recovery on Windows.
 

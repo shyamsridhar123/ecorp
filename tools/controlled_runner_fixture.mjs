@@ -37,7 +37,7 @@ export function artifactStagingFixtureConfig(args, env) {
 }
 
 export function controlledReadinessSource(runnerId, connectionEpoch) {
-  assert.match(runnerId, /^aaa-artifact-staging-[0-9a-f-]{36}$/u)
+  assert.match(runnerId, /^aaa-(artifact-staging|identity-probe)-[0-9a-f-]{36}$/u)
   assert.match(connectionEpoch, /^[0-9a-f-]{36}$/u)
   // A synthetic, per-connection marker for preview selection only. No mission
   // is executed against this marker and it is not evidence of a Git checkout.
@@ -82,7 +82,7 @@ export async function waitForControlledRunnerDispatch({ request, demo, runner },
     const preview = await request(`${prefix}/missions/preview`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ requested_by: demo.alice_actor_id, preferred_adapter: 'fake-process',
-        title: 'Preview controlled artifact runner readiness only.', source }),
+        title: 'Preview controlled fixture runner readiness only.', source }),
     })
     previews++
     if (preview.response.status === 200) return previews
@@ -94,8 +94,8 @@ export async function waitForControlledRunnerDispatch({ request, demo, runner },
 }
 
 export function assertControlledAssignment(launch, runner) {
-  assert.equal(launch.runner_id, runner.runnerId, 'Artifact fixture assignment went to a different runner')
-  assert.ok(launch.run_id, 'Artifact fixture launch omitted the assigned run')
+  assert.equal(launch.runner_id, runner.runnerId, 'Controlled fixture assignment went to a different runner')
+  assert.ok(launch.run_id, 'Controlled fixture launch omitted the assigned run')
 }
 
 export function selectFixtureRunnerForSource(state, demo, expected) {

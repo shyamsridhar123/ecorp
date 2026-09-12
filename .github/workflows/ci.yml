@@ -28,7 +28,7 @@ jobs:
       - name: Test platform-specific CI fixture contracts
         env:
           ECORP_OWNED_PROCESS_TEST: '1'
-        run: node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs
+        run: node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs tools/identity_fixture.test.mjs tools/ci_runner_tests.test.mjs
       - name: Test native Linux process ownership
         run: python3 -B tools/owned_test_process_linux_test.py -v
       - run: node tools/check_migrations.mjs
@@ -186,7 +186,13 @@ jobs:
       - name: Verify idempotent branch and pull-request publication with recovery
         run: node tools/e2e_factory_publication.mjs
       - name: Verify OIDC, Corp RBAC, runner enrollment, rotation, replay defense, and revocation
-        run: node tools/e2e_identity.mjs
+        env:
+          CRONY_IDENTITY_TEST: '1'
+          CRONY_AUTH_TEST_PORT: '18473'
+          FAKE_OIDC_PORT: '18472'
+        run: |
+          node tools/e2e_identity.mjs --dry-run
+          node tools/e2e_identity.mjs
       - name: Verify scoped secret brokering without plaintext leakage
         run: node tools/e2e_secrets.mjs
       - name: Verify durable risky-action approvals and exactly-once decision effects
@@ -295,7 +301,14 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p crony-runner
+      # Keep every test and the native 10-second private-ACL deadline. Avoid
+      # unrelated test-process contention on the hosted Windows worker.
+      - name: Run Windows runner tests serially
+        if: runner.os == 'Windows'
+        run: cargo test -p crony-runner -- --test-threads=1
+      - name: Run Unix runner tests
+        if: runner.os != 'Windows'
+        run: cargo test -p crony-runner
       - run: node tools/platform_runner_contract.mjs
       - uses: actions/upload-artifact@v4
         with:

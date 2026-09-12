@@ -71,6 +71,7 @@ $preview = [ordered]@{
         'Verify signed artifact download, session, usage and provider termination before completion.',
         'Verify the original mixed Codex/Claude parallel graph, dependency artifacts and bounded retries.',
         'Verify controlled-runner readiness and exact assignment using one synthetic artifact; no fault injection or restart.',
+        'Verify synthetic runner identity readiness, rotation, replay fencing and active revocation; no OIDC service.',
         'Stop only owned fixture processes and preserve all data, worktrees and evidence.'
     )
     services_started = $false
@@ -311,6 +312,16 @@ try {
     Invoke-FixtureCommand 'controlled-runner-preview' $node @((Join-Path $repo 'tools/e2e_artifact_staging.mjs'), '--readiness-smoke', '--dry-run') $controlledEnv | Out-Null
     Invoke-FixtureCommand 'controlled-runner-readiness' $node @((Join-Path $repo 'tools/e2e_artifact_staging.mjs'), '--readiness-smoke') $controlledEnv 90 | Out-Null
     $report.controlled_runner_readiness = 'passed'
+    $identityEnv = $childEnv.Clone()
+    $identityEnv.CRONY_IDENTITY_TEST = '1'; $identityEnv.CRONY_SERVER_HTTP = $api
+    $identityEnv.CRONY_IDENTITY_OUTPUT = Join-Path $evidence 'e2e-identity-lifecycle.json'
+    Invoke-FixtureCommand 'identity-preview' $node @((Join-Path $repo 'tools/e2e_identity.mjs'), '--lifecycle-only', '--dry-run') $identityEnv | Out-Null
+    Invoke-FixtureCommand 'identity-lifecycle' $node @((Join-Path $repo 'tools/e2e_identity.mjs'), '--lifecycle-only') $identityEnv 90 | Out-Null
+    $identityReport = Get-Content -LiteralPath $identityEnv.CRONY_IDENTITY_OUTPUT -Raw | ConvertFrom-Json
+    if ($identityReport.coverage -ne 'runner_identity_lifecycle_only' -or $identityReport.oidc_executed -or
+        $identityReport.probe_runner_id -ne $identityReport.assigned_runner_id -or
+        $identityReport.active_revocation_run_status -ne 'lost') { throw 'Identity lifecycle evidence is incomplete or overstated.' }
+    $report.identity_lifecycle = 'passed'
     $after = Invoke-FixtureCommand 'source-after' $git @('-C', $source, 'rev-parse', 'HEAD')
     $status = Invoke-FixtureCommand 'source-status' $git @('-C', $source, 'status', '--porcelain')
     if ($after -ne $report.fixture_source_commit -or $status) { throw 'The fixture source checkout changed.' }
