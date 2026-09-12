@@ -731,6 +731,7 @@ fn artifact_policy() -> VerificationPolicy {
 
 fn contract(objective: String, expected_output: &str, budget_tokens: i64) -> TaskContract {
     TaskContract {
+        workspace_connection_id: None,
         objective,
         expected_output: expected_output.to_owned(),
         source_repository: None,

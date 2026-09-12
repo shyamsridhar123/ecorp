@@ -42,6 +42,35 @@ Server unit coverage checks that only failure reporting uses the cleanup permiss
 effect-advancing variants retain `Publish`. These are scoped store and server-unit checks,
 not a new real-provider or real-GitHub publication run.
 
+## Exact mission-to-Factory context
+
+The [exact mission-context report](evidence/2026-09-09-mission-work-context.md)
+records the separate #199 source-attribution check: twelve actual-migration
+store cases, including a target outside the 500-item Factory window, plus
+authorized API/browser reads and a guest-visible mission that retains neutral
+origin. It creates no new provider run and does not replace Factory publication
+or production-identity acceptance.
+
+## Saved-connection Factory routing
+
+The [saved-connection report](evidence/2026-09-09-factory-saved-connections.md)
+separates 14 actual-store cases, four actual-handler/real-migration cases,
+read-only native API checks, and a real three-specialist Copilot dispatch.
+The final integration source was retained after a task-budget stop; its
+verification/review/publication remain pending #206. Passing preflight or
+specialist handoffs must not be reported as an accepted application.
+
+## Checkpoint cancellation reconciliation
+
+The [#206 reconciliation report](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md)
+separates eleven actual-migration store cases from CLI/client coverage and the retained
+application's runtime outcome. Store cases exercise the exact legacy controller cancellation,
+current authority and replay, actor-demotion serialization, quarantined predecessors, stale
+events/source proof, explicit stops, policy cancellations and transactional rollback.
+Run only the explicitly owned `issue206_` SQLx lane for those cases; ordinary workspace tests
+leave it ignored. A successful reconciliation is not application verification, review or
+publication, and a missing required artifact must still fail its persisted check.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

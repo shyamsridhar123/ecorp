@@ -201,6 +201,34 @@ filesystem boundary; external CLI adapters currently refuse Unix execution.
 
 ## Mission launch admission
 
+### Saved project execution connections
+
+Room-scoped `workspace_connections` retain repository/agent/node configuration
+independently of live runner inventory. Actor-private setup operations cross the
+existing authenticated runner channel as fixed native operations, not server
+shell execution. GitHub CLI and the native coding-agent authentication/catalog
+interfaces remain the implementation boundary. Shared events carry only status
+refresh hints; private sign-in instructions and discovery catalogues do not enter
+the shared connection DTO.
+
+Runs persist an optional execution-connection ID. Planning, run admission,
+dispatch and resume retain that binding alongside the immutable source tuple.
+Legacy unbound work uses only legacy capabilities; it cannot borrow another
+project connection's account or source. Source-only recovery resolves previously
+accepted pins without requiring a new provider sign-in. Native final setup
+receipts survive reconnect and wait for a server acknowledgement before provider
+readiness becomes dispatchable. See [project connections](PROJECT_CONNECTIONS.md).
+
+Factory can persist the same optional `workspace_connection_id` in its immutable
+claim policy. New bound controller intake reads the existing checked source
+through a scoped connection lookup rather than requiring a second local checkout.
+Preflight uses the connection-aware planner and current connection-room admission;
+materialization reads the binding together with the claimed source and repeats
+admission. Every task must match the policy's exact connection, including its
+absence for legacy work. Recovery cannot change that binding or borrow unbound
+capabilities. The lookup returns the shared connection DTO, not its private native
+configuration, setup reports or credentials.
+
 A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
 Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
 materialization leave the mission in that held state. The existing authenticated launch endpoint
@@ -578,6 +606,18 @@ existing `VerifyRun` command, with no model, provider session, provider secrets,
 allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
 unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
 
+Legacy controller catch-up could project that recoverable suspension as a terminal Factory
+`cancelled` item. The exact recovery-context endpoint now returns a
+`checkpoint_cancellation_event_id` only when native source authority and the current
+controller-cancellation operation prove that specific case. Explicit checkpoint recovery
+reconciles it through a separate, actor-authorized operation, appending
+`factory.checkpoint_cancellation_reconciled` and advancing only the Factory version/state.
+The CLI then refreshes context and uses the existing claim and recovery path. Dry runs never
+reconcile; generic polling, provider resume, and other recovery modes cannot reopen cancelled
+work. Future catch-up leaves server-validated checkpoints recoverable instead of mirroring
+them into terminal cancellation. See
+[the reconciliation evidence](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md).
+
 The original checkpoint HEAD still guards admission, while the native exporter may create a
 first verification commit. Retention accepts that new HEAD only through the exact verifier's
 ready source artifact and source/policy/verification bindings. A missing or mismatched commit
@@ -734,6 +774,24 @@ revision. GitHub Project status remains `In Progress`; only verified publication
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.
+The snapshot is not an origin index: an omitted Factory item cannot establish
+that a mission was created directly.
+
+`GET /api/corps/{corp_id}/missions/{mission_id}/context` resolves one authorized
+mission's exact stored Factory link. It uses the existing unique mission-to-item
+relationship, not the recent-item window. Authorization and the left join share
+one database statement; only current human operators who belong to the mission's
+room receive a result. The response contains the echoed viewer/mission/room scope
+and minimal issue/link metadata, not a claim token, policy or account report.
+Unknown, hidden or unavailable context stays neutral in the UI.
+
+Factory materialization commits mission creation and the unique link together,
+and no supported path later adopts or unlinks a committed mission. Therefore a
+successful complete lookup without a link establishes a direct/non-Factory
+mission. It does not prove that somebody used the browser rather than another
+direct client. An inconsistent cross-Corp link is rejected rather than filtered
+into a false Direct classification.
+
 Controller discovery does not use that bounded snapshot as an index. After listing the current
 GitHub Project candidates, the trusted controller sends only those Project item IDs to a
 Corp-authorized lookup endpoint together with the normalized Project owner and Project number. The

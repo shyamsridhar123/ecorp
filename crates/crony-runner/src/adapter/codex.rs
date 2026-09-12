@@ -38,6 +38,7 @@ pub struct CodexAdapter {
     prefix_args: Arc<Vec<OsString>>,
     available: bool,
     usage: Arc<DashMap<String, UsageSnapshot>>,
+    profile: Option<super::connection::ProfileEnvironment>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,22 @@ impl CodexAdapter {
             prefix_args: Arc::new(prefix_args),
             available,
             usage: Arc::new(DashMap::new()),
+            profile: None,
+        }
+    }
+
+    pub(crate) fn for_connection(
+        command: Option<PathBuf>,
+        prefix_args: Vec<OsString>,
+        profile: super::connection::ProfileEnvironment,
+    ) -> Self {
+        let available = command.as_ref().is_some_and(|path| path.is_file());
+        Self {
+            command: command.unwrap_or_default(),
+            prefix_args: Arc::new(prefix_args),
+            available,
+            usage: Arc::new(DashMap::new()),
+            profile: Some(profile),
         }
     }
 
@@ -132,24 +149,17 @@ impl CodexAdapter {
         });
 
         let mut command = self.command();
+        append_app_server_args(&mut command, self.profile.as_ref());
         command
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            // Do not expose a supervised run to user-configured MCP servers or apps. Managed
-            // policies can still add mandatory controls, which Codex reports as notifications.
-            .arg("-c")
-            .arg("mcp_servers={}")
-            .arg("-c")
-            .arg("features.apps=false")
-            .arg("-c")
-            .arg("hooks={}")
             .envs(&request.environment)
             .current_dir(&request.workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(profile) = &self.profile {
+            profile.apply_request(&mut command, &request.environment)?;
+        }
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn Codex app-server {}", self.command.display()))?;
@@ -589,6 +599,27 @@ impl CodexAdapter {
                 AdapterExit::Cancelled
             }
         })
+    }
+}
+
+pub(crate) fn append_app_server_args(
+    command: &mut Command,
+    profile: Option<&super::connection::ProfileEnvironment>,
+) {
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        // Keep native hooks/apps/MCP disabled for both setup and execution.
+        .args([
+            "-c",
+            "mcp_servers={}",
+            "-c",
+            "features.apps=false",
+            "-c",
+            "hooks={}",
+        ]);
+    if profile.is_some_and(|scope| !scope.is_system()) {
+        // Avoid a process-wide keyring identity escaping the personal CODEX_HOME.
+        command.args(["-c", "cli_auth_credentials_store=\"file\""]);
     }
 }
 

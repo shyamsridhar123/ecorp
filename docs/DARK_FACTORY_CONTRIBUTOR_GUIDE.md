@@ -387,6 +387,27 @@ lease, fencing token, policy snapshot, and version provide execution authority.
 
 ## Run the factory controller
 
+### Reuse a saved project connection
+
+If the repository and native coding agent were connected in ECorp, give the
+trusted controller `--workspace-connection-id <saved-connection-id>` and the
+matching repository, source ref and adapter. New intake reads the connection's
+runner-checked commit through the existing control plane: it does not require
+another manually cloned checkout on the controller host.
+
+The supported launcher accepts and remembers
+`ECORP_FACTORY_WORKSPACE_CONNECTION_ID` and `ECORP_FACTORY_SOURCE_BASE_REF`.
+The latter is independent of the legacy runner's source ref. Setting up another
+project must not retarget that runner's original checkout or replace its native
+account. See [the connection guide](PROJECT_CONNECTIONS.md#use-the-same-connection-for-factory).
+
+The connection becomes immutable claim policy. Keep the same option when
+recovering that work item; another connection or an omitted option is rejected,
+not silently substituted. Current room access is still required. Read-only
+replay of a materialized mission does not require the provider to be online.
+The legacy checkout-based examples below remain available when no saved
+connection is selected.
+
 ### Preview without mutation
 
 Run a dry run first:

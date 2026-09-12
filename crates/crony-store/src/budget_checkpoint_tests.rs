@@ -3,6 +3,9 @@
 use super::*;
 use crony_domain::{DeliverableForm, DeliverableSpec, StoppedSourceCheckpoint};
 
+#[path = "checkpoint_cancellation_tests.rs"]
+mod cancellation_reconciliation;
+
 const CORP: Uuid = Uuid::from_u128(1);
 const MISSION: Uuid = Uuid::from_u128(2);
 const TASK: Uuid = Uuid::from_u128(3);

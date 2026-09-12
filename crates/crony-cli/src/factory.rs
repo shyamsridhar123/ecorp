@@ -18,6 +18,7 @@ use clap::{Args, ValueEnum};
 use crony_domain::{
     FactoryVerificationRecoveryMode, TaskContract, VerificationPolicy, write_scope_is_valid,
 };
+use crony_protocol::FactoryVerificationRecoveryContextResponse;
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,6 +67,10 @@ pub struct FactoryArgs {
         default_value = "."
     )]
     pub source_repository_path: PathBuf,
+
+    /// Reuse a saved native project/agent connection rather than legacy runner routing.
+    #[arg(long, env = "ECORP_FACTORY_WORKSPACE_CONNECTION_ID")]
+    pub workspace_connection_id: Option<Uuid>,
 
     #[arg(long)]
     pub adapter: String,
@@ -245,6 +250,7 @@ struct ProjectFieldOption {
 
 #[derive(Debug, Clone)]
 struct ExistingFactoryItem {
+    id: Uuid,
     version: i64,
     source_project_owner: String,
     source_project_number: i64,
@@ -261,6 +267,7 @@ struct ExistingFactoryItem {
     mission_id: Option<Uuid>,
     policy: Value,
     lease_expires_at: DateTime<Utc>,
+    checkpoint_cancellation: Option<FactoryVerificationRecoveryContextResponse>,
 }
 
 struct ResolvedSourceCommit {
@@ -356,7 +363,8 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         .filter(|item| project_item_is_candidate(&args, item))
         .map(|item| item.id.clone())
         .collect::<Vec<_>>();
-    let existing = lookup_factory_work_items(client, server, &args, &candidate_ids).await?;
+    let mut existing = lookup_factory_work_items(client, server, &args, &candidate_ids).await?;
+    load_checkpoint_cancellations(client, server, &args, &mut existing).await?;
     let mut issue_cache = HashMap::new();
     let mut evaluated = evaluate_items(&args, project_items.items, &existing, &mut issue_cache)?;
     evaluated.sort_by(|left, right| {
@@ -371,18 +379,18 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         args.active_issue
             .store(evaluated[index].issue.number, Ordering::Relaxed);
     }
-    let selected_source_base_commit = selected_index
-        .map(|index| {
-            if evaluated[index].recovery {
-                resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)
-            } else {
-                resolve_source_base_commit(&args).map(|commit| ResolvedSourceCommit {
-                    commit,
-                    legacy_upgrade_required: false,
-                })
+    let selected_source_base_commit = if let Some(index) = selected_index {
+        Some(if evaluated[index].recovery {
+            resolve_recovery_source_base_commit(&args, &evaluated[index], &existing)?
+        } else {
+            ResolvedSourceCommit {
+                commit: resolve_new_source_base_commit(client, server, &args).await?,
+                legacy_upgrade_required: false,
             }
         })
-        .transpose()?;
+    } else {
+        None
+    };
     let preview_publication_base_ref = selected_index
         .map(|index| {
             if evaluated[index].recovery {
@@ -482,6 +490,15 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
                 .as_ref()
                 .is_some_and(|resolved| resolved.legacy_upgrade_required),
             "preflight": preflight,
+            "checkpoint_reconciliation_needed": selected_index.is_some_and(|index| {
+                existing.get(&evaluated[index].project_item.id)
+                    .is_some_and(|item| item.checkpoint_cancellation.is_some())
+            }),
+            "checkpoint_reconciliation": selected_index.and_then(|index| {
+                existing.get(&evaluated[index].project_item.id)
+                    .and_then(|item| item.checkpoint_cancellation.as_ref())
+                    .map(checkpoint_next_action)
+            }),
             "selected": selected_index.map(|index| evaluated[index].as_json()),
             "evaluated": evaluated_json,
             "github_polling": args.github_budget.snapshot(),
@@ -496,7 +513,36 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )
     })?;
     let selected = evaluated.swap_remove(selected_index);
-    let (refreshed, persisted) = refresh_selected(client, server, &args, &selected).await?;
+    let (mut refreshed, mut persisted) = refresh_selected(client, server, &args, &selected).await?;
+    let checkpoint_reconciliation = if let Some(original) =
+        persisted.as_ref().filter(|item| item.state == "cancelled")
+    {
+        revalidate_selected_for_effect(
+            &args,
+            &refreshed,
+            &refreshed.project_item.status,
+            "checkpoint reconciliation",
+        )?;
+        let reconciled =
+            reconcile_checkpoint_cancellation(client, server, &args, &refreshed, original).await?;
+        let refreshed_after = refresh_selected(client, server, &args, &refreshed).await?;
+        let current = refreshed_after
+            .1
+            .as_ref()
+            .context("reconciled factory item disappeared")?;
+        if current.id != original.id
+            || current.mission_id != original.mission_id
+            || current.policy != original.policy
+            || current.source_revision != original.source_revision
+            || refreshed_after.0.issue.updated_at != refreshed.issue.updated_at
+        {
+            bail!("checkpoint reconciliation refresh changed the selected source or policy");
+        }
+        (refreshed, persisted) = refreshed_after;
+        Some(reconciled)
+    } else {
+        None
+    };
     let source_resolution = if refreshed.recovery {
         resolve_recovery_source_base_commit_from_item(
             &args,
@@ -506,7 +552,7 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         )?
     } else {
         ResolvedSourceCommit {
-            commit: resolve_source_base_commit(&args)?,
+            commit: resolve_new_source_base_commit(client, server, &args).await?,
             legacy_upgrade_required: false,
         }
     };
@@ -908,7 +954,20 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
     if let Some(recovery_version) = launch.get("factory_version").and_then(Value::as_i64) {
         work_item_version = recovery_version;
     }
-    if matches!(mission_status, Some("failed" | "cancelled")) {
+    let checkpoint = if mission_status == Some("cancelled") {
+        let context = read_checkpoint_context(client, server, &args, work_item_id).await?;
+        checkpoint_catch_up(
+            &context,
+            args.corp_id,
+            work_item_id,
+            mission_id,
+            work_item_version,
+            &work_item_state,
+        )?
+    } else {
+        None
+    };
+    if checkpoint.is_none() && matches!(mission_status, Some("failed" | "cancelled")) {
         let mission_terminal_state = mission_status.expect("matched terminal mission state");
         let terminal_state = if mission_terminal_state == "failed"
             && launch
@@ -948,10 +1007,12 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
             work_item_state
         );
     }
-    let mission_awaiting_approval = launch
-        .get("awaiting_approval")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // A retained checkpoint is a next action, not a fresh mission outcome.
+    let mission_awaiting_approval = checkpoint.is_none()
+        && launch
+            .get("awaiting_approval")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let workspace_cleanup_pending = launch
         .get("workspace_cleanup_pending")
         .and_then(Value::as_bool)
@@ -1037,6 +1098,9 @@ pub async fn run(client: &Client, server: &str, mut args: FactoryArgs) -> Result
         "materialized_now": materialized,
         "preflight": preflight,
         "launch": launch,
+        "checkpoint_ready": checkpoint.is_some(),
+        "next_action": checkpoint,
+        "checkpoint_reconciliation": checkpoint_reconciliation,
         "auto_merge": false,
     }))
 }
@@ -1268,7 +1332,7 @@ fn new_factory_policy(
     verification_policy: Option<&VerificationPolicy>,
     adapter_allowlist: &[String],
 ) -> Value {
-    json!({
+    let mut policy = json!({
         "schema_version": 1,
         "source_of_truth": "github_project",
         "project_owner": args.owner,
@@ -1309,7 +1373,13 @@ fn new_factory_policy(
             "deploy": false
         },
         "verification_policy": verification_policy,
-    })
+    });
+    // Omit the field for legacy work so its exact policy/idempotency snapshots
+    // do not change merely because the CLI was upgraded.
+    if let Some(connection_id) = args.workspace_connection_id {
+        policy["workspace_connection_id"] = json!(connection_id);
+    }
+    policy
 }
 
 fn preflight_policy(policy: &Value, source_base_commit: &str) -> Result<Value> {
@@ -1414,6 +1484,9 @@ async fn preflight_factory_mission(
 
 fn validate_args(args: &FactoryArgs) -> Result<()> {
     repository_parts(&args.repository)?;
+    if args.workspace_connection_id.is_some_and(|id| id.is_nil()) {
+        bail!("factory workspace_connection_id must be a non-nil UUID");
+    }
     validate_source_base_ref(&args.source_base_ref)?;
     validate_publication_base_ref(args)?;
     if args.owner.trim().is_empty() || args.owner.chars().any(char::is_whitespace) {
@@ -1595,17 +1668,22 @@ fn validate_publication_base_ref(args: &FactoryArgs) -> Result<()> {
     let Some(branch) = publication_base_branch(publication_base_ref)? else {
         return Ok(());
     };
-    source_git_output(
-        &args.source_repository_path,
-        &["check-ref-format", "--branch", branch],
-    )
-    .map(|_| ())
-    .with_context(|| {
-        format!(
-            "factory publication base ref {} is not a valid Git branch",
-            publication_base_ref
-        )
-    })
+    // Git validates a branch name without a repository. A saved connection's
+    // source lives on its runner; do not require a second controller checkout
+    // just to perform this native syntax check.
+    let directory = if args.workspace_connection_id.is_some() {
+        Path::new(".")
+    } else {
+        args.source_repository_path.as_path()
+    };
+    source_git_output(directory, &["check-ref-format", "--branch", branch])
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "factory publication base ref {} is not a valid Git branch",
+                publication_base_ref
+            )
+        })
 }
 
 fn selected_publication_base_ref(args: &FactoryArgs) -> &str {
@@ -1671,6 +1749,7 @@ fn resolve_recovery_source_base_commit_from_item(
     args: &FactoryArgs,
     item: &ExistingFactoryItem,
 ) -> Result<ResolvedSourceCommit> {
+    ensure_recovery_connection_matches(args, &item.policy)?;
     let policy = item
         .policy
         .as_object()
@@ -1708,8 +1787,63 @@ fn resolve_recovery_source_base_commit_from_item(
     })
 }
 
-fn resolve_source_base_commit(args: &FactoryArgs) -> Result<String> {
-    resolve_source_base_commit_at_ref(args, &args.source_base_ref)
+fn ensure_recovery_connection_matches(args: &FactoryArgs, policy: &Value) -> Result<()> {
+    let persisted =
+        crony_domain::factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
+    if persisted != args.workspace_connection_id {
+        bail!(
+            "factory recovery workspace connection differs from the persisted policy; retain the original connection option"
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_new_source_base_commit(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+) -> Result<String> {
+    let Some(connection_id) = args.workspace_connection_id else {
+        return resolve_source_base_commit_at_ref(args, &args.source_base_ref);
+    };
+    let value = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/connections/{connection_id}?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await
+    .context("read the selected saved Factory connection")?;
+    checked_connection_source(args, value)
+}
+
+fn checked_connection_source(args: &FactoryArgs, value: Value) -> Result<String> {
+    let connection: crony_domain::WorkspaceConnection = serde_json::from_value(value)
+        .map_err(|_| anyhow!("invalid saved Factory connection response"))?;
+    if Some(connection.id) != args.workspace_connection_id || connection.corp_id != args.corp_id {
+        bail!("saved Factory connection response does not match the requested scope");
+    }
+    if connection.status != crony_domain::WorkspaceConnectionStatus::Ready
+        || !connection.runner_connected
+    {
+        bail!("the saved Factory connection needs attention; test or reconnect its machine");
+    }
+    if connection.agent.as_str() != args.adapter {
+        bail!("Factory must use the coding agent configured for the saved connection");
+    }
+    let source = connection
+        .source
+        .context("the saved Factory repository has not been checked")?;
+    if !source.repository.eq_ignore_ascii_case(&args.repository)
+        || source.base_ref != args.source_base_ref
+    {
+        bail!("Factory repository and source ref must match the saved connection");
+    }
+    validate_source_base_commit(&source.base_commit)?;
+    Ok(source.base_commit.to_ascii_lowercase())
 }
 
 fn resolve_source_base_commit_at_ref(args: &FactoryArgs, source_base_ref: &str) -> Result<String> {
@@ -1978,6 +2112,271 @@ fn load_issue(
     .and_then(|value| serde_json::from_value(value).context("decode GitHub issue"))
 }
 
+async fn read_checkpoint_context(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    work_item_id: Uuid,
+) -> Result<FactoryVerificationRecoveryContextResponse> {
+    let value = server_json(
+        client,
+        Method::GET,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{work_item_id}/verification-recoveries?actor_id={}",
+            args.corp_id, args.actor_id
+        ),
+        None,
+    )
+    .await
+    .context("read native checkpoint recovery context; no terminal projection was inferred")?;
+    serde_json::from_value(value).map_err(|_| anyhow!("invalid native checkpoint recovery context"))
+}
+
+fn validate_checkpoint_context(
+    context: &FactoryVerificationRecoveryContextResponse,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    mission_id: Uuid,
+    version: i64,
+) -> Result<bool> {
+    if context.work_item.id != work_item_id
+        || context.work_item.corp_id != corp_id
+        || context.work_item.version != version
+        || context.work_item.mission_id != Some(mission_id)
+        || context.mission_id != mission_id
+        || version <= 0
+    {
+        bail!(
+            "native checkpoint context does not match the current Factory item/version and mission"
+        );
+    }
+    if !context.checkpoint_verification {
+        return Ok(false);
+    }
+    let fingerprint = context.workspace_fingerprint.as_deref().unwrap_or_default();
+    let head = context.expected_head_commit.as_deref().unwrap_or_default();
+    if context.source_run_id.is_nil()
+        || context.task_id.is_nil()
+        || fingerprint.len() != 64
+        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("native checkpoint context omitted its exact source or fingerprint");
+    }
+    validate_source_base_commit(head)?;
+    if context
+        .checkpoint_cancellation_event_id
+        .is_some_and(|id| id.is_nil())
+    {
+        bail!("native checkpoint cancellation event is invalid");
+    }
+    if context.checkpoint_cancellation_event_id.is_some()
+        && context.work_item.state.as_str() != "cancelled"
+    {
+        bail!("native checkpoint cancellation marker belongs only to a cancelled projection");
+    }
+    Ok(!context
+        .recoveries
+        .iter()
+        .any(|recovery| matches!(recovery.status.as_str(), "authorized" | "running")))
+}
+
+fn checkpoint_item_matches(
+    context: &FactoryVerificationRecoveryContextResponse,
+    item: &ExistingFactoryItem,
+) -> bool {
+    let source = &context.work_item;
+    source.policy == item.policy
+        && source.source_revision == item.source_revision
+        && source.source_project_owner == item.source_project_owner
+        && source.source_project_number == item.source_project_number
+        && source.source_project_item_id == item.source_project_item_id
+        && source.source_repository_owner == item.source_repository_owner
+        && source.source_repository_name == item.source_repository_name
+        && source.source_issue_number == item.source_issue_number
+        && source.source_issue_node_id == item.source_issue_node_id
+        && source.source_issue_url == item.source_issue_url
+}
+
+async fn load_checkpoint_cancellations(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    items: &mut HashMap<String, ExistingFactoryItem>,
+) -> Result<()> {
+    if args.verification_recovery != Some(VerificationRecoveryModeArg::CheckpointVerification)
+        || args.issue.is_none()
+    {
+        return Ok(());
+    }
+    for item in items.values_mut() {
+        if item.state != "cancelled" || args.issue != Some(item.source_issue_number) {
+            continue;
+        }
+        let Some(mission_id) = item.mission_id else {
+            continue;
+        };
+        let context = read_checkpoint_context(client, server, args, item.id).await?;
+        if validate_checkpoint_context(&context, args.corp_id, item.id, mission_id, item.version)?
+            && context.work_item.state.as_str() == "cancelled"
+            && context.checkpoint_cancellation_event_id.is_some()
+            && checkpoint_item_matches(&context, item)
+        {
+            item.checkpoint_cancellation = Some(context);
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_cancellation_selected(args: &FactoryArgs, item: &ExistingFactoryItem) -> bool {
+    args.verification_recovery == Some(VerificationRecoveryModeArg::CheckpointVerification)
+        && args.issue == Some(item.source_issue_number)
+        && item.state == "cancelled"
+        && item
+            .checkpoint_cancellation
+            .as_ref()
+            .is_some_and(|context| {
+                item.mission_id.is_some_and(|mission_id| {
+                    validate_checkpoint_context(
+                        context,
+                        args.corp_id,
+                        item.id,
+                        mission_id,
+                        item.version,
+                    )
+                    .unwrap_or(false)
+                }) && context.work_item.state.as_str() == "cancelled"
+                    && context.checkpoint_cancellation_event_id.is_some()
+                    && checkpoint_item_matches(context, item)
+            })
+}
+
+fn checkpoint_next_action(context: &FactoryVerificationRecoveryContextResponse) -> Value {
+    json!({
+        "mode": "checkpoint-verification",
+        "requires_explicit_authorization": true,
+        "factory_work_item_id": context.work_item.id,
+        "expected_factory_version": context.work_item.version,
+        "mission_id": context.mission_id,
+        "task_id": context.task_id,
+        "source_run_id": context.source_run_id,
+        "checkpoint_reconciliation_needed": context.checkpoint_cancellation_event_id.is_some(),
+    })
+}
+
+fn checkpoint_catch_up(
+    context: &FactoryVerificationRecoveryContextResponse,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    mission_id: Uuid,
+    version: i64,
+    current_state: &str,
+) -> Result<Option<Value>> {
+    let ready = validate_checkpoint_context(context, corp_id, work_item_id, mission_id, version)?;
+    if context.work_item.state.as_str() != current_state {
+        bail!("Factory checkpoint catch-up context changed state before reconciliation");
+    }
+    // This path only keeps an existing running projection recoverable. It cannot
+    // reopen a cancelled item, remove another block, or authorize a provider.
+    Ok((ready && current_state == "running").then(|| checkpoint_next_action(context)))
+}
+
+fn checkpoint_reconciliation_request(
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    item: &ExistingFactoryItem,
+    context: &FactoryVerificationRecoveryContextResponse,
+) -> Result<Value> {
+    let mut checked = item.clone();
+    checked.checkpoint_cancellation = Some(context.clone());
+    if !checkpoint_cancellation_selected(args, &checked)
+        || !factory_recovery_source_matches(args, &selected.project_item, &selected.issue, item)
+        || selected.issue.updated_at != item.source_revision
+    {
+        bail!(
+            "cancelled Factory work requires explicit checkpoint verification and its current native cancellation marker"
+        );
+    }
+    ensure_recovery_connection_matches(args, &item.policy)?;
+    if item.policy.get("source_base_ref").and_then(Value::as_str)
+        != Some(args.source_base_ref.as_str())
+    {
+        bail!("checkpoint reconciliation must retain the persisted source ref");
+    }
+    validate_source_base_commit(
+        item.policy
+            .get("source_base_commit")
+            .and_then(Value::as_str)
+            .context("checkpoint reconciliation requires its immutable source commit")?,
+    )?;
+    let reason = args
+        .verification_recovery_reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .context("checkpoint reconciliation requires an explicit reason")?;
+    let mut request = json!({
+        "actor_id": args.actor_id,
+        "source_run_id": context.source_run_id,
+        "expected_factory_version": item.version,
+        "expected_workspace_fingerprint": context.workspace_fingerprint,
+        "expected_head_commit": context.expected_head_commit,
+        "cancellation_event_id": context.checkpoint_cancellation_event_id,
+        "observed_source_revision": selected.issue.updated_at,
+        "reason": reason,
+    });
+    request["idempotency_key"] = json!(format!(
+        "checkpoint-reconciliation:{}",
+        stable_uuid(&format!("{}:{}:{}", args.corp_id, item.id, request))
+    ));
+    Ok(request)
+}
+
+async fn reconcile_checkpoint_cancellation(
+    client: &Client,
+    server: &str,
+    args: &FactoryArgs,
+    selected: &EvaluatedItem,
+    item: &ExistingFactoryItem,
+) -> Result<Value> {
+    let context = read_checkpoint_context(client, server, args, item.id).await?;
+    let request = checkpoint_reconciliation_request(args, selected, item, &context)?;
+    if args.dry_run {
+        return Ok(json!({
+            "checkpoint_reconciliation_needed": true,
+            "next_action": checkpoint_next_action(&context),
+            "mutations": [],
+        }));
+    }
+    let response = server_json(
+        client,
+        Method::POST,
+        format!(
+            "{server}/api/corps/{}/factory/work-items/{}/checkpoint-reconciliation",
+            args.corp_id, item.id
+        ),
+        Some(request),
+    )
+    .await?;
+    if response
+        .get("claim_token")
+        .is_some_and(|value| !value.is_null())
+        || value_uuid(&response, "/work_item/id")? != item.id
+        || value_uuid(&response, "/work_item/corp_id")? != args.corp_id
+        || value_optional_uuid(&response, "/work_item/mission_id")? != item.mission_id
+        || value_string(&response, "/work_item/state")? != "running"
+        || value_i64(&response, "/work_item/version")? <= item.version
+        || response.pointer("/work_item/policy") != Some(&item.policy)
+        || value_string(&response, "/work_item/source_revision")? != item.source_revision
+    {
+        bail!("checkpoint reconciliation returned inconsistent Factory authority");
+    }
+    Ok(json!({
+        "replayed": response.get("replayed").and_then(Value::as_bool).unwrap_or(false),
+        "factory_work_item_id": item.id,
+        "factory_version": value_i64(&response, "/work_item/version")?,
+        "source_run_id": context.source_run_id,
+    }))
+}
+
 fn evaluate_items(
     args: &FactoryArgs,
     items: Vec<ProjectItem>,
@@ -2018,10 +2417,10 @@ fn evaluate_items(
                 && (factory_item.claim_owner_id == args.actor_id
                     || factory_item.lease_expires_at <= now);
             let explicit_verification_recovery = args.verification_recovery.is_some()
-                && matches!(
+                && (matches!(
                     factory_item.state.as_str(),
                     "verification_failed" | "running" | "blocked" | "awaiting_approval"
-                )
+                ) || checkpoint_cancellation_selected(args, factory_item))
                 && (factory_item.claim_owner_id == args.actor_id
                     || factory_item.lease_expires_at <= now);
             if factory_item.state == "verification_failed" && args.verification_recovery.is_none() {
@@ -2034,6 +2433,7 @@ fn evaluate_items(
                     factory_item.state.as_str(),
                     "verification_failed" | "running" | "blocked" | "awaiting_approval"
                 )
+                && !checkpoint_cancellation_selected(args, factory_item)
             {
                 reasons.push(format!(
                     "verification recovery is incompatible with factory state {}",
@@ -2074,6 +2474,11 @@ fn evaluate_items(
                             "verification recovery must retain the original Project item and issue identity"
                                 .to_owned(),
                         );
+                    }
+                    if args.verification_recovery == Some(VerificationRecoveryModeArg::CheckpointVerification)
+                        && factory_item.source_revision != issue.updated_at
+                    {
+                        reasons.push("checkpoint verification must retain the persisted source revision".to_owned());
                     }
                 }
                 _ => reasons.push(
@@ -2209,8 +2614,9 @@ async fn refresh_selected(
     selected: &EvaluatedItem,
 ) -> Result<(EvaluatedItem, Option<ExistingFactoryItem>)> {
     let item = load_project_item_exact(args, &selected.project_item.id)?;
-    let existing =
+    let mut existing =
         lookup_factory_work_items(client, server, args, std::slice::from_ref(&item.id)).await?;
+    load_checkpoint_cancellations(client, server, args, &mut existing).await?;
     let mut cache = HashMap::new();
     let refreshed = evaluate_items(args, vec![item], &existing, &mut cache)?
         .into_iter()
@@ -2410,6 +2816,7 @@ fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFac
             Ok((
                 project_item_id,
                 ExistingFactoryItem {
+                    id: value_uuid(item, "/id")?,
                     version: value_i64(item, "/version")?,
                     source_project_owner: value_string(item, "/source_project_owner")?,
                     source_project_number: value_i64(item, "/source_project_number")?,
@@ -2429,6 +2836,7 @@ fn existing_factory_items(items: &[Value]) -> Result<HashMap<String, ExistingFac
                         .cloned()
                         .context("factory work item omitted its policy snapshot")?,
                     lease_expires_at: value_datetime(item, "/lease_expires_at")?,
+                    checkpoint_cancellation: None,
                 },
             ))
         })
@@ -2609,6 +3017,14 @@ async fn load_factory_recovery_snapshot(
         || value_uuid(&context, "/mission_id")? != mission_id
     {
         bail!("factory recovery context does not match the selected work item");
+    }
+    if mode == FactoryVerificationRecoveryMode::CheckpointVerification
+        && context
+            .get("checkpoint_verification")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("the server did not authorize native stopped-source checkpoint verification");
     }
     let recoveries = context
         .get("recoveries")
@@ -3830,13 +4246,14 @@ mod tests {
         FactoryVerificationRecoveryMode, IssueLabel, IssueView, ProjectContent, ProjectItem,
         RECOVERY_SOURCE_REFERENCE_PREFIX, VerificationRecoveryModeArg, acceptance_tests,
         active_recovery_contract_revision, blocked_dependency_numbers,
-        cached_recovery_contract_revision, evaluate_items, factory_completion_is_ready,
-        factory_item_recoverable_by, factory_recovery_source_matches, graphql_envelope_has_errors,
-        issue_numbers, normalize_github_component, parse_exact_project_item,
-        parse_github_repository_identity, publication_base_branch, recovery_contract_request,
-        recovery_replacement_contract, recovery_revision_key, recovery_revision_required,
-        resolve_recovery_publication_base_ref, reviewed_recovery_source, sanitize_failure_detail,
-        selected_publication_base_ref, truncate_utf8, validate_source_base_commit,
+        cached_recovery_contract_revision, ensure_recovery_connection_matches, evaluate_items,
+        factory_completion_is_ready, factory_item_recoverable_by, factory_recovery_source_matches,
+        graphql_envelope_has_errors, issue_numbers, new_factory_policy, normalize_github_component,
+        parse_exact_project_item, parse_github_repository_identity, publication_base_branch,
+        recovery_contract_request, recovery_replacement_contract, recovery_revision_key,
+        recovery_revision_required, resolve_recovery_publication_base_ref,
+        reviewed_recovery_source, sanitize_failure_detail, selected_publication_base_ref,
+        truncate_utf8, validate_args, validate_source_base_commit,
     };
 
     struct RecoveryFixture {
@@ -3859,6 +4276,7 @@ mod tests {
                 source_base_ref: "main".to_owned(),
                 publication_base_ref: None,
                 source_repository_path: ".".into(),
+                workspace_connection_id: None,
                 adapter: "github-copilot".to_owned(),
                 allowed_adapters: Vec::new(),
                 strategy: "single".to_owned(),
@@ -4008,6 +4426,7 @@ mod tests {
 
         fn persisted_item(&self) -> ExistingFactoryItem {
             ExistingFactoryItem {
+                id: self.work_item_id,
                 version: 1,
                 source_project_owner: self.args.owner.clone(),
                 source_project_number: i64::from(self.args.project_number),
@@ -4024,8 +4443,385 @@ mod tests {
                 mission_id: Some(self.mission_id),
                 policy: json!({}),
                 lease_expires_at: Utc::now() + Duration::minutes(5),
+                checkpoint_cancellation: None,
             }
         }
+    }
+
+    fn issue206_checkpoint_fixture() -> (
+        RecoveryFixture,
+        ExistingFactoryItem,
+        super::FactoryVerificationRecoveryContextResponse,
+    ) {
+        let mut f = RecoveryFixture::new();
+        f.args.verification_recovery = Some(VerificationRecoveryModeArg::CheckpointVerification);
+        f.args.workspace_connection_id = Some(Uuid::from_u128(206));
+        f.args.source_repository_path = "__issue206_no_controller_checkout__".into();
+        let mut item = f.persisted_item();
+        item.state = "cancelled".to_owned();
+        item.version = 60;
+        item.source_revision = f.selected.issue.updated_at.clone();
+        item.policy = json!({
+            "source_base_ref": "main",
+            "source_base_commit": "a".repeat(40),
+            "workspace_connection_id": f.args.workspace_connection_id,
+        });
+        let context: super::FactoryVerificationRecoveryContextResponse =
+            serde_json::from_value(json!({
+                "work_item": {
+                    "id": item.id, "corp_id": f.args.corp_id, "source_kind": "github_project_issue",
+                    "source_project_owner": item.source_project_owner,
+                    "source_project_number": item.source_project_number,
+                    "source_project_item_id": item.source_project_item_id,
+                    "source_repository_owner": item.source_repository_owner,
+                    "source_repository_name": item.source_repository_name,
+                    "source_issue_number": item.source_issue_number,
+                    "source_issue_node_id": item.source_issue_node_id,
+                    "source_issue_url": item.source_issue_url,
+                    "source_title": item.source_title, "source_revision": item.source_revision,
+                    "state": item.state, "version": item.version, "claim_owner_id": item.claim_owner_id,
+                    "lease_expires_at": item.lease_expires_at, "policy": item.policy,
+                    "mission_id": item.mission_id, "failure_detail": null,
+                    "created_at": Utc::now(), "updated_at": Utc::now(),
+                },
+                "recoveries": [], "mission_id": f.mission_id,
+                "task_id": f.snapshot.task_id, "source_run_id": f.snapshot.source_run_id,
+                "remaining_attempts": 0, "remaining_mission_tokens": 0,
+                "remaining_mission_cost_microusd": 0,
+                "workspace_fingerprint": "b".repeat(64), "expected_head_commit": "c".repeat(40),
+                "checkpoint_verification": true,
+                "checkpoint_cancellation_event_id": Uuid::from_u128(260),
+            })).unwrap();
+        item.checkpoint_cancellation = Some(context.clone());
+        (f, item, context)
+    }
+
+    #[test]
+    fn issue206_only_explicit_checkpoint_recovery_admits_the_marked_cancelled_item() {
+        let (f, item, _) = issue206_checkpoint_fixture();
+        for mode in [
+            None,
+            Some(VerificationRecoveryModeArg::VerifierOnly),
+            Some(VerificationRecoveryModeArg::SourceCorrection),
+            Some(VerificationRecoveryModeArg::CheckpointVerification),
+        ] {
+            let mut args = f.args.clone();
+            args.verification_recovery = mode;
+            let mut cache = HashMap::from([(f.selected.issue.number, f.selected.issue.clone())]);
+            let items = HashMap::from([(f.selected.project_item.id.clone(), item.clone())]);
+            let evaluated = evaluate_items(
+                &args,
+                vec![f.selected.project_item.clone()],
+                &items,
+                &mut cache,
+            )
+            .unwrap();
+            assert_eq!(
+                evaluated[0].eligible(),
+                mode == Some(VerificationRecoveryModeArg::CheckpointVerification)
+            );
+        }
+        let mut implicit = f.args.clone();
+        implicit.issue = None;
+        assert!(!super::checkpoint_cancellation_selected(&implicit, &item));
+        for marked in [false, true] {
+            let mut stopped = item.clone();
+            let context = stopped.checkpoint_cancellation.as_mut().unwrap();
+            context.checkpoint_verification = marked;
+            context.checkpoint_cancellation_event_id = None;
+            assert!(!super::checkpoint_cancellation_selected(&f.args, &stopped));
+        }
+    }
+
+    #[test]
+    fn issue206_reconciliation_request_is_exact_idempotent_and_never_uses_a_checkout() {
+        let (f, item, context) = issue206_checkpoint_fixture();
+        let request =
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &context)
+                .unwrap();
+        assert_eq!(request["source_run_id"], json!(context.source_run_id));
+        assert_eq!(request["expected_factory_version"], json!(60));
+        assert_eq!(
+            request["expected_workspace_fingerprint"],
+            json!("b".repeat(64))
+        );
+        assert_eq!(request["expected_head_commit"], json!("c".repeat(40)));
+        assert_eq!(
+            request["cancellation_event_id"],
+            json!(context.checkpoint_cancellation_event_id)
+        );
+        assert_eq!(
+            request["observed_source_revision"],
+            json!(f.selected.issue.updated_at)
+        );
+        assert!(request.get("claim_token").is_none());
+        assert_eq!(
+            request,
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &context)
+                .unwrap()
+        );
+        let mut args = f.args.clone();
+        args.verification_recovery_reason = Some("Another explicit reason".to_owned());
+        assert_ne!(
+            request["idempotency_key"],
+            super::checkpoint_reconciliation_request(&args, &f.selected, &item, &context).unwrap()
+                ["idempotency_key"]
+        );
+        args = f.args.clone();
+        args.workspace_connection_id = None;
+        assert!(
+            super::checkpoint_reconciliation_request(&args, &f.selected, &item, &context).is_err()
+        );
+        args = f.args.clone();
+        args.source_base_ref = "another-ref".to_owned();
+        assert!(
+            super::checkpoint_reconciliation_request(&args, &f.selected, &item, &context).is_err()
+        );
+        let mut changed = context.clone();
+        changed.work_item.version += 1;
+        assert!(
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &changed)
+                .is_err()
+        );
+        changed = context.clone();
+        changed.work_item.corp_id = Uuid::from_u128(999);
+        assert!(
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &changed)
+                .is_err()
+        );
+        changed = context.clone();
+        changed.expected_head_commit = None;
+        assert!(
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &changed)
+                .is_err()
+        );
+        changed = context;
+        changed.checkpoint_verification = false;
+        assert!(
+            super::checkpoint_reconciliation_request(&f.args, &f.selected, &item, &changed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn issue206_future_catch_up_keeps_only_a_server_validated_running_checkpoint_recoverable() {
+        let (f, item, mut context) = issue206_checkpoint_fixture();
+        context.work_item.state = crony_domain::FactoryWorkItemState::Running;
+        context.checkpoint_cancellation_event_id = None;
+        let ready = super::checkpoint_catch_up(
+            &context,
+            f.args.corp_id,
+            item.id,
+            f.mission_id,
+            item.version,
+            "running",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready["mode"], "checkpoint-verification");
+        assert_eq!(ready["source_run_id"], json!(f.snapshot.source_run_id));
+        assert_eq!(ready["requires_explicit_authorization"], true);
+        assert!(!factory_completion_is_ready(false, false, "running"));
+        context.checkpoint_verification = false;
+        assert!(
+            super::checkpoint_catch_up(
+                &context,
+                f.args.corp_id,
+                item.id,
+                f.mission_id,
+                item.version,
+                "running",
+            )
+            .unwrap()
+            .is_none()
+        );
+        context.checkpoint_verification = true;
+        context.work_item.state = crony_domain::FactoryWorkItemState::Cancelled;
+        assert!(
+            super::checkpoint_catch_up(
+                &context,
+                f.args.corp_id,
+                item.id,
+                f.mission_id,
+                item.version,
+                "cancelled",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::checkpoint_catch_up(
+                &context,
+                f.args.corp_id,
+                item.id,
+                f.mission_id,
+                item.version + 1,
+                "cancelled",
+            )
+            .is_err()
+        );
+    }
+
+    async fn issue206_http_fixture(
+        responses: Vec<Value>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0; 2048];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0 && bytes.len() + read < 65_536);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let first = String::from_utf8_lossy(&bytes[..header_end])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                let body = if length == 0 {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+                };
+                requests.push((first, body));
+                let body = response.to_string();
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body,
+                ).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn issue206_dry_run_reads_proof_but_never_posts_reconciliation_or_opens_a_checkout() {
+        let (mut f, item, context) = issue206_checkpoint_fixture();
+        f.args.dry_run = true;
+        let (server, requests) = issue206_http_fixture(vec![json!(context)]).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result =
+            super::reconcile_checkpoint_cancellation(&client, &server, &f.args, &f.selected, &item)
+                .await
+                .unwrap();
+        assert_eq!(result["checkpoint_reconciliation_needed"], true);
+        assert_eq!(result["mutations"], json!([]));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.starts_with("GET "));
+        assert!(
+            requests[0]
+                .0
+                .contains(&format!("/{}/verification-recoveries?", item.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn issue206_explicit_reconciliation_uses_only_the_current_marker_and_native_endpoint() {
+        let (f, item, context) = issue206_checkpoint_fixture();
+        let mut updated = context.work_item.clone();
+        updated.state = crony_domain::FactoryWorkItemState::Running;
+        updated.version += 1;
+        let (server, requests) = issue206_http_fixture(vec![
+            json!(context),
+            json!({"work_item": updated, "claim_token": null, "replayed": false}),
+        ])
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result =
+            super::reconcile_checkpoint_cancellation(&client, &server, &f.args, &f.selected, &item)
+                .await
+                .unwrap();
+        assert_eq!(result["factory_version"], 61);
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.starts_with("GET "));
+        assert!(requests[1].0.starts_with(&format!(
+            "POST /api/corps/{}/factory/work-items/{}/checkpoint-reconciliation ",
+            f.args.corp_id, item.id,
+        )));
+        assert_eq!(requests[1].1["source_run_id"], json!(context.source_run_id));
+        assert_eq!(
+            requests[1].1["cancellation_event_id"],
+            json!(context.checkpoint_cancellation_event_id)
+        );
+        assert!(requests[1].1.get("claim_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn issue206_generic_polling_and_other_modes_never_read_or_repair_cancelled_items() {
+        let (f, item, _) = issue206_checkpoint_fixture();
+        let client = reqwest::Client::new();
+        for mode in [
+            None,
+            Some(VerificationRecoveryModeArg::VerifierOnly),
+            Some(VerificationRecoveryModeArg::SourceCorrection),
+        ] {
+            let mut args = f.args.clone();
+            args.verification_recovery = mode;
+            let mut items = HashMap::from([(item.source_project_item_id.clone(), item.clone())]);
+            super::load_checkpoint_cancellations(
+                &client,
+                "invalid-unused-server",
+                &args,
+                &mut items,
+            )
+            .await
+            .unwrap();
+            assert!(!super::checkpoint_cancellation_selected(
+                &args,
+                &items[&item.source_project_item_id]
+            ));
+        }
+    }
+
+    #[test]
+    fn issue206_production_flow_returns_dry_run_before_repair_and_refreshes_before_claim() {
+        let source = include_str!("factory.rs");
+        let run = source
+            .split("pub async fn run(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn watch(")
+            .next()
+            .unwrap();
+        let dry = run.find("if args.dry_run").unwrap();
+        let repair = run.find("reconcile_checkpoint_cancellation(").unwrap();
+        let refresh = run.find("let refreshed_after = refresh_selected").unwrap();
+        let claim = run.find("let claim_generation =").unwrap();
+        assert!(dry < repair && repair < refresh && refresh < claim);
+        let marker = run.find("checkpoint_catch_up(").unwrap();
+        let mirror = run.find("let mission_terminal_state =").unwrap();
+        assert!(marker < mirror);
     }
 
     #[test]
@@ -4581,6 +5377,7 @@ Blocked by #999 outside the section.
             source_base_ref: "release".to_owned(),
             publication_base_ref: None,
             source_repository_path: ".".into(),
+            workspace_connection_id: None,
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
@@ -4608,6 +5405,7 @@ Blocked by #999 outside the section.
     fn recovery_publication_base_reuses_persisted_policy() {
         let now = Utc::now();
         let mut item = ExistingFactoryItem {
+            id: Uuid::new_v4(),
             version: 1,
             source_project_owner: "owner".to_owned(),
             source_project_number: 1,
@@ -4628,6 +5426,7 @@ Blocked by #999 outside the section.
                 }
             }),
             lease_expires_at: now + Duration::minutes(5),
+            checkpoint_cancellation: None,
         };
         let mut args = FactoryArgs {
             corp_id: Uuid::new_v4(),
@@ -4638,6 +5437,7 @@ Blocked by #999 outside the section.
             source_base_ref: "release".to_owned(),
             publication_base_ref: None,
             source_repository_path: ".".into(),
+            workspace_connection_id: None,
             adapter: "fake-process".to_owned(),
             allowed_adapters: Vec::new(),
             strategy: "single".to_owned(),
@@ -4667,11 +5467,217 @@ Blocked by #999 outside the section.
     }
 
     #[test]
+    fn issue204_new_policy_pins_connection_without_changing_legacy_shape() {
+        let mut fixture = RecoveryFixture::new();
+        let legacy = new_factory_policy(
+            &fixture.args,
+            &fixture.selected,
+            &"a".repeat(40),
+            "main",
+            None,
+            &["github-copilot".to_owned()],
+        );
+        assert!(legacy.get("workspace_connection_id").is_none());
+        let id = Uuid::new_v4();
+        fixture.args.workspace_connection_id = Some(id);
+        let mut connected = new_factory_policy(
+            &fixture.args,
+            &fixture.selected,
+            &"a".repeat(40),
+            "main",
+            None,
+            &["github-copilot".to_owned()],
+        );
+        assert_eq!(connected["workspace_connection_id"], json!(id));
+        connected
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_connection_id");
+        assert_eq!(connected, legacy);
+    }
+
+    #[test]
+    fn issue204_recovery_rejects_connection_substitution_or_silent_fallback() {
+        let mut args = RecoveryFixture::new().args;
+        assert!(ensure_recovery_connection_matches(&args, &json!({})).is_ok());
+        let id = Uuid::new_v4();
+        let policy = json!({"workspace_connection_id": id});
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_err());
+        args.workspace_connection_id = Some(id);
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_ok());
+        assert!(ensure_recovery_connection_matches(&args, &json!({})).is_err());
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        assert!(ensure_recovery_connection_matches(&args, &policy).is_err());
+        assert!(
+            ensure_recovery_connection_matches(
+                &args,
+                &json!({"workspace_connection_id": "invalid"})
+            )
+            .is_err()
+        );
+    }
+
+    fn issue204_connection_response(args: &FactoryArgs) -> Value {
+        json!({
+            "id": args.workspace_connection_id.unwrap(),
+            "corp_id": args.corp_id,
+            "room_id": Uuid::new_v4(),
+            "created_by": args.actor_id,
+            "runner_id": "issue204-fixture",
+            "label": "Shared project",
+            "agent": args.adapter,
+            "source": {
+                "repository": args.repository,
+                "repository_id": "fixture-repository",
+                "base_ref": args.source_base_ref,
+                "base_commit": "a".repeat(40),
+            },
+            "status": "ready",
+            "detail": "Synthetic checked source",
+            "models": [],
+            "version": 1,
+            "last_checked_at": Utc::now(),
+            "runner_connected": true,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        })
+    }
+
+    #[test]
+    fn issue204_checked_source_fences_scope_readiness_adapter_and_revision() {
+        use super::checked_connection_source;
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        let valid = issue204_connection_response(&args);
+        assert_eq!(
+            checked_connection_source(&args, valid.clone()).unwrap(),
+            "a".repeat(40)
+        );
+        for (field, value) in [
+            ("id", json!(Uuid::new_v4())),
+            ("corp_id", json!(Uuid::new_v4())),
+            ("runner_connected", json!(false)),
+            ("status", json!("offline")),
+            ("status", json!("needs_sign_in")),
+            ("agent", json!("codex")),
+            ("source", Value::Null),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            assert!(
+                checked_connection_source(&args, changed).is_err(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("repository", "another/project"),
+            ("base_ref", "another-branch"),
+            ("base_commit", "not-a-commit"),
+        ] {
+            let mut changed = valid.clone();
+            changed["source"][field] = json!(value);
+            assert!(
+                checked_connection_source(&args, changed).is_err(),
+                "{field}"
+            );
+        }
+        let mut malformed = valid;
+        malformed["status"] = json!("private-diagnostic-must-not-be-echoed");
+        let error = checked_connection_source(&args, malformed).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid saved Factory connection response"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue204_bound_source_resolution_needs_no_controller_checkout() {
+        use super::resolve_new_source_base_commit;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::new_v4());
+        args.source_repository_path = "__issue204_no_controller_checkout__".into();
+        // Cover the complete admission path, not only the final source lookup.
+        validate_args(&args).unwrap();
+        let response = issue204_connection_response(&args).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = format!(
+            "GET /api/corps/{}/connections/{}?actor_id={} HTTP/1.1",
+            args.corp_id,
+            args.workspace_connection_id.unwrap(),
+            args.actor_id
+        );
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 8192];
+            let length = socket.read(&mut buffer).await.unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..length]).starts_with(&expected));
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            resolve_new_source_base_commit(&client, &format!("http://{address}"), &args)
+                .await
+                .unwrap(),
+            "a".repeat(40)
+        );
+        request.await.unwrap();
+    }
+
+    #[test]
+    fn issue204_factory_option_is_typed_and_rejects_nil() {
+        use clap::Parser;
+        let id = Uuid::new_v4();
+        for command in ["factory", "factory-watch"] {
+            let parsed = crate::Args::try_parse_from([
+                "crony",
+                command,
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000011",
+                "--adapter",
+                "github-copilot",
+                "--budget-tokens",
+                "1000",
+                "--budget-cost-microusd",
+                "1000000",
+                "--workspace-connection-id",
+                &id.to_string(),
+            ])
+            .unwrap();
+            let args = match parsed.command {
+                crate::Command::Factory { args } => *args,
+                crate::Command::FactoryWatch { args } => args.factory,
+                _ => unreachable!(),
+            };
+            assert_eq!(args.workspace_connection_id, Some(id));
+            assert!(validate_args(&args).is_ok());
+        }
+        let mut args = RecoveryFixture::new().args;
+        args.workspace_connection_id = Some(Uuid::nil());
+        assert!(
+            validate_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("non-nil")
+        );
+    }
+
+    #[test]
     fn verified_items_leave_the_queue_and_expired_claims_allow_failover() {
         let now = Utc::now();
         let owner = Uuid::new_v4();
         let replacement = Uuid::new_v4();
         let mut item = ExistingFactoryItem {
+            id: Uuid::new_v4(),
             version: 1,
             source_project_owner: "owner".to_owned(),
             source_project_number: 1,
@@ -4688,6 +5694,7 @@ Blocked by #999 outside the section.
             mission_id: Some(Uuid::new_v4()),
             policy: json!({}),
             lease_expires_at: now + Duration::minutes(5),
+            checkpoint_cancellation: None,
         };
         assert!(!factory_item_recoverable_by(
             &item,

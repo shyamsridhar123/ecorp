@@ -92,6 +92,13 @@ function Launch([string]$Role, [string]$Executable, [string[]]$Arguments, [strin
         throw $persistenceFailure
     }
 }
+function Test-LocalSettingChanged([string]$Name, [string]$Before, [string]$After) {
+    if ($Name -in @('source_base_ref','factory_source_base_ref')) {
+        # Git refs are exact strings even on a case-insensitive Windows host.
+        return ![string]::Equals($Before, $After, [StringComparison]::Ordinal)
+    }
+    return $Before -ne $After
+}
 function Explicit-Environment([string[]]$Names) {
     $values = @{}
     foreach ($name in $Names) {
@@ -111,6 +118,9 @@ $sourceRef = [string](Setting 'CRONY_SOURCE_BASE_REF' 'source_base_ref' 'HEAD')
 $runnerWorkspace = [IO.Path]::GetFullPath([string](Setting 'CRONY_RUNNER_WORKSPACE' 'runner_workspace' (Join-Path $output 'runner')))
 $copilotHome = [IO.Path]::GetFullPath([string](Setting 'CRONY_COPILOT_HOME' 'copilot_home' (Join-Path $runnerWorkspace 'copilot-home')))
 $runnerId = [string](Setting 'CRONY_RUNNER_ID' 'runner_id' 'runner-local')
+$connectionsDirectory = [string](Setting 'CRONY_CONNECTIONS_DIRECTORY' 'connections_directory' '')
+$repositoryRoots = [string](Setting 'CRONY_REPOSITORY_ROOTS' 'repository_roots' '')
+$githubCommand = [string](Setting 'CRONY_GITHUB_COMMAND' 'github_command' 'gh')
 $watchSetting = [string](Setting 'ECORP_FACTORY_WATCH' 'factory_enabled' '0')
 if ($watchSetting -notin @('0','1','False','True')) { throw 'ECORP_FACTORY_WATCH must be 0 or 1.' }
 $factoryEnabled = $watchSetting -in @('1','True')
@@ -122,9 +132,11 @@ $factory = @{
     project_owner = [string](Setting 'ECORP_GITHUB_PROJECT_OWNER' 'factory_project_owner' 'shyamsridhar123')
     project_number = [uint32](Setting 'ECORP_GITHUB_PROJECT_NUMBER' 'factory_project_number' 3)
     repository = [string](Setting 'ECORP_FACTORY_REPOSITORY' 'factory_repository' 'shyamsridhar123/ecorp')
+    source_base_ref = [string](Setting 'ECORP_FACTORY_SOURCE_BASE_REF' 'factory_source_base_ref' $sourceRef)
     github_cli = [string](Setting 'ECORP_GITHUB_CLI' 'factory_github_cli' 'gh')
     publication_base_ref = [string](Setting 'ECORP_FACTORY_PUBLICATION_BASE_REF' 'factory_publication_base_ref' '')
     verification_policy_file = [string](Setting 'ECORP_FACTORY_VERIFICATION_POLICY_FILE' 'factory_verification_policy_file' '')
+    workspace_connection_id = [string](Setting 'ECORP_FACTORY_WORKSPACE_CONNECTION_ID' 'factory_workspace_connection_id' '')
 }
 if ($factoryEnabled) {
     $controllerId = [guid]::Empty
@@ -135,6 +147,24 @@ if ($factoryEnabled) {
         throw 'Factory needs its existing controller ID, Project, repository and positive limits. No service was changed.'
     }
     $factory.controller_id = $controllerId.ToString('D')
+    if ([string]::IsNullOrWhiteSpace($factory.source_base_ref)) {
+        throw 'Factory source ref cannot be empty. No service was changed.'
+    }
+    if ((Test-LocalSettingChanged 'factory_source_base_ref' $sourceRef $factory.source_base_ref) -and
+        (Role-Live 'factoryController') -and !$saved.ContainsKey('factory_source_base_ref')) {
+        throw 'Use explicit restart to change the running Factory source ref. No service was changed.'
+    }
+    if ($factory.workspace_connection_id) {
+        $connectionId = [guid]::Empty
+        if (![guid]::TryParse($factory.workspace_connection_id, [ref]$connectionId) -or
+            $connectionId -eq [guid]::Empty) {
+            throw 'Factory workspace connection must be an existing non-empty connection ID. No service was changed.'
+        }
+        if ((Role-Live 'factoryController') -and !$saved.ContainsKey('factory_workspace_connection_id')) {
+            throw 'Use explicit restart to bind the running Factory controller to a saved connection. No service was changed.'
+        }
+        $factory.workspace_connection_id = $connectionId.ToString('D')
+    }
     if ($factory.verification_policy_file) {
         $policyPath = [IO.Path]::GetFullPath($factory.verification_policy_file, $root)
         if (!(Test-Path -LiteralPath $policyPath -PathType Leaf)) {
@@ -147,6 +177,7 @@ $configuration = @{
     server_port=$serverPortValue; web_port=$webPortValue
     source_repository=$source; source_base_ref=$sourceRef; runner_workspace=$runnerWorkspace; runner_id=$runnerId
     copilot_home=$copilotHome
+    connections_directory=$connectionsDirectory; repository_roots=$repositoryRoots; github_command=$githubCommand
     factory_enabled=$factoryEnabled; factory_adapter=$factory.adapter
     factory_budget_tokens=$factory.budget_tokens; factory_budget_cost_microusd=$factory.budget_cost_microusd
 }
@@ -178,7 +209,8 @@ foreach ($key in $configuration.Keys) {
     # Adding a missing Factory worker must not restart the healthy API, runner
     # or UI. Changes to an already running worker still require explicit restart.
     $affectedProcessLive = if ($key.StartsWith('factory_')) { Role-Live 'factoryController' } else { $anyLive }
-    if ($affectedProcessLive -and $saved.ContainsKey($key) -and [string]$saved[$key] -ne [string]$configuration[$key]) {
+    if ($affectedProcessLive -and $saved.ContainsKey($key) -and
+        (Test-LocalSettingChanged $key ([string]$saved[$key]) ([string]$configuration[$key]))) {
         throw 'A live owned stack has different requested settings. Use explicit restart to apply configuration changes; start will not replace it.'
     }
 }
@@ -327,6 +359,9 @@ $runnerEnvironment = Explicit-Environment @('CRONY_COPILOT_CLI_PATH','CRONY_COPI
     'CRONY_COPILOT_USE_LOGGED_IN_USER','CRONY_COPILOT_FIXTURE','CRONY_COPILOT_LOG_LEVEL',
     'CRONY_CODEX_COMMAND','CRONY_CLAUDE_COMMAND','CRONY_OPENCODE_COMMAND','CRONY_PLAYWRIGHT_MODULE','RUST_LOG')
 $runnerEnvironment.CRONY_COPILOT_HOME = $copilotHome
+$runnerEnvironment.CRONY_GITHUB_COMMAND = $githubCommand
+if ($connectionsDirectory) { $runnerEnvironment.CRONY_CONNECTIONS_DIRECTORY = $connectionsDirectory }
+if ($repositoryRoots) { $runnerEnvironment.CRONY_REPOSITORY_ROOTS = $repositoryRoots }
 $runnerArguments = @('--server-ws',"$($serverUrl.Replace('http:','ws:'))/ws/runner",
     '--runner-id',$runnerId,'--corp-id',$state.corp_id,'--credential-file',$credential,
     '--enrollment-token-file',$enrollment,'--workspace',$runnerWorkspace,
@@ -347,9 +382,10 @@ if ($needsController) {
         '--github-cli',$factory.github_cli,
         '--adapter',$factory.adapter,'--budget-tokens',[string]$factory.budget_tokens,
         '--budget-cost-microusd',[string]$factory.budget_cost_microusd,
-        '--source-repository-path',$source,'--source-base-ref',$sourceRef)
+        '--source-repository-path',$source,'--source-base-ref',$factory.source_base_ref)
     if ($factory.publication_base_ref) { $arguments += @('--publication-base-ref',$factory.publication_base_ref) }
     if ($factory.verification_policy_file) { $arguments += @('--verification-policy-file',$factory.verification_policy_file) }
+    if ($factory.workspace_connection_id) { $arguments += @('--workspace-connection-id',$factory.workspace_connection_id) }
     $controllerEnvironment = Explicit-Environment @('GH_TOKEN','GITHUB_TOKEN','GH_HOST','CRONY_ACCESS_TOKEN',
         'ECORP_GITHUB_CLI_PREFIX_ARGS_JSON','ECORP_FAKE_GITHUB_STATE','ECORP_FAKE_GITHUB_EXPECT_TOKEN','RUST_LOG')
     Launch 'factoryController' $controllerExe $arguments $guardDirectory $controllerEnvironment

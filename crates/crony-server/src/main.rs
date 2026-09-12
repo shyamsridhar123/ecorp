@@ -1,9 +1,12 @@
 mod artifacts;
 mod auth;
 mod dependency_source;
+#[cfg(test)]
+mod factory_connection_tests;
 mod planning;
 mod secrets;
 mod staffing;
+mod workspace_connections;
 
 use std::{
     collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration,
@@ -55,14 +58,15 @@ use crony_protocol::{
     PreflightFactoryMissionRequest, PreflightFactoryMissionResponse, PreviewMissionResponse,
     PreviewMissionTask, ProposeMissionBudgetRevisionRequest, PullRequestPublicationCheckpoint,
     PullRequestPublicationResponse, QueueMessageRequest, QueueMessageResponse,
-    RecordPullRequestPublicationCheckpointRequest, ReleaseLeaseRequest,
-    RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest, ResolvedSecret,
-    ResumeRunRequest, ResumeRunResponse, RevokePublicationPublisherCredentialRequest,
-    RevokePublicationPublisherCredentialResponse, RevokeRunnerRequest, RevokeRunnerResponse,
-    RevokeSecretRequest, RunnerCapability, RunnerSummary, RunnerToServer, ServerToRunner,
-    SetBudgetPolicyRequest, SnapshotResponse, StartPullRequestPublicationRequest,
-    TransferLeaseRequest, TransitionFactoryWorkItemRequest, UpgradeFactorySourceCommitRequest,
-    VerificationArtifactReference, VerificationDecisionRequest, VerificationDecisionResponse,
+    ReconcileFactoryCheckpointCancellationRequest, RecordPullRequestPublicationCheckpointRequest,
+    ReleaseLeaseRequest, RenewFactoryWorkItemRequest, RenewPullRequestPublicationRequest,
+    ResolvedSecret, ResumeRunRequest, ResumeRunResponse,
+    RevokePublicationPublisherCredentialRequest, RevokePublicationPublisherCredentialResponse,
+    RevokeRunnerRequest, RevokeRunnerResponse, RevokeSecretRequest, RunnerCapability,
+    RunnerSummary, RunnerToServer, ServerToRunner, SetBudgetPolicyRequest, SnapshotResponse,
+    StartPullRequestPublicationRequest, TransferLeaseRequest, TransitionFactoryWorkItemRequest,
+    UpgradeFactorySourceCommitRequest, VerificationArtifactReference, VerificationDecisionRequest,
+    VerificationDecisionResponse,
 };
 use crony_store::{
     CheckpointFactoryWorkspaceInput, ClaimFactoryWorkItemInput, ConfigureFactoryControllerInput,
@@ -224,6 +228,7 @@ struct AppState {
     secret_cipher: SecretCipher,
     artifacts: ArtifactStore,
     artifact_retention_days: i64,
+    workspace_sign_in: Arc<DashMap<Uuid, workspace_connections::PendingSignIn>>,
 }
 
 #[derive(Clone)]
@@ -403,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         secret_cipher,
         artifacts,
         artifact_retention_days: args.artifact_retention_days.clamp(1, 3_650),
+        workspace_sign_in: Arc::new(DashMap::new()),
     };
     let retirement_state = state.clone();
     tokio::spawn(async move {
@@ -500,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let protected = Router::new()
+        .merge(workspace_connections::routes())
         .route("/api/corps/{corp_id}/snapshot", get(snapshot))
         .route(
             "/api/corps/{corp_id}/artifacts/{artifact_id}",
@@ -509,6 +516,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/corps/{corp_id}/missions/preview",
             post(preview_mission),
+        )
+        .route(
+            "/api/corps/{corp_id}/missions/{mission_id}/context",
+            get(get_mission_context),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/lookup",
@@ -554,6 +565,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/verification-recoveries",
             get(get_factory_verification_recovery_context)
                 .post(create_factory_verification_recovery),
+        )
+        .route(
+            "/api/corps/{corp_id}/factory/work-items/{work_item_id}/checkpoint-reconciliation",
+            post(reconcile_factory_checkpoint_cancellation),
         )
         .route(
             "/api/corps/{corp_id}/factory/work-items/{work_item_id}/materialize",
@@ -1646,6 +1661,8 @@ struct FactoryRecoveryRunnerCommandPayload {
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    #[serde(default)]
+    workspace_connection_id: Option<Uuid>,
     workspace_base_commit: String,
     expected_workspace_fingerprint: String,
     expected_head_commit: Option<String>,
@@ -1671,6 +1688,8 @@ struct FactoryWorkspaceCheckpointRunnerCommandPayload {
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    #[serde(default)]
+    workspace_connection_id: Option<Uuid>,
     workspace_base_commit: String,
     expected_head_commit: String,
 }
@@ -1709,6 +1728,7 @@ async fn decode_recovery_runner_command(
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::ResumeRun {
+                        workspace_connection_id: payload.workspace_connection_id,
                         command_id: Some(command.id),
                         corp_id: payload.corp_id,
                         room_id: payload.room_id,
@@ -1773,6 +1793,7 @@ async fn decode_recovery_runner_command(
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::VerifyRun {
+                        workspace_connection_id: payload.workspace_connection_id,
                         command_id: command.id,
                         corp_id: payload.corp_id,
                         room_id: payload.room_id,
@@ -2083,6 +2104,7 @@ fn decode_runner_command(
                 ));
             }
             Ok(ServerToRunner::CheckpointWorkspace {
+                workspace_connection_id: payload.workspace_connection_id,
                 command_id: command.id,
                 corp_id: payload.corp_id,
                 room_id: payload.room_id,
@@ -2122,6 +2144,11 @@ async fn snapshot(
         .snapshot(corp_id, actor_id)
         .await
         .map_err(map_store_error)?;
+    let visible_connections = state
+        .store
+        .visible_workspace_connections(corp_id, actor_id)
+        .await
+        .map_err(map_store_error)?;
     let runners = state
         .store
         .runner_records(corp_id)
@@ -2134,7 +2161,13 @@ async fn snapshot(
             hostname: record.hostname,
             os: record.os,
             capabilities: serde_json::from_value::<Vec<RunnerCapability>>(record.capabilities)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|cap| {
+                    cap.workspace_connection_id
+                        .is_none_or(|id| visible_connections.contains(&id))
+                })
+                .collect(),
             connected: record.status == "connected",
             status: record.status,
             last_seen_at: record.last_seen_at.to_rfc3339(),
@@ -2250,6 +2283,7 @@ struct MissionPlanInput<'a> {
     reasoning_effort: Option<&'a str>,
     strategy: Option<&'a str>,
     source: Option<&'a MissionSource>,
+    workspace_connection_id: Option<Uuid>,
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
@@ -2270,6 +2304,7 @@ impl<'a> MissionPlanInput<'a> {
             reasoning_effort: request.reasoning_effort.as_deref(),
             strategy: request.strategy.as_deref(),
             source: request.source.as_ref(),
+            workspace_connection_id: request.workspace_connection_id,
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
@@ -2304,10 +2339,48 @@ async fn plan_mission(
                 input.reasoning_effort,
             )
         };
-    let source = input
-        .source
-        .map(|source| resolve_mission_source(state, corp_id, source))
-        .transpose()?;
+    let source = if let Some(connection_id) = input.workspace_connection_id {
+        let (connection, _) = state
+            .store
+            .workspace_connection_settings(corp_id, input.actor_id, connection_id)
+            .await
+            .map_err(map_store_error)?;
+        if connection.status != crony_domain::WorkspaceConnectionStatus::Ready {
+            return Err(ApiError::conflict(
+                "the saved connection needs attention before starting work",
+            ));
+        }
+        if preferred_adapter != Some(connection.agent.as_str()) {
+            return Err(ApiError::bad_request(
+                "choose the coding agent configured for this saved connection",
+            ));
+        }
+        let expected = connection
+            .source
+            .ok_or_else(|| ApiError::conflict("the saved repository has not been checked"))?;
+        let requested = input.source.ok_or_else(|| {
+            ApiError::bad_request("review the saved repository and revision before building")
+        })?;
+        if requested.repository != expected.repository
+            || requested.base_ref != expected.base_ref
+            || requested.base_commit != expected.base_commit
+        {
+            return Err(ApiError::conflict(
+                "the saved source changed; review its current revision before building",
+            ));
+        }
+        Some(resolve_mission_source_in_connection(
+            state,
+            corp_id,
+            requested,
+            Some(connection_id),
+        )?)
+    } else {
+        input
+            .source
+            .map(|source| resolve_mission_source(state, corp_id, source))
+            .transpose()?
+    };
     validate_requested_model(
         state,
         corp_id,
@@ -2353,6 +2426,7 @@ async fn plan_mission(
                         source_base_commit: source
                             .as_ref()
                             .map(|source| source.base_commit.as_str()),
+                        workspace_connection_id: input.workspace_connection_id,
                     },
                 )
                 .is_some()
@@ -2397,6 +2471,9 @@ async fn plan_mission(
     if let Some(source) = &source {
         apply_mission_source(&mut plan, source);
     }
+    for task in &mut plan.tasks {
+        task.contract.workspace_connection_id = input.workspace_connection_id;
+    }
     apply_mission_description(&mut plan, input.description)?;
     if let Some(policy) = input.verification_policy {
         apply_verification_policy(&mut plan, policy);
@@ -2439,6 +2516,15 @@ fn resolve_mission_source(
     corp_id: Uuid,
     requested: &MissionSource,
 ) -> Result<MissionSource, ApiError> {
+    resolve_mission_source_in_connection(state, corp_id, requested, None)
+}
+
+fn resolve_mission_source_in_connection(
+    state: &AppState,
+    corp_id: Uuid,
+    requested: &MissionSource,
+    connection_id: Option<Uuid>,
+) -> Result<MissionSource, ApiError> {
     if requested.repository.trim().is_empty()
         || requested.base_ref.trim().is_empty()
         || requested.base_commit.trim().is_empty()
@@ -2454,6 +2540,7 @@ fn resolve_mission_source(
         .flat_map(|entry| entry.capabilities.clone())
         .find(|capability| {
             capability.name == "workspace-isolation"
+                && capability.workspace_connection_id == connection_id
                 && capability.available
                 && capability
                     .source_repository
@@ -2505,6 +2592,7 @@ fn validate_plan_runner_compatibility(
             source_repository: task.contract.source_repository.as_deref(),
             source_base_ref: task.contract.source_base_ref.as_deref(),
             source_base_commit: task.contract.source_base_commit.as_deref(),
+            workspace_connection_id: task.contract.workspace_connection_id,
         };
         if select_runner(state, corp_id, &requirements).is_none() {
             return Err(ApiError::bad_request(format!(
@@ -2705,6 +2793,34 @@ fn mission_preview_response(plan: &TaskGraphPlan) -> PreviewMissionResponse {
             })
             .collect(),
     }
+}
+
+async fn get_mission_context(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, mission_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<(HeaderMap, Json<crony_domain::MissionContext>), ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(query.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let context = state
+        .store
+        .mission_context(corp_id, actor_id, mission_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("mission context was not found"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok((headers, Json(context)))
 }
 
 async fn preview_mission(
@@ -3140,6 +3256,48 @@ async fn get_factory_verification_recovery_context(
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
         checkpoint_verification: context.checkpoint_verification,
+        checkpoint_cancellation_event_id: context.checkpoint_cancellation_event_id,
+    }))
+}
+
+async fn reconcile_factory_checkpoint_cancellation(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((corp_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ReconcileFactoryCheckpointCancellationRequest>,
+) -> Result<Json<FactoryWorkItemResponse>, ApiError> {
+    let actor_id = authorize_actor(
+        &state,
+        &principal,
+        corp_id,
+        Some(request.actor_id),
+        Permission::Operate,
+    )
+    .await?;
+    let outcome = state
+        .store
+        .reconcile_checkpoint_cancellation(crony_store::ReconcileCheckpointCancellationInput {
+            corp_id,
+            work_item_id,
+            actor_id,
+            source_run_id: request.source_run_id,
+            expected_factory_version: request.expected_factory_version,
+            cancellation_event_id: request.cancellation_event_id,
+            expected_workspace_fingerprint: request.expected_workspace_fingerprint,
+            expected_head_commit: request.expected_head_commit,
+            observed_source_revision: request.observed_source_revision,
+            idempotency_key: request.idempotency_key,
+            reason: request.reason,
+        })
+        .await
+        .map_err(map_store_error)?;
+    if let Some(event) = outcome.event {
+        publish(&state, event);
+    }
+    Ok(Json(FactoryWorkItemResponse {
+        work_item: outcome.work_item,
+        claim_token: None,
+        replayed: outcome.replayed,
     }))
 }
 
@@ -3313,10 +3471,13 @@ async fn preflight_factory_mission(
         Permission::Operate,
     )
     .await?;
-    let staffing_source = if needs_factory_staffing_source(
-        request.strategy.as_deref(),
-        request.preferred_adapter.as_deref(),
-    ) {
+    let workspace_connection_id = crony_domain::factory_workspace_connection_id(&request.policy)
+        .map_err(ApiError::bad_request)?;
+    let staffing_source = if workspace_connection_id.is_some()
+        || needs_factory_staffing_source(
+            request.strategy.as_deref(),
+            request.preferred_adapter.as_deref(),
+        ) {
         Some(MissionSource {
             repository: format!(
                 "{}/{}",
@@ -3338,6 +3499,7 @@ async fn preflight_factory_mission(
         &state,
         corp_id,
         MissionPlanInput {
+            workspace_connection_id,
             actor_id: request.actor_id,
             title: &request.title,
             description: &request.description,
@@ -3466,36 +3628,38 @@ async fn materialize_factory_mission(
             replayed: true,
         }));
     }
-    let staffing_source = if needs_factory_staffing_source(
-        request.strategy.as_deref(),
-        request.preferred_adapter.as_deref(),
-    ) {
-        match state
-            .store
-            .factory_staffing_source(corp_id, work_item_id, actor_id)
-            .await
-        {
-            Ok((repository, base_ref, base_commit)) => Some(MissionSource {
-                repository,
-                base_ref,
-                base_commit,
-            }),
-            Err(error) => {
-                return Err(reject_factory_materialization_error(
-                    &state,
-                    &materialize_input,
-                    map_store_error(error),
-                )
-                .await);
-            }
+    // Read the source and connection together from the immutable claimed policy.
+    // A materialization request cannot substitute its own account or machine.
+    let (repository, base_ref, base_commit, workspace_connection_id) = match state
+        .store
+        .factory_staffing_source(corp_id, work_item_id, actor_id)
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            return Err(reject_factory_materialization_error(
+                &state,
+                &materialize_input,
+                map_store_error(error),
+            )
+            .await);
         }
-    } else {
-        None
     };
+    let staffing_source = (workspace_connection_id.is_some()
+        || needs_factory_staffing_source(
+            request.strategy.as_deref(),
+            request.preferred_adapter.as_deref(),
+        ))
+    .then_some(MissionSource {
+        repository,
+        base_ref,
+        base_commit,
+    });
     let plan = match plan_mission(
         &state,
         corp_id,
         MissionPlanInput {
+            workspace_connection_id,
             actor_id,
             title: &request.title,
             description: &request.description,
@@ -3517,9 +3681,7 @@ async fn materialize_factory_mission(
     {
         Ok(plan) => plan,
         Err(error) => {
-            return Err(
-                reject_factory_materialization_error(&state, &materialize_input, error).await,
-            );
+            return Err(reject_factory_admission_error(&state, &materialize_input, error).await);
         }
     };
     let outcome = match state
@@ -3556,6 +3718,17 @@ async fn reject_factory_materialization_error(
     if error.status == StatusCode::CONFLICT {
         return error;
     }
+    reject_factory_admission_error(state, input, error).await
+}
+
+// A connection becoming unavailable or changing source is an admission conflict,
+// not an idempotency/version conflict. Release that exact claim generation even
+// for HTTP 409; the existing compensation transaction fences newer owners/mission.
+async fn reject_factory_admission_error(
+    state: &AppState,
+    input: &MaterializeFactoryMissionInput,
+    error: ApiError,
+) -> ApiError {
     match persist_factory_materialization_rejection(state, input, &error.message).await {
         Ok(()) => error,
         Err(compensation) if compensation.status == StatusCode::CONFLICT => {
@@ -4154,6 +4327,7 @@ async fn schedule_ready_tasks(
             source_repository: candidate.required_source_repository.as_deref(),
             source_base_ref: candidate.required_source_base_ref.as_deref(),
             source_base_commit: candidate.required_source_base_commit.as_deref(),
+            workspace_connection_id: candidate.workspace_connection_id,
         };
         let Some((runner_id, connection_epoch)) = select_runner(state, corp_id, &requirements)
         else {
@@ -4246,6 +4420,7 @@ async fn schedule_ready_tasks(
             &runner_id,
             connection_epoch,
             ServerToRunner::StartRun {
+                workspace_connection_id: record.workspace_connection_id,
                 corp_id: record.corp_id,
                 room_id: record.room_id,
                 mission_id: record.mission_id,
@@ -4620,6 +4795,7 @@ struct RunnerRequirements<'a> {
     source_repository: Option<&'a str>,
     source_base_ref: Option<&'a str>,
     source_base_commit: Option<&'a str>,
+    workspace_connection_id: Option<Uuid>,
 }
 
 fn select_runner(
@@ -4638,15 +4814,21 @@ fn select_ready_runner(
     let mut runners = connections
         .iter()
         .filter(|entry| {
+            let capabilities = entry
+                .capabilities
+                .iter()
+                .filter(|cap| cap.workspace_connection_id == requirements.workspace_connection_id)
+                .cloned()
+                .collect::<Vec<_>>();
             entry.dispatch_ready
                 && entry.corp_id == corp_id
                 && runner_workspace_satisfies_requirement(
-                    &entry.capabilities,
+                    &capabilities,
                     requirements.source_repository,
                     requirements.source_base_ref,
                     requirements.source_base_commit,
                 )
-                && entry.capabilities.iter().any(|capability| {
+                && capabilities.iter().any(|capability| {
                     capability_satisfies_requirement(
                         capability,
                         requirements.adapter,
@@ -4805,12 +4987,39 @@ async fn resume_run(
             "source run's runner is enrolled to a different Corp",
         ));
     }
-    if !runner_workspace_satisfies_requirement(
-        &runner.capabilities,
-        record.source_repository.as_deref(),
-        record.source_base_ref.as_deref(),
-        record.source_base_commit.as_deref(),
-    ) {
+    let source_available = if let Some(connection_id) = record.workspace_connection_id {
+        // Existing runs keep their original commit. The native connection
+        // manager checks its accepted historical source snapshot on resume.
+        runner.capabilities.iter().any(|cap| {
+            cap.workspace_connection_id == Some(connection_id)
+                && cap.name == "workspace-isolation"
+                && cap.available
+                && cap.source_repository.as_ref() == record.source_repository.as_ref()
+                && cap.source_base_ref.as_ref() == record.source_base_ref.as_ref()
+        }) && runner.capabilities.iter().any(|cap| {
+            cap.workspace_connection_id == Some(connection_id)
+                && capability_satisfies_requirement(
+                    cap,
+                    &record.adapter,
+                    record.model.as_deref(),
+                    record.reasoning_effort.as_deref(),
+                )
+        })
+    } else {
+        let legacy = runner
+            .capabilities
+            .iter()
+            .filter(|cap| cap.workspace_connection_id.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        runner_workspace_satisfies_requirement(
+            &legacy,
+            record.source_repository.as_deref(),
+            record.source_base_ref.as_deref(),
+            record.source_base_commit.as_deref(),
+        )
+    };
+    if !source_available {
         drop(runner);
         let failure = state
             .store
@@ -4846,6 +5055,7 @@ async fn resume_run(
         source_repository: record.source_repository.clone(),
         source_base_ref: record.source_base_ref.clone(),
         source_base_commit: record.source_base_commit.clone(),
+        workspace_connection_id: record.workspace_connection_id,
         verification_policy: record.verification_policy.clone(),
         write_scope: record.write_scope.clone(),
         deliverable: record.deliverable.clone(),
@@ -4904,6 +5114,7 @@ async fn resume_run(
         &record.runner_id,
         connection_epoch,
         ServerToRunner::ResumeRun {
+            workspace_connection_id: record.workspace_connection_id,
             command_id: None,
             corp_id: record.corp_id,
             room_id: record.room_id,
@@ -5478,6 +5689,130 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
             }
         };
         match incoming {
+            RunnerToServer::WorkspaceSetupReport {
+                runner_id,
+                corp_id,
+                connection_epoch,
+                operation_id,
+                report,
+            } => {
+                let current =
+                    registered.as_ref().is_some_and(|(id, corp, epoch)| {
+                        id == &runner_id && *corp == corp_id && *epoch == connection_epoch
+                    }) && runner_epoch_is_ready(&state.runners, &runner_id, connection_epoch);
+                if !current {
+                    continue;
+                }
+                match state
+                    .store
+                    .apply_workspace_setup_report(
+                        corp_id,
+                        &runner_id,
+                        connection_epoch,
+                        operation_id,
+                        report,
+                    )
+                    .await
+                {
+                    Ok(outcome) => {
+                        for event in outcome.events {
+                            publish(&state, event);
+                        }
+                        if outcome.operation.status.terminal() {
+                            let _ = command_tx.send(ServerToRunner::WorkspaceSetupAck {
+                                operation_id,
+                                accepted: true,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        // A transient store failure is not a negative receipt.
+                        // The node retains and replays its final outbox entry.
+                        if error.downcast_ref::<sqlx::Error>().is_none() {
+                            let _ = command_tx.send(ServerToRunner::WorkspaceSetupAck {
+                                operation_id,
+                                accepted: false,
+                            });
+                        }
+                        warn!(%error,%operation_id,"workspace setup result not accepted");
+                    }
+                }
+            }
+            RunnerToServer::WorkspaceSignInAck {
+                runner_id,
+                corp_id,
+                connection_epoch,
+                operation_id,
+                request_id,
+                applied,
+            } => {
+                let current =
+                    registered.as_ref().is_some_and(|(id, corp, epoch)| {
+                        id == &runner_id && *corp == corp_id && *epoch == connection_epoch
+                    }) && runner_epoch_is_ready(&state.runners, &runner_id, connection_epoch);
+                if current {
+                    workspace_connections::acknowledge_sign_in(
+                        &state,
+                        corp_id,
+                        &runner_id,
+                        connection_epoch,
+                        operation_id,
+                        request_id,
+                        applied,
+                    );
+                }
+            }
+            RunnerToServer::CapabilitiesUpdated {
+                runner_id,
+                corp_id,
+                connection_epoch,
+                capabilities,
+            } => {
+                let current =
+                    registered.as_ref().is_some_and(|(id, corp, epoch)| {
+                        id == &runner_id && *corp == corp_id && *epoch == connection_epoch
+                    }) && runner_epoch_is_ready(&state.runners, &runner_id, connection_epoch);
+                if !current {
+                    continue;
+                }
+                match workspace_connections::filter_capabilities(
+                    &state,
+                    corp_id,
+                    &runner_id,
+                    capabilities,
+                )
+                .await
+                {
+                    Ok(capabilities) => {
+                        match state
+                            .store
+                            .update_runner_capabilities(
+                                corp_id,
+                                &runner_id,
+                                connection_epoch,
+                                json!(&capabilities),
+                            )
+                            .await
+                        {
+                            Ok((true, event)) => {
+                                if let Some(mut connection) = state.runners.get_mut(&runner_id)
+                                    && connection.connection_epoch == connection_epoch
+                                {
+                                    connection.capabilities = capabilities;
+                                }
+                                if let Some(event) = event {
+                                    publish(&state, event);
+                                }
+                            }
+                            Ok((false, _)) => {}
+                            Err(error) => {
+                                warn!(%error,%runner_id,"runner capability update remains uncommitted")
+                            }
+                        }
+                    }
+                    Err(error) => warn!(%error,%runner_id,"runner capability update rejected"),
+                }
+            }
             RunnerToServer::Register {
                 runner_id,
                 corp_id,
@@ -5513,6 +5848,24 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     }
                 };
                 publish(&state, authentication.event);
+                let capabilities = match workspace_connections::filter_capabilities(
+                    &state,
+                    corp_id,
+                    &runner_id,
+                    capabilities.clone(),
+                )
+                .await
+                {
+                    Ok(filtered) => filtered,
+                    Err(error) => {
+                        warn!(%error,%runner_id,"saved connection capabilities could not be validated");
+                        capabilities
+                            .into_iter()
+                            .filter(|cap| cap.workspace_connection_id.is_none())
+                            .take(64)
+                            .collect()
+                    }
+                };
                 let record = match state
                     .store
                     .runner_connected(RunnerConnectInput {
@@ -5696,6 +6049,9 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     status = %record.status,
                     "runner connected"
                 );
+                if let Err(error) = workspace_connections::dispatch(&state, &runner_id).await {
+                    warn!(%error,%runner_id,"connection setup remains queued after registration");
+                }
             }
             RunnerToServer::Heartbeat {
                 runner_id,
@@ -5733,6 +6089,11 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                         .await
                         {
                             warn!(%error, %runner_id, "heartbeat command reconciliation failed");
+                        }
+                        if let Err(error) =
+                            workspace_connections::dispatch(&state, &runner_id).await
+                        {
+                            warn!(%error,%runner_id,"heartbeat connection setup reconciliation failed");
                         }
                     }
                     Ok(false) => {
@@ -6482,6 +6843,7 @@ mod tests {
     #[test]
     fn checkpoint_verification_requires_explicit_runner_support() {
         let mut capability = RunnerCapability {
+            workspace_connection_id: None,
             name: "verification-artifact-transfer-v1".to_owned(),
             available: true,
             detail: None,
@@ -7056,6 +7418,7 @@ mod tests {
         let runners = Arc::new(DashMap::new());
         let (mut connection, mut received) = reconnect_test_connection(epoch);
         connection.capabilities.push(RunnerCapability {
+            workspace_connection_id: None,
             name: "fake-process".to_owned(),
             available: true,
             detail: None,
@@ -7067,6 +7430,7 @@ mod tests {
         let corp_id = connection.corp_id;
         runners.insert("runner".to_owned(), connection);
         let requirements = RunnerRequirements {
+            workspace_connection_id: None,
             adapter: "fake-process",
             model: None,
             reasoning_effort: None,
@@ -7328,6 +7692,7 @@ mod tests {
     #[test]
     fn model_less_adapter_reports_the_invalid_model_requirement() {
         let capabilities = vec![RunnerCapability {
+            workspace_connection_id: None,
             name: "fake-process".to_owned(),
             available: true,
             detail: None,
@@ -7353,6 +7718,7 @@ mod tests {
     #[test]
     fn runner_matching_enforces_model_and_reasoning_support() {
         let capability = RunnerCapability {
+            workspace_connection_id: None,
             name: "github-copilot".to_owned(),
             available: true,
             detail: None,
@@ -7378,6 +7744,7 @@ mod tests {
     #[test]
     fn runner_matching_enforces_repository_and_base_ref() {
         let capabilities = vec![RunnerCapability {
+            workspace_connection_id: None,
             name: "workspace-isolation".to_owned(),
             available: true,
             detail: Some(
@@ -7603,6 +7970,7 @@ mod tests {
                 key: "deliver".to_owned(),
                 title: "Deliver".to_owned(),
                 contract: TaskContract {
+                    workspace_connection_id: None,
                     objective: "Produce the role-specific output.".to_owned(),
                     expected_output: "Output".to_owned(),
                     source_repository: None,

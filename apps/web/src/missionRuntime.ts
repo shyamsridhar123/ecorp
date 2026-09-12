@@ -20,6 +20,7 @@ export type RunnerCapability = {
   source_repository?: string | null
   source_base_ref?: string | null
   source_base_commit?: string | null
+  workspace_connection_id?: string | null
 }
 
 export type RunnerNode = {
@@ -41,6 +42,7 @@ export type RepositoryTarget = {
   baseCommit: string
   runnerIds: string[]
   runnerLabels: string[]
+  workspaceConnectionId?: string
 }
 
 const MISSION_RUNTIMES = [
@@ -61,6 +63,7 @@ export function workspaceCapability(runner: RunnerNode): RunnerCapability | unde
   return runner.capabilities.find(
     (capability) =>
       capability.name === 'workspace-isolation' &&
+      !capability.workspace_connection_id &&
       capability.available &&
       capability.source_repository &&
       capability.source_base_ref &&
@@ -73,6 +76,14 @@ export function runnerMatchesRepository(
   target: RepositoryTarget,
 ): boolean {
   const capability = workspaceCapability(runner)
+  if (target.workspaceConnectionId) {
+    return runner.capabilities.some((candidate) =>
+      candidate.name === 'workspace-isolation' && candidate.available &&
+      candidate.workspace_connection_id === target.workspaceConnectionId &&
+      candidate.source_repository?.toLowerCase() === target.repository.toLowerCase() &&
+      candidate.source_base_ref === target.baseRef &&
+      candidate.source_base_commit?.toLowerCase() === target.baseCommit.toLowerCase())
+  }
   return Boolean(
     capability?.source_repository?.toLowerCase() === target.repository.toLowerCase() &&
     capability.source_base_ref === target.baseRef &&
@@ -93,7 +104,10 @@ export function availableRunnerAdapters(
     connectedRunners
       .flatMap((runner) => runner.capabilities)
       .filter(
-        (capability) => capability.available && MISSION_RUNTIMES.includes(capability.name),
+        (capability) => capability.available && MISSION_RUNTIMES.includes(capability.name) &&
+          (!target || (target.workspaceConnectionId
+            ? capability.workspace_connection_id === target.workspaceConnectionId
+            : !capability.workspace_connection_id)),
       )
       .reduce((adapters, capability) => {
         const existing = adapters.get(capability.name)
