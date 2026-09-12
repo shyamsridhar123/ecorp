@@ -993,6 +993,68 @@ function Invoke-SourceCases {
             $arguments.Elements.Count -eq 2 -and
             (Test-SourceMember $arguments.Elements[1] 'factory' 'verification_policy_file')) 'The controller must receive the canonicalized policy field.'
     }
+    Invoke-Case 'Factory saved connection is retained and passed only as an explicit native option' {
+        $options = @($start.FindAll({ param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Value -eq '--workspace-connection-id'
+        }, $true))
+        Assert-Equal $options.Count 1 'Only the native Factory invocation receives the selected connection.'
+        $arguments = $options[0].Parent
+        Assert-True ($arguments -is [Management.Automation.Language.ArrayLiteralAst] -and
+            $arguments.Elements.Count -eq 2 -and
+            (Test-SourceMember $arguments.Elements[1] 'factory' 'workspace_connection_id')) 'The option must use the validated persisted connection, not an inferred current account.'
+        $guards = @(Get-ConditionalAncestors $options[0] | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            ($_.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -match '\$factory\.workspace_connection_id'
+        })
+        Assert-True ($guards.Count -gt 0) 'Legacy unbound Factory must not receive an empty connection argument.'
+        $settings = @($commands | Where-Object {
+            $_.GetCommandName() -eq 'Setting' -and
+            $_.Extent.Text -match 'ECORP_FACTORY_WORKSPACE_CONNECTION_ID'
+        })
+        Assert-Equal $settings.Count 1 'Factory connection selection must use the supported host setting.'
+        Assert-True ($settings[0].Extent.Text -match 'factory_workspace_connection_id') 'Ordinary restart must reuse the recorded non-secret connection ID.'
+        $validation = @($start.FindAll({ param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+            $node.Value -like 'Factory workspace connection must be*'
+        }, $true))
+        Assert-Equal $validation.Count 1 'Invalid or nil connection IDs must be rejected before service changes.'
+        $refs = @($commands | Where-Object {
+            $_.GetCommandName() -eq 'Setting' -and $_.Extent.Text -match 'ECORP_FACTORY_SOURCE_BASE_REF'
+        })
+        Assert-Equal $refs.Count 1 'Factory must retain its own source ref instead of retargeting the runner.'
+        Assert-True ($refs[0].Extent.Text -match 'factory_source_base_ref') 'The controller ref must survive restart.'
+        $upgrades = @($start.FindAll({ param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Value -like 'Use explicit restart to change the running Factory source ref*'
+        }, $true))
+        Assert-Equal $upgrades.Count 1 'An old ownership record cannot silently adopt a different ref for a live controller.'
+        $upgradeGuards = @(Get-ConditionalAncestors $upgrades[0] | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Extent.Text -match 'factory_source_base_ref' -and
+            $_.Extent.Text -match "Test-LocalSettingChanged 'factory_source_base_ref'" -and
+            $_.Extent.Text -match "Role-Live 'factoryController'"
+        })
+        Assert-True ($upgradeGuards.Count -gt 0) 'The old-record guard must compare the legacy effective ref and actual live controller.'
+    }
+    Invoke-Case 'live source-ref changes use exact comparison for old and current records' {
+        $comparators = @($start.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-LocalSettingChanged'
+        }, $true))
+        Assert-Equal $comparators.Count 1 'One production comparator must protect both configuration paths.'
+        # Execute only this AST-extracted pure function, never a starter.
+        . ([ScriptBlock]::Create($comparators[0].Extent.Text))
+        foreach ($name in @('source_base_ref','factory_source_base_ref')) {
+            Assert-True (Test-LocalSettingChanged $name 'main' 'Main') 'Case-only Git refs are distinct.'
+            Assert-True (Test-LocalSettingChanged $name "caf$([char]0xE9)" "cafe$([char]0x301)") 'Distinct Unicode ref strings must not compare equal.'
+            Assert-True (!(Test-LocalSettingChanged $name 'main' 'main')) 'An identical ref must reuse the current controller.'
+        }
+        Assert-True (!(Test-LocalSettingChanged 'runner_workspace' 'C:\Workspace' 'c:\workspace')) 'Preserve Windows path comparison behavior for unrelated settings.'
+        $calls = @($commands | Where-Object { $_.GetCommandName() -eq 'Test-LocalSettingChanged' })
+        Assert-Equal $calls.Count 2 'The comparator must protect both legacy upgrade and ordinary live configuration checks.'
+        Assert-True (@($calls | Where-Object { $_.Extent.Text -match '\$key' }).Count -eq 1) 'Existing saved ref keys must also use the exact comparator.'
+    }
     Invoke-Case 'starter never deletes enrollment or credentials without an explicit reset/rotation guard' {
         foreach ($command in $commands | Where-Object {
             $_.GetCommandName() -eq 'Remove-Item' -and $_.Extent.Text -match 'credential|enrollment'

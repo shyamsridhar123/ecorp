@@ -11,23 +11,41 @@ use crony_domain::{
     PullRequestPublication, PullRequestPublicationAttempt, PullRequestPublicationState,
     QueuedMessage, Room, RoomMessage, Run, RunStatus, SourceDeliverable, Task, TaskContract,
     TaskGraphPlan, TaskSecretReference, TaskStatus, VerificationEvidence, VerificationPolicy,
-    VerificationRequest, VerifierCheck, repository_relative_path_is_valid, write_scope_allows_path,
-    write_scope_is_valid,
+    VerificationRequest, VerifierCheck, factory_workspace_connection_id,
+    repository_relative_path_is_valid, write_scope_allows_path, write_scope_is_valid,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+mod budget_checkpoint;
 mod budget_revision;
+mod checkpoint_cancellation;
+mod checkpoint_publication;
+mod checkpoint_retention;
+pub use checkpoint_cancellation::ReconcileCheckpointCancellationInput;
 mod contract_revision;
 mod factory_controller;
 mod factory_run_failure;
+mod mission_context;
 mod publication;
 mod staffing;
+mod terminal_accounting;
+mod verification_dispatch;
+mod workspace_connections;
+pub use workspace_connections::{
+    CreateWorkspaceConnectionInput, WorkspaceSetupInput, WorkspaceSetupMutation,
+};
 
 #[cfg(test)]
+mod budget_checkpoint_tests;
+#[cfg(test)]
 mod factory_recovery_loss_tests;
+#[cfg(test)]
+mod mission_context_tests;
+#[cfg(test)]
+mod workspace_connections_tests;
 
 const DEMO_CORP_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEMO_ALICE_ID: &str = "00000000-0000-4000-8000-000000000011";
@@ -295,6 +313,8 @@ pub struct FactoryVerificationRecoveryContext {
     pub remaining_mission_cost_microusd: i64,
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
+    pub checkpoint_verification: bool,
+    pub checkpoint_cancellation_event_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +479,7 @@ pub struct LaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub verification_policy: VerificationPolicy,
     pub write_scope: Vec<String>,
     pub deliverable: Option<DeliverableSpec>,
@@ -475,6 +496,7 @@ pub struct SchedulableTask {
     pub required_source_repository: Option<String>,
     pub required_source_base_ref: Option<String>,
     pub required_source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +519,7 @@ pub struct ResumeLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_base_commit: String,
     pub verification_policy: VerificationPolicy,
     pub write_scope: Vec<String>,
@@ -1637,7 +1660,7 @@ impl PgStore {
                    r.input_tokens, r.output_tokens, r.cost_microusd,
                    r.budget_tokens_limit, r.budget_cost_microusd_limit, r.breaker_stage,
                    r.no_progress_events, r.repeated_tool_count,
-                   r.source_repository, r.source_base_ref, r.source_base_commit,
+                   r.workspace_connection_id, r.source_repository, r.source_base_ref, r.source_base_commit,
                    r.workspace_path, r.workspace_branch, r.workspace_base_ref,
                    r.workspace_base_commit, r.workspace_disposition, r.workspace_detail,
                    r.workspace_fingerprint, r.execution_mode,
@@ -2986,7 +3009,17 @@ impl PgStore {
 
         let mut tx = self.pool.begin().await?;
         assert_actor_scope_tx(&mut tx, input.corp_id, input.actor_id).await?;
-        mission_room_for_actor_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        if workspace_connections::plan_room_tx(
+            &mut tx,
+            input.corp_id,
+            input.actor_id,
+            &constrained_plan,
+        )
+        .await?
+        .is_none()
+        {
+            mission_room_for_actor_tx(&mut tx, input.corp_id, input.actor_id).await?;
+        }
         tx.commit().await?;
         Ok(constrained_plan)
     }
@@ -2999,6 +3032,8 @@ impl PgStore {
         let idempotency_key = normalize_factory_idempotency_key(&input.idempotency_key)?;
         let lease_seconds = validate_factory_lease_seconds(input.lease_seconds)?;
         let policy = normalize_factory_policy(input.policy)?;
+        let workspace_connection_id =
+            factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
         let operation_request = json!({
             "source_project_owner": &source.project_owner,
             "source_project_number": source.project_number,
@@ -3044,7 +3079,7 @@ impl PgStore {
                 &operation_request,
             )?;
             let (work_item, current_token) =
-                factory_work_item_tx(&mut tx, input.corp_id, operation.work_item_id, false)
+                factory_work_item_tx(&mut tx, input.corp_id, operation.work_item_id, true)
                     .await?
                     .context("idempotent factory claim references a missing work item")?;
             ensure_factory_source_matches(&work_item, &source)?;
@@ -3052,6 +3087,15 @@ impl PgStore {
                 return Err(anyhow!(
                     "factory idempotency key was reused with a different policy snapshot"
                 ));
+            }
+            if let Some(connection_id) = workspace_connection_id {
+                workspace_connections::assert_connection_operator_tx(
+                    &mut tx,
+                    input.corp_id,
+                    input.actor_id,
+                    connection_id,
+                )
+                .await?;
             }
             let claim_token =
                 replayable_factory_claim_token(&work_item, current_token, &operation, now);
@@ -3105,6 +3149,15 @@ impl PgStore {
                         return Err(anyhow!(
                             "factory recovery policy does not match the persisted policy snapshot"
                         ));
+                    }
+                    if let Some(connection_id) = workspace_connection_id {
+                        workspace_connections::assert_connection_operator_tx(
+                            &mut tx,
+                            input.corp_id,
+                            input.actor_id,
+                            connection_id,
+                        )
+                        .await?;
                     }
                     record_factory_operation_tx(
                         &mut tx,
@@ -3245,6 +3298,18 @@ impl PgStore {
             (map_factory_work_item(row)?, "factory.work_item_claimed")
         };
 
+        // Lock the Factory row before the connection, including new claims.
+        // An authorization failure rolls back the insert/reclaim before any
+        // operation or event can be committed.
+        if let Some(connection_id) = workspace_connection_id {
+            workspace_connections::assert_connection_operator_tx(
+                &mut tx,
+                input.corp_id,
+                input.actor_id,
+                connection_id,
+            )
+            .await?;
+        }
         record_factory_operation_tx(
             &mut tx,
             NewFactoryOperation {
@@ -3712,6 +3777,20 @@ impl PgStore {
         )
         .await?;
 
+        if let Some(outcome) = checkpoint_retention::request_review_checkpoint_tx(
+            &mut tx,
+            &input,
+            &expected_head_commit,
+            &idempotency_key,
+            &command_idempotency_key,
+            &operation_request,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(outcome);
+        }
+
         let existing_command = sqlx::query(
             r#"
             SELECT id, runner_id, run_id, payload
@@ -3840,7 +3919,8 @@ impl PgStore {
                    run.workspace_disposition,
                    run.workspace_base_commit, run.breaker_stage,
                    run.verification_status AS source_verification_status,
-                   run.source_repository, run.source_base_ref, run.source_base_commit
+                   run.source_repository, run.source_base_ref, run.source_base_commit,
+                   run.workspace_connection_id
             FROM missions mission
             JOIN tasks task ON task.mission_id = mission.id
             JOIN runs run ON run.task_id = task.id
@@ -3949,6 +4029,7 @@ impl PgStore {
             "source_repository": row.get::<Option<String>, _>("source_repository"),
             "source_base_ref": row.get::<Option<String>, _>("source_base_ref"),
             "source_base_commit": row.get::<Option<String>, _>("source_base_commit"),
+            "workspace_connection_id": row.get::<Option<Uuid>, _>("workspace_connection_id"),
             "workspace_base_commit": workspace_base_commit,
             "expected_head_commit": expected_head_commit,
         });
@@ -4316,7 +4397,7 @@ impl PgStore {
                 SELECT task.id AS task_id, source.workspace_run_id
                 FROM tasks task
                 JOIN LATERAL (
-                    SELECT run.workspace_run_id
+                    SELECT run.workspace_run_id, run.breaker_stage, run.execution_mode
                     FROM runs run
                     WHERE run.corp_id = task.corp_id
                       AND run.task_id = task.id
@@ -4325,8 +4406,12 @@ impl PgStore {
                 ) source ON TRUE
                 WHERE task.corp_id = $1
                   AND task.mission_id = $2
-                  AND task.status = 'verification_failed'
-                  AND task.verification_status IN ('failed', 'pending')
+                  AND (
+                    (task.status = 'verification_failed' AND task.verification_status IN ('failed', 'pending'))
+                    OR (task.status IN ('failed','cancelled')
+                        AND source.breaker_stage IN ('suspend','stop')
+                        AND source.execution_mode='provider')
+                  )
                 ORDER BY task.created_at, task.id
                 "#,
             )
@@ -4352,7 +4437,13 @@ impl PgStore {
             r#"
             SELECT task.attempt_count, task.max_attempts,
                    mission.budget_tokens, mission.budget_cost_microusd,
-                   source.id
+                   source.id, source.breaker_stage,
+                   EXISTS (
+                     SELECT 1 FROM factory_verification_recoveries recovery
+                     WHERE recovery.corp_id=source.corp_id
+                       AND recovery.replacement_run_id=source.id
+                       AND recovery.mode='checkpoint_verification'
+                   ) AS checkpoint_recovery
             FROM tasks task
             JOIN missions mission
               ON mission.id = task.mission_id AND mission.corp_id = task.corp_id
@@ -4368,8 +4459,33 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await?
         .context("factory recovery context source run was not found")?;
-        let checkpoint = source_workspace_checkpoint_tx(&mut tx, corp_id, source_run_id).await?;
-        checkpoint.ensure_factory_terminal()?;
+        let mut checkpoint =
+            source_workspace_checkpoint_tx(&mut tx, corp_id, source_run_id).await?;
+        let checkpoint_verification = matches!(
+            row.get::<String, _>("breaker_stage").as_str(),
+            "suspend" | "stop"
+        ) || row.get::<bool, _>("checkpoint_recovery");
+        let mut checkpoint_cancellation_event_id = None;
+        if checkpoint_verification {
+            let authority = budget_checkpoint::source_authority_tx(
+                &mut tx,
+                corp_id,
+                work_item_id,
+                source_run_id,
+            )
+            .await?;
+            checkpoint_cancellation_event_id =
+                checkpoint_cancellation::cancellation_event_tx(&mut tx, &work_item, source_run_id)
+                    .await?;
+            // A retry may have already exported its authorized verification
+            // commit. Preserve that bound head; the provider origin remains
+            // immutable authority, not the verifier's current checkout head.
+            if checkpoint.execution_mode == "provider" {
+                checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit);
+            }
+        } else {
+            checkpoint.ensure_factory_terminal()?;
+        }
         checkpoint.ensure_preserved()?;
         let (mission_tokens_used, mission_cost_used) =
             budget_revision::mission_usage_tx(&mut tx, corp_id, mission_id).await?;
@@ -4389,6 +4505,8 @@ impl PgStore {
                 .max(0),
             workspace_fingerprint: checkpoint.fingerprint,
             expected_head_commit: checkpoint.expected_head_commit,
+            checkpoint_verification,
+            checkpoint_cancellation_event_id,
         };
         tx.commit().await?;
         Ok(Some(context))
@@ -4438,6 +4556,13 @@ impl PgStore {
                 "reviewed source snapshot does not match the observed source revision"
             ));
         }
+        let checkpoint_verification =
+            input.mode == FactoryVerificationRecoveryMode::CheckpointVerification;
+        if checkpoint_verification && input.contract_revision_id.is_some() {
+            return Err(anyhow!(
+                "checkpoint verification cannot revise the preserved source policy"
+            ));
+        }
         let request = json!({
             "work_item_id": input.work_item_id,
             "source_run_id": input.source_run_id,
@@ -4475,6 +4600,12 @@ impl PgStore {
             "factory:item:{}:{}",
             input.corp_id, input.work_item_id
         ));
+        if checkpoint_verification {
+            lock_keys.push(format!(
+                "publication:factory:{}:{}",
+                input.corp_id, input.work_item_id
+            ));
+        }
         lock_keys.push(format!(
             "resume:workspace:{}:{}",
             input.corp_id, workspace_run_id
@@ -4623,12 +4754,54 @@ impl PgStore {
         let mission_status: String = row.get("mission_status");
         let revised_verification_pending =
             input.contract_revision_id.is_some() && task_verification_status == "pending";
-        let checkpoint =
+        let mut checkpoint =
             source_workspace_checkpoint_tx(&mut tx, input.corp_id, input.source_run_id).await?;
-        checkpoint.ensure_factory_terminal()?;
+        let checkpoint_authority = if checkpoint_verification {
+            let authority = budget_checkpoint::source_authority_tx(
+                &mut tx,
+                input.corp_id,
+                input.work_item_id,
+                input.source_run_id,
+            )
+            .await?;
+            if !matches!(
+                task_status.as_str(),
+                "failed" | "cancelled" | "verification_failed"
+            ) || !matches!(mission_status.as_str(), "failed" | "cancelled")
+                || observed_source_revision != work_item.source_revision
+            {
+                return Err(anyhow!(
+                    "checkpoint verification cannot replace active or accepted work"
+                ));
+            }
+            let owned_block = work_item.state == FactoryWorkItemState::Blocked
+                && factory_run_failure::owns_block_tx(
+                    &mut tx,
+                    &work_item,
+                    current_token,
+                    input.source_run_id,
+                )
+                .await?;
+            if !matches!(
+                work_item.state,
+                FactoryWorkItemState::Running | FactoryWorkItemState::VerificationFailed
+            ) && !owned_block
+            {
+                return Err(anyhow!(
+                    "checkpoint verification cannot clear an unrelated factory state"
+                ));
+            }
+            if checkpoint.execution_mode == "provider" {
+                checkpoint.expected_head_commit = Some(authority.checkpoint.head_commit.clone());
+            }
+            Some(authority)
+        } else {
+            checkpoint.ensure_factory_terminal()?;
+            None
+        };
         checkpoint.ensure_preserved()?;
         let mut events = Vec::new();
-        if work_item.state != FactoryWorkItemState::VerificationFailed {
+        if !checkpoint_verification && work_item.state != FactoryWorkItemState::VerificationFailed {
             if task_status != "verification_failed"
                 || (task_verification_status != "failed" && !revised_verification_pending)
                 || mission_status != "failed"
@@ -4656,10 +4829,11 @@ impl PgStore {
             work_item = reconciled;
             events.push(event);
         }
-        if task_status != "verification_failed"
-            || (task_verification_status != "failed" && !revised_verification_pending)
-            || mission_status != "failed"
-            || row.get::<String, _>("source_verification_status") != "failed"
+        if !checkpoint_verification
+            && (task_status != "verification_failed"
+                || (task_verification_status != "failed" && !revised_verification_pending)
+                || mission_status != "failed"
+                || row.get::<String, _>("source_verification_status") != "failed")
         {
             return Err(anyhow!(
                 "factory verification recovery requires failed verification, task, and mission state"
@@ -4684,13 +4858,14 @@ impl PgStore {
         }
         let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
         if lineage.iter().any(|candidate| {
-            matches!(
+            (matches!(
                 candidate.get::<String, _>("breaker_stage").as_str(),
                 "suspend" | "stop"
-            ) || candidate
-                .get::<Option<String>, _>("workspace_disposition")
-                .as_deref()
-                == Some("quarantined")
+            ) && !checkpoint_verification)
+                || candidate
+                    .get::<Option<String>, _>("workspace_disposition")
+                    .as_deref()
+                    == Some("quarantined")
         }) {
             return Err(anyhow!(
                 "factory verification recovery cannot bypass a suspended, stopped, or quarantined lineage"
@@ -4701,6 +4876,16 @@ impl PgStore {
             return Err(anyhow!(
                 "factory verification recovery source run is not the latest workspace checkpoint"
             ));
+        }
+        if let Some(authority) = &checkpoint_authority {
+            budget_checkpoint::validate_lineage_tx(
+                &mut tx,
+                input.corp_id,
+                work_item.id,
+                workspace_run_id,
+                authority,
+            )
+            .await?;
         }
         let active_run: bool = sqlx::query_scalar(
             r#"
@@ -4725,12 +4910,16 @@ impl PgStore {
         }
         let attempt_count: i32 = row.get("attempt_count");
         let max_attempts: i32 = row.get("max_attempts");
-        if attempt_count >= max_attempts {
+        if !checkpoint_verification && attempt_count >= max_attempts {
             return Err(anyhow!(
                 "factory verification recovery task exhausted its attempt limit"
             ));
         }
-        let attempt = attempt_count + 1;
+        let attempt = if checkpoint_verification {
+            attempt_count
+        } else {
+            attempt_count + 1
+        };
         let contract: TaskContract =
             serde_json::from_value(row.get("contract")).context("decode recovery task contract")?;
         let current_verification_policy: VerificationPolicy =
@@ -4777,31 +4966,42 @@ impl PgStore {
         let mission_budget_cost_microusd: i64 = row.get("mission_budget_cost_microusd");
         let remaining_mission_tokens = mission_budget_tokens - mission_tokens_used;
         let remaining_mission_cost_microusd = mission_budget_cost_microusd - mission_cost_used;
-        if remaining_mission_tokens <= 0 || remaining_mission_cost_microusd <= 0 {
+        if !checkpoint_verification
+            && (remaining_mission_tokens <= 0 || remaining_mission_cost_microusd <= 0)
+        {
             return Err(anyhow!(
                 "factory verification recovery has no remaining mission budget"
             ));
         }
         let rolling = rolling_budget_remaining_tx(&mut tx, input.corp_id, requester).await?;
-        if rolling.actor_tokens <= 0
-            || rolling.actor_cost_microusd <= 0
-            || rolling.corp_tokens <= 0
-            || rolling.corp_cost_microusd <= 0
+        if !checkpoint_verification
+            && (rolling.actor_tokens <= 0
+                || rolling.actor_cost_microusd <= 0
+                || rolling.corp_tokens <= 0
+                || rolling.corp_cost_microusd <= 0)
         {
             return Err(anyhow!(
                 "factory verification recovery has no remaining requester or Corp budget"
             ));
         }
-        let run_budget_tokens = contract
-            .budget_tokens
-            .min(remaining_mission_tokens)
-            .min(rolling.actor_tokens)
-            .min(rolling.corp_tokens);
-        let run_budget_cost_microusd = contract
-            .budget_cost_microusd
-            .min(remaining_mission_cost_microusd)
-            .min(rolling.actor_cost_microusd)
-            .min(rolling.corp_cost_microusd);
+        let run_budget_tokens = if checkpoint_verification {
+            0
+        } else {
+            contract
+                .budget_tokens
+                .min(remaining_mission_tokens)
+                .min(rolling.actor_tokens)
+                .min(rolling.corp_tokens)
+        };
+        let run_budget_cost_microusd = if checkpoint_verification {
+            0
+        } else {
+            contract
+                .budget_cost_microusd
+                .min(remaining_mission_cost_microusd)
+                .min(rolling.actor_cost_microusd)
+                .min(rolling.corp_cost_microusd)
+        };
         let required_adapter: String = row.get("required_adapter");
         let adapter: String = row.get("adapter");
         if required_adapter != adapter {
@@ -4822,7 +5022,7 @@ impl PgStore {
         let recovery_id = Uuid::new_v4();
         let command_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
-        let execution_mode = if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+        let execution_mode = if input.mode.is_verifier_only() {
             "verification_only"
         } else {
             "provider"
@@ -4836,24 +5036,22 @@ impl PgStore {
         let provider_session_id = (input.mode == FactoryVerificationRecoveryMode::SourceCorrection)
             .then(|| row.get::<Option<String>, _>("provider_session_id"))
             .flatten();
-        let reused_artifact_id = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_id = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<Uuid>, _>("artifact_id"))
             .flatten();
-        let reused_artifact_uri = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_uri = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<String>, _>("artifact_uri"))
             .flatten();
-        let reused_artifact_signature = (input.mode
-            == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_signature = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<String>, _>("artifact_signature"))
             .flatten();
-        let reused_artifact_path = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_path = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<String>, _>("artifact_path"))
             .flatten();
-        let reused_artifact_sha256 = (input.mode == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_sha256 = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<String>, _>("artifact_sha256"))
             .flatten();
-        let reused_artifact_media_type = (input.mode
-            == FactoryVerificationRecoveryMode::VerifierOnly)
+        let reused_artifact_media_type = (input.mode.is_verifier_only())
             .then(|| row.get::<Option<String>, _>("artifact_media_type"))
             .flatten();
         sqlx::query(
@@ -4894,6 +5092,8 @@ impl PgStore {
         .bind(&reused_artifact_media_type)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, input.corp_id, run_id).await?;
         let queued_messages = if input.mode == FactoryVerificationRecoveryMode::SourceCorrection {
             reserve_queued_messages_tx(&mut tx, input.corp_id, row.get("agent_id"), run_id).await?
         } else {
@@ -4918,7 +5118,7 @@ impl PgStore {
         sqlx::query(
             "UPDATE agents SET status = 'starting', station = $1, current_run_id = $2, retired_at = NULL WHERE id = $3",
         )
-        .bind(if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+        .bind(if input.mode.is_verifier_only() {
             "review"
         } else {
             "dispatch"
@@ -4954,11 +5154,12 @@ impl PgStore {
                 source_run_id, replacement_run_id, mode, status, authorized_by,
                 reason, idempotency_key, observed_source_revision,
                 reviewed_source_snapshot, contract_revision_id,
-                previous_verification_policy, replacement_verification_policy, request
+                previous_verification_policy, replacement_verification_policy, request,
+                checkpoint_authority
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, $11,
-                $12, $13, $14, $15, $16, $17
+                $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -4979,6 +5180,12 @@ impl PgStore {
         .bind(serde_json::to_value(&previous_verification_policy)?)
         .bind(serde_json::to_value(&replacement_verification_policy)?)
         .bind(&request)
+        .bind(
+            checkpoint_authority
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
         .execute(&mut *tx)
         .await?;
 
@@ -5002,7 +5209,7 @@ impl PgStore {
             .map(usize::try_from)
             .transpose()
             .context("provider artifact size is out of range")?;
-        let provider_artifact = if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+        let provider_artifact = if input.mode.is_verifier_only() {
             match (
                 provider_artifact_path.as_ref(),
                 provider_artifact_sha256.as_ref(),
@@ -5050,6 +5257,7 @@ impl PgStore {
             "source_repository": contract.source_repository,
             "source_base_ref": contract.source_base_ref,
             "source_base_commit": contract.source_base_commit,
+            "workspace_connection_id": workspace_connection_id,
             "workspace_base_commit": workspace_base_commit,
             "expected_workspace_fingerprint": input.expected_workspace_fingerprint,
             "expected_head_commit": input.expected_head_commit,
@@ -5113,7 +5321,7 @@ impl PgStore {
                 ..NewEvent::new(
                     input.corp_id,
                     Some(input.actor_id),
-                    if input.mode == FactoryVerificationRecoveryMode::VerifierOnly {
+                    if input.mode.is_verifier_only() {
                         "run.verification_requested"
                     } else {
                         "run.resume_requested"
@@ -5189,6 +5397,7 @@ impl PgStore {
             contract.source_repository.clone(),
             contract.source_base_ref.clone(),
             contract.source_base_commit.clone(),
+            workspace_connection_id,
             workspace_base_commit,
             input.expected_workspace_fingerprint,
             input.expected_head_commit,
@@ -5443,7 +5652,7 @@ impl PgStore {
             .mission_id
             .context("idempotent factory materialization has no mission linkage")?;
         let (ids, strategy) =
-            factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+            factory_mission_details_tx(&mut tx, input.corp_id, mission_id, input.actor_id).await?;
         tx.commit().await?;
         Ok(Some(FactoryMissionOutcome {
             work_item,
@@ -5498,7 +5707,8 @@ impl PgStore {
                 .mission_id
                 .context("idempotent factory materialization has no mission linkage")?;
             let (ids, strategy) =
-                factory_mission_details_tx(&mut tx, input.corp_id, mission_id).await?;
+                factory_mission_details_tx(&mut tx, input.corp_id, mission_id, input.actor_id)
+                    .await?;
             tx.commit().await?;
             return Ok(FactoryMissionOutcome {
                 work_item,
@@ -5755,7 +5965,8 @@ impl PgStore {
                    t.contract->>'reasoning_effort' AS required_reasoning_effort,
                    t.contract->>'source_repository' AS required_source_repository,
                    t.contract->>'source_base_ref' AS required_source_base_ref,
-                   t.contract->>'source_base_commit' AS required_source_base_commit
+                   t.contract->>'source_base_commit' AS required_source_base_commit,
+                   (t.contract->>'workspace_connection_id')::uuid AS workspace_connection_id
             FROM tasks t
             JOIN missions m ON m.id = t.mission_id
             JOIN agents a ON a.id = t.assigned_agent_id
@@ -5800,6 +6011,7 @@ impl PgStore {
                 required_source_repository: row.get("required_source_repository"),
                 required_source_base_ref: row.get("required_source_base_ref"),
                 required_source_base_commit: row.get("required_source_base_commit"),
+                workspace_connection_id: row.get("workspace_connection_id"),
             })
         })
         .collect()
@@ -5963,6 +6175,8 @@ impl PgStore {
         .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, corp_id, run_id).await?;
         let queued_messages =
             reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
         append_queued_messages(&mut task_prompt, &queued_messages);
@@ -6034,6 +6248,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
+                workspace_connection_id,
                 verification_policy,
                 write_scope: contract.write_scope,
                 deliverable: contract.deliverable,
@@ -6266,6 +6481,8 @@ impl PgStore {
         .bind(&contract.source_base_commit)
         .execute(&mut *tx)
         .await?;
+        let workspace_connection_id =
+            workspace_connections::bind_new_run_tx(&mut tx, corp_id, run_id).await?;
         let queued_messages =
             reserve_queued_messages_tx(&mut tx, corp_id, agent_id, run_id).await?;
         sqlx::query("UPDATE missions SET status = 'running', updated_at = now() WHERE id = $1")
@@ -6357,6 +6574,7 @@ impl PgStore {
                 source_repository: contract.source_repository.clone(),
                 source_base_ref: contract.source_base_ref.clone(),
                 source_base_commit: contract.source_base_commit.clone(),
+                workspace_connection_id,
                 workspace_base_commit,
                 verification_policy,
                 write_scope: contract.write_scope,
@@ -7368,7 +7586,7 @@ impl PgStore {
               AND run.execution_mode = 'verification_only'
               AND run.status IN ('provisioning', 'starting', 'running', 'verifying',
                                  'waiting_for_input', 'waiting_for_approval')
-              AND recovery.mode = 'verifier_only'
+              AND recovery.mode IN ('verifier_only', 'checkpoint_verification')
               AND recovery.status IN ('authorized', 'running')
               AND artifact.artifact_role = 'provider_evidence'
               AND artifact.status = 'ready'
@@ -7503,7 +7721,7 @@ impl PgStore {
                              AND recovery.corp_id = parent.corp_id
                              AND recovery.task_id = parent.id
                              AND recovery.mission_id = parent.mission_id
-                             AND recovery.mode = 'verifier_only'
+                             AND recovery.mode IN ('verifier_only', 'checkpoint_verification')
                              AND (
                                  (lineage.depth = 0 AND recovery.status = 'completed')
                                  OR (lineage.depth > 0
@@ -7635,7 +7853,7 @@ impl PgStore {
                 r.status IN ('provisioning', 'starting', 'running',
                              'waiting_for_input', 'waiting_for_approval', 'verifying')
                 OR (
-                  $6::text IN ('run.workspace_preserved', 'run.workspace_removed')
+                  $6::text IN ('run.workspace_preserved', 'run.workspace_removed', 'run.session_terminated')
                   AND r.status IN ('completed', 'failed', 'cancelled', 'lost')
                 )
               )
@@ -7686,6 +7904,24 @@ impl PgStore {
         let existing_workspace_disposition: Option<String> =
             row.get("existing_workspace_disposition");
         let breaker_stage: String = row.get("breaker_stage");
+        if event_type == "run.usage"
+            && row.get::<String, _>("execution_mode") == "verification_only"
+        {
+            return Err(anyhow!(
+                "provider-free verification cannot report model usage"
+            ));
+        }
+        if event_type == "run.session_terminated" {
+            terminal_accounting::validate_termination_tx(
+                &mut tx,
+                corp_id,
+                task_id,
+                run_id,
+                &row.get::<String, _>("execution_mode"),
+                &payload,
+            )
+            .await?;
+        }
         let verification_policy: VerificationPolicy =
             serde_json::from_value(row.get("verification_policy"))
                 .context("decode task verification policy")?;
@@ -10960,7 +11196,7 @@ async fn mark_runner_runs_lost_tx(
           ON recovery.replacement_run_id = r.id AND recovery.corp_id = r.corp_id
          AND recovery.task_id = r.task_id AND recovery.mission_id = m.id
          AND (
-             (recovery.mode = 'verifier_only' AND r.execution_mode = 'verification_only')
+             (recovery.mode IN ('verifier_only', 'checkpoint_verification') AND r.execution_mode = 'verification_only')
              OR (recovery.mode = 'source_correction' AND r.execution_mode = 'provider')
          )
          AND recovery.status IN ('authorized', 'running')
@@ -11004,6 +11240,11 @@ async fn mark_runner_runs_lost_tx(
     for row in rows {
         let run_id: Uuid = row.get("run_id");
         let corp_id: Uuid = row.get("corp_id");
+        if checkpoint_retention::review_ready_tx(tx, corp_id, run_id).await? {
+            // The verifier finished. Its durable human review does not require
+            // an active provider claim and must survive runner/server reconnect.
+            continue;
+        }
         let task_id: Uuid = row.get("task_id");
         let agent_id: Uuid = row.get("agent_id");
         let mission_id: Uuid = row.get("mission_id");
@@ -11097,7 +11338,11 @@ async fn mission_creation_admission_tx(
     let description = normalize_mission_description(description)?;
     assert_mission_operator_tx(tx, corp_id, requested_by).await?;
     staffing::validate_staffing(plan)?;
-    let room_id = mission_room_for_actor_tx(tx, corp_id, requested_by).await?;
+    let room_id = match workspace_connections::plan_room_tx(tx, corp_id, requested_by, plan).await?
+    {
+        Some(room_id) => room_id,
+        None => mission_room_for_actor_tx(tx, corp_id, requested_by).await?,
+    };
     Ok((title, description, room_id))
 }
 
@@ -11432,6 +11677,17 @@ fn validate_factory_plan_against_policy_parts(
     policy: &Value,
     plan: &TaskGraphPlan,
 ) -> Result<()> {
+    let connection_id = factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
+    if let Some(task) = plan
+        .tasks
+        .iter()
+        .find(|task| task.contract.workspace_connection_id != connection_id)
+    {
+        return Err(anyhow!(
+            "factory task {} must preserve the claimed workspace connection",
+            task.key
+        ));
+    }
     let policy = policy
         .as_object()
         .context("factory policy snapshot must be a JSON object")?;
@@ -11882,9 +12138,16 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         Value::Object(_) => policy,
         _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
     };
+    let connection_id = factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
     let policy_object = policy
         .as_object_mut()
         .context("factory policy snapshot must be a JSON object")?;
+    if let Some(connection_id) = connection_id {
+        policy_object.insert(
+            "workspace_connection_id".to_owned(),
+            Value::String(connection_id.to_string()),
+        );
+    }
     let source_base_ref = factory_policy_required_string(policy_object, "source_base_ref", 240)?;
     validate_factory_base_ref(&source_base_ref)?;
     if let Some(publication) = policy_object.get("publication") {
@@ -12241,10 +12504,24 @@ async fn source_workspace_checkpoint_tx(
     corp_id: Uuid,
     run_id: Uuid,
 ) -> Result<SourceWorkspaceCheckpoint> {
-    let row = sqlx::query(
+    source_workspace_checkpoint_with_lock_tx(tx, corp_id, run_id, true).await
+}
+
+async fn source_workspace_checkpoint_with_lock_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    run_id: Uuid,
+    lock_source: bool,
+) -> Result<SourceWorkspaceCheckpoint> {
+    let source_lock = if lock_source { "FOR UPDATE OF run" } else { "" };
+    let row = sqlx::query(&format!(
         r#"
         SELECT run.status, run.execution_mode, run.verification_status,
                run.workspace_path, run.workspace_disposition, run.workspace_fingerprint,
+               run.deliverable_sha256,
+               COALESCE(task.contract#>>'{{deliverable,form}}'='commit_branch'
+                 OR task.contract#>>'{{deliverable,commit_after_verification}}'='true',false)
+                 AS expects_verification_commit,
                deliverable.head_commit, recovery.id AS recovery_id,
                recovery.status AS recovery_status, recovery.mode AS recovery_mode,
                recovery.request->>'expected_workspace_fingerprint' AS authorized_fingerprint,
@@ -12259,7 +12536,7 @@ async fn source_workspace_checkpoint_tx(
           ON recovery.replacement_run_id = run.id AND recovery.corp_id = run.corp_id
          AND recovery.task_id = run.task_id AND recovery.mission_id = task.mission_id
          AND (
-             (recovery.mode = 'verifier_only' AND run.execution_mode = 'verification_only')
+             (recovery.mode IN ('verifier_only', 'checkpoint_verification') AND run.execution_mode = 'verification_only')
              OR (recovery.mode = 'source_correction' AND run.execution_mode = 'provider')
          )
          AND EXISTS (
@@ -12277,9 +12554,9 @@ async fn source_workspace_checkpoint_tx(
          AND previous.source_base_commit IS NOT DISTINCT FROM run.source_base_commit
          AND previous.workspace_fingerprint = recovery.request->>'expected_workspace_fingerprint'
         WHERE run.id = $1 AND run.corp_id = $2
-        FOR UPDATE OF run
+        {source_lock}
         "#,
-    )
+    ))
     .bind(run_id)
     .bind(corp_id)
     .fetch_optional(&mut **tx)
@@ -12312,7 +12589,21 @@ async fn source_workspace_checkpoint_tx(
         // Native verifier cleanup emits this fingerprint only after checking both
         // assigned guards. Keep the authorized head even when a lost/cancelled
         // run never exported a deliverable; never weaken Some(head) to None.
-        head = checkpoint_head_commit(head, row.get("authorized_head"))?;
+        let exported_head = checkpoint_retention::exported_head_tx(tx, corp_id, run_id).await?;
+        if row.get::<Option<String>, _>("recovery_mode").as_deref()
+            == Some("checkpoint_verification")
+            && row.get::<bool, _>("expects_verification_commit")
+            && row.get::<Option<String>, _>("deliverable_sha256").is_some()
+            && exported_head.is_none()
+        {
+            return Err(anyhow!(
+                "checkpoint export head has no exact ready artifact binding"
+            ));
+        }
+        head = match exported_head {
+            Some(exported) if head.as_ref() == Some(&exported) => Some(exported),
+            _ => checkpoint_head_commit(head, row.get("authorized_head"))?,
+        };
         Some(fingerprint)
     } else {
         None
@@ -12438,6 +12729,7 @@ fn factory_verification_recovery_launch_from_parts(
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    workspace_connection_id: Option<Uuid>,
     workspace_base_commit: String,
     expected_workspace_fingerprint: String,
     expected_head_commit: Option<String>,
@@ -12473,6 +12765,7 @@ fn factory_verification_recovery_launch_from_parts(
                 source_repository,
                 source_base_ref,
                 source_base_commit,
+                workspace_connection_id,
                 workspace_base_commit,
                 verification_policy,
                 write_scope,
@@ -12481,7 +12774,8 @@ fn factory_verification_recovery_launch_from_parts(
                 queued_messages,
             })
         }
-        FactoryVerificationRecoveryMode::VerifierOnly => {
+        FactoryVerificationRecoveryMode::VerifierOnly
+        | FactoryVerificationRecoveryMode::CheckpointVerification => {
             FactoryVerificationRecoveryLaunch::VerifierOnly(VerifyLaunchRecord {
                 corp_id,
                 room_id,
@@ -12496,6 +12790,7 @@ fn factory_verification_recovery_launch_from_parts(
                 source_repository,
                 source_base_ref,
                 source_base_commit,
+                workspace_connection_id,
                 workspace_base_commit,
                 expected_workspace_fingerprint,
                 expected_head_commit,
@@ -12529,7 +12824,7 @@ async fn factory_verification_recovery_launch_tx(
                     AS provider_session_id,
                 run.workspace_run_id,
                run.model, run.reasoning_effort, run.source_repository,
-               run.source_base_ref, run.source_base_commit,
+               run.source_base_ref, run.source_base_commit, run.workspace_connection_id,
                source.workspace_base_commit,
                authorized.request->>'expected_workspace_fingerprint' AS workspace_fingerprint,
                source.artifact_path, source.artifact_sha256,
@@ -12632,6 +12927,7 @@ async fn factory_verification_recovery_launch_tx(
         row.get("source_repository"),
         row.get("source_base_ref"),
         row.get("source_base_commit"),
+        row.get("workspace_connection_id"),
         row.get::<Option<String>, _>("workspace_base_commit")
             .context("factory recovery replay source omitted workspace base commit")?,
         row.get::<Option<String>, _>("workspace_fingerprint")
@@ -13022,14 +13318,20 @@ async fn factory_mission_details_tx(
     tx: &mut Transaction<'_, Postgres>,
     corp_id: Uuid,
     mission_id: Uuid,
+    actor_id: Uuid,
 ) -> Result<(MissionPlanIds, String)> {
-    let strategy: Option<String> =
-        sqlx::query_scalar("SELECT strategy FROM missions WHERE id = $1 AND corp_id = $2")
+    assert_mission_operator_tx(tx, corp_id, actor_id).await?;
+    let mission =
+        sqlx::query("SELECT strategy, room_id FROM missions WHERE id = $1 AND corp_id = $2")
             .bind(mission_id)
             .bind(corp_id)
             .fetch_optional(&mut **tx)
-            .await?;
-    let strategy = strategy.context("factory mission linkage references a missing mission")?;
+            .await?
+            .context("factory mission linkage references a missing mission")?;
+    // Both materialization replay paths are historical reads. Retain current
+    // human/room authority without depending on provider or runner readiness.
+    workspace_connections::actor_role_tx(tx, corp_id, mission.get("room_id"), actor_id).await?;
+    let strategy = mission.get("strategy");
     let task_ids = sqlx::query_scalar(
         "SELECT id FROM tasks WHERE mission_id = $1 AND corp_id = $2 ORDER BY created_at, id",
     )
@@ -13123,6 +13425,7 @@ pub struct VerifyLaunchRecord {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_base_commit: String,
     pub expected_workspace_fingerprint: String,
     pub expected_head_commit: Option<String>,
@@ -14346,6 +14649,7 @@ fn map_run(row: sqlx::postgres::PgRow) -> Result<Run> {
         source_repository: row.get("source_repository"),
         source_base_ref: row.get("source_base_ref"),
         source_base_commit: row.get("source_base_commit"),
+        workspace_connection_id: row.get("workspace_connection_id"),
         workspace_path: row.get("workspace_path"),
         workspace_branch: row.get("workspace_branch"),
         workspace_base_ref: row.get("workspace_base_ref"),
@@ -14377,6 +14681,7 @@ fn map_factory_verification_recovery(
     let mode = match row.get::<String, _>("mode").as_str() {
         "source_correction" => FactoryVerificationRecoveryMode::SourceCorrection,
         "verifier_only" => FactoryVerificationRecoveryMode::VerifierOnly,
+        "checkpoint_verification" => FactoryVerificationRecoveryMode::CheckpointVerification,
         other => {
             return Err(anyhow!(
                 "unknown factory verification recovery mode {other}"
@@ -14999,9 +15304,11 @@ async fn hard_breaker_reached_tx(
     corp_id: Uuid,
     run_id: Uuid,
 ) -> Result<bool> {
+    let zero_provider = budget_checkpoint::zero_provider_allocation_tx(tx, corp_id, run_id).await?;
     let reached = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
+          (NOT $3::boolean AND (
             (run.budget_tokens_limit > 0
              AND run.input_tokens + run.output_tokens >= run.budget_tokens_limit)
          OR (run.budget_cost_microusd_limit > 0
@@ -15048,6 +15355,7 @@ async fn hard_breaker_reached_tx(
                 WHERE other.corp_id = run.corp_id
                   AND other.created_at >= now() - interval '24 hours'
             ) >= COALESCE(policy.corp_cost_microusd_per_24h, 100000000))
+          ))
          OR (COALESCE(policy.no_progress_event_limit, 8) > 0
              AND run.no_progress_events >= COALESCE(policy.no_progress_event_limit, 8))
          OR (COALESCE(policy.repeated_tool_limit, 5) > 0
@@ -15062,6 +15370,7 @@ async fn hard_breaker_reached_tx(
     )
     .bind(run_id)
     .bind(corp_id)
+    .bind(zero_provider)
     .fetch_one(&mut **tx)
     .await?;
     Ok(reached)
@@ -16380,6 +16689,7 @@ mod tests {
                 key: "deliver".to_owned(),
                 title: "Deliver".to_owned(),
                 contract: TaskContract {
+                    workspace_connection_id: None,
                     objective: "Deliver the issue".to_owned(),
                     expected_output: "A verified change".to_owned(),
                     source_repository: Some("owner/repo".to_owned()),
@@ -16414,6 +16724,48 @@ mod tests {
             }],
         };
         (work_item, plan)
+    }
+
+    #[test]
+    fn issue204_factory_policy_rejects_missing_substituted_and_unclaimed_connections() {
+        let (mut item, mut plan) = factory_policy_plan(None, None);
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        let id = Uuid::new_v4();
+        item.policy["workspace_connection_id"] = json!(id);
+        assert!(
+            validate_factory_plan_against_policy(&item, &plan)
+                .unwrap_err()
+                .to_string()
+                .contains("claimed workspace connection")
+        );
+        plan.tasks[0].contract.workspace_connection_id = Some(id);
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        plan.tasks[0].contract.workspace_connection_id = Some(Uuid::new_v4());
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        item.policy
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_connection_id");
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+    }
+
+    #[test]
+    fn issue204_policy_normalization_rejects_bad_binding_and_canonicalizes_uuid() {
+        let (item, _) = factory_policy_plan(None, None);
+        let legacy = normalize_factory_policy(item.policy.clone()).unwrap();
+        assert!(legacy.get("workspace_connection_id").is_none());
+        let id = Uuid::new_v4();
+        let mut policy = item.policy.clone();
+        policy["workspace_connection_id"] = json!(id.to_string().to_uppercase());
+        assert_eq!(
+            normalize_factory_policy(policy).unwrap()["workspace_connection_id"],
+            json!(id)
+        );
+        for value in [json!("invalid"), json!(Uuid::nil()), json!(7), json!({})] {
+            let mut policy = item.policy.clone();
+            policy["workspace_connection_id"] = value;
+            assert!(normalize_factory_policy(policy).is_err());
+        }
     }
 
     #[test]

@@ -62,6 +62,13 @@ prohibitions, write scope, token budget, or cost budget. Factory `verified` stat
 authoritative completed mission and passing task-verification records.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
+An optional saved execution-connection ID is part of the immutable Factory policy.
+Malformed/nil IDs and task-policy mismatches fail closed; an omitted legacy binding
+does not grant access to a bound native account. The exact connection lookup uses
+current Corp/room/operator authorization and emits only the shared DTO. Preflight
+and materialization reuse connection/source/readiness admission, and the native
+run/resume boundary keeps the persisted connection. Changing controller options
+cannot rebind an existing Factory lineage.
 Provider-backed factory outcomes require a manual verification gate; an artifact-only final
 result cannot become accepted completion without an authorized evidence decision. Internal
 handoffs retain their automated file, integrity, and content checks without an additional
@@ -74,6 +81,13 @@ Publication states cannot be asserted through the generic factory transition end
 Guests and spectators do not receive factory work items in snapshots. Pre-materialization factory
 events omit GitHub source metadata; once a mission exists, factory events inherit its room
 visibility.
+The exact mission-context read retains `Operate` authorization and repeats
+human operator-role, Corp and mission-room membership checks in the same SQL
+statement as linkage lookup. It does not reveal hidden Factory context to guests
+or infer Direct from a denied/filtered query. Its minimal projection excludes
+claim tokens, policies, native sign-in details and credentials. This is an
+inspection surface, not publication or execution authority.
+
 The controller's selected-Project-item lookup requires Corp `Operate` authorization and repeats the
 store-side human operator-role check before returning source or policy metadata. Requests are
 bounded to 1,000 Project item IDs of at most 160 characters and are deduplicated before the query.
@@ -275,6 +289,35 @@ ancestors. Shared snapshots expose revision rationale and decisions for audit bu
 assignment or fencing token. Browser-generated proposal and decision keys remain stable across a
 lost response so retry replays one committed operation.
 
+Budget-stopped source may instead receive an explicit `checkpoint_verification` operation in the
+existing Factory recovery aggregate. This is not provider resume. Admission validates the native
+termination and checkpoint journal records against the exact assignment, source, current evidence
+policy, and latest preserved lineage. The replacement is provider-free and has zero model-token
+and model-cost allocation; reporting model usage from any verifier-only run is rejected.
+Exhausted model-usage counters do not veto that exact authorized operation, but they are never
+reset or reallocated. A bare zero limit or changed execution-mode flag grants no exemption.
+Explicit stop, loop and quarantine checks, current room/role authority, independent review, and
+the separate publication/merge/deployment boundaries remain. Missing artifact evidence cannot be
+manufactured or dropped from the persisted verifier policy.
+
+Checkpoint-cancellation reconciliation is not a generic terminal-state override. It requires
+current owner/admin/manager authority and mission-room membership, holds the actor row through
+commit, and reuses the native source, lineage, budget and Factory/publication locks. The exact
+current cancellation event must match its original controller transition operation, claim,
+actor, mission and version; later events, explicit stops, policy cancellations and quarantined
+lineage remain ineligible. A controller operation-key pattern identifies provenance, not
+authentication. Reconciliation grants no claim token, provider execution or publication right,
+and replay repeats current authorization. It does not rewrite original runs, task contracts,
+source evidence, attempts or accounting.
+
+Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
+verification commit. Ready-artifact joins bind the new head to its run, producer, source,
+policy and verification digest; these relational checks are not fresh signature/byte validation.
+Same-run checkpoint re-attestation rechecks current role/room and source authority and cannot
+start a provider, alter budgets, or overwrite another assignment. Definite authorization denial
+retires only its command; database failures remain retryable. Outcome review and publication
+retain their separate authorization and integrity checks.
+
 Artifact uploads are server-mediated and size-bounded. The server verifies byte count, digest, and
 declared media type in memory, then performs authoritative assignment, task, budget, and breaker
 checks while reserving the event-specific staging key in Postgres. No object bytes are written
@@ -352,6 +395,18 @@ The publisher's mission-room membership is rechecked in the same transaction on 
 idempotent replay, expired-lease recovery, and every renewal. Removing a still-manager actor from
 the room therefore blocks branch, pull-request, and Project effects.
 
+Failure-only checkpoints do not renew or advance publication authority. Their HTTP route still
+authenticates the human Corp identity, then requires the independently authenticated publisher
+credential and the exact attempt actor, token, version and unexpired lease in the store. This
+allows an owned attempt to record its failure after role, room or artifact authority changes.
+It does not grant publication permission, relax ordinary room-scoped reads, or accept a revoked
+publisher credential. All effect-advancing checkpoint variants still require `Publish`.
+
+Checkpoint publication provenance uses schema 3. Previously absent schema-1/2 checkpoint proof
+can be reconstructed only after current native source, review and authority validation. Altered
+non-null legacy proof and missing or altered schema-3 proof reject; reconstruction is not a
+general missing-provenance bypass.
+
 PR adoption also requires the exact authorized title and body. A collaborator-created PR with the
 right branch and SHA but altered content is ignored and cannot advance Project state. Publication
 retries remain pinned to the persisted deliverable ID even when the mission contains other
@@ -387,6 +442,14 @@ trailing newline.
 The CLI reads the publisher credential from a file before its first publication API mutation and
 never places it in arguments, plans, output, events, snapshots, or durable publication records.
 
+Publication of an explicitly recovered checkpoint starts no provider. Its model-budget
+exception is derived from exact native origin events, immutable checkpoint authority,
+completed zero-provider recovery, retained fingerprint and the ready verified export.
+The authorization never resets spending or permits another model session; unrelated enforced
+stops, explicit stops, loops and current scoped authority remain guards. New publication
+checkpoints repeat current authority/provenance validation instead of relying on a live lease
+alone. Metadata bindings do not replace the publisher's signed-byte and Git-bundle validation.
+
 A retry of a durable `published` result performs no remote preflight or external effect. It returns
 the persisted PR identity even if the PR was later merged or the base branch advanced.
 For an unfinished publication, the publisher renews authority before remote reads, refreshes the
@@ -396,6 +459,20 @@ preventing a stale publisher or a closed, retargeted, edited, or auto-merge-enab
 advancing or being recorded as reviewed.
 
 ## Required production boundaries
+
+Saved execution connections add a room-scoped resource boundary, not a remote
+shell API. Setup requests are typed and actor-authorized; local checkout imports
+also remain inside operator-configured roots. Private native state is outside
+source repositories and agent worktrees. Provider sign-in instructions and
+repository catalogues are visible only to the requesting actor, while shared
+connection status uses fixed non-sensitive copy.
+
+Personal native GitHub configuration does not constitute a separate OS identity.
+Native keychain/file-storage behavior and environment delivery retain their
+reported assurance; setup does not claim stronger containment than the selected
+harness and operating system provide. One-time Claude authorization-code input
+is transient, prompt-ID bound, and may reach only its matching native login
+process—not an agent session or a general stdin/shell endpoint.
 
 - Every persistent object is scoped to a Corp.
 - Authorization runs before reads, writes, and subscriptions.

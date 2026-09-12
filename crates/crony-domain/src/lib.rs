@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod workspace_connections;
+pub use workspace_connections::*;
+mod factory_connection;
+pub use factory_connection::factory_workspace_connection_id;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
@@ -164,6 +169,8 @@ impl FactoryWorkItemState {
 pub enum FactoryVerificationRecoveryMode {
     SourceCorrection,
     VerifierOnly,
+    /// Verify a sealed budget-boundary checkpoint with no provider allocation.
+    CheckpointVerification,
 }
 
 impl FactoryVerificationRecoveryMode {
@@ -171,8 +178,39 @@ impl FactoryVerificationRecoveryMode {
         match self {
             Self::SourceCorrection => "source_correction",
             Self::VerifierOnly => "verifier_only",
+            Self::CheckpointVerification => "checkpoint_verification",
         }
     }
+
+    pub const fn is_verifier_only(self) -> bool {
+        matches!(self, Self::VerifierOnly | Self::CheckpointVerification)
+    }
+}
+
+/// Evidence emitted by the native runner after provider termination.
+/// This is not recovery authority: admission must bind every field to the
+/// persisted assignment, policy and latest preserved workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoppedSourceCheckpoint {
+    pub schema_version: u32,
+    pub corp_id: Uuid,
+    pub mission_id: Uuid,
+    pub task_id: Uuid,
+    pub run_id: Uuid,
+    pub workspace_run_id: Uuid,
+    pub agent_id: Uuid,
+    pub runner_id: String,
+    pub source_repository: String,
+    pub source_base_ref: String,
+    pub source_base_commit: String,
+    pub workspace_base_commit: String,
+    pub branch: String,
+    pub head_commit: String,
+    pub workspace_fingerprint: String,
+    pub verification_policy_sha256: String,
+    pub write_scope_sha256: String,
+    pub deliverable_policy_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +302,30 @@ pub struct Mission {
     pub status: MissionStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Exact, viewer-scoped linkage for a mission; not a filtered snapshot inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionContext {
+    pub corp_id: Uuid,
+    pub actor_id: Uuid,
+    pub mission_id: Uuid,
+    pub room_id: Uuid,
+    pub origin: MissionOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MissionOrigin {
+    /// The complete stored relationship has no Factory work item.
+    /// This does not distinguish browser creation from other direct clients.
+    Direct,
+    Factory {
+        work_item_id: Uuid,
+        source_repository: String,
+        source_issue_number: i64,
+        source_issue_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +504,8 @@ pub struct TaskContract {
     pub source_base_ref: Option<String>,
     #[serde(default)]
     pub source_base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
     pub acceptance_tests: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub prohibited_actions: Vec<String>,
@@ -762,6 +826,8 @@ pub struct Run {
     pub source_repository: Option<String>,
     pub source_base_ref: Option<String>,
     pub source_base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
     pub workspace_base_ref: Option<String>,
@@ -1092,6 +1158,41 @@ pub struct CorpSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mission_context_wire_shape_contains_only_scoped_source_linkage() {
+        let mut context = MissionContext {
+            corp_id: Uuid::from_u128(1),
+            actor_id: Uuid::from_u128(2),
+            mission_id: Uuid::from_u128(3),
+            room_id: Uuid::from_u128(4),
+            origin: MissionOrigin::Direct,
+        };
+        let direct = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(direct["origin"], serde_json::json!({"kind": "direct"}));
+        assert_eq!(direct.as_object().expect("object").len(), 5);
+
+        context.origin = MissionOrigin::Factory {
+            work_item_id: Uuid::from_u128(5),
+            source_repository: "example/project".to_owned(),
+            source_issue_number: 199,
+            source_issue_url: "https://github.com/example/project/issues/199".to_owned(),
+        };
+        let factory = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(factory["origin"]["kind"], "factory");
+        assert_eq!(
+            factory["origin"].as_object().expect("origin object").len(),
+            5
+        );
+        for private_field in ["claim_token", "policy", "account_login", "sign_in"] {
+            assert!(factory.get(private_field).is_none());
+            assert!(factory["origin"].get(private_field).is_none());
+        }
+        assert_eq!(
+            serde_json::from_value::<MissionContext>(factory).expect("round trip"),
+            context
+        );
+    }
 
     #[test]
     fn status_serialization_is_stable() {

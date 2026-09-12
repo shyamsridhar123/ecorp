@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
+import { writeCheckpointApplication } from './checkpoint-application-fixture.mjs'
 
 if (process.argv.includes('--version')) {
   process.stdout.write('codex-cli fake-app-server\n')
@@ -171,13 +172,30 @@ function startTurn(message) {
     completedAtMs: Date.now(),
   })
 
-  if (prompt.includes('[budget-stream]')) {
+  if (prompt.includes('[checkpoint-app]')) {
+    writeCheckpointApplication(workspace)
+  }
+
+  if (prompt.includes('[budget-queued-completion]')) {
+    // Isolated #193 race candidate: base.txt already exists. Emit both usage
+    // frames and completion in THIS turn, before reading another control frame.
+    // The native adapter may enqueue its artifact before hard control arrives.
+    // Only the server journal can prove that race; fixture ordering alone cannot.
+    emitUsageOnFinish = false
+    emitUsage(3_000, 0)
+    emitUsage(3_000, 0)
+    finish('completed')
+  } else if (prompt.includes('[budget-stream]') || prompt.includes('[budget-stream-ui]')) {
+    // The browser's smallest normal preset is 500K. Keep its real request
+    // unchanged and scale only this deterministic fixture's reported usage.
+    // These are synthetic protocol counters, never vendor billing evidence.
+    const tokensPerEvent = prompt.includes('[budget-stream-ui]') ? 300_000 : 3_000
     emitUsageOnFinish = false
     setTimeout(() => {
-      if (!terminal) emitUsage(3_000, 0)
+      if (!terminal) emitUsage(tokensPerEvent, 0)
     }, 40)
     setTimeout(() => {
-      if (!terminal) emitUsage(3_000, 0)
+      if (!terminal) emitUsage(tokensPerEvent, 0)
     }, 120)
     completionTimer = setTimeout(() => finish('completed'), 1_000)
   } else if (prompt.includes('[fail]') && !resumed) {

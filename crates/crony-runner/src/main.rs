@@ -1,5 +1,7 @@
 mod adapter;
+mod connections;
 mod deliverable;
+mod source_checkpoint;
 mod verifier;
 mod workspace;
 
@@ -8,7 +10,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -150,6 +152,19 @@ struct Args {
 
     #[arg(long, env = "CRONY_COPILOT_FIXTURE", default_value_t = false)]
     copilot_fixture: bool,
+
+    #[arg(long, env = "CRONY_CONNECTIONS_DIRECTORY")]
+    connections_directory: Option<PathBuf>,
+
+    #[arg(
+        long = "repository-root",
+        env = "CRONY_REPOSITORY_ROOTS",
+        value_delimiter = ';'
+    )]
+    repository_roots: Vec<PathBuf>,
+
+    #[arg(long, env = "CRONY_GITHUB_COMMAND", default_value = "gh")]
+    github_command: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +185,7 @@ struct Assignment {
     source_repository: Option<String>,
     source_base_ref: Option<String>,
     source_base_commit: Option<String>,
+    workspace_connection_id: Option<Uuid>,
     resume_workspace_base_commit: Option<String>,
     verification_policy: VerificationPolicy,
     write_scope: Vec<String>,
@@ -178,6 +194,65 @@ struct Assignment {
     expected_workspace_fingerprint: Option<String>,
     expected_head_commit: Option<String>,
     provider_artifact: Option<VerificationArtifactReference>,
+    checkpoint_verification: bool,
+    hard_boundary_checkpoint: Arc<HardBoundaryControl>,
+}
+
+impl Assignment {
+    fn hard_boundary_requested(&self) -> bool {
+        self.hard_boundary_checkpoint.requested()
+    }
+}
+
+#[derive(Debug)]
+struct HardBoundaryControl {
+    phase: AtomicU8,
+    cancellation: watch::Sender<bool>,
+}
+
+impl Default for HardBoundaryControl {
+    fn default() -> Self {
+        Self {
+            phase: AtomicU8::new(Self::OPEN),
+            cancellation: watch::channel(false).0,
+        }
+    }
+}
+
+impl HardBoundaryControl {
+    const OPEN: u8 = 0;
+    const REQUESTED: u8 = 1;
+    const FINALIZING: u8 = 2;
+
+    fn request(&self) -> bool {
+        match self.phase.compare_exchange(
+            Self::OPEN,
+            Self::REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(Self::REQUESTED) => {
+                self.cancellation.send_replace(true);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn requested(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == Self::REQUESTED
+    }
+
+    fn begin_finalization(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                Self::OPEN,
+                Self::FINALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -193,6 +268,29 @@ struct ActiveRunControl {
     assignment_token: Uuid,
     control: mpsc::UnboundedSender<AdapterControl>,
     artifact_ack: mpsc::UnboundedSender<ArtifactAck>,
+    hard_boundary_checkpoint: Arc<HardBoundaryControl>,
+}
+
+impl ActiveRunControl {
+    fn apply_circuit_breaker(&self, stage: String, reason: String) -> bool {
+        let hard = matches!(stage.as_str(), "suspend" | "stop");
+        if hard {
+            // Remember native stop authority before handing it to the adapter.
+            // This is retention intent, never authority to resume or complete.
+            if !self.hard_boundary_checkpoint.request() {
+                // Finalization won the boundary. Never acknowledge retention
+                // after cleanup has committed to its native removal decision.
+                return false;
+            }
+        }
+        let delivered = self
+            .control
+            .send(AdapterControl::CircuitBreaker { stage, reason })
+            .is_ok();
+        // The assignment can still own cancellable verification after the
+        // provider's control receiver closes. The hard directive applies there too.
+        delivered || hard
+    }
 }
 
 #[derive(Debug)]
@@ -209,6 +307,25 @@ struct AssignmentChannels {
 
 type ActiveRuns = Arc<DashMap<Uuid, ActiveRunControl>>;
 
+fn apply_circuit_breaker_command(
+    seen_commands: &DashMap<Uuid, ()>,
+    active_runs: &ActiveRuns,
+    command_id: Uuid,
+    run_id: Uuid,
+    stage: String,
+    reason: String,
+) -> (bool, bool) {
+    let duplicate = seen_commands.contains_key(&command_id);
+    let applied = duplicate
+        || active_runs
+            .get(&run_id)
+            .is_some_and(|active| active.apply_circuit_breaker(stage, reason));
+    if applied {
+        seen_commands.insert(command_id, ());
+    }
+    (applied, duplicate)
+}
+
 fn default_codex_command() -> PathBuf {
     if cfg!(windows) {
         PathBuf::from("codex.exe")
@@ -223,6 +340,29 @@ fn default_provider_command(name: &str) -> PathBuf {
     } else {
         PathBuf::from(name)
     }
+}
+
+fn connections_directory(args: &Args) -> Result<PathBuf> {
+    if let Some(directory) = &args.connections_directory {
+        return Ok(directory.clone());
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+    }
+    .context("configure CRONY_CONNECTIONS_DIRECTORY outside the source repositories")?;
+    let namespace = hex::encode(sha2::Sha256::digest(
+        format!("{}|{}|{}", args.server_ws, args.corp_id, args.runner_id).as_bytes(),
+    ));
+    Ok(base
+        .join("ECorp")
+        .join("connections")
+        .join(&namespace[..24]))
 }
 
 fn copilot_config(args: &Args) -> Result<CopilotSdkConfig> {
@@ -274,6 +414,17 @@ struct OutboundState {
 }
 
 impl OutboundBus {
+    fn send_live(&self, mut message: RunnerToServer) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let (Some(connection), Some(epoch)) = (&state.connection, state.connection_epoch) else {
+            return false;
+        };
+        bind_connection_epoch(&mut message, epoch);
+        connection.send(message).is_ok()
+    }
+
     fn attach(&self, connection: mpsc::UnboundedSender<RunnerToServer>, connection_epoch: Uuid) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -332,6 +483,18 @@ fn bind_connection_epoch(message: &mut RunnerToServer, connection_epoch: Uuid) {
         | RunnerToServer::CommandAck {
             connection_epoch: event_epoch,
             ..
+        }
+        | RunnerToServer::WorkspaceSetupReport {
+            connection_epoch: event_epoch,
+            ..
+        }
+        | RunnerToServer::WorkspaceSignInAck {
+            connection_epoch: event_epoch,
+            ..
+        }
+        | RunnerToServer::CapabilitiesUpdated {
+            connection_epoch: event_epoch,
+            ..
         } => *event_epoch = connection_epoch,
         _ => {}
     }
@@ -363,7 +526,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(default_codex_command);
     let copilot_config = copilot_config(&args)?;
-    let adapters = Arc::new(AdapterRegistry::new(AdapterRegistryConfig {
+    let adapter_config = AdapterRegistryConfig {
         fake_agent_script: args.fake_agent_script.clone(),
         codex_command,
         codex_prefix_args: args.codex_command_args.clone(),
@@ -378,7 +541,33 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| default_provider_command("opencode")),
         opencode_prefix_args: args.opencode_command_args.clone(),
         copilot: copilot_config,
-    }));
+    };
+    let adapters = Arc::new(AdapterRegistry::new(adapter_config.clone()));
+    let connection_root = connections_directory(&args)?;
+    let connection_manager = match connections::ConnectionManager::new(
+        connections::ConnectionManagerConfig {
+            root: connection_root,
+            corp_id: args.corp_id,
+            runner_id: args.runner_id.clone(),
+            default_workspaces: workspaces.clone(),
+            default_adapters: adapters.clone(),
+            adapter_config,
+            github_command: args.github_command.clone(),
+            allowed_local_roots: if args.repository_roots.is_empty() {
+                vec![args.source_repository.clone()]
+            } else {
+                args.repository_roots.clone()
+            },
+        },
+    )
+    .await
+    {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(error) => {
+            warn!(%error, "new project setup needs operator-private storage; existing runner work remains available");
+            None
+        }
+    };
     loop {
         let delay = match run_connection(
             args.clone(),
@@ -387,6 +576,7 @@ async fn main() -> Result<()> {
             outbound.clone(),
             adapters.clone(),
             workspaces.clone(),
+            connection_manager.clone(),
         )
         .await
         {
@@ -407,6 +597,7 @@ async fn run_connection(
     outbound: OutboundBus,
     adapters: Arc<AdapterRegistry>,
     workspaces: Arc<WorkspaceManager>,
+    connection_manager: Option<Arc<connections::ConnectionManager>>,
 ) -> Result<Duration> {
     let credential = load_runner_credential(&args).await?;
     let (socket, _) = connect_async(&args.server_ws)
@@ -472,6 +663,7 @@ async fn run_connection(
             Vec::new()
         };
         capabilities.push(RunnerCapability {
+            workspace_connection_id: None,
             name: adapter.id().to_owned(),
             available,
             detail: Some(detail),
@@ -482,6 +674,7 @@ async fn run_connection(
         });
     }
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "workspace-isolation".to_owned(),
         available: true,
         detail: Some(format!(
@@ -498,6 +691,7 @@ async fn run_connection(
         source_base_commit: Some(workspaces.base_commit().to_owned()),
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "durable-control-v1".to_owned(),
         available: true,
         detail: Some(
@@ -510,6 +704,7 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "verification-artifact-transfer-v1".to_owned(),
         available: true,
         detail: Some(
@@ -522,6 +717,20 @@ async fn run_connection(
         source_base_commit: None,
     });
     capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
+        name: "checkpoint-verification-v1".to_owned(),
+        available: true,
+        detail: Some(
+            "exact stopped-source admission and runner-owned verification commit without a provider"
+                .to_owned(),
+        ),
+        models: Vec::new(),
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    });
+    capabilities.push(RunnerCapability {
+        workspace_connection_id: None,
         name: "secret-delivery".to_owned(),
         available: true,
         detail: Some(
@@ -533,6 +742,13 @@ async fn run_connection(
         source_base_ref: None,
         source_base_commit: None,
     });
+    let setup_capability = workspace_setup_capability(connection_manager.is_some());
+    let setup_available = setup_capability.available;
+    capabilities.push(setup_capability);
+    let base_capabilities = Arc::new(capabilities.clone());
+    if let Some(manager) = &connection_manager {
+        capabilities.extend(manager.capabilities());
+    }
     out_tx
         .send(RunnerToServer::Register {
             runner_id: args.runner_id.clone(),
@@ -550,6 +766,9 @@ async fn run_connection(
     let heartbeat_tx = out_tx.clone();
     let heartbeat_runner_id = args.runner_id.clone();
     let heartbeat_runs = active_runs.clone();
+    let heartbeat_connections = connection_manager.clone();
+    let heartbeat_outbound = outbound.clone();
+    let heartbeat_corp = args.corp_id;
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -564,11 +783,23 @@ async fn run_connection(
             {
                 break;
             }
+            if let Some(manager) = &heartbeat_connections {
+                for (operation_id, report) in manager.pending_reports() {
+                    heartbeat_outbound.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id: heartbeat_runner_id.clone(),
+                        corp_id: heartbeat_corp,
+                        connection_epoch,
+                        operation_id,
+                        report,
+                    });
+                }
+            }
         }
     });
 
     info!(runner_id = %args.runner_id, %connection_epoch, server = %args.server_ws, "runner connected");
     let mut reconnect_delay = Duration::from_secs(2);
+    let mut registration_accepted = false;
     'read: while let Some(message) = socket_rx.next().await {
         let text = match message {
             Ok(Message::Text(text)) => text,
@@ -582,6 +813,126 @@ async fn run_connection(
         let command: ServerToRunner =
             serde_json::from_str(text.as_str()).context("decode server command")?;
         match command {
+            ServerToRunner::WorkspaceSetup { command } => {
+                if !registration_accepted
+                    || command.corp_id != args.corp_id
+                    || command.runner_id != args.runner_id
+                {
+                    warn!("rejected setup outside this registered runner");
+                    continue;
+                }
+                if !setup_available {
+                    outbound.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id: args.runner_id.clone(),
+                        corp_id: args.corp_id,
+                        connection_epoch,
+                        operation_id: command.operation_id,
+                        report: crony_domain::WorkspaceSetupReport {
+                            status: crony_domain::WorkspaceSetupStatus::Failed,
+                            detail: workspace_setup_capability(connection_manager.is_some())
+                                .detail
+                                .unwrap_or_else(|| {
+                                    "Native connection setup is unavailable.".to_owned()
+                                }),
+                            connection_status: command
+                                .action
+                                .connection_id()
+                                .map(|_| crony_domain::WorkspaceConnectionStatus::Failed),
+                            source: None,
+                            models: vec![],
+                            account_login: None,
+                            sign_in: None,
+                            repositories: vec![],
+                        },
+                    });
+                    continue;
+                }
+                let Some(manager) = connection_manager.clone() else {
+                    continue;
+                };
+                let output = outbound.clone();
+                let runner_id = args.runner_id.clone();
+                let corp_id = args.corp_id;
+                tokio::spawn(async move {
+                    let operation_id = command.operation_id;
+                    let connection_id = command.action.connection_id();
+                    let progress_output = output.clone();
+                    let progress_runner = runner_id.clone();
+                    let progress: connections::SetupProgress = Arc::new(move |report| {
+                        progress_output.send_live(RunnerToServer::WorkspaceSetupReport {
+                            runner_id: progress_runner.clone(),
+                            corp_id,
+                            connection_epoch,
+                            operation_id,
+                            report,
+                        });
+                    });
+                    let report = match manager.execute(command, progress).await {
+                        Ok(report) => report,
+                        Err(error) => {
+                            warn!(%error, %operation_id, "native setup could not finish");
+                            crony_domain::WorkspaceSetupReport {
+                                status: crony_domain::WorkspaceSetupStatus::Failed,
+                                detail: "The native connection check could not finish. Review this machine's setup and try again.".to_owned(),
+                                connection_status: connection_id.map(|_|crony_domain::WorkspaceConnectionStatus::Failed),
+                                source: None, models: vec![], account_login: None, sign_in: None,
+                                repositories: vec![],
+                            }
+                        }
+                    };
+                    output.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id,
+                        corp_id,
+                        connection_epoch,
+                        operation_id,
+                        report,
+                    });
+                });
+            }
+            ServerToRunner::WorkspaceSetupAck {
+                operation_id,
+                accepted,
+            } => {
+                if !registration_accepted {
+                    continue;
+                }
+                if let Some(manager) = &connection_manager {
+                    if let Err(error) = manager.acknowledge(operation_id, accepted).await {
+                        warn!(%error, %operation_id, "setup acknowledgment could not be retained");
+                        continue;
+                    }
+                    let mut capabilities = (*base_capabilities).clone();
+                    capabilities.extend(manager.capabilities());
+                    outbound.send_live(RunnerToServer::CapabilitiesUpdated {
+                        runner_id: args.runner_id.clone(),
+                        corp_id: args.corp_id,
+                        connection_epoch,
+                        capabilities,
+                    });
+                }
+            }
+            ServerToRunner::WorkspaceSignInInput {
+                operation_id,
+                request_id,
+                response,
+            } => {
+                if !registration_accepted {
+                    continue;
+                }
+                let applied = if let Some(manager) = &connection_manager {
+                    manager.submit_sign_in(operation_id, response).await.is_ok()
+                } else {
+                    false
+                };
+                outbound.send_live(RunnerToServer::WorkspaceSignInAck {
+                    runner_id: args.runner_id.clone(),
+                    corp_id: args.corp_id,
+                    connection_epoch,
+                    operation_id,
+                    request_id,
+                    applied,
+                });
+            }
             ServerToRunner::Registered {
                 runner_id,
                 credential,
@@ -597,6 +948,7 @@ async fn run_connection(
                     },
                 )
                 .await?;
+                registration_accepted = runner_id == args.runner_id;
                 if let Some(enrollment_file) = &args.enrollment_token_file {
                     let _ = tokio::fs::remove_file(enrollment_file).await;
                 }
@@ -620,6 +972,7 @@ async fn run_connection(
                 }
             }
             ServerToRunner::StartRun {
+                workspace_connection_id,
                 corp_id,
                 room_id,
                 mission_id,
@@ -656,6 +1009,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: None,
                     verification_policy,
                     write_scope,
@@ -664,8 +1018,12 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: None,
                     provider_artifact: None,
+                    checkpoint_verification: false,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     send_run_event(
                         &outbound,
                         &args.runner_id,
@@ -713,14 +1071,16 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_assignment(
+                    if let Err(error) = execute_connected_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -731,6 +1091,7 @@ async fn run_connection(
                             artifact_acks: artifact_ack_rx,
                         },
                         None,
+                        task_connections,
                     )
                     .await
                     {
@@ -747,6 +1108,7 @@ async fn run_connection(
                 });
             }
             ServerToRunner::ResumeRun {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -800,6 +1162,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: workspace_base_commit,
                     verification_policy,
                     write_scope,
@@ -808,8 +1171,12 @@ async fn run_connection(
                     expected_workspace_fingerprint,
                     expected_head_commit,
                     provider_artifact: None,
+                    checkpoint_verification: false,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     if let Some(command_id) = command_id {
                         seen_commands.remove(&command_id);
                     }
@@ -898,14 +1265,16 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_assignment(
+                    if let Err(error) = execute_connected_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -916,6 +1285,7 @@ async fn run_connection(
                             artifact_acks: artifact_ack_rx,
                         },
                         Some(provider_session_id),
+                        task_connections,
                     )
                     .await
                     {
@@ -940,6 +1310,7 @@ async fn run_connection(
                 );
             }
             ServerToRunner::VerifyRun {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -955,6 +1326,7 @@ async fn run_connection(
                 workspace_base_commit,
                 expected_workspace_fingerprint,
                 expected_head_commit,
+                checkpoint_verification,
                 verification_policy,
                 write_scope,
                 deliverable,
@@ -988,6 +1360,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: Some(workspace_base_commit),
                     verification_policy,
                     write_scope,
@@ -996,8 +1369,12 @@ async fn run_connection(
                     expected_workspace_fingerprint: Some(expected_workspace_fingerprint),
                     expected_head_commit,
                     provider_artifact,
+                    checkpoint_verification,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
-                if let Err(error) = validate_assignment_source(&workspaces, &assignment) {
+                if assignment.workspace_connection_id.is_none()
+                    && let Err(error) = validate_assignment_source(&workspaces, &assignment)
+                {
                     seen_commands.remove(&command_id);
                     send_run_event(
                         &outbound,
@@ -1036,14 +1413,16 @@ async fn run_connection(
                         assignment_token,
                         control: control_tx,
                         artifact_ack: artifact_ack_tx,
+                        hard_boundary_checkpoint: assignment.hard_boundary_checkpoint.clone(),
                     },
                 );
                 let task_workspaces = workspaces.clone();
                 let runner_id = args.runner_id.clone();
                 let task_outbound = outbound.clone();
                 let task_runs = active_runs.clone();
+                let task_connections = connection_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = execute_verification_assignment(
+                    if let Err(error) = execute_connected_verification_assignment(
                         task_workspaces,
                         runner_id.clone(),
                         assignment.clone(),
@@ -1052,6 +1431,7 @@ async fn run_connection(
                             controls: control_rx,
                             artifact_acks: artifact_ack_rx,
                         },
+                        task_connections,
                     )
                     .await
                     {
@@ -1076,6 +1456,7 @@ async fn run_connection(
                 );
             }
             ServerToRunner::CheckpointWorkspace {
+                workspace_connection_id,
                 command_id,
                 corp_id,
                 room_id,
@@ -1119,6 +1500,7 @@ async fn run_connection(
                     source_repository,
                     source_base_ref,
                     source_base_commit,
+                    workspace_connection_id,
                     resume_workspace_base_commit: Some(workspace_base_commit),
                     verification_policy: VerificationPolicy {
                         checks: Vec::new(),
@@ -1130,12 +1512,15 @@ async fn run_connection(
                     expected_workspace_fingerprint: None,
                     expected_head_commit: Some(expected_head_commit),
                     provider_artifact: None,
+                    checkpoint_verification: false,
+                    hard_boundary_checkpoint: Arc::default(),
                 };
-                match checkpoint_preserved_workspace(
+                match checkpoint_connected_workspace(
                     workspaces.clone(),
                     args.runner_id.clone(),
                     assignment,
                     outbound.clone(),
+                    connection_manager.clone(),
                 )
                 .await
                 {
@@ -1272,14 +1657,14 @@ async fn run_connection(
                 stage,
                 reason,
             } => {
-                let duplicate = seen_commands.insert(command_id, ()).is_some();
-                let applied = duplicate
-                    || active_runs.get(&run_id).is_some_and(|active| {
-                        active
-                            .control
-                            .send(AdapterControl::CircuitBreaker { stage, reason })
-                            .is_ok()
-                    });
+                let (applied, duplicate) = apply_circuit_breaker_command(
+                    &seen_commands,
+                    &active_runs,
+                    command_id,
+                    run_id,
+                    stage,
+                    reason,
+                );
                 outbound.send(RunnerToServer::CommandAck {
                     runner_id: args.runner_id.clone(),
                     connection_epoch,
@@ -1290,7 +1675,8 @@ async fn run_connection(
                     } else if applied {
                         "circuit-breaker command delivered to the active provider".to_owned()
                     } else {
-                        "circuit-breaker command had no active provider".to_owned()
+                        "circuit-breaker command had no active provider or cancellable verification"
+                            .to_owned()
                     },
                 });
             }
@@ -1430,6 +1816,12 @@ impl AdapterEventSink for RunnerEventSink {
                     "text": text,
                 }),
             ),
+            AdapterEvent::Artifact(_) if self.assignment.hard_boundary_requested() => {
+                // Native adapters may finish their local transcript on interruption.
+                // Keep those bytes in the retained worktree, but do not turn a known
+                // hard stop into a rejected upload and premature run.failed event.
+                return;
+            }
             AdapterEvent::Artifact(artifact) => match std::fs::read(&artifact.path) {
                 Ok(bytes) => {
                     if let Ok(mut artifacts) = self.artifacts.lock() {
@@ -1592,6 +1984,94 @@ fn schedule_secret_expiry(ttl: Option<Duration>, control: mpsc::UnboundedSender<
     });
 }
 
+fn connection_source(assignment: &Assignment) -> Result<crony_domain::WorkspaceSourceIdentity> {
+    Ok(crony_domain::WorkspaceSourceIdentity {
+        repository: assignment
+            .source_repository
+            .clone()
+            .context("saved connection omitted its repository")?,
+        repository_id: None,
+        base_ref: assignment
+            .source_base_ref
+            .clone()
+            .context("saved connection omitted its source ref")?,
+        base_commit: assignment
+            .source_base_commit
+            .clone()
+            .context("saved connection omitted its pinned commit")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_connected_assignment(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    adapter: Arc<dyn AgentAdapter>,
+    outbound: OutboundBus,
+    channels: AssignmentChannels,
+    resume_session_id: Option<String>,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let (workspaces, adapter) = if let Some(id) = assignment.workspace_connection_id {
+        let manager =
+            connections.context("this runner cannot open the saved execution connection")?;
+        let runtime = manager
+            .resolve(id, &connection_source(&assignment)?, &assignment.adapter)
+            .await?;
+        (runtime.workspaces, runtime.adapter)
+    } else {
+        (workspaces, adapter)
+    };
+    execute_assignment(
+        workspaces,
+        runner_id,
+        assignment,
+        adapter,
+        outbound,
+        channels,
+        resume_session_id,
+    )
+    .await
+}
+
+async fn execute_connected_verification_assignment(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+    channels: AssignmentChannels,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let workspaces = if let Some(id) = assignment.workspace_connection_id {
+        connections
+            .context("this runner cannot open the saved workspace")?
+            .resolve_workspace(id, &connection_source(&assignment)?)
+            .await?
+    } else {
+        workspaces
+    };
+    execute_verification_assignment(workspaces, runner_id, assignment, outbound, channels).await
+}
+
+async fn checkpoint_connected_workspace(
+    workspaces: Arc<WorkspaceManager>,
+    runner_id: String,
+    assignment: Assignment,
+    outbound: OutboundBus,
+    connections: Option<Arc<connections::ConnectionManager>>,
+) -> Result<()> {
+    let workspaces = if let Some(id) = assignment.workspace_connection_id {
+        connections
+            .context("this runner cannot open the saved workspace")?
+            .resolve_workspace(id, &connection_source(&assignment)?)
+            .await?
+    } else {
+        workspaces
+    };
+    checkpoint_preserved_workspace(workspaces, runner_id, assignment, outbound).await
+}
+
 async fn execute_assignment(
     workspaces: Arc<WorkspaceManager>,
     runner_id: String,
@@ -1672,6 +2152,8 @@ async fn execute_assignment(
     let mut preserve_workspace =
         execution.is_err() || assignment.resume_workspace_base_commit.is_some();
     let mut workspace_quarantined = false;
+    let mut checkpoint_reported = false;
+    let mut verification_started = false;
     let provider_outcome = match &execution {
         Ok(AdapterExit::Completed) => "completed",
         Ok(AdapterExit::Failed) => "failed",
@@ -1692,7 +2174,7 @@ async fn execute_assignment(
     );
     if execution.is_ok() {
         let buffered = terminal.lock().ok().and_then(|mut value| value.take());
-        let terminal =
+        let mut terminal =
             buffered.unwrap_or_else(|| match execution.as_ref().expect("checked above") {
                 AdapterExit::Completed => {
                     BufferedTerminal::Completed("Agent completed without a summary.".to_owned())
@@ -1704,8 +2186,32 @@ async fn execute_assignment(
                     BufferedTerminal::Cancelled("Agent cancelled without a reason.".to_owned())
                 }
             });
+        if assignment.hard_boundary_requested() {
+            source_checkpoint::report(
+                &outbound,
+                &runner_id,
+                &assignment,
+                &workspace,
+                &workspaces,
+                !teardown_uncertain.load(Ordering::Acquire),
+                false,
+            )
+            .await;
+            checkpoint_reported = true;
+            preserve_workspace = true;
+            if matches!(terminal, BufferedTerminal::Completed(_)) {
+                // A delivered hard stop wins over a late provider completion.
+                // Verification requires a separately authorized recovery.
+                terminal = BufferedTerminal::Cancelled(
+                    "Hard circuit-breaker boundary reached; source retained for explicit recovery."
+                        .to_owned(),
+                );
+            }
+        }
         match terminal {
             BufferedTerminal::Completed(summary) => {
+                verification_started = true;
+                let mut cancellation = assignment.hard_boundary_checkpoint.cancellation.subscribe();
                 let verification = send_verification_events(
                     &outbound,
                     &runner_id,
@@ -1722,10 +2228,20 @@ async fn execute_assignment(
                     None,
                     None,
                     None,
+                    Some(&mut cancellation),
                 )
                 .await;
                 preserve_workspace |= verification != VerificationRunOutcome::Finished;
                 workspace_quarantined |= verification == VerificationRunOutcome::IntegrityFailed;
+                if verification == VerificationRunOutcome::Cancelled {
+                    send_run_event(
+                        &outbound,
+                        &runner_id,
+                        &assignment,
+                        "run.cancelled",
+                        json!({"reason": "Hard circuit breaker cancelled verification; source retained without a pre-verification checkpoint."}),
+                    );
+                }
             }
             BufferedTerminal::Failed(error) => {
                 preserve_workspace = true;
@@ -1747,6 +2263,28 @@ async fn execute_assignment(
                 );
             }
         }
+    }
+    if !checkpoint_reported && !assignment.hard_boundary_checkpoint.begin_finalization() {
+        // Atomically choose retention or ordinary finalization before either
+        // path awaits. A subsequently delivered hard directive cannot race removal.
+        source_checkpoint::report(
+            &outbound,
+            &runner_id,
+            &assignment,
+            &workspace,
+            &workspaces,
+            execution.is_ok()
+                && !teardown_uncertain.load(Ordering::Acquire)
+                && !verification_started,
+            workspace_quarantined,
+        )
+        .await;
+        checkpoint_reported = true;
+    }
+    if checkpoint_reported {
+        // No finalize, second seal, or source deletion after a hard-boundary report.
+        execution?;
+        return Ok(());
     }
     if teardown_uncertain.load(Ordering::Acquire) || preserve_workspace {
         let fingerprint = workspaces.fingerprint(&workspace).await.ok();
@@ -1861,6 +2399,7 @@ async fn execute_verification_assignment(
     let mut artifact_snapshot = None;
     let mut checkpoint_admitted = false;
     let mut workspace_quarantined = false;
+    let mut cleanup_head_commit = assignment.expected_head_commit.clone();
     let result = async {
         let expected_fingerprint = assignment
             .expected_workspace_fingerprint
@@ -1927,7 +2466,12 @@ async fn execute_verification_assignment(
             &mut artifact_acks,
             "Verifier-only recovery completed without starting a provider.",
             Some(expected_fingerprint),
-            assignment.expected_head_commit.as_deref(),
+            if assignment.checkpoint_verification {
+                None
+            } else {
+                assignment.expected_head_commit.as_deref()
+            },
+            Some(&mut cleanup_head_commit),
             Some(&mut cancellation_rx),
         );
         tokio::pin!(verification);
@@ -1978,8 +2522,13 @@ async fn execute_verification_assignment(
         {
             failures.push(format!("verifier-only snapshot cleanup failed: {error:#}"));
         }
-        if let Err(error) =
-            verify_prepared_recovery_workspace(&workspaces, &workspace, &assignment).await
+        if let Err(error) = verify_preserved_workspace_checkpoint(
+            &workspaces,
+            &workspace,
+            assignment.expected_workspace_fingerprint.as_deref(),
+            cleanup_head_commit.as_deref(),
+        )
+        .await
         {
             workspace_quarantined = true;
             failures.push(format!("verifier-only source is quarantined: {error:#}"));
@@ -2446,6 +2995,7 @@ async fn send_verification_events(
     completion_summary: &str,
     expected_workspace_fingerprint: Option<&str>,
     preserve_head_commit: Option<&str>,
+    mut cleanup_head_commit: Option<&mut Option<String>>,
     mut cancellation: Option<&mut watch::Receiver<bool>>,
 ) -> VerificationRunOutcome {
     send_run_event(
@@ -2457,7 +3007,11 @@ async fn send_verification_events(
             "check_count": assignment.verification_policy.checks.len(),
         }),
     );
-    let mut completion_head_commit = preserve_head_commit.map(str::to_owned);
+    // Admission still binds the original checkpoint HEAD. Only the exporter may
+    // replace it with the exact runner-owned verification commit after checks.
+    let mut completion_head_commit = preserve_head_commit
+        .or(expected_workspace_fingerprint.and(assignment.expected_head_commit.as_deref()))
+        .map(str::to_owned);
     if expected_workspace_fingerprint.is_some() && completion_head_commit.is_none() {
         match workspaces.head_commit(workspace).await {
             Ok(head) => completion_head_commit = Some(head),
@@ -2526,7 +3080,21 @@ async fn send_verification_events(
             }
         }
         (None, None, None) => {
-            verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await
+            if let Some(cancellation) = cancellation.as_deref_mut() {
+                match verifier::verify_cancellable(
+                    &assignment.verification_policy,
+                    &workspace.path,
+                    &artifacts,
+                    cancellation,
+                )
+                .await
+                {
+                    Some(report) => report,
+                    None => return VerificationRunOutcome::Cancelled,
+                }
+            } else {
+                verifier::verify(&assignment.verification_policy, &workspace.path, &artifacts).await
+            }
         }
         _ => {
             send_run_event(
@@ -2596,6 +3164,12 @@ async fn send_verification_events(
             VerificationRunOutcome::Failed
         };
     }
+    if cancellation
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return VerificationRunOutcome::Cancelled;
+    }
     let deliverable_linkage = if let Some(spec) = &assignment.deliverable {
         let exported = match deliverable::export(
             assignment.run_id,
@@ -2629,6 +3203,11 @@ async fn send_verification_events(
             // A first authorized commit may be created by export. Bind that exact produced head
             // for the upload wait, without ever replacing an explicitly preserved head.
             completion_head_commit = Some(head.clone());
+            // ACK failure or cancellation must retain this exact runner-owned head,
+            // not mistake it for source tampering. Never read/adopt a cleanup-time HEAD.
+            if let Some(cleanup_guard) = cleanup_head_commit.as_mut() {
+                **cleanup_guard = completion_head_commit.clone();
+            }
         }
         if cancellation
             .as_ref()
@@ -2691,7 +3270,17 @@ async fn send_verification_events(
             );
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let attempt = tokio::time::timeout_at(deadline, artifact_acks.recv()).await;
+                let attempt = if let Some(cancellation) = cancellation.as_deref_mut() {
+                    tokio::select! {
+                        biased;
+                        () = verifier::wait_for_verifier_cancellation(cancellation) => {
+                            return VerificationRunOutcome::Cancelled;
+                        }
+                        attempt = tokio::time::timeout_at(deadline, artifact_acks.recv()) => attempt,
+                    }
+                } else {
+                    tokio::time::timeout_at(deadline, artifact_acks.recv()).await
+                };
                 // Every ACK (including an unrelated one) is an asynchronous boundary, not an
                 // integrity receipt. Keep this check outside the upload-wait timeout itself.
                 if let Err(error) = verify_preserved_workspace_checkpoint(
@@ -2954,6 +3543,30 @@ fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
     claims
 }
 
+fn workspace_setup_capability(private_storage_ready: bool) -> RunnerCapability {
+    // Setup invokes OwnedProcessTree, whose Unix implementation deliberately
+    // rejects spawning. Private storage alone cannot establish native support.
+    let process_ownership_supported = cfg!(windows);
+    RunnerCapability {
+        workspace_connection_id: None,
+        name: "workspace-setup-v1".to_owned(),
+        available: private_storage_ready && process_ownership_supported,
+        detail: Some(if !process_ownership_supported {
+            "Native connection setup requires supported process ownership; it is unavailable on this platform."
+                .to_owned()
+        } else if !private_storage_ready {
+            "Configure an operator-private connections directory outside source repositories"
+                .to_owned()
+        } else {
+            "Native repository and coding-agent connections with runner-private state".to_owned()
+        }),
+        models: vec![],
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, process::Command as StdCommand};
@@ -2963,6 +3576,29 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn workspace_setup_capability_requires_storage_and_native_process_ownership() {
+        for private_storage_ready in [false, true] {
+            let capability = workspace_setup_capability(private_storage_ready);
+            assert_eq!(capability.name, "workspace-setup-v1");
+            assert_eq!(
+                capability.available,
+                private_storage_ready && cfg!(windows),
+                "private storage must not advertise unsupported native process execution"
+            );
+            assert!(capability.workspace_connection_id.is_none());
+            assert!(capability.models.is_empty());
+            let detail = capability.detail.unwrap();
+            if !cfg!(windows) {
+                assert!(detail.contains("unavailable on this platform"));
+            } else if !private_storage_ready {
+                assert!(detail.contains("operator-private connections directory"));
+            } else {
+                assert!(detail.contains("Native repository and coding-agent connections"));
+            }
+        }
+    }
 
     struct LatchedTeardownAdapter {
         uncertain: Arc<Notify>,
@@ -3112,6 +3748,7 @@ mod tests {
 
     fn verification_assignment(workspace: &WorkspaceLease, run_id: Uuid) -> Assignment {
         Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),
@@ -3139,6 +3776,8 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
+            hard_boundary_checkpoint: Arc::default(),
         }
     }
 
@@ -3698,6 +4337,250 @@ mod tests {
         AckClosed,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CheckpointAck {
+        Immediate,
+        Closed,
+        Cancelled,
+    }
+
+    async fn checkpoint_commit_case(
+        checkpoint_mode: bool,
+        change_head: bool,
+        acknowledgment: CheckpointAck,
+    ) {
+        let (root, workspaces, workspace, mut assignment) = prepared_verification_fixture().await;
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(canonical_root != temporary && canonical_root.starts_with(&temporary));
+        std::fs::write(workspace.path.join("checkpoint.txt"), b"completed source\n").unwrap();
+        let original_head = assignment.expected_head_commit.clone().unwrap();
+        let fingerprint = workspaces.fingerprint(&workspace).await.unwrap();
+        assignment.expected_workspace_fingerprint = Some(fingerprint.clone());
+        assignment.checkpoint_verification = checkpoint_mode;
+        assignment.verification_policy = VerificationPolicy {
+            checks: vec![crony_domain::VerifierCheck::File {
+                path: "checkpoint.txt".to_owned(),
+                min_bytes: 1,
+            }],
+            manual_gate: None,
+        };
+        assignment.write_scope = vec!["checkpoint.txt".to_owned()];
+        assignment.deliverable = Some(DeliverableSpec {
+            form: crony_domain::DeliverableForm::CommitBranch,
+            commit_after_verification: true,
+            paths: vec!["checkpoint.txt".to_owned()],
+        });
+        let outbound = OutboundBus::default();
+        let (connection, mut received) = mpsc::unbounded_channel();
+        outbound.attach(connection, assignment.connection_epoch);
+        let (control_tx, controls) = mpsc::unbounded_channel();
+        let (ack_tx, artifact_acks) = mpsc::unbounded_channel();
+        let mut ack_tx = Some(ack_tx);
+        let task_assignment = assignment.clone();
+        let task_workspaces = workspaces.clone();
+        let execution = tokio::spawn(async move {
+            execute_verification_assignment(
+                task_workspaces,
+                "runner-test".to_owned(),
+                task_assignment,
+                outbound,
+                AssignmentChannels {
+                    controls,
+                    artifact_acks,
+                },
+            )
+            .await
+        });
+        let mut uploaded = false;
+        let mut final_head = None;
+        let mut events = Vec::new();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while let Some(message) = received.recv().await {
+                if let RunnerToServer::RunEvent {
+                    event_type,
+                    payload,
+                    ..
+                } = message
+                {
+                    if event_type == "run.deliverable_upload" {
+                        assert!(
+                            checkpoint_mode,
+                            "ordinary verifier must preserve its existing commit"
+                        );
+                        assert!(!uploaded, "one native upload with an immediate ACK");
+                        uploaded = true;
+                        let bytes = BASE64
+                            .decode(payload["content_base64"].as_str().unwrap())
+                            .unwrap();
+                        let document: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(document["base_commit"], workspace.base_commit);
+                        assert_eq!(document["changes"][0]["path"], "checkpoint.txt");
+                        assert_eq!(
+                            BASE64
+                                .decode(document["changes"][0]["content_base64"].as_str().unwrap())
+                                .unwrap(),
+                            b"completed source\n"
+                        );
+                        let bundle = BASE64
+                            .decode(document["git_bundle_base64"].as_str().unwrap())
+                            .unwrap();
+                        assert!(!bundle.is_empty());
+                        assert_eq!(
+                            hex::encode(sha2::Sha256::digest(&bundle)),
+                            document["git_bundle_sha256"]
+                        );
+                        assert_ne!(payload["head_commit"], original_head);
+                        assert_eq!(payload["publication_ready"], true);
+                        final_head = Some(payload["head_commit"].as_str().unwrap().to_owned());
+                        if change_head {
+                            git(
+                                &workspace.path,
+                                &[
+                                    "-c",
+                                    "user.name=ECorp Test",
+                                    "-c",
+                                    "user.email=test@example.invalid",
+                                    "commit",
+                                    "--allow-empty",
+                                    "--no-gpg-sign",
+                                    "-m",
+                                    "unauthorized head drift",
+                                ],
+                            );
+                        }
+                        if acknowledgment == CheckpointAck::Cancelled {
+                            control_tx
+                                .send(AdapterControl::Interrupt {
+                                    reason: "cancel after the runner-owned verification commit"
+                                        .to_owned(),
+                                })
+                                .unwrap();
+                        }
+                        if acknowledgment == CheckpointAck::Closed {
+                            drop(ack_tx.take());
+                        } else {
+                            ack_tx
+                                .as_ref()
+                                .unwrap()
+                                .send(ArtifactAck {
+                                    artifact_id: Uuid::new_v4(),
+                                    artifact_role: "source_deliverable".to_owned(),
+                                    sha256: payload["sha256"].as_str().unwrap().to_owned(),
+                                })
+                                .unwrap();
+                        }
+                    }
+                    let finished = event_type == "run.workspace_preserved";
+                    events.push((event_type, payload));
+                    if finished {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("native verifier and upload ACK settle");
+        execution.await.unwrap().unwrap();
+        let completed = events.iter().any(|(kind, _)| kind == "run.completed");
+        assert_eq!(
+            completed,
+            checkpoint_mode && !change_head && acknowledgment == CheckpointAck::Immediate,
+            "{events:?}"
+        );
+        assert_eq!(uploaded, checkpoint_mode, "{events:?}");
+        let retained = events
+            .iter()
+            .find(|(kind, _)| kind == "run.workspace_preserved")
+            .unwrap();
+        assert_eq!(
+            retained.1["workspace_quarantined"], change_head,
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|(kind, _)| matches!(
+            kind.as_str(),
+            "run.session" | "run.session_terminated" | "run.output" | "run.usage"
+        )));
+        assert_eq!(
+            workspaces.fingerprint(&workspace).await.unwrap(),
+            fingerprint
+        );
+        assert_eq!(
+            std::fs::read(workspace.path.join("checkpoint.txt")).unwrap(),
+            b"completed source\n"
+        );
+        if checkpoint_mode && !change_head {
+            assert_eq!(
+                workspaces.head_commit(&workspace).await.unwrap(),
+                final_head.unwrap()
+            );
+            assert_eq!(
+                git(&workspace.path, &["rev-parse", "HEAD^"]),
+                workspace.base_commit
+            );
+            if acknowledgment == CheckpointAck::Cancelled {
+                assert!(
+                    events.iter().any(|(kind, _)| kind == "run.cancelled"),
+                    "{events:?}"
+                );
+                assert!(
+                    !events.iter().any(|(kind, _)| kind == "run.failed"),
+                    "{events:?}"
+                );
+            } else if acknowledgment == CheckpointAck::Closed {
+                assert!(
+                    events.iter().any(|(kind, _)| kind == "run.failed"),
+                    "{events:?}"
+                );
+            }
+        } else {
+            let error = events
+                .iter()
+                .find(|(kind, _)| kind == "run.failed")
+                .unwrap();
+            assert!(
+                error.1["error"].as_str().unwrap().contains(if change_head {
+                    "head mismatch"
+                } else {
+                    "tree changed from preserved head"
+                }),
+                "{error:?}"
+            );
+        }
+        assert_no_verification_snapshots(assignment.run_id);
+        std::fs::remove_dir_all(canonical_root).expect("remove exact owned checkpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_exports_uncommitted_source_without_a_provider() {
+        checkpoint_commit_case(true, false, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_verifier_still_rejects_an_uncommitted_replacement_tree() {
+        checkpoint_commit_case(false, false, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_rejects_head_drift_after_its_owned_commit() {
+        checkpoint_commit_case(true, true, CheckpointAck::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_retains_own_commit_after_ack_failure() {
+        checkpoint_commit_case(true, false, CheckpointAck::Closed).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_cancellation_does_not_quarantine_own_commit() {
+        checkpoint_commit_case(true, false, CheckpointAck::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_verifier_cancellation_still_quarantines_unexpected_head() {
+        checkpoint_commit_case(true, true, CheckpointAck::Cancelled).await;
+    }
+
     async fn held_upload_checkpoint_case(change: HeldUploadChange, manual_gate: bool) {
         let (root, workspaces, workspace, mut assignment) = prepared_verification_fixture().await;
         let resolved = std::fs::canonicalize(&root).unwrap();
@@ -4101,6 +4984,7 @@ mod tests {
             "cleanup fixture",
             Some(&fingerprint),
             None,
+            None,
             Some(&mut cancellation),
         )
         .await;
@@ -4203,6 +5087,7 @@ mod tests {
     #[test]
     fn teardown_fail_closed_preserves_workspace_without_false_terminal_claim() {
         let assignment = Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),
@@ -4230,6 +5115,8 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
+            hard_boundary_checkpoint: Arc::default(),
         };
         let workspace = WorkspaceLease {
             path: PathBuf::from("worktrees/exact-run"),
@@ -4320,6 +5207,7 @@ mod tests {
         );
         let base_commit = workspaces.base_commit().to_owned();
         let assignment = Assignment {
+            workspace_connection_id: None,
             corp_id: Uuid::new_v4(),
             connection_epoch: Uuid::new_v4(),
             room_id: Uuid::new_v4(),
@@ -4347,6 +5235,8 @@ mod tests {
             expected_workspace_fingerprint: None,
             expected_head_commit: None,
             provider_artifact: None,
+            checkpoint_verification: false,
+            hard_boundary_checkpoint: Arc::default(),
         };
         let uncertain = Arc::new(Notify::new());
         let verified = Arc::new(Notify::new());

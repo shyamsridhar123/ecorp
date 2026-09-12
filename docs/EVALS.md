@@ -14,6 +14,63 @@ An implementation claim needs evidence at the same scope:
 - Postgres records state and events
 - the browser receives the final state
 
+The opt-in `issue148_checkpoint_` store family applies the real migrations in SQLx-owned disposable
+databases. It covers zero-provider checkpoint admission after exhausted budget/attempt history,
+unchanged original records, exact retry/replay, native independent review, missing/tampered
+evidence, wrong modes/source/actors, quarantine and loop guards, other active assignments, and
+transaction rollback. A generic zero-limit verifier receives no model-budget exemption. These are
+store metadata tests, not proof of physical files, signed artifact bytes, a browser recovery, or a
+real application delivered after a stop. See
+[the scoped report](evidence/2026-09-08-checkpoint-verification-admission.md).
+
+The separate [native same-lineage acceptance](evidence/2026-09-08-checkpoint-retention-accepted.md)
+records a budget-stopped application, provider-free verification, a server-only upgrade,
+same-run native re-attestation, Bob's actual browser review and an identical downloaded bundle.
+It preserves the earlier failure and distinguishes deterministic protocol evidence from
+real-vendor inference, publication and production identity.
+
+The [checkpoint publication drill](evidence/2026-09-08-checkpoint-publication.md) continues that
+same retained case through the native publisher, real local Git and the existing fake-GitHub
+boundary. It verifies a single review PR record, unchanged original `main`, checkpoint-bound
+provenance, idempotent replay, and an actual API/runner/web restart. It does not create a real
+GitHub application PR or claim real-provider inference.
+
+The [publication review follow-up](evidence/2026-09-08-publication-review-recovery.md)
+records actual-store failure reporting after role/room/artifact changes, retained publisher
+ownership checks, and transactional legacy source/checkpoint upgrades including renewal replay.
+Server unit coverage checks that only failure reporting uses the cleanup permission; all
+effect-advancing variants retain `Publish`. These are scoped store and server-unit checks,
+not a new real-provider or real-GitHub publication run.
+
+## Exact mission-to-Factory context
+
+The [exact mission-context report](evidence/2026-09-09-mission-work-context.md)
+records the separate #199 source-attribution check: twelve actual-migration
+store cases, including a target outside the 500-item Factory window, plus
+authorized API/browser reads and a guest-visible mission that retains neutral
+origin. It creates no new provider run and does not replace Factory publication
+or production-identity acceptance.
+
+## Saved-connection Factory routing
+
+The [saved-connection report](evidence/2026-09-09-factory-saved-connections.md)
+separates 14 actual-store cases, four actual-handler/real-migration cases,
+read-only native API checks, and a real three-specialist Copilot dispatch.
+The final integration source was retained after a task-budget stop; its
+verification/review/publication remain pending #206. Passing preflight or
+specialist handoffs must not be reported as an accepted application.
+
+## Checkpoint cancellation reconciliation
+
+The [#206 reconciliation report](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md)
+separates eleven actual-migration store cases from CLI/client coverage and the retained
+application's runtime outcome. Store cases exercise the exact legacy controller cancellation,
+current authority and replay, actor-demotion serialization, quarantined predecessors, stale
+events/source proof, explicit stops, policy cancellations and transactional rollback.
+Run only the explicitly owned `issue206_` SQLx lane for those cases; ordinary workspace tests
+leave it ignored. A successful reconciliation is not application verification, review or
+publication, and a missing required artifact must still fail its persisted check.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.

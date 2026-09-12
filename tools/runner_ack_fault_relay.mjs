@@ -2,7 +2,7 @@
 // Only original source_deliverable ACK frames can be withheld. All provider work,
 // artifact uploads, timeout/retry decisions, and state transitions remain native.
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { createServer, Server } from 'node:http'
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import path from 'node:path'
@@ -133,7 +133,21 @@ export class AckFaultGate {
   }
 }
 
-export function validateConfig(config) {
+// Import-only seam: synthetic tests retain their bound upstream, never probe/reopen
+// a free port or opt a JSON/CLI config into arbitrary transport endpoints.
+function syntheticOrigin(upstream) {
+  assert(upstream instanceof Server && upstream.listening,
+    'Synthetic upstream must be an already-listening HTTP server')
+  const address = upstream.address()
+  assert.equal(address?.address, '127.0.0.1')
+  assert.equal(address.family, 'IPv4')
+  assert(Number.isInteger(address.port) && address.port >= 1024 && address.port <= 65535 &&
+    ![18961, 18963, 18962, 15491, 8791, 5432].includes(address.port),
+    'Synthetic upstream must not use QA/manual/default ports')
+  return `http://${address.address}:${address.port}`
+}
+
+export function validateConfig(config, { syntheticUpstream } = {}) {
   assert.equal(config.test_owned, true)
   assert.equal(config.purpose, 'issue169-ack-acceptance')
   assert(path.isAbsolute(config.output_root))
@@ -142,8 +156,9 @@ export function validateConfig(config) {
   assert.equal(directory, fixedCandidate
     ? 'issue169-ack-acceptance-20260907-fixed'
     : 'issue169-ack-acceptance-20260907')
-  assert.equal(config.server_url, 'http://127.0.0.1:18961')
-  assert.equal(config.listen_port, 18963)
+  assert.equal(config.server_url, syntheticUpstream === undefined
+    ? 'http://127.0.0.1:18961' : syntheticOrigin(syntheticUpstream))
+  assert.equal(config.listen_port, syntheticUpstream === undefined ? 18963 : 0)
   assert.equal(config.runner_id, fixedCandidate
     ? 'issue169-ack-real-copilot-fixed' : 'issue169-ack-real-copilot')
   assert.equal(config.repository, 'shyamsridhar123/ecorp-enterprise-lab')
@@ -156,8 +171,8 @@ export function validateConfig(config) {
   return config
 }
 
-export async function startRelay(input) {
-  const config = validateConfig(input)
+export async function startRelay(input, options) {
+  const config = validateConfig(input, options)
   const { WebSocket, WebSocketServer } = require('ws')
   const receipt = path.join(config.output_root, 'evidence', 'ack-transport.jsonl')
   const statusPath = path.join(config.output_root, 'evidence', 'relay-status.json')

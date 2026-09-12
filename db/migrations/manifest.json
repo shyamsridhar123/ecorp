@@ -190,6 +190,16 @@
       "version": 38,
       "file": "0038_workspace_integrity_quarantine.sql",
       "sha384": "c9e8b03df1545f747d39d5d39e49c2757c2927c60a228dc353cf3f56fa9cfec5a850780345f0fa6df69aa0b31bd7c1fa"
+    },
+    {
+      "version": 39,
+      "file": "0039_budget_checkpoint_verification.sql",
+      "sha384": "a3684d6aceb2f2af021c9899b83ae9f97a219674a4bf02e98a424e4d3f32ac6bcac01a5e8dc1df8f6bccdba8102f4949"
+    },
+    {
+      "version": 40,
+      "file": "0040_workspace_connections.sql",
+      "sha384": "a9a3b61e8832b875d32ae693dd641aeb8da8343509c63489d9621b4e42340f8a45b804f00876d043481912184bca3522"
     }
   ]
 }

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub use crony_domain::RunnerModel;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerCapability {
     pub name: String,
@@ -22,22 +24,8 @@ pub struct RunnerCapability {
     pub source_base_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_base_commit: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunnerModel {
-    pub id: String,
-    pub name: String,
-    pub policy_state: Option<String>,
-    pub policy_terms: Option<String>,
-    pub supports_vision: bool,
-    pub supports_reasoning_effort: bool,
-    pub max_prompt_tokens: Option<u64>,
-    pub max_context_window_tokens: Option<u64>,
-    #[serde(default)]
-    pub supported_reasoning_efforts: Vec<String>,
-    pub default_reasoning_effort: Option<String>,
-    pub billing_multiplier: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +37,27 @@ pub struct ActiveRunClaim {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerToServer {
+    WorkspaceSetupReport {
+        runner_id: String,
+        corp_id: Uuid,
+        connection_epoch: Uuid,
+        operation_id: Uuid,
+        report: crony_domain::WorkspaceSetupReport,
+    },
+    WorkspaceSignInAck {
+        runner_id: String,
+        corp_id: Uuid,
+        connection_epoch: Uuid,
+        operation_id: Uuid,
+        request_id: Uuid,
+        applied: bool,
+    },
+    CapabilitiesUpdated {
+        runner_id: String,
+        corp_id: Uuid,
+        connection_epoch: Uuid,
+        capabilities: Vec<RunnerCapability>,
+    },
     Register {
         runner_id: String,
         corp_id: Uuid,
@@ -87,6 +96,18 @@ pub enum RunnerToServer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToRunner {
+    WorkspaceSetup {
+        command: crony_domain::WorkspaceSetupCommand,
+    },
+    WorkspaceSetupAck {
+        operation_id: Uuid,
+        accepted: bool,
+    },
+    WorkspaceSignInInput {
+        operation_id: Uuid,
+        request_id: Uuid,
+        response: crony_domain::NativeSignInResponse,
+    },
     Registered {
         runner_id: String,
         credential: String,
@@ -102,6 +123,8 @@ pub enum ServerToRunner {
         sha256: String,
     },
     StartRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_connection_id: Option<Uuid>,
         corp_id: Uuid,
         room_id: Uuid,
         mission_id: Uuid,
@@ -123,6 +146,8 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     ResumeRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_connection_id: Option<Uuid>,
         #[serde(default)]
         command_id: Option<Uuid>,
         corp_id: Uuid,
@@ -153,6 +178,8 @@ pub enum ServerToRunner {
         secrets: Vec<ResolvedSecret>,
     },
     VerifyRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_connection_id: Option<Uuid>,
         command_id: Uuid,
         corp_id: Uuid,
         room_id: Uuid,
@@ -168,6 +195,10 @@ pub enum ServerToRunner {
         workspace_base_commit: String,
         expected_workspace_fingerprint: String,
         expected_head_commit: Option<String>,
+        /// A separately authorized stopped-source checkpoint may create its first
+        /// verification commit. The expected HEAD still fences source admission.
+        #[serde(default)]
+        checkpoint_verification: bool,
         verification_policy: VerificationPolicy,
         #[serde(default)]
         write_scope: Vec<String>,
@@ -175,6 +206,8 @@ pub enum ServerToRunner {
         provider_artifact: Option<VerificationArtifactReference>,
     },
     CheckpointWorkspace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_connection_id: Option<Uuid>,
         command_id: Uuid,
         corp_id: Uuid,
         room_id: Uuid,
@@ -367,6 +400,8 @@ pub struct CreateMissionRequest {
     pub strategy: Option<String>,
     #[serde(default)]
     pub source: Option<MissionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_connection_id: Option<Uuid>,
     #[serde(default)]
     pub secret_refs: Vec<TaskSecretReference>,
     pub budget_tokens: Option<i64>,
@@ -642,6 +677,24 @@ pub struct FactoryVerificationRecoveryContextResponse {
     pub remaining_mission_cost_microusd: i64,
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
+    #[serde(default)]
+    pub checkpoint_verification: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cancellation_event_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileFactoryCheckpointCancellationRequest {
+    pub actor_id: Uuid,
+    pub source_run_id: Uuid,
+    pub expected_factory_version: i64,
+    pub cancellation_event_id: Uuid,
+    pub expected_workspace_fingerprint: String,
+    pub expected_head_commit: String,
+    pub observed_source_revision: String,
+    pub idempotency_key: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -201,6 +201,34 @@ filesystem boundary; external CLI adapters currently refuse Unix execution.
 
 ## Mission launch admission
 
+### Saved project execution connections
+
+Room-scoped `workspace_connections` retain repository/agent/node configuration
+independently of live runner inventory. Actor-private setup operations cross the
+existing authenticated runner channel as fixed native operations, not server
+shell execution. GitHub CLI and the native coding-agent authentication/catalog
+interfaces remain the implementation boundary. Shared events carry only status
+refresh hints; private sign-in instructions and discovery catalogues do not enter
+the shared connection DTO.
+
+Runs persist an optional execution-connection ID. Planning, run admission,
+dispatch and resume retain that binding alongside the immutable source tuple.
+Legacy unbound work uses only legacy capabilities; it cannot borrow another
+project connection's account or source. Source-only recovery resolves previously
+accepted pins without requiring a new provider sign-in. Native final setup
+receipts survive reconnect and wait for a server acknowledgement before provider
+readiness becomes dispatchable. See [project connections](PROJECT_CONNECTIONS.md).
+
+Factory can persist the same optional `workspace_connection_id` in its immutable
+claim policy. New bound controller intake reads the existing checked source
+through a scoped connection lookup rather than requiring a second local checkout.
+Preflight uses the connection-aware planner and current connection-room admission;
+materialization reads the binding together with the claimed source and repeats
+admission. Every task must match the policy's exact connection, including its
+absence for legacy work. Recovery cannot change that binding or borrow unbound
+capabilities. The lookup returns the shared connection DTO, not its private native
+configuration, setup reports or credentials.
+
 A persisted `ready` mission is a saved plan awaiting explicit dispatch, not permission for a
 Corp-wide scheduling sweep to start it. Both ordinary mission creation and factory
 materialization leave the mission in that held state. The existing authenticated launch endpoint
@@ -571,6 +599,41 @@ source-validation, adapter, or other pre-start rejection terminalizes the replac
 recovery, returns the factory item to `verification_failed`, consumes the failed command, and leaves
 the preserved source checkpoint eligible for a separately authorized retry.
 
+`checkpoint_verification` extends this same aggregate for native budget-stopped source. It requires
+a preserved, terminal assignment, a measured budget incident, native provider termination, and the
+runner's exact source/policy-bound checkpoint. It creates a `verification_only` run using the
+existing `VerifyRun` command, with no model, provider session, provider secrets, model-token
+allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
+unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
+
+Legacy controller catch-up could project that recoverable suspension as a terminal Factory
+`cancelled` item. The exact recovery-context endpoint now returns a
+`checkpoint_cancellation_event_id` only when native source authority and the current
+controller-cancellation operation prove that specific case. Explicit checkpoint recovery
+reconciles it through a separate, actor-authorized operation, appending
+`factory.checkpoint_cancellation_reconciled` and advancing only the Factory version/state.
+The CLI then refreshes context and uses the existing claim and recovery path. Dry runs never
+reconcile; generic polling, provider resume, and other recovery modes cannot reopen cancelled
+work. Future catch-up leaves server-validated checkpoints recoverable instead of mirroring
+them into terminal cancellation. See
+[the reconciliation evidence](evidence/2026-09-09-checkpoint-cancellation-reconciliation.md).
+
+The original checkpoint HEAD still guards admission, while the native exporter may create a
+first verification commit. Retention accepts that new HEAD only through the exact verifier's
+ready source artifact and source/policy/verification bindings. A missing or mismatched commit
+artifact never silently falls back to the old HEAD. A finished checkpoint verifier awaiting
+human review can request the existing `CheckpointWorkspace` operation to repair a missing
+retention receipt on the same run; the runner checks the physical HEAD and fingerprint again.
+Such an evidence-complete review needs no live provider claim and survives runner reconnect.
+See [the same-lineage native acceptance](evidence/2026-09-08-checkpoint-retention-accepted.md).
+
+Only that exactly bound recovery can proceed despite exhausted model-usage budgets. A zero limit
+or a generic `verification_only` flag is insufficient. Explicit stops, loop breakers, quarantine,
+other active assignments, and unrelated Factory blocks remain effective. The checkpoint operation
+cannot revise source or evidence policy. In particular, a required provider-artifact check still
+requires real durably stored evidence; source preservation alone cannot satisfy it. See the
+[checkpoint-admission evidence and remaining runtime scope](evidence/2026-09-08-checkpoint-verification-admission.md).
+
 Runner loss terminalizes an exactly bound active recovery in either mode, including a
 source-correction command acknowledged before its start report arrives. The recovery slot is
 released and the Factory/task projections return to `verification_failed`; the run remains
@@ -711,6 +774,24 @@ revision. GitHub Project status remains `In Progress`; only verified publication
 
 Factory snapshots are limited to roles that can operate missions. Pre-materialization events omit
 source issue metadata, and events become room-scoped as soon as a mission exists.
+The snapshot is not an origin index: an omitted Factory item cannot establish
+that a mission was created directly.
+
+`GET /api/corps/{corp_id}/missions/{mission_id}/context` resolves one authorized
+mission's exact stored Factory link. It uses the existing unique mission-to-item
+relationship, not the recent-item window. Authorization and the left join share
+one database statement; only current human operators who belong to the mission's
+room receive a result. The response contains the echoed viewer/mission/room scope
+and minimal issue/link metadata, not a claim token, policy or account report.
+Unknown, hidden or unavailable context stays neutral in the UI.
+
+Factory materialization commits mission creation and the unique link together,
+and no supported path later adopts or unlinks a committed mission. Therefore a
+successful complete lookup without a link establishes a direct/non-Factory
+mission. It does not prove that somebody used the browser rather than another
+direct client. An inconsistent cross-Corp link is rejected rather than filtered
+into a false Direct classification.
+
 Controller discovery does not use that bounded snapshot as an index. After listing the current
 GitHub Project candidates, the trusted controller sends only those Project item IDs to a
 Corp-authorized lookup endpoint together with the normalized Project owner and Project number. The
@@ -866,15 +947,25 @@ provenance keeps the original claim and the reviewed recovery source distinct. T
 `claimed_revision` remains the revision captured by the factory claim, while `revision` records the
 effective reviewed revision observed by the completed recovery and `recovery_id` links that
 recovery. Recovery selection follows the selected deliverable run's persisted resume lineage rather
-than requiring the deliverable to belong directly to the first replacement run. New provenance is
-schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
+than requiring the deliverable to belong directly to the first replacement run. Ordinary provenance
+is schema version 2; authority revalidation accepts legacy schema-version-1 records by their original
 claimed revision so an in-flight publication can survive deployment. Without a completed recovery,
 both revisions are the claimed revision and `recovery_id` is null.
 
+Checkpoint publications additionally retain the original native checkpoint/termination event
+IDs, workspace/fingerprint, original HEAD, verified export HEAD and authority digest under
+`provenance.checkpoint` in schema version 3. Renewal and effect-advancing checkpoints revalidate
+that proof. Validated older schema-1/2 publications may acquire previously absent proof
+transactionally; non-null changed proof and missing schema-3 proof fail closed. Source and
+checkpoint upgrades are combined, and renewal replay returns the upgraded persisted record.
+
 Publisher workloads have a separate Corp-scoped identity and credential from the authorizing human.
 Owners or admins enroll bounded credentials whose plaintext is returned once and whose SHA-256 hash,
-expiry, revocation state, and last-use time are stored. Start, renewal, failure, and every checkpoint
-require both current human authority and the independently authenticated publisher identity. The
+expiry, revocation state, and last-use time are stored. Start, renewal and effect advancement require
+current publication authority and the independently authenticated publisher identity. Failure
+reporting retains authenticated Corp identity plus exact actor, publisher, token, version and lease
+ownership, but can close that attempt after effect authority changes. It advances no external
+effect and does not require renewed `Publish` permission. The
 server derives the publisher ID from that workload credential and requires the request's publisher
 ID to match exactly. The CLI reads the credential from a file and sends it only in the authenticated
 publication request header.
@@ -932,11 +1023,18 @@ persisted role plus current mission, verifier, deliverable, policy, run, request
 hard-breaker authority before extending the lease. New starts, idempotent start replay, collision
 recovery, and every renewal also require the acting publisher to remain a current member of the
 mission room.
-The selected deliverable run is always checked against current budget and breaker authority. A
+The selected deliverable run is always checked against current budget and breaker authority. By default, a
 `stop` stage anywhere in the mission remains terminal. A historical `suspend` is accepted only when
 it is an explicit resumed ancestor of the selected verified run and its current no-progress and
 repeated-tool counters remain below the current policy limits. Unrelated suspends, stop-level loop
 metrics, and missing, duplicate, or cyclic resume lineage fail closed.
+
+An explicit publication of a completed, exactly bound checkpoint-verification result is a
+zero-provider operation. It may proceed past that checkpoint's measured model-budget stop and
+retrospective shared model counters without changing spending. Other actual stop/suspend state,
+explicit stops, loop limits, quarantine, source/verification identity, actor/room and publisher
+credentials remain effective. This is not a general exemption for publishing arbitrary results.
+See [the native publication and restart evidence](evidence/2026-09-08-checkpoint-publication.md).
 For the Project effect, the publisher reads the exact Project and Status identities, renews
 authority, refreshes the exact item status, and re-fetches the durable PR to revalidate its open
 state, base/head, content, repository/SHA, URL, draft, and auto-merge identity. It then performs a

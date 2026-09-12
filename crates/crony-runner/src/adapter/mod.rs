@@ -1,4 +1,5 @@
 mod codex;
+pub(crate) mod connection;
 mod copilot;
 mod copilot_fs;
 mod external;
@@ -289,6 +290,7 @@ pub struct AdapterRegistry {
     adapters: Arc<HashMap<String, Arc<dyn AgentAdapter>>>,
 }
 
+#[derive(Clone)]
 pub struct AdapterRegistryConfig {
     pub fake_agent_script: PathBuf,
     pub codex_command: PathBuf,
