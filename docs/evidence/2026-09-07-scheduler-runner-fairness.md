@@ -1,5 +1,10 @@
 # ECorp: bounded runner scheduling fairness
 
+> September 12 follow-up: the unchanged scheduler fix passed all 16 scheduler
+> and readiness regressions plus fresh two-runner retention/replay acceptance.
+> See [current standalone and runtime acceptance](2026-09-12-scheduler-standalone-acceptance.md). The older
+> September 7 transport failure below remains a historical failure, not a pass.
+
 Date: September 7, 2026. Issue: #172. Integration: existing draft PR #170.
 This is a control-plane coordination fix, not a replacement agent harness or
 a claim that the whole dark factory is production-ready.
