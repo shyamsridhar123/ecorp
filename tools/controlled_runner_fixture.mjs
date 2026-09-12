@@ -110,3 +110,36 @@ export function selectFixtureRunnerForSource(state, demo, expected) {
   assert.equal(matches.length, 1, 'Expected exactly one owned runner advertising the declared immutable checkout')
   return matches[0]
 }
+
+export function assertAutomaticFactoryVerification(state, { corpId, workItemId, missionId, runId, previousVersion }) {
+  const snapshot = state.snapshot
+  const items = snapshot.factory_work_items.filter(item => item.id === workItemId)
+  assert.equal(items.length, 1)
+  const item = items[0]
+  assert.equal(item.corp_id, corpId)
+  assert.equal(item.mission_id, missionId)
+  assert.equal(item.state, 'verified', 'Native completion must settle the factory item')
+  assert.equal(item.version, previousVersion + 1, 'Native verification must advance exactly once')
+  const mission = snapshot.missions.find(candidate => candidate.id === missionId)
+  assert.equal(mission?.corp_id, corpId)
+  assert.equal(mission.status, 'completed')
+  const run = snapshot.runs.find(candidate => candidate.id === runId)
+  assert.equal(run?.corp_id, corpId)
+  assert.equal(run.status, 'completed')
+  assert.equal(run.verification_status, 'passed')
+  const tasks = snapshot.tasks.filter(task => task.mission_id === missionId)
+  assert.ok(tasks.length && tasks.every(task => task.corp_id === corpId && task.status === 'completed' &&
+    task.verification_status === 'passed'), 'All persisted task verifiers must pass')
+  assert.ok(tasks.some(task => task.id === run.task_id))
+  const events = snapshot.events.filter(event => event.aggregate_id === workItemId && event.type === 'factory.verified')
+  assert.equal(events.length, 1, 'Expected one native factory.verified event')
+  const event = events[0]
+  assert.equal(event.corp_id, corpId)
+  assert.equal(event.actor_id, null, 'The automated fixture must not require a second operator transition')
+  assert.equal(event.aggregate_version, item.version)
+  assert.equal(event.correlation_id, missionId)
+  assert.equal(event.causation_id, runId)
+  assert.equal(event.idempotency_key, `factory:${workItemId}:verified:${runId}`)
+  assert.deepEqual(event.payload, { previous_state: 'running', state: 'verified', mission_id: missionId, run_id: runId })
+  return item
+}

@@ -24,6 +24,11 @@ test('claims keep casing normalization, immutable-source assertions and pre-effe
   assert.match(source, /selectFixtureRunnerForSource\(await snapshot\(demo\), demo/u)
   assert.match(source, /const initialReadinessPreviews = await waitForFixtureSource\(demo\)/u)
   assert.match(source, /await restartLocalServer\(\)\nconst restartReadinessPreviews = await waitForFixtureSource\(demo\)/u)
+  assert.match(source, /assertAutomaticFactoryVerification\(completed\.state/u)
+  assert.match(source, /assert\.equal\(staleVerified\.response\.status, 409\)/u)
+  assert.match(source, /factory work item version is 5, not 4/u)
+  assert.match(source, /'factory\.verified'/u)
+  assert.doesNotMatch(source, /const verified = await postOk/u)
   for (const assertion of [
     'assert.equal(duplicateActive.response.status, 409)',
     'assert.equal(staleRenewal.response.status, 409)',

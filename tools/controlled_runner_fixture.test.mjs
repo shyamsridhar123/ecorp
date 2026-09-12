@@ -4,6 +4,7 @@ import path from 'node:path'
 import test from 'node:test'
 import {
   artifactStagingFixtureConfig,
+  assertAutomaticFactoryVerification,
   assertControlledAssignment,
   controlledReadinessCapability,
   controlledReadinessSource,
@@ -171,6 +172,44 @@ test('source-bound fixture readiness verifies the expected repository, ref, comm
     const changed = structuredClone(state)
     change(changed)
     assert.throws(() => selectFixtureRunnerForSource(changed, demo, expected))
+  }
+})
+
+test('automatic factory verification requires exact persisted completion, scope, version and event lineage', () => {
+  const expected = { corpId: 'corp', workItemId: 'item', missionId: 'mission', runId: 'run', previousVersion: 4 }
+  const state = { snapshot: {
+    factory_work_items: [{ id: 'item', corp_id: 'corp', mission_id: 'mission', state: 'verified', version: 5 }],
+    missions: [{ id: 'mission', corp_id: 'corp', status: 'completed' }],
+    tasks: [{ id: 'task', corp_id: 'corp', mission_id: 'mission', status: 'completed', verification_status: 'passed' }],
+    runs: [{ id: 'run', corp_id: 'corp', task_id: 'task', status: 'completed', verification_status: 'passed' }],
+    events: [{ type: 'factory.verified', aggregate_id: 'item', aggregate_version: 5, corp_id: 'corp', actor_id: null,
+      correlation_id: 'mission', causation_id: 'run', idempotency_key: 'factory:item:verified:run',
+      payload: { previous_state: 'running', state: 'verified', mission_id: 'mission', run_id: 'run' } }],
+  } }
+  const before = structuredClone(state)
+  assert.equal(assertAutomaticFactoryVerification(state, expected).version, 5)
+  assert.deepEqual(state, before)
+  for (const change of [
+    snapshot => { snapshot.factory_work_items = [] },
+    snapshot => { snapshot.factory_work_items[0].state = 'running' },
+    snapshot => { snapshot.factory_work_items[0].corp_id = 'other' },
+    snapshot => { snapshot.factory_work_items[0].version = 6 },
+    snapshot => { snapshot.missions[0].status = 'running' },
+    snapshot => { snapshot.tasks[0].verification_status = 'pending' },
+    snapshot => { snapshot.runs[0].verification_status = 'pending' },
+    snapshot => { snapshot.runs[0].task_id = 'other-task' },
+    snapshot => { snapshot.events = [] },
+    snapshot => { snapshot.events.push(structuredClone(snapshot.events[0])) },
+    snapshot => { snapshot.events[0].type = 'factory.state_changed' },
+    snapshot => { snapshot.events[0].actor_id = 'second-operator' },
+    snapshot => { snapshot.events[0].aggregate_version = 4 },
+    snapshot => { snapshot.events[0].causation_id = 'other-run' },
+    snapshot => { snapshot.events[0].idempotency_key = 'different-key' },
+    snapshot => { snapshot.events[0].payload.run_id = 'other-run' },
+  ]) {
+    const changed = structuredClone(state)
+    change(changed.snapshot)
+    assert.throws(() => assertAutomaticFactoryVerification(changed, expected))
   }
 })
 

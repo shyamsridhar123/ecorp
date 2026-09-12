@@ -310,13 +310,52 @@ The updated factory-claim, controller and publication runtime results remain a
 hosted-CI gate at this pre-publication checkpoint; static regressions are not a
 claim that those full runtime suites have already passed.
 
+## Native automatic-verification fixture contract
+
+Hosted run `34683575362` on `8a0d7bf9a5e54a165dd0cd1cb7cb98d50fcc0ba2`
+passed all six other jobs. The factory-claim fixture passed source admission,
+restart readiness, materialization, dispatch and completed-run assertions. It
+then submitted a stale manual verification transition and received the correct
+HTTP 409: `factory work item version is 5, not 4`.
+
+The native store settles a successfully verified factory mission in the same
+transaction as run completion: `reconcile_factory_verified_tx` advances the item
+once and emits `factory.verified`. The old fixture expected a second operator
+transition and a second `factory.state_changed` event. The production version
+fence and automatic transition are unchanged and must not be bypassed.
+
+The fixture now checks the persisted native result before testing the stale
+request. Its pure assertion helper requires the exact Corp/mission/run/task
+linkage, passed task and run verification, verified work-item state, one version
+advance, and exactly one native event with matching version, correlation,
+causation, idempotency key and payload. Automated completion must have no second
+operator actor. The stale version-4 write is still sent and must be rejected
+specifically because version 5 is authoritative; it is not refreshed or retried.
+The final snapshot must remain at version 5 with one `factory.verified` event.
+The pre-verification rejection now also checks its verifier-policy error reason.
+
+Local validation on parent `8a0d7bf` plus this fixture-only correction:
+
+- Four Node test files: 46 passed, zero skipped. The new regression rejects
+  unverified tasks/runs, missing or duplicate native events, wrong scope, actor,
+  version, causation, idempotency key and payload.
+- Node syntax and diff checks passed. Claims HTTP requests are now bounded and
+  refuse redirects, including requests used by the readiness preview.
+- All required migration/Rust/web gates passed again: 40 immutable migrations,
+  Rust format, offline Clippy, 452 passing Rust tests with 200 explicitly ignored
+  database cases and no ambient `DATABASE_URL`, web build and lint.
+- No production code, local service, live factory state, account setting or
+  pending recovery file changed. The updated full factory runtime assertions
+  remain pending the next hosted run at this pre-publication checkpoint.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence and unit-tested Unix admission
 logic. It is not real vendor inference or browser acceptance. Hosted runs have
 now proved both external-adapter lanes, Linux roster SQL, both graph variants,
-and the full Linux artifact-staging/restart suite. The next run must validate the
-ATV-aligned factory fixtures and remaining integration steps. The local readiness
+and the full Linux artifact-staging/restart suite. The ATV factory claim now
+dispatches and completes its governed run. The next run must validate the updated
+automatic-verification assertions and remaining factory/integration steps. The local readiness
 smoke does not claim SQL fault injection or restart recovery on Windows.
 
 The live factory, original runner identity, paused work, budgets and pending #50

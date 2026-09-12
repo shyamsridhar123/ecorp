@@ -8,7 +8,11 @@ import {
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { selectFixtureRunnerForSource, waitForControlledRunnerDispatch } from './controlled_runner_fixture.mjs'
+import {
+  assertAutomaticFactoryVerification,
+  selectFixtureRunnerForSource,
+  waitForControlledRunnerDispatch,
+} from './controlled_runner_fixture.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -20,7 +24,9 @@ const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
 }).trim()
 
 async function request(url, init) {
-  const response = await fetch(`${server}${url}`, init)
+  const response = await fetch(`${server}${url}`, {
+    ...init, redirect: 'error', signal: AbortSignal.timeout(10_000),
+  })
   const body = response.status === 204 ? null : await response.json()
   return { response, body }
 }
@@ -489,24 +495,31 @@ const forgedVerified = await post(transitionPath, {
   state: 'verified',
 })
 assert.equal(forgedVerified.response.status, 409)
+assert.match(forgedVerified.body.error, /cannot enter verified before its mission and task verification pass/u)
 
 const completed = await waitForMission(demo, materialized[0].mission_id)
 assert.equal(completed.mission.status, 'completed')
 const run = completed.state.snapshot.runs.find((item) => item.id === launch.run_id)
 assert.equal(run.status, 'completed')
-const verified = await postOk(transitionPath, {
+const verified = assertAutomaticFactoryVerification(completed.state, {
+  corpId: demo.corp_id, workItemId: claim.work_item.id, missionId: materialized[0].mission_id,
+  runId: launch.run_id, previousVersion: running.work_item.version,
+})
+const staleVerified = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
   expected_version: running.work_item.version,
   idempotency_key: `factory-e2e-verified-${nonce}`,
   state: 'verified',
 })
-assert.equal(verified.work_item.state, 'verified')
-assert.equal(verified.work_item.version, 5)
+assert.equal(staleVerified.response.status, 409)
+assert.match(staleVerified.body.error, /factory work item version is 5, not 4/u)
+assert.equal(verified.state, 'verified')
+assert.equal(verified.version, 5)
 const forgedPublished = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-forged-published-${nonce}`,
   state: 'published',
 })
@@ -514,7 +527,7 @@ assert.equal(forgedPublished.response.status, 400)
 const invalidRegression = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-invalid-regression-${nonce}`,
   state: 'running',
 })
@@ -524,6 +537,7 @@ const finalFactoryItem = finalState.snapshot.factory_work_items.find(
   (item) => item.id === claim.work_item.id,
 )
 assert.equal(finalFactoryItem.state, 'verified')
+assert.equal(finalFactoryItem.version, 5)
 const finalFactoryEvents = finalState.snapshot.events.filter(
   (event) => event.aggregate_id === claim.work_item.id,
 )
@@ -534,7 +548,7 @@ assert.deepEqual(
     'factory.claim_renewed',
     'factory.mission_linked',
     'factory.state_changed',
-    'factory.state_changed',
+    'factory.verified',
   ],
 )
 const finalGuestSnapshot = await request(
@@ -734,6 +748,8 @@ const report = {
   policy_widening_rejected: true,
   tool_and_secret_widening_rejected: true,
   pre_verification_transition_rejected: true,
+  automatic_verification_observed: true,
+  stale_verified_transition_rejected: staleVerified.response.status === 409,
   publication_state_requires_dedicated_operation: true,
   invalid_state_regression_rejected: true,
   expired_reclaim_policy_widening_rejected: true,
