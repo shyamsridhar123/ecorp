@@ -123,3 +123,11 @@ reconciliation bypass, or increased timeout is introduced.
 All prior storage, rollback, digest, event and restart assertions remain.
 The retained failing run is not relabelled as success; the repaired native
 storage E2E still needs a fresh result on its new head.
+
+Run `34675872689` retained a fixture-policy error in that first routing attempt:
+the existing planner forbids model selection for `fake-process`. The simulator
+now advertises a synthetic Codex model instead, using the existing supported
+model-routing contract without executing Codex or another provider. The
+readiness loop retries only the exact native reconciliation-not-ready error;
+other policy errors fail immediately. The production fake-process restriction
+is unchanged. This correction still requires native CI acceptance.

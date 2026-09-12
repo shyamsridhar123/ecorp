@@ -307,7 +307,7 @@ function connectRunner({ corpId, runnerId, credential, source, modelId }) {
           os: process.platform,
           capabilities: [
             {
-              name: 'fake-process',
+              name: 'codex',
               available: true,
               detail: 'controlled artifact staging runner',
               models: [{
@@ -400,7 +400,7 @@ function sendRunEvent(runner, assignment, eventType, payload, eventId) {
 async function controlledRun(demo, runner, title) {
   const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
-    preferred_adapter: 'fake-process',
+    preferred_adapter: 'codex',
     preferred_model: runner.modelId,
     source: runner.source,
     title,
@@ -715,7 +715,7 @@ while (Date.now() < readyDeadline) {
     body: JSON.stringify({
       requested_by: demo.alice_actor_id,
       title: 'Controlled artifact runner dispatch readiness',
-      preferred_adapter: 'fake-process',
+      preferred_adapter: 'codex',
       preferred_model: modelId,
       source,
     }),
@@ -725,7 +725,12 @@ while (Date.now() < readyDeadline) {
     dispatchReady = true
     break
   }
-  assert.ok([400, 409].includes(preview.response.status), 'unexpected readiness denial')
+  assert.equal(preview.response.status, 400, 'unexpected readiness denial')
+  assert.equal(
+    preview.body?.error,
+    'no connected runner can staff the selected mission runtime, model, and source',
+    'Only native reconciliation readiness is retryable; invalid fixture policy must fail immediately',
+  )
   await new Promise((resolve) => setTimeout(resolve, 50))
 }
 assert.ok(dispatchReady, 'controlled artifact runner did not become dispatch-ready')
