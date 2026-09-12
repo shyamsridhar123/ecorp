@@ -295,9 +295,13 @@ interrupt, emergency stop, usage persistence, run ancestry, and artifact hash ve
 and linked worktrees are distinct, verifies the configured checkout's HEAD and working state do not
 change, confirms dirty work is preserved, and confirms a clean evidence-only run removes both its
 worktree and branch.
-`tools/e2e_task_graph.mjs` validates a three-node graph with two parallel specialist roots and a
-dependency-gated synthesis task. The synthesis artifact must contain both verified specialist
-outputs, not merely their task names. The same test proves an always-failing task stops exactly at
+`tools/e2e_task_graph.mjs` validates a source-selected three-node graph with native
+mission-owned staffing, two parallel specialist roots and dependency-gated synthesis.
+It binds every task to the runner's advertised immutable source and chosen fixture
+runtime, without depending on an unavailable agent in the legacy demo roster.
+The synthesis artifact must contain both verified specialist outputs, not merely
+their task names. Windows additionally retains the original mixed-provider
+demo-roster case. The same test proves an always-failing task stops exactly at
 its retry limit.
 `tools/e2e_verification.mjs` proves all six automated verifier types, a missing-file failure that
 blocks completion, an owner approval gate, and an independent-review gate that rejects the
@@ -394,9 +398,18 @@ artifact, produced no completion or retry, removed the clean worktree, and rende
 failed state in desktop and mobile Chromium. See
 `docs/evidence/2026-09-02-real-provider-budget-stop.md`.
 
-The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
-through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
-completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
+On a Windows runner, `tools/e2e_external_adapters.mjs` runs one common sample
+through Claude Code and OpenCode normalization, verifying session, usage, signed
+artifact, and completion evidence. Linux/macOS instead must return the native
+unavailable-adapter denial without persisting a run or execution journal.
+The driver reads the connected fixture runner's OS; an optional
+`CRONY_TEST_RUNNER_PLATFORM` expectation must match it and cannot select a weaker
+test mode. The fixture requires exactly one connected runner.
+`node --test tools/e2e_external_adapters.test.mjs` checks the driver with synthetic
+HTTP responses, including wrong-platform, false-success, unrelated-denial, and
+child-cleanup negatives; it does not replace native integration acceptance.
+See `docs/evidence/2026-08-30-external-adapter-validation.md` and
+`docs/evidence/2026-09-12-pr234-platform-contract.md`.
 
 The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
 stream JSON. It verifies manual permission mode, the initialize response before the typed initial
@@ -696,7 +709,11 @@ S3-compatible backend. See `docs/evidence/2026-08-30-artifact-storage-validation
 
 `tools/e2e_artifact_staging.mjs` holds the run row, applies a hard breaker, and proves authoritative
 rejection occurs before staging while an accepted artifact with the same digest remains
-downloadable. It injects a Postgres reservation failure and proves no object bytes are written, then
+downloadable. Its controlled runner uses a unique fixture routing model and the
+actual immutable source tuple. A read-only source-selected mission preview must
+confirm dispatch readiness before creating work; registration alone is not
+readiness, and the ordinary runner must not receive the controlled assignment.
+It injects a Postgres reservation failure and proves no object bytes are written, then
 injects a metadata-finalization failure after both staged and final bytes exist and proves restart
 recovery completes the commit. The same recovery pass finalizes staged metadata, rejects an old row
 whose bytes fail validation, releases an old reservation whose staged and final objects are both

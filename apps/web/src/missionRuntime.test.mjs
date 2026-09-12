@@ -114,6 +114,48 @@ test('catalog merging prefers an enabled model without changing the source snaps
   assert.deepEqual(data, before)
 })
 
+test('unscoped status and crew include ready connection-bound runtimes, but dispatch keeps its exact binding', () => {
+  const bound = (connection, adapter, modelId, workspace = {}) => runner({
+    id: `runner-${connection}`,
+    capabilities: [
+      runner({}, { workspace_connection_id: connection, ...workspace }).capabilities[0],
+      capability(adapter, { workspace_connection_id: connection, models: [model(modelId)] }),
+    ],
+  })
+  const data = { runners: [
+    bound('connection-a', 'github-copilot', 'model-a'),
+    bound('connection-b', 'github-copilot', 'model-b'),
+    bound('connection-c', 'codex', 'model-c'),
+    { ...bound('offline', 'claude-code', 'offline-model'), connected: false, status: 'offline' },
+    runner({ id: 'unready', capabilities: [capability('opencode', {
+      workspace_connection_id: 'unready', available: false,
+    })] }),
+  ] }
+  const original = structuredClone(data)
+  const status = availableRunnerAdapters(data)
+  assert.deepEqual(status.map((adapter) => adapter.name), ['github-copilot', 'codex'])
+  assert.deepEqual(status[0].models.map((entry) => entry.id), ['model-a', 'model-b'])
+  assert.deepEqual(availableRunnerAdapters(data, source), [],
+    'an explicit legacy target cannot borrow an account-bound runtime')
+  const [dispatch] = availableRunnerAdapters(data, { ...source, workspaceConnectionId: 'connection-a' })
+  assert.deepEqual(dispatch.models.map((entry) => entry.id), ['model-a'])
+  assert.equal(dispatch.workspace_connection_id, 'connection-a')
+  for (const wrong of [
+    { workspaceConnectionId: 'missing' }, { repository: 'owner/other' },
+    { baseRef: 'release' }, { baseCommit: 'b'.repeat(40) },
+  ]) {
+    assert.deepEqual(availableRunnerAdapters(data, {
+      ...source, workspaceConnectionId: 'connection-a', ...wrong,
+    }), [])
+  }
+  const mixed = { runners: [...data.runners, runner({ id: 'legacy' })] }
+  assert.deepEqual(availableRunnerAdapters(mixed, source)[0].models.map((entry) => entry.id), ['copilot-model'])
+  assert.deepEqual(availableRunnerAdapters(mixed, {
+    ...source, workspaceConnectionId: 'connection-a',
+  })[0].models.map((entry) => entry.id), ['model-a'], 'a bound target cannot borrow the legacy catalogue either')
+  assert.deepEqual(data, original)
+})
+
 test('studio always selects Copilot even when another runtime was requested', () => {
   const adapters = [capability('codex'), capability('fake-process'), capability()]
   assert.equal(selectMissionAdapter(STUDIO_STRATEGY, adapters, 'codex')?.name, 'github-copilot')

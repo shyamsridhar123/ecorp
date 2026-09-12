@@ -1,11 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import {
-  existsSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs'
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -53,67 +47,12 @@ async function restartServer() {
   if (process.env.CRONY_SKIP_SERVER_RESTART === '1') return false
   const pidPath = process.env.CRONY_TEST_SERVER_PID_FILE
   if (!pidPath) return false
-  if (!existsSync(pidPath)) {
-    throw new Error(`test-owned server PID file does not exist: ${pidPath}`)
-  }
-  const pid = Number(readFileSync(pidPath, 'utf8').trim())
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    throw new Error(`test-owned server PID is invalid: ${pid}`)
-  }
   const databaseUrl = process.env.DATABASE_URL
   if (!databaseUrl) {
     throw new Error('DATABASE_URL is required for the approval restart test')
   }
-  const testServer = new URL(server)
-  const bind =
-    process.env.CRONY_TEST_SERVER_BIND ??
-    `${testServer.hostname}:${testServer.port}`
-  const logDir =
-    process.env.CRONY_TEST_SERVER_LOG_DIR ?? path.dirname(path.resolve(pidPath))
-  process.kill(pid, 0)
-  process.kill(pid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-  const binary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const stdout = openSync(path.join(logDir, 'server-restart.stdout.log'), 'a')
-  const stderr = openSync(path.join(logDir, 'server-restart.stderr.log'), 'a')
-  const child = spawn(
-    binary,
-    [
-      '--bind',
-      bind,
-      '--database-url',
-      databaseUrl,
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout, stderr],
-    },
-  )
-  writeFileSync(pidPath, `${child.pid}\n`)
-  child.unref()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return true
-    } catch {
-      // Server or runner is still reconnecting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  throw new Error('server or runner did not recover after approval restart')
+  await restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'approval-restart' })
+  return true
 }
 
 const demo = await post('/api/demo/reset', {})

@@ -763,21 +763,9 @@ async fn run_connection(
         source_base_ref: None,
         source_base_commit: None,
     });
-    capabilities.push(RunnerCapability {
-        workspace_connection_id: None,
-        name: "workspace-setup-v1".to_owned(),
-        available: connection_manager.is_some(),
-        detail: Some(if connection_manager.is_some() {
-            "Native repository and coding-agent connections with runner-private state".to_owned()
-        } else {
-            "Configure an operator-private connections directory outside source repositories"
-                .to_owned()
-        }),
-        models: vec![],
-        source_repository: None,
-        source_base_ref: None,
-        source_base_commit: None,
-    });
+    let setup_capability = workspace_setup_capability(connection_manager.is_some());
+    let setup_available = setup_capability.available;
+    capabilities.push(setup_capability);
     let base_capabilities = Arc::new(capabilities.clone());
     if let Some(manager) = &connection_manager {
         capabilities.extend(manager.capabilities());
@@ -852,6 +840,32 @@ async fn run_connection(
                     || command.runner_id != args.runner_id
                 {
                     warn!("rejected setup outside this registered runner");
+                    continue;
+                }
+                if !setup_available {
+                    outbound.send_live(RunnerToServer::WorkspaceSetupReport {
+                        runner_id: args.runner_id.clone(),
+                        corp_id: args.corp_id,
+                        connection_epoch,
+                        operation_id: command.operation_id,
+                        report: crony_domain::WorkspaceSetupReport {
+                            status: crony_domain::WorkspaceSetupStatus::Failed,
+                            detail: workspace_setup_capability(connection_manager.is_some())
+                                .detail
+                                .unwrap_or_else(|| {
+                                    "Native connection setup is unavailable.".to_owned()
+                                }),
+                            connection_status: command
+                                .action
+                                .connection_id()
+                                .map(|_| crony_domain::WorkspaceConnectionStatus::Failed),
+                            source: None,
+                            models: vec![],
+                            account_login: None,
+                            sign_in: None,
+                            repositories: vec![],
+                        },
+                    });
                     continue;
                 }
                 let Some(manager) = connection_manager.clone() else {
@@ -3651,6 +3665,30 @@ fn active_run_claims(active_runs: &ActiveRuns) -> Vec<ActiveRunClaim> {
     claims
 }
 
+fn workspace_setup_capability(private_storage_ready: bool) -> RunnerCapability {
+    // Setup invokes OwnedProcessTree, whose Unix implementation deliberately
+    // rejects spawning. Private storage alone cannot establish native support.
+    let process_ownership_supported = cfg!(windows);
+    RunnerCapability {
+        workspace_connection_id: None,
+        name: "workspace-setup-v1".to_owned(),
+        available: private_storage_ready && process_ownership_supported,
+        detail: Some(if !process_ownership_supported {
+            "Native connection setup requires supported process ownership; it is unavailable on this platform."
+                .to_owned()
+        } else if !private_storage_ready {
+            "Configure an operator-private connections directory outside source repositories"
+                .to_owned()
+        } else {
+            "Native repository and coding-agent connections with runner-private state".to_owned()
+        }),
+        models: vec![],
+        source_repository: None,
+        source_base_ref: None,
+        source_base_commit: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, process::Command as StdCommand};
@@ -3660,6 +3698,29 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn workspace_setup_capability_requires_storage_and_native_process_ownership() {
+        for private_storage_ready in [false, true] {
+            let capability = workspace_setup_capability(private_storage_ready);
+            assert_eq!(capability.name, "workspace-setup-v1");
+            assert_eq!(
+                capability.available,
+                private_storage_ready && cfg!(windows),
+                "private storage must not advertise unsupported native process execution"
+            );
+            assert!(capability.workspace_connection_id.is_none());
+            assert!(capability.models.is_empty());
+            let detail = capability.detail.unwrap();
+            if !cfg!(windows) {
+                assert!(detail.contains("unavailable on this platform"));
+            } else if !private_storage_ready {
+                assert!(detail.contains("operator-private connections directory"));
+            } else {
+                assert!(detail.contains("Native repository and coding-agent connections"));
+            }
+        }
+    }
 
     struct LatchedTeardownAdapter {
         uncertain: Arc<Notify>,

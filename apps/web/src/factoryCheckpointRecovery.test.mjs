@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import * as jsxRuntime from 'react/jsx-runtime'
+import { renderToStaticMarkup } from 'react-dom/server'
 import vm from 'node:vm'
 import ts from 'typescript'
 import {
@@ -606,4 +608,131 @@ test('actual resume handler and rendered provider control respect native recover
     && node.expression.getText(app) === 'copyRecoveryCommand')
   assert.equal(copy.length, 1)
   assert.equal(copy[0].arguments[0].getText(app), 'mode')
+})
+
+test('actual App Resume control survives an ineligible ordinary Factory recovery lookup and uses the native actor-bound POST', async () => {
+  const loads = [], calls = [], remembered = []
+  const ordinaryRun = {
+    id: id(50), task_id: id(40), provider_session_id: 'native-session',
+    status: 'cancelled', execution_mode: 'provider', breaker_stage: null,
+    workspace_disposition: 'preserved', workspace_run_id: id(50),
+  }
+  const globals = {
+    AbortController, setTimeout: () => 1, clearTimeout: () => {},
+    api: async (path, init) => {
+      calls.push({ path, init })
+      if (init.method === 'GET') throw new Error('factory recovery context requires exactly one failed task; found 0')
+      return {}
+    },
+    bootstrap: { corp_id: scope.corpId }, selectedActor: { id: scope.actorId },
+    setBusy: () => {}, setError: () => {},
+    refresh: async () => ({ snapshot: { runs: [{
+      id: id(51), task_id: id(40), resumed_from_run_id: id(50),
+    }] } }),
+    factoryRecoveryBlocksProviderResume, recoveryScope: scope, recoveryContextLoad: null,
+    factoryItem: { ...context().work_item, state: 'running' }, recoveryItemState: 'running',
+    mission: { id: scope.missionId },
+    tasks: [{ id: id(40), mission_id: scope.missionId, status: 'cancelled', verification_status: 'pending' }],
+    runs: [ordinaryRun], factoryRecoveries: [], resumableRun: ordinaryRun, evidenceRun: ordinaryRun,
+    hasUnfinishedRuns: false, busy: false, resumeStopBlocked: false, resumeBudgetBlocked: false,
+    pendingBudgetRevision: null, rememberEvidenceRun: (runId) => remembered.push(runId),
+    formatTokens: String, formatUsd: String,
+  }
+  evaluate(`${functionNode('factoryRecoveryScopeKey').getText(app)}
+    ${functionNode('currentFactoryRecoveryLoad').getText(app)}
+    ${functionNode('requestFactoryRecoveryContext').getText(app)}`, globals)
+  const cleanup = globals.requestFactoryRecoveryContext(scope, (load) => loads.push(load))
+  await new Promise(setImmediate)
+  cleanup()
+  globals.recoveryContextLoad = loads.at(-1)
+  assert.equal(globals.recoveryContextLoad.status, 'error')
+  assert.equal(globals.recoveryContextLoad.data, null)
+  const guard = all(card, (node) => ts.isConditionalExpression(node)
+    && node.whenTrue.getText(app).includes('onClick={() => void resumeEvidence()}'))[0]
+  assert.ok(guard, 'use the actual MissionCard branch, disabled predicates and click callback')
+  const rendered = ts.transpileModule(`globalThis.renderResume = () => (${guard.getText(app)});`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  })
+  globals.require = (name) => {
+    assert.equal(name, 'react/jsx-runtime')
+    return jsxRuntime
+  }
+  globals.exports = {}
+  vm.runInNewContext(rendered.outputText, globals)
+  const refreshControls = () => {
+    for (const name of ['scopedRecoveryLoad', 'recoveryContext', 'resumeLineageRuns', 'requiresFactoryRecovery', 'resumeRecoveryBlocked']) {
+      // The pre-fix App has no separate mandatory-recovery predicate.
+      const declaration = all(card, (node) => ts.isVariableDeclaration(node)
+        && ts.isIdentifier(node.name) && node.name.text === name)
+      if (declaration.length) evaluate(`globalThis.${name} = ${initializer(name)};`, globals)
+    }
+    evaluate(`globalThis.resumeEvidence = ${initializer('resumeEvidence')};`, globals)
+    return globals.renderResume()
+  }
+  evaluate(`globalThis.onResume = ${initializer('resumeAgentRun', functionNode('App'))};`, globals)
+  const tree = refreshControls()
+  const html = renderToStaticMarkup(tree)
+  assert.match(html, /Resume agent session/)
+  assert.doesNotMatch(html, /disabled=/)
+  const resumeButton = tree.props.children.find((node) => node?.type === 'button')
+  assert.ok(resumeButton)
+  resumeButton.props.onClick()
+  await new Promise(setImmediate)
+  assert.equal(calls.length, 2, 'one failed read and one explicit native resume, not a recovery mutation')
+  assert.equal(calls[1].path, `/api/corps/${scope.corpId}/runs/${ordinaryRun.id}/resume`)
+  assert.equal(calls[1].init.method, 'POST')
+  const body = JSON.parse(calls[1].init.body)
+  assert.equal(body.requested_by, scope.actorId)
+  assert.deepEqual(Object.keys(body).sort(), ['prompt', 'requested_by'])
+  assert.deepEqual(remembered, [id(51)])
+  // A sibling task's recovered history, or another workspace for this same
+  // task, must not hide the selected ordinary session's native resume.
+  for (const historical of [
+    { id: id(70), task_id: id(41), workspace_run_id: id(70) },
+    { id: id(71), task_id: ordinaryRun.task_id, workspace_run_id: id(71) },
+  ]) {
+    globals.runs = [ordinaryRun, { ...historical, execution_mode: 'verification_only', breaker_stage: 'stop' }]
+    globals.tasks.push({ id: id(41), mission_id: scope.missionId, status: 'verification_failed', verification_status: 'failed' })
+    globals.factoryRecoveries = [{
+      factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: historical.task_id, source_run_id: historical.id,
+      mode: 'checkpoint_verification', status: 'completed',
+    }]
+    assert.match(renderToStaticMarkup(refreshControls()), /Resume agent session/)
+    globals.tasks.pop()
+  }
+  globals.runs = [ordinaryRun]
+  globals.factoryRecoveries = []
+  for (const changes of [
+    { recoveryItemState: 'verification_failed', factoryItem: { ...globals.factoryItem, state: 'verification_failed' } },
+    { recoveryItemState: 'cancelled', factoryItem: { ...globals.factoryItem, state: 'cancelled' } },
+    { tasks: [{ ...globals.tasks[0], status: 'verification_failed' }] },
+    { runs: [{ ...ordinaryRun, breaker_stage: 'suspend' }] },
+    { runs: [{ ...ordinaryRun, breaker_stage: 'stop' }] },
+    { runs: [{ ...ordinaryRun, execution_mode: 'verification_only' }] },
+    { factoryRecoveries: [{ factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: ordinaryRun.task_id, source_run_id: ordinaryRun.id,
+      mode: 'checkpoint_verification', status: 'completed' }] },
+    { factoryRecoveries: [{ factory_work_item_id: scope.itemId, mission_id: scope.missionId,
+      task_id: ordinaryRun.task_id, source_run_id: id(80), mode: 'source_correction', status: 'authorized' }] },
+  ]) {
+    const original = Object.fromEntries(Object.keys(changes).map((key) => [key, globals[key]]))
+    Object.assign(globals, changes)
+    assert.equal(refreshControls(), null, 'unavailable governed recovery must remain fail-closed')
+    await globals.resumeEvidence()
+    assert.equal(calls.length, 2)
+    Object.assign(globals, original)
+  }
+  globals.recoveryContextLoad = {
+    scopeKey: JSON.stringify([scope.corpId, scope.actorId, scope.missionId, scope.itemId, scope.version, scope.reload]),
+    status: 'ready', error: null, data: { ...context(),
+      work_item: { ...globals.factoryItem }, checkpoint_cancellation_event_id: null },
+  }
+  globals.recoveryContextLoad.data.task_id = id(41)
+  assert.match(renderToStaticMarkup(refreshControls()), /Resume agent session/,
+    'another task native checkpoint context is not a block on this session')
+  globals.recoveryContextLoad.data.task_id = ordinaryRun.task_id
+  assert.equal(refreshControls(), null, 'positive native checkpoint context is never generic-resume authority')
+  await globals.resumeEvidence()
+  assert.equal(calls.length, 2)
 })
