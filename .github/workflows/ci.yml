@@ -25,9 +25,13 @@ jobs:
           cache: pnpm
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
+      - name: Test platform-specific CI fixture contracts
+        env:
+          ECORP_OWNED_PROCESS_TEST: '1'
+        run: node --test tools/e2e_external_adapters.test.mjs tools/e2e_external_adapters_http.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs tools/identity_fixture.test.mjs tools/ci_runner_tests.test.mjs tools/fixture_source_identity.test.mjs tools/budget_fixture.test.mjs
+      - name: Test native Linux process ownership
+        run: python3 -B tools/owned_test_process_linux_test.py -v
       - run: node tools/check_migrations.mjs
-      - name: Verify external-adapter E2E expectations cannot hide runtime failures
-        run: node --test tools/e2e_external_adapters.test.mjs tools/fixture_source_identity.test.mjs tools/owned_test_stack.test.mjs
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -36,12 +40,13 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
-      CRONY_SERVER_HTTP: http://127.0.0.1:18791
-      CRONY_TEST_SERVER_BIND: 127.0.0.1:18791
+      ECORP_CI_OWNED_SERVER: '1'
+      CRONY_SERVER_HTTP: http://127.0.0.1:18471
       CRONY_TEST_SERVER_BINARY: ${{ github.workspace }}/target/debug/crony-server
       CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.json
-      CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
+      DATABASE_URL: postgres://crony:crony@127.0.0.1:55471/crony
     services:
       postgres:
         image: postgres:17-alpine
@@ -50,7 +55,7 @@ jobs:
           POSTGRES_PASSWORD: crony
           POSTGRES_DB: crony
         ports:
-          - 54329:5432
+          - 55471:5432
         options: >-
           --health-cmd "pg_isready -U crony -d crony"
           --health-interval 2s
@@ -74,42 +79,25 @@ jobs:
       - name: Start control and execution planes
         shell: bash
         run: |
-          DATABASE_URL=postgres://crony:crony@127.0.0.1:54329/crony \
-          "$CRONY_TEST_SERVER_BINARY" \
-            --bind "$CRONY_TEST_SERVER_BIND" \
-            > output/server-ci.log 2>&1 &
-          SERVER_PID=$!
-          for attempt in $(seq 1 60); do
-            if curl --fail --silent "$CRONY_SERVER_HTTP/health" | grep -q '"status":"ok"'; then
-              break
-            fi
-            sleep 1
-          done
-          ECORP_CI_SERVER_PID="$SERVER_PID" node --input-type=module -e '
-            import { captureOwnedTestServerManifest } from "./tools/owned_test_stack.mjs";
-            await captureOwnedTestServerManifest({
-              root: process.cwd(), server: process.env.CRONY_SERVER_HTTP,
-              binary: process.env.CRONY_TEST_SERVER_BINARY,
-              pidPath: process.env.CRONY_TEST_SERVER_PID_FILE,
-              pid: Number(process.env.ECORP_CI_SERVER_PID)
-            });
-          '
+          mkdir -p output
+          node tools/ci_owned_test_server.mjs --dry-run
+          node tools/ci_owned_test_server.mjs --start
           DEMO_JSON="$(curl --fail --silent -X POST \
             -H 'content-type: application/json' \
             -d '{}' \
-            "$CRONY_SERVER_HTTP/api/demo/bootstrap")"
+            http://127.0.0.1:18471/api/demo/bootstrap)"
           CORP_ID="$(node -e 'console.log(JSON.parse(process.argv[1]).corp_id)' "$DEMO_JSON")"
           ALICE_ID="$(node -e 'console.log(JSON.parse(process.argv[1]).alice_actor_id)' "$DEMO_JSON")"
           ENROLLMENT_JSON="$(curl --fail --silent -X POST \
             -H 'content-type: application/json' \
             -d "{\"actor_id\":\"$ALICE_ID\",\"runner_id\":\"runner-local\",\"expires_in_seconds\":600}" \
-            "$CRONY_SERVER_HTTP/api/corps/$CORP_ID/runners/enroll")"
+            "http://127.0.0.1:18471/api/corps/$CORP_ID/runners/enroll")"
           mkdir -p output/runner
           node -e 'process.stdout.write(JSON.parse(process.argv[1]).enrollment_token)' \
             "$ENROLLMENT_JSON" > output/runner/enrollment.token
           chmod 600 output/runner/enrollment.token
           target/debug/crony-runner \
-            --server-ws ws://127.0.0.1:18791/ws/runner \
+            --server-ws ws://127.0.0.1:18471/ws/runner \
             --runner-id runner-local \
             --corp-id "$CORP_ID" \
             --credential-file "$PWD/output/runner/credential.json" \
@@ -131,12 +119,12 @@ jobs:
         shell: bash
         run: |
           for attempt in $(seq 1 60); do
-            if curl --fail --silent "$CRONY_SERVER_HTTP/health" | grep -q '"runners":1'; then
+            if curl --fail --silent http://127.0.0.1:18471/health | grep -q '"runners":1'; then
               exit 0
             fi
             sleep 1
           done
-          cat output/server-ci.log || true
+          cat output/server-ci.stdout.log output/server-ci.stderr.log || true
           cat output/runner-ci.log || true
           exit 1
       - name: Race demo bootstrap and reset lifecycle
@@ -150,8 +138,13 @@ jobs:
         run: node tools/e2e_portable_deliverables.mjs
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
-      - name: Verify external-CLI platform admission and supported lifecycle evidence
-        run: node tools/e2e_external_adapters.mjs
+      - name: Verify external CLI providers fail closed on Unix
+        env:
+          CRONY_EXTERNAL_ADAPTER_TEST: '1'
+          CRONY_SERVER_HTTP: http://127.0.0.1:18471
+        run: |
+          node tools/e2e_external_adapters.mjs --expect-unix --dry-run
+          node tools/e2e_external_adapters.mjs --expect-unix
       - name: Verify GitHub Copilot harness, model discovery, selection, and resume
         run: node tools/e2e_copilot.mjs
       - name: Verify MCP, ACP, and A2A gateway conformance
@@ -159,7 +152,12 @@ jobs:
       - name: Verify parallel worktree isolation and source-checkout preservation
         run: node tools/e2e_worktrees.mjs
       - name: Verify bounded task-graph planning, scheduling, and retries
-        run: node tools/e2e_task_graph.mjs
+        env:
+          CRONY_TASK_GRAPH_TEST: '1'
+          CRONY_SERVER_HTTP: http://127.0.0.1:18471
+        run: |
+          node tools/e2e_task_graph.mjs --dry-run
+          node tools/e2e_task_graph.mjs
       - name: Verify automated, failed, human, and independent evidence gates
         run: node tools/e2e_verification.mjs
       - name: Verify resumable event replay
@@ -174,43 +172,46 @@ jobs:
         run: node tools/e2e_idempotency.mjs
       - name: Verify atomic artifact staging, cleanup, and restart recovery
         env:
-          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.json
-          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
-        run: node tools/e2e_artifact_staging.mjs
+          CRONY_ARTIFACT_STAGING_TEST: '1'
+          CRONY_SERVER_HTTP: http://127.0.0.1:18471
+        run: |
+          node tools/e2e_artifact_staging.mjs --dry-run
+          node tools/e2e_artifact_staging.mjs
       - name: Verify fenced factory claims, restart recovery, and one linked mission
-        env:
-          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.json
-          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
-          CRONY_TEST_SERVER_BIND: 127.0.0.1:18791
-          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
         run: node tools/e2e_factory_claims.mjs
       - name: Verify Project eligibility, dry run, dispatch, status sync, and replay
         run: node tools/e2e_factory_controller.mjs
       - name: Verify idempotent branch and pull-request publication with recovery
-        env:
-          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.json
-          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
-          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
         run: node tools/e2e_factory_publication.mjs
       - name: Verify OIDC, Corp RBAC, runner enrollment, rotation, replay defense, and revocation
-        run: node tools/e2e_identity.mjs
+        env:
+          CRONY_IDENTITY_TEST: '1'
+          CRONY_AUTH_TEST_PORT: '18473'
+          FAKE_OIDC_PORT: '18472'
+        run: |
+          node tools/e2e_identity.mjs --dry-run
+          node tools/e2e_identity.mjs
       - name: Verify scoped secret brokering without plaintext leakage
         run: node tools/e2e_secrets.mjs
       - name: Verify durable risky-action approvals and exactly-once decision effects
-        env:
-          CRONY_TEST_SERVER_PID_FILE: ${{ github.workspace }}/output/server-ci.json
-          CRONY_TEST_SERVER_LOG_DIR: ${{ github.workspace }}/output
-          CRONY_TEST_SERVER_BIND: 127.0.0.1:18791
-          DATABASE_URL: postgres://crony:crony@127.0.0.1:54329/crony
         run: node tools/e2e_approvals.mjs
       - name: Verify budget and loop circuit-breaker stages
-        run: node tools/e2e_budgets.mjs
+        env:
+          CRONY_BUDGET_TEST: '1'
+          CRONY_BUDGET_RUNNER_ID: runner-local
+          CRONY_BUDGET_OUTPUT: ${{ github.workspace }}/output/e2e-budgets.json
+        run: |
+          node tools/e2e_budgets.mjs --dry-run
+          node tools/e2e_budgets.mjs
       - name: Verify terminal provider cleanup and off-shift agent state
         run: node tools/e2e_idle_cleanup.mjs
       - name: Run the versioned 100-scenario deterministic evaluation lane
         run: node tools/run_evals.mjs
       - name: Consolidate chaos and restart evidence
         run: node tools/e2e_chaos_report.mjs
+      - name: Stop the ownership-verified CI server
+        if: always()
+        run: node tools/ci_owned_test_server.mjs --stop
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -247,8 +248,13 @@ jobs:
             output/publication-server-restart.stderr.log
             output/e2e-replay.json
             output/e2e-leases.json
-            output/server-ci.log
             output/server-ci.json
+            output/server-ci.stdout.log
+            output/server-ci.stderr.log
+            output/factory-server-restart.stdout.log
+            output/factory-server-restart.stderr.log
+            output/server-restart.stdout.log
+            output/server-restart.stderr.log
             output/*restart*.stdout.log
             output/*restart*.stderr.log
             output/artifact-recovery-server.stdout.log
@@ -256,6 +262,35 @@ jobs:
             output/runner-ci.log
             output/runner/**/result.md
             output/runner/**/evidence/*.json
+
+  external-adapters-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p crony-server -p crony-runner
+      - name: Verify Windows owned-server receipts and restart
+        env:
+          ECORP_OWNED_PROCESS_TEST: '1'
+        run: node --test tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs
+      - name: Preview isolated external-adapter fixture
+        shell: pwsh
+        run: ./tools/ci_external_adapters_windows.ps1 -FixtureRoot (Join-Path $env:RUNNER_TEMP 'ecorp-external-adapters-ci') -PgBin $env:PGBIN -DryRun
+      - name: Verify external-adapter lifecycle and cross-provider graph
+        shell: pwsh
+        run: ./tools/ci_external_adapters_windows.ps1 -FixtureRoot (Join-Path $env:RUNNER_TEMP 'ecorp-external-adapters-ci') -PgBin $env:PGBIN -Execute
+      - name: Upload external-adapter fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-adapters-windows-evidence
+          # Never upload the private runner credential, database or worktrees.
+          path: ${{ runner.temp }}/ecorp-external-adapters-ci/evidence/
 
   runner-platforms:
     strategy:
@@ -272,7 +307,14 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p crony-runner
+      # Keep every test and the native 10-second private-ACL deadline. Avoid
+      # unrelated test-process contention on the hosted Windows worker.
+      - name: Run Windows runner tests serially
+        if: runner.os == 'Windows'
+        run: cargo test -p crony-runner -- --test-threads=1
+      - name: Run Unix runner tests
+        if: runner.os != 'Windows'
+        run: cargo test -p crony-runner
       - run: node tools/platform_runner_contract.mjs
       - uses: actions/upload-artifact@v4
         with:

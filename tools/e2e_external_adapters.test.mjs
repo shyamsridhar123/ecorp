@@ -1,203 +1,233 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { createServer } from 'node:http'
-import os from 'node:os'
-import path from 'node:path'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import {
+  assertExternalRunner,
+  assertUnavailableLaunch,
+  externalAdapterConfig,
+  runExternalAdapterContract,
+} from './e2e_external_adapters.mjs'
 
-const script = path.join(import.meta.dirname, 'e2e_external_adapters.mjs')
+const env = { CRONY_EXTERNAL_ADAPTER_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18437' }
+const disabledSummary = 'spawn=no, stream=no, steer=no, interrupt=no, stop=no, resume=no, usage=no, artifacts=no'
+const enabledSummary = 'spawn=yes, stream=yes, steer=no, interrupt=yes, stop=yes, resume=yes, usage=yes, artifacts=yes'
+const providers = ['claude-code', 'opencode']
+const runner = (os, available = os === 'windows') => ({
+  id: 'fixture-runner', os, connected: true,
+  capabilities: [
+    ...providers.map(name => ({ name, available, detail: name + '; ' + (os === 'windows' ? enabledSummary : disabledSummary) })),
+    { name: 'workspace-isolation', available: true, source_repository: 'local/fixture-123',
+      source_base_ref: 'HEAD', source_base_commit: 'a'.repeat(40) },
+  ],
+})
 
-// These are HTTP-contract regressions for the E2E driver, not native provider
-// acceptance. The complete integration job still exercises the real runner.
-async function runFixture(platform, {
-  status = 409,
-  reason,
-  orphanRun = false,
-  reportedOS = { win32: 'windows', linux: 'linux', darwin: 'macos' }[platform],
-  holdLaunch = false,
-  timeoutMs = 10_000,
-} = {}) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'ecorp-external-contract-'))
-  const report = path.join(directory, 'report.json')
-  const tasks = []
-  const runs = []
+test('fixture configuration requires explicit ownership, origin and one platform expectation', () => {
+  assert.equal(externalAdapterConfig(['--expect-unix', '--dry-run'], env).dryRun, true)
+  assert.equal(externalAdapterConfig(['--expect-windows'], env).expectedPlatform, 'windows')
+  for (const args of [[], ['--expect-unix', '--expect-windows'], ['--expect-unix', '--expect-unix'], ['--skip']]) {
+    assert.throws(() => externalAdapterConfig(args, env))
+  }
+  assert.throws(() => externalAdapterConfig(['--expect-unix'], {}), /owned disposable fixture/)
+  assert.throws(() => externalAdapterConfig(['--expect-unix'], { CRONY_EXTERNAL_ADAPTER_TEST: '1' }), /explicit owned/)
+})
+
+test('manual, remote, credential-bearing and non-origin endpoints are rejected', () => {
+  for (const server of [
+    'http://127.0.0.1:8791', 'http://127.0.0.1:8793', 'https://example.com:18437',
+    'http://user:secret@127.0.0.1:18437', 'http://127.0.0.1:18437/path',
+    'http://127.0.0.1:18437/?query', 'http://127.0.0.1:18437/#fragment', 'http://127.0.0.1',
+  ]) {
+    assert.throws(() => externalAdapterConfig(['--expect-unix'], { ...env, CRONY_SERVER_HTTP: server }))
+  }
+  assert.equal(externalAdapterConfig(['--expect-unix'], {
+    ...env, CRONY_SERVER_HTTP: 'http://127.0.0.1:8791', GITHUB_ACTIONS: 'true', CI: 'true',
+  }).server, 'http://127.0.0.1:8791')
+})
+
+for (const os of ['linux', 'macos']) {
+  test(os + ' requires explicit unavailability and native disabled-feature flags', () => {
+    assert.equal(assertExternalRunner({ runners: [runner(os)] }, 'unix').os, os)
+    assert.throws(() => assertExternalRunner({ runners: [runner(os, true)] }, 'unix'), /availability/)
+    const unrelatedFailure = runner(os)
+    unrelatedFailure.capabilities[0].detail = enabledSummary + '; model discovery failed: command not found'
+    assert.throws(() => assertExternalRunner({ runners: [unrelatedFailure] }, 'unix'), /disabled execution features/)
+  })
+}
+
+test('Windows unavailability is a failure, never an unsupported-platform success', () => {
+  assert.equal(assertExternalRunner({ runners: [runner('windows')] }, 'windows').id, 'fixture-runner')
+  assert.throws(() => assertExternalRunner({ runners: [runner('windows', false)] }, 'windows'), /availability/)
+  assert.throws(() => assertExternalRunner({ runners: [runner('windows', false)] }, 'unix'), /runner OS/)
+  assert.throws(() => assertExternalRunner({ runners: [runner('linux')] }, 'windows'), /runner OS/)
+  assert.throws(() => assertExternalRunner({ runners: [runner('unknown')] }, 'unix'), /runner OS/)
+})
+
+test('missing, multiple, ambiguous and connection-bound capabilities cannot satisfy the legacy fixture', () => {
+  assert.throws(() => assertExternalRunner({ runners: [] }, 'unix'), /exactly one/)
+  assert.throws(() => assertExternalRunner({ runners: [runner('linux'), runner('linux')] }, 'unix'), /exactly one/)
+  for (const capabilities of [
+    [], [runner('linux').capabilities[0]],
+    [...runner('linux').capabilities, runner('linux').capabilities[0]],
+    runner('linux').capabilities.map(capability => ({ ...capability, workspace_connection_id: 'other-connection' })),
+  ]) {
+    assert.throws(() => assertExternalRunner({ runners: [{ ...runner('linux'), capabilities }] }, 'unix'), /capability/)
+  }
+})
+
+function refusal() {
+  const before = { snapshot: {
+    tasks: [{ id: 'task-1', mission_id: 'mission-1', required_adapter: 'claude-code', status: 'ready' }],
+    missions: [{ id: 'mission-1', status: 'ready' }], runs: [], events: [],
+  } }
+  return {
+    adapter: 'claude-code', missionId: 'mission-1', before, after: structuredClone(before),
+    launch: { status: 409, body: { error: 'mission dispatch incomplete (0 new runs dispatched): task task-1 requires adapter claude-code, but that adapter is unavailable' } },
+  }
+}
+
+test('a platform refusal must prove the exact task, zero allocations and held work', () => {
+  assertUnavailableLaunch(refusal())
+  for (const corrupt of [
+    input => { input.launch.status = 200 },
+    input => { input.launch.status = 500 },
+    input => { input.launch.body.error = 'another conflict' },
+    input => { input.launch.body.error = input.launch.body.error.replace('task-1', 'different-task') },
+    input => { input.after.snapshot.runs.push({ id: 'fallback', task_id: 'task-1' }) },
+    input => { input.after.snapshot.events.push({ type: 'run.requested', correlation_id: 'mission-1' }) },
+    input => { input.after.snapshot.events.push({ type: 'run.started', aggregate_id: 'task-1' }) },
+    input => { input.after.snapshot.missions[0].status = 'running' },
+    input => { input.after.snapshot.tasks[0].status = 'running' },
+    input => { input.before.snapshot.tasks[0].required_adapter = 'fake-process' },
+  ]) {
+    const input = refusal()
+    corrupt(input)
+    assert.throws(() => assertUnavailableLaunch(input))
+  }
+})
+
+function mockApi(os, { launchStatus, omitTermination = false, wrongArtifact = false, reconcilingPreviews = 0 } = {}) {
+  const state = { runners: [runner(os)], snapshot: { missions: [], tasks: [], runs: [], events: [] } }
   const calls = []
-  const server = createServer(async (request, response) => {
-    let text = ''
-    for await (const chunk of request) text += chunk
-    const body = text ? JSON.parse(text) : {}
-    calls.push({ method: request.method, url: request.url })
-    response.setHeader('content-type', 'application/json')
-    if (request.url === '/api/demo/reset') {
-      response.end(JSON.stringify({ corp_id: 'fixture', alice_actor_id: 'alice' }))
-    } else if (request.url === '/api/corps/fixture/missions') {
-      const id = body.preferred_adapter
-      tasks.push({ id: `task-${id}`, mission_id: `mission-${id}`, status: 'ready' })
-      response.end(JSON.stringify({ mission_id: `mission-${id}` }))
-    } else if (request.url.endsWith('/launch')) {
-      if (holdLaunch) return
-      const task = tasks.at(-1)
-      const adapter = task.id.slice('task-'.length)
-      if (orphanRun) runs.push({ id: 'orphan', task_id: task.id, status: 'starting' })
-      response.statusCode = status
-      response.end(JSON.stringify(status === 200
-        ? { run_id: 'unexpected-run' }
-        : { error: reason ?? `mission dispatch incomplete (0 new runs dispatched): task ${task.id} requires adapter ${adapter}, but that adapter is unavailable` }))
-    } else if (request.url.startsWith('/api/corps/fixture/snapshot?')) {
-      response.end(JSON.stringify({
-        snapshot: { tasks, runs, events: [] },
-        runners: [{ id: 'fixture-runner', os: reportedOS, connected: true }],
-      }))
-    } else {
-      response.statusCode = 404
-      response.end(JSON.stringify({ error: 'unexpected fixture request' }))
-    }
-  })
-  let child
-  let timer
-  let closed
-  let childClosed = false
-  async function waitForClose(timeout) {
-    let deadline
-    try {
-      return await Promise.race([
-        closed.then(() => true),
-        new Promise((resolve) => { deadline = setTimeout(() => resolve(false), timeout) }),
-      ])
-    } finally {
-      clearTimeout(deadline)
-    }
-  }
-  try {
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    child = spawn(process.execPath, [script], {
-      cwd: directory,
-      windowsHide: true,
-      env: {
-        PATH: process.env.PATH,
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-        CRONY_SERVER_HTTP: `http://127.0.0.1:${server.address().port}`,
-        CRONY_TEST_RUNNER_PLATFORM: platform,
-        CRONY_EXTERNAL_ADAPTER_REPORT: report,
-      },
-    })
-    closed = new Promise((resolve) => child.once('close', (code) => {
-      childClosed = true
-      resolve(code)
-    }))
-    let stdout = ''
-    let stderr = ''
-    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk })
-    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
-    const code = await new Promise((resolve, reject) => {
-      timer = setTimeout(() => {
-        reject(new Error('owned HTTP-contract child timed out'))
-      }, timeoutMs)
-      child.once('error', reject)
-      closed.then(resolve)
-    })
-    const bytes = await readFile(report, 'utf8').catch((error) => {
-      if (error.code === 'ENOENT') return null
-      throw error
-    })
-    return { code, stdout, stderr, calls, report: bytes ? JSON.parse(bytes) : null }
-  } finally {
-    clearTimeout(timer)
-    let cleanupError
-    if (child && !childClosed) {
-      child.kill()
-      if (!await waitForClose(2000)) {
-        child.kill('SIGKILL')
-        if (!await waitForClose(2000)) {
-          cleanupError = new Error(`owned child did not terminate; retained ${directory}`)
+  return {
+    calls,
+    wait: async () => {},
+    fetchImpl: async (url, init) => {
+      const pathname = new URL(url).pathname
+      calls.push({ pathname, method: init.method ?? 'GET' })
+      let status = 200
+      let body
+      if (pathname === '/api/demo/reset') {
+        body = { corp_id: 'corp-1', alice_actor_id: 'alice' }
+      } else if (pathname.endsWith('/snapshot')) {
+        body = structuredClone(state)
+      } else if (pathname.endsWith('/missions/preview')) {
+        assert.equal(state.snapshot.missions.length, state.snapshot.runs.length,
+          'Readiness must precede mission creation and must not retry a launch')
+        if (reconcilingPreviews-- > 0) {
+          status = 400
+          body = { error: 'no connected runner can staff this source-bound mission' }
+        } else body = { tasks: [] }
+      } else if (pathname.endsWith('/missions')) {
+        const request = JSON.parse(init.body)
+        const number = state.snapshot.missions.length + 1
+        const missionId = 'mission-' + number
+        state.snapshot.missions.push({ id: missionId, status: 'ready' })
+        state.snapshot.tasks.push({ id: 'task-' + number, mission_id: missionId, required_adapter: request.preferred_adapter, status: 'ready' })
+        status = 201
+        body = { mission_id: missionId }
+      } else if (pathname.endsWith('/launch')) {
+        const missionId = pathname.split('/').at(-2)
+        const task = state.snapshot.tasks.find(task => task.mission_id === missionId)
+        status = launchStatus ?? (os === 'windows' ? 200 : 409)
+        if (status === 200) {
+          const run = {
+            id: 'run-' + task.id, task_id: task.id, runner_id: 'fixture-runner',
+            provider_session_id: 'session-' + task.id, status: 'completed', workspace_disposition: 'removed',
+            artifact_sha256: 'digest-' + task.id, input_tokens: 100, output_tokens: 40, provider: task.required_adapter,
+          }
+          state.snapshot.runs.push(run)
+          if (!omitTermination) state.snapshot.events.push({
+            aggregate_id: run.id, type: 'run.session_terminated', seq: 1, payload: { provider_process_alive: false },
+          })
+          state.snapshot.events.push({ aggregate_id: run.id, type: 'run.completed', seq: 2 })
+          body = { run_id: run.id }
+        } else {
+          body = { error: 'mission dispatch incomplete (0 new runs dispatched): task ' + task.id +
+            ' requires adapter ' + task.required_adapter + ', but that adapter is unavailable' }
         }
-      }
-    }
-    server.closeAllConnections()
-    await new Promise((resolve) => server.close(resolve))
-    if (cleanupError) throw cleanupError
-    assert.ok(!child || childClosed, 'child close must precede directory cleanup')
-    // Only this test's unique temporary directory is eligible for cleanup.
-    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()))
-    assert.ok(path.basename(directory).startsWith('ecorp-external-contract-'))
-    await rm(directory, { recursive: true, force: true })
+      } else throw new Error('Unexpected fixture request: ' + pathname)
+      return { status, json: async () => body }
+    },
+    downloadArtifact: async (_server, _demo, run) => Buffer.from(JSON.stringify({
+      provider: wrongArtifact ? 'other' : run.provider, exit_success: true,
+    })),
   }
 }
 
-for (const platform of ['linux', 'darwin']) {
-  test(`${platform}: native unavailable admission is a verified refusal, not provider success`, async () => {
-    const result = await runFixture(platform)
-    assert.equal(result.code, 0, result.stderr)
-    assert.equal(result.report.runner_platform, platform)
-    assert.equal(result.report.common_sample, false)
-    assert.equal(result.report.execution_supported, false)
-    assert.deepEqual(result.report.providers.map((provider) => ({
-      adapter: provider.adapter,
-      dispatched: provider.dispatched,
-      launch_status: provider.launch_status,
-    })), [
-      { adapter: 'claude-code', dispatched: false, launch_status: 409 },
-      { adapter: 'opencode', dispatched: false, launch_status: 409 },
-    ])
-    assert.equal(result.calls.filter((call) => call.url.endsWith('/launch')).length, 2)
-  })
-}
-
-test('Windows: an unavailable provider remains a failure', async () => {
-  const result = await runFixture('win32')
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /adapter claude-code.*unavailable/)
-  assert.equal(result.report, null)
+test('the Unix suite actually attempts both adapters and reports rejection, not lifecycle success', async () => {
+  const api = mockApi('linux')
+  const report = await runExternalAdapterContract({ server: env.CRONY_SERVER_HTTP, expectedPlatform: 'unix' }, api)
+  assert.equal(api.calls.filter(call => call.pathname.endsWith('/launch')).length, 2)
+  assert.equal(report.coverage, 'unsupported_admission')
+  assert.equal(report.common_sample, false)
+  assert.deepEqual(report.providers.map(result => result.adapter), providers)
+  assert.ok(report.providers.every(result => result.runs_created === 0 && result.launch_status === 409))
 })
 
-test('Unix: accidentally accepting an unsupported provider fails the contract', async () => {
-  const result = await runFixture('linux', { status: 200 })
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /must refuse Unix dispatch/)
-  assert.equal(result.report, null)
+test('unrelated HTTP errors cannot be recorded as a successful Unix refusal', async () => {
+  await assert.rejects(runExternalAdapterContract(
+    { server: env.CRONY_SERVER_HTTP, expectedPlatform: 'unix' }, mockApi('linux', { launchStatus: 500 }),
+  ), /Unsupported execution/)
 })
 
-test('Unix: an unrelated admission failure cannot stand in for containment refusal', async () => {
-  const result = await runFixture('linux', { reason: 'actor is not authorized' })
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /unexpected claude-code refusal/)
-  assert.equal(result.report, null)
-})
-
-test('Unix: a refusal with a persisted run is rejected', async () => {
-  const result = await runFixture('linux', { orphanRun: true })
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /unsupported adapter dispatch must not persist a run/)
-  assert.equal(result.report, null)
-})
-
-test('Unknown runner platforms fail before resetting a fixture', async () => {
-  const result = await runFixture('unknown')
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /unsupported external-adapter test runner platform/)
-  assert.equal(result.calls.length, 0)
-  assert.equal(result.report, null)
-})
-
-test('A Linux expectation cannot conceal an unavailable Windows runner', async () => {
-  const result = await runFixture('linux', { reportedOS: 'windows' })
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /does not match the connected runner platform/)
-  assert.equal(result.calls.filter((call) => call.url.endsWith('/missions')).length, 0)
-  assert.equal(result.report, null)
-})
-
-test('Unknown reported runner OS fails before creating provider work', async () => {
-  const result = await runFixture('linux', { reportedOS: 'unknown' })
-  assert.notEqual(result.code, 0)
-  assert.match(result.stderr, /unsupported connected runner OS/)
-  assert.equal(result.calls.filter((call) => call.url.endsWith('/missions')).length, 0)
-})
-
-test('An owned child stuck on HTTP is reaped before fixture cleanup', async () => {
-  await assert.rejects(
-    runFixture('linux', { holdLaunch: true, timeoutMs: 2000 }),
-    /owned HTTP-contract child timed out/,
+test('the Windows suite retains session, usage, artifact and termination evidence for both providers', async () => {
+  const report = await runExternalAdapterContract(
+    { server: env.CRONY_SERVER_HTTP, expectedPlatform: 'windows' }, mockApi('windows'),
   )
+  assert.equal(report.coverage, 'fixture_lifecycle')
+  assert.equal(report.common_sample, true)
+  assert.equal(report.real_provider_inference, false)
+  assert.deepEqual(report.providers.map(result => result.adapter), providers)
+  assert.ok(report.providers.every(result => result.outcome === 'completed' && result.provider_process_alive === false))
+})
+
+test('Windows evidence rejects missing termination and a mismatched provider artifact', async () => {
+  for (const failure of [{ omitTermination: true }, { wrongArtifact: true }]) {
+    await assert.rejects(runExternalAdapterContract(
+      { server: env.CRONY_SERVER_HTTP, expectedPlatform: 'windows' }, mockApi('windows', failure),
+    ))
+  }
+})
+
+test('Windows readiness retries only native read-only previews, with one launch per provider', async () => {
+  const api = mockApi('windows', { reconcilingPreviews: 2 })
+  const report = await runExternalAdapterContract(
+    { server: env.CRONY_SERVER_HTTP, expectedPlatform: 'windows' }, api,
+  )
+  assert.deepEqual(report.providers.map(result => result.readiness_previews), [3, 1])
+  assert.equal(api.calls.filter(call => call.pathname.endsWith('/launch')).length, 2)
+})
+
+test('native readiness has a bound and cannot launch while reconciliation remains incomplete', async () => {
+  const api = mockApi('windows', { reconcilingPreviews: 100 })
+  let clock = 0
+  await assert.rejects(runExternalAdapterContract(
+    { server: env.CRONY_SERVER_HTTP, expectedPlatform: 'windows' },
+    { ...api, now: () => { clock += 20_000; return clock } },
+  ), /Timed out waiting for read-only native dispatch readiness/)
+  assert.equal(api.calls.some(call => call.pathname.endsWith('/launch')), false)
+})
+
+test('CI wires a Unix refusal and a separate Windows lifecycle fixture without uploading private state', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+  const unix = workflow.split('\n  integration:')[1].split('\n  external-adapters-windows:')[0]
+  const windows = workflow.split('\n  external-adapters-windows:')[1].split('\n  runner-platforms:')[0]
+  assert.match(unix, /runs-on: ubuntu-latest/)
+  assert.match(unix, /e2e_external_adapters\.mjs --expect-unix --dry-run/)
+  assert.match(unix, /e2e_external_adapters\.mjs --expect-unix\n/)
+  assert.match(windows, /runs-on: windows-latest/)
+  assert.match(windows, /ci_external_adapters_windows\.ps1.*-DryRun/)
+  assert.match(windows, /ci_external_adapters_windows\.ps1.*-Execute/)
+  assert.match(windows, /path:.*ecorp-external-adapters-ci\/evidence\//)
+  assert.doesNotMatch(windows, /continue-on-error|credential\.json|pg-data\/|runner-workspaces\//)
 })

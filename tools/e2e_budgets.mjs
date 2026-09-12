@@ -1,13 +1,26 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { readFile, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, lstat, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { assertBudgetFixtureReady, budgetFixtureConfig, budgetFixturePreview } from './budget_fixture.mjs'
 
-const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const root = path.resolve(import.meta.dirname, '..')
+const config = budgetFixtureConfig(process.argv.slice(2), process.env)
+if (config.dryRun) {
+  console.log(JSON.stringify(budgetFixturePreview(config), null, 2))
+  process.exit(0)
+}
+const server = config.server
+await access(path.dirname(config.output), constants.W_OK)
+try {
+  await lstat(config.output)
+  throw new Error('Budget evidence already exists; preserve it and choose a new owned evidence directory')
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error
+}
 
 async function request(url, init) {
-  const response = await fetch(`${server}${url}`, init)
+  const response = await fetch(`${server}${url}`, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) })
   const body = response.status === 204 ? null : await response.json()
   if (!response.ok) {
     throw new Error(`${response.status}: ${JSON.stringify(body)}`)
@@ -100,7 +113,12 @@ async function launch(demo, title, budgetTokens) {
   })
 }
 
+const fixtureDemo = { corp_id: '00000000-0000-4000-8000-000000000001',
+  alice_actor_id: '00000000-0000-4000-8000-000000000011' }
+assertBudgetFixtureReady(await snapshot(fixtureDemo), fixtureDemo, config.runnerId)
 const demo = await post('/api/demo/reset', {})
+assert.equal(demo.corp_id, fixtureDemo.corp_id)
+assert.equal(demo.alice_actor_id, fixtureDemo.alice_actor_id)
 await setPolicy(demo)
 const spendLaunch = await launch(
   demo,
@@ -256,6 +274,8 @@ const approvalResponse = await fetch(
   `${server}/api/corps/${demo.corp_id}/approvals/${approvalRace.approval.id}/decision`,
   {
     method: 'POST',
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000),
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       actor_id: demo.bob_actor_id,
@@ -359,7 +379,8 @@ const report = {
   healthy_conversation_incidents: 0,
 }
 await writeFile(
-  path.join(root, 'output', 'e2e-budgets.json'),
+  config.output,
   `${JSON.stringify(report, null, 2)}\n`,
+  { encoding: 'utf8', flag: 'wx' },
 )
 console.log(JSON.stringify(report, null, 2))

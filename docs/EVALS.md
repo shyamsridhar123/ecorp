@@ -4,6 +4,10 @@ The [September 12 scheduler acceptance](evidence/2026-09-12-scheduler-standalone
 records PR #179's main-based source gate separately from the combined recovery
 and two-runner runtime acceptance. Earlier failed attempts remain retained.
 
+The [PR #237 main-sync report](evidence/2026-09-12-main-sync-ci-validation.md)
+records the subsequent local combined-candidate checks and owned Windows QA,
+separately from hosted integration, real providers and live-factory deployment.
+
 ## Evidence rule
 
 An implementation claim needs evidence at the same scope:
@@ -434,9 +438,12 @@ unavailable-adapter denial without persisting a run or execution journal.
 The driver reads the connected fixture runner's OS; an optional
 `CRONY_TEST_RUNNER_PLATFORM` expectation must match it and cannot select a weaker
 test mode. The fixture requires exactly one connected runner.
-`node --test tools/e2e_external_adapters.test.mjs` checks the driver with synthetic
-HTTP responses, including wrong-platform, false-success, unrelated-denial, and
-child-cleanup negatives; it does not replace native integration acceptance.
+The driver additionally requires `CRONY_EXTERNAL_ADAPTER_TEST=1`, an explicit
+owned endpoint, and `--expect-windows` or `--expect-unix`; `--dry-run` makes no
+requests. `tools/e2e_external_adapters.test.mjs` and the retained upstream
+`tools/e2e_external_adapters_http.test.mjs` check synthetic HTTP responses,
+wrong-platform/false-success/unrelated-denial cases, empty execution journals
+and child cleanup. They do not replace native integration acceptance.
 See `docs/evidence/2026-08-30-external-adapter-validation.md` and
 `docs/evidence/2026-09-12-pr234-platform-contract.md`.
 

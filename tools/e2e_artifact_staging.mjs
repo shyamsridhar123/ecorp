@@ -4,20 +4,36 @@ import { createHash } from 'node:crypto'
 import {
   copyFile,
   mkdir,
+  readFile,
   rm,
   stat,
   writeFile,
 } from 'node:fs/promises'
 import path from 'node:path'
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import { promisify } from 'node:util'
 
 import {
   downloadVerifiedArtifact,
 } from './artifact_client.mjs'
-import { restartOwnedTestServer } from './owned_test_stack.mjs'
+import {
+  artifactStagingFixtureConfig,
+  assertControlledAssignment,
+  waitForControlledRunnerDispatch,
+} from './controlled_runner_fixture.mjs'
 
 const execFile = promisify(execFileCallback)
-const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
+const config = artifactStagingFixtureConfig(process.argv.slice(2), process.env)
+const server = config.server
+if (config.dryRun) {
+  console.log(JSON.stringify({ ...config, services_started: false, database_writes: false,
+    proposed: config.readinessSmoke
+      ? ['reset the owned fixture, verify read-only controlled-runner readiness, assignment identity and artifact acceptance',
+        'close the synthetic runner; no SQL faults, file removal or server restart']
+      : ['run the complete artifact staging, fault-injection and restart suite on the existing Actions fixture'],
+  }, null, 2))
+  process.exit(0)
+}
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
 const root = path.resolve(import.meta.dirname, '..')
@@ -26,7 +42,9 @@ const artifactRoot = path.join(root, 'output', 'artifact-objects')
 let psqlMode
 
 async function request(pathname, init) {
-  const response = await fetch(`${server}${pathname}`, init)
+  const response = await fetch(`${server}${pathname}`, {
+    ...init, redirect: 'error', signal: AbortSignal.timeout(10_000),
+  })
   const body = response.status === 204 ? null : await response.json()
   return { response, body }
 }
@@ -338,6 +356,8 @@ function connectRunner({ corpId, runnerId, credential, source, modelId }) {
           runnerId,
           source,
           modelId,
+          readinessSource: source,
+          adapter: 'codex',
           credential: payload.credential,
           waitForAssignment(runId, timeoutMs = 10_000) {
             const index = assignments.findIndex(
@@ -405,6 +425,7 @@ async function controlledRun(demo, runner, title) {
     `/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`,
     { requested_by: demo.alice_actor_id },
   )
+  assertControlledAssignment(launch, runner)
   const assignment = await runner.waitForAssignment(launch.run_id)
   assert.equal(assignment.run_id, launch.run_id)
   const assigned = await snapshot(demo)
@@ -625,39 +646,10 @@ const runner = await connectRunner({
   source,
   modelId,
 })
+const readinessPreviews = await waitForControlledRunnerDispatch({ request, demo, runner })
 
-// Registered acknowledges identity before native reconciliation enables
-// dispatch. A unique fixture model prevents the already-ready normal runner
-// from taking this work; source-selected preview proves the controlled runner
-// is actually selectable before any storage-fixture mission is created.
-const readyDeadline = Date.now() + 10_000
-let dispatchReady = false
-while (Date.now() < readyDeadline) {
-  const preview = await request(`/api/corps/${demo.corp_id}/missions/preview`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      requested_by: demo.alice_actor_id,
-      title: 'Controlled artifact runner dispatch readiness',
-      preferred_adapter: 'codex',
-      preferred_model: modelId,
-      source,
-    }),
-    signal: AbortSignal.timeout(Math.max(1, readyDeadline - Date.now())),
-  })
-  if (preview.response.ok) {
-    dispatchReady = true
-    break
-  }
-  assert.equal(preview.response.status, 400, 'unexpected readiness denial')
-  assert.equal(
-    preview.body?.error,
-    'no connected runner can staff the selected mission runtime, model, and source',
-    'Only native reconciliation readiness is retryable; invalid fixture policy must fail immediately',
-  )
-  await new Promise((resolve) => setTimeout(resolve, 50))
-}
-assert.ok(dispatchReady, 'controlled artifact runner did not become dispatch-ready')
+// The shared bounded preview barrier above selects this exact model/source.
+// Registration and runner ordering are not dispatch authority.
 
 const sharedBytes = Buffer.from(`shared digest ${crypto.randomUUID()}\n`, 'utf8')
 const accepted = await acceptedArtifact(
@@ -669,6 +661,20 @@ const accepted = await acceptedArtifact(
 )
 const acceptedDownload = await downloadVerifiedArtifact(server, demo, accepted.run)
 assert.deepEqual(acceptedDownload, sharedBytes)
+if (config.readinessSmoke) {
+  runner.socket.close()
+  const report = {
+    schema_version: 1, coverage: 'controlled_runner_readiness_only',
+    runner_id: runner.runnerId, assigned_runner_id: accepted.run.runner_id,
+    readiness_previews: readinessPreviews, run_id: accepted.run.id,
+    run_status: accepted.run.status, artifact_sha256: accepted.sha256,
+    artifact_verified: true, fault_injection_executed: false, server_restarted: false,
+  }
+  assert.equal(report.assigned_runner_id, runner.runnerId)
+  await writeFile(config.output, `${JSON.stringify(report, null, 2)}\n`)
+  console.log(JSON.stringify(report, null, 2))
+  process.exit(0)
+}
 assert.equal(
   await psql(
     `SELECT count(*) FROM artifacts WHERE run_id = ` +
@@ -1035,6 +1041,8 @@ assert.equal(await exists(cleanupFinalPath), true)
 
 const report = {
   checked_at: new Date().toISOString(),
+  controlled_runner_id: runner.runnerId,
+  readiness_previews: readinessPreviews,
   accepted_shared_digest: {
     run_id: accepted.run.id,
     artifact_id: accepted.run.artifact_id,
@@ -1080,7 +1088,7 @@ const report = {
   },
 }
 await writeFile(
-  path.join(root, 'output', 'e2e-artifact-staging.json'),
+  config.output,
   `${JSON.stringify(report, null, 2)}\n`,
 )
 console.log(JSON.stringify(report, null, 2))

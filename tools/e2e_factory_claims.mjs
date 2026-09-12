@@ -4,6 +4,11 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import {
+  assertAutomaticFactoryVerification,
+  selectFixtureRunnerForSource,
+  waitForControlledRunnerDispatch,
+} from './controlled_runner_fixture.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -17,7 +22,9 @@ const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
 }).trim()
 
 async function request(url, init) {
-  const response = await fetch(`${server}${url}`, init)
+  const response = await fetch(`${server}${url}`, {
+    ...init, redirect: 'error', signal: AbortSignal.timeout(10_000),
+  })
   const body = response.status === 204 ? null : await response.json()
   return { response, body }
 }
@@ -46,6 +53,13 @@ async function snapshot(demo) {
     throw new Error(`${result.response.status}: ${JSON.stringify(result.body)}`)
   }
   return result.body
+}
+
+async function waitForFixtureSource(demo) {
+  const runner = selectFixtureRunnerForSource(await snapshot(demo), demo, {
+    repository: fixtureSource.repository, base_ref: 'HEAD', base_commit: sourceBaseCommit,
+  })
+  return waitForControlledRunnerDispatch({ request, demo, runner })
 }
 
 async function waitForMission(demo, missionId, timeoutMs = 30_000) {
@@ -115,11 +129,12 @@ async function restartLocalServer(demo) {
 }
 
 const demo = await postOk('/api/demo/reset', {})
+const initialReadinessPreviews = await waitForFixtureSource(demo)
 const nonce = crypto.randomUUID()
 const claimPath = `/api/corps/${demo.corp_id}/factory/work-items/claim`
 const claimRequest = {
   actor_id: demo.alice_actor_id,
-  source_project_owner: 'shyamsridhar123',
+  source_project_owner: fixtureSource.owner,
   source_project_number: 3,
   source_project_item_id: `PVTI_FACTORY_E2E_${nonce}`,
   source_repository_owner: fixtureSource.owner,
@@ -173,7 +188,7 @@ assert.equal(claim.work_item.version, 1)
 assert.ok(claim.claim_token)
 const mixedCaseReplay = await postOk(claimPath, {
   ...claimRequest,
-  source_project_owner: 'ShYaMsRiDhAr123',
+  source_project_owner: fixtureSource.owner.toUpperCase(),
   source_repository_owner: fixtureSource.owner.toUpperCase(),
   source_repository_name: fixtureSource.name.toUpperCase(),
   source_issue_url: `https://github.com/${fixtureSource.repository.toUpperCase()}/issues/59`,
@@ -181,7 +196,7 @@ const mixedCaseReplay = await postOk(claimPath, {
 })
 assert.equal(mixedCaseReplay.work_item.id, claim.work_item.id)
 assert.equal(mixedCaseReplay.claim_token, claim.claim_token)
-assert.equal(mixedCaseReplay.work_item.source_project_owner, 'shyamsridhar123')
+assert.equal(mixedCaseReplay.work_item.source_project_owner, fixtureSource.owner)
 assert.equal(mixedCaseReplay.work_item.source_repository_owner, fixtureSource.owner)
 assert.equal(mixedCaseReplay.work_item.source_repository_name, fixtureSource.name)
 
@@ -236,6 +251,7 @@ const duplicateActive = await post(claimPath, {
 assert.equal(duplicateActive.response.status, 409)
 
 const restarted = await restartLocalServer(demo)
+const restartReadinessPreviews = await waitForFixtureSource(demo)
 
 const renewPath = `/api/corps/${demo.corp_id}/factory/work-items/${claim.work_item.id}/renew`
 const renewRequest = {
@@ -497,6 +513,10 @@ assert.deepEqual(verifiedEvents[0].payload, {
   mission_id: materialized[0].mission_id,
   run_id: launch.run_id,
 })
+assertAutomaticFactoryVerification(completed.state, {
+  corpId: demo.corp_id, workItemId: claim.work_item.id, missionId: materialized[0].mission_id,
+  runId: launch.run_id, previousVersion: running.work_item.version,
+})
 const staleVerified = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
@@ -718,6 +738,10 @@ assert.equal(failoverMaterialize.work_item.state, 'mission_created')
 
 const report = {
   checked_at: new Date().toISOString(),
+  source_repository: fixtureSource.repository,
+  source_base_commit: sourceBaseCommit,
+  initial_readiness_previews: initialReadinessPreviews,
+  restart_readiness_previews: restartReadinessPreviews,
   source_issue: claim.work_item.source_issue_url,
   work_item_id: claim.work_item.id,
   mission_id: materialized[0].mission_id,

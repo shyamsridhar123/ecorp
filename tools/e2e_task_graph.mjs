@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
-import path from 'node:path'
 import { downloadVerifiedArtifact } from './artifact_client.mjs'
+import { graphFixtureSource, taskGraphFixtureConfig } from './task_graph_fixture.mjs'
 
-const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const root = path.resolve(import.meta.dirname, '..')
+const config = taskGraphFixtureConfig(process.argv.slice(2), process.env)
+const server = config.server
+if (config.dryRun) {
+  console.log(JSON.stringify({ ...config, services_started: false, database_writes: false,
+    proposed: ['reset only the explicitly owned demo fixture',
+      'verify native source-selected staffing, concurrent roots, dependency artifacts and bounded retries',
+      'also verify the original mixed Codex/Claude graph on Windows; no roster SQL mutations'],
+  }, null, 2))
+  process.exit(0)
+}
 const activeStatuses = new Set([
   'provisioning',
   'starting',
@@ -75,17 +83,7 @@ async function parallelGraphScenario({ sourceSelected = false } = {}) {
   const adapter = sourceSelected ? 'fake-process' : 'codex'
   let source
   if (sourceSelected) {
-    const workspace = runner.capabilities.find((capability) =>
-      capability.name === 'workspace-isolation' && capability.available &&
-      capability.workspace_connection_id == null,
-    )
-    assert.ok(workspace?.source_repository && workspace.source_base_ref)
-    assert.match(workspace.source_base_commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i)
-    source = {
-      repository: workspace.source_repository,
-      base_ref: workspace.source_base_ref,
-      base_commit: workspace.source_base_commit,
-    }
+    source = graphFixtureSource(initial, demo.corp_id).source
   }
   const created = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
@@ -125,6 +123,9 @@ async function parallelGraphScenario({ sourceSelected = false } = {}) {
     assert.ok(task.contract.write_scope.length)
     assert.ok(task.contract.budget_tokens > 0)
     assert.ok(task.max_attempts <= 3)
+    assert.ok(planned.runners.some(candidate => candidate.connected && candidate.capabilities.some(capability =>
+      capability.name === task.required_adapter && capability.available && capability.workspace_connection_id == null)),
+    'Graph fixture planned an unavailable adapter: ' + task.required_adapter)
     if (sourceSelected) {
       assert.equal(task.required_adapter, adapter)
       assert.deepEqual({
@@ -205,6 +206,7 @@ async function parallelGraphScenario({ sourceSelected = false } = {}) {
   }
 
   return {
+    root_adapters: rootRuns.map(run => taskById.get(run.task_id).required_adapter).sort(),
     mission_id: created.mission_id,
     runner_os: runner.os,
     source_selected: sourceSelected,
@@ -263,6 +265,7 @@ async function retryBoundScenario() {
 // where its external-CLI worker is supported; Unix refusal is tested separately.
 const parallelGraph = await parallelGraphScenario({ sourceSelected: true })
 const report = {
+  schema_version: 2,
   checked_at: new Date().toISOString(),
   parallel_graph: parallelGraph,
   legacy_mixed_provider_graph: parallelGraph.runner_os === 'windows'
@@ -271,7 +274,7 @@ const report = {
   retry_bound: await retryBoundScenario(),
 }
 await writeFile(
-  path.join(root, 'output', 'e2e-task-graph.json'),
+  config.output,
   `${JSON.stringify(report, null, 2)}\n`,
 )
 console.log(JSON.stringify(report, null, 2))

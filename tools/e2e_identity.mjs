@@ -2,19 +2,24 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { captureIdentityAssignment, identityFixtureConfig, identityFixturePreview, waitForIdentityProbe } from './identity_fixture.mjs'
 
-const devServer = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const databaseUrl =
-  process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
+const config = identityFixtureConfig(process.argv.slice(2), process.env)
+if (config.dryRun) {
+  console.log(JSON.stringify(identityFixturePreview(config), null, 2))
+  process.exit(0)
+}
+const devServer = config.server
+const databaseUrl = process.env.DATABASE_URL
 const root = path.resolve(import.meta.dirname, '..')
-const productionPort = Number(process.env.CRONY_AUTH_TEST_PORT ?? 8793)
-const oidcPort = Number(process.env.FAKE_OIDC_PORT ?? 8792)
+const productionPort = config.productionPort
+const oidcPort = config.oidcPort
 const productionServer = `http://127.0.0.1:${productionPort}`
 const productionSocket = `ws://127.0.0.1:${productionPort}`
 const issuer = `http://127.0.0.1:${oidcPort}`
 
 async function json(url, init) {
-  const response = await fetch(url, init)
+  const response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10_000) })
   const body = response.status === 204 ? null : await response.json()
   return { response, body }
 }
@@ -68,7 +73,12 @@ function connectRunner({
       const payload = JSON.parse(message.data)
       if (payload.type === 'registered' || payload.type === 'registration_rejected') {
         clearTimeout(timeout)
-        resolve({ socket, payload, connectionEpoch })
+        if (payload.type === 'registered' && payload.runner_id !== runnerId) {
+          socket.close()
+          reject(new Error('Identity registration returned a different runner'))
+          return
+        }
+        resolve({ socket, payload, connectionEpoch, runnerId })
       }
     }
   })
@@ -190,48 +200,11 @@ const second = await connectRunner({
 assert.equal(second.payload.type, 'registered')
 const currentCredential = second.payload.credential
 
-// Registration/credential rotation precedes native dispatch readiness. Select
-// this protocol simulator by its unique model/source, never by runner ordering.
-const readyDeadline = Date.now() + 10_000
-let dispatchReady = false
-while (Date.now() < readyDeadline) {
-  const preview = await json(`${devServer}/api/corps/${demo.corp_id}/missions/preview`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      requested_by: demo.alice_actor_id,
-      title: 'Identity fixture dispatch readiness',
-      preferred_adapter: 'codex',
-      preferred_model: lifecycleModel,
-      source: lifecycleSource,
-    }),
-    signal: AbortSignal.timeout(Math.max(1, readyDeadline - Date.now())),
-  })
-  if (preview.response.ok) {
-    dispatchReady = true
-    break
-  }
-  assert.equal(preview.response.status, 400)
-  assert.equal(preview.body?.error,
-    'no connected runner can staff the selected mission runtime, model, and source')
-  await new Promise((resolve) => setTimeout(resolve, 50))
-}
-assert.ok(dispatchReady, 'current identity fixture did not become dispatch-ready')
-
-const assignmentPromise = new Promise((resolve, reject) => {
-  const timeout = setTimeout(
-    () => reject(new Error('timed out waiting for lifecycle assignment')),
-    10_000,
-  )
-  const listener = (message) => {
-    const payload = JSON.parse(message.data)
-    if (payload.type === 'start_run') {
-      clearTimeout(timeout)
-      second.socket.removeEventListener('message', listener)
-      resolve(payload)
-    }
-  }
-  second.socket.addEventListener('message', listener)
+second.readinessSource = lifecycleSource
+second.adapter = 'codex'
+second.modelId = lifecycleModel
+const readinessPreviews = await waitForIdentityProbe({
+  request: (pathname, init) => json(`${devServer}${pathname}`, init), demo, probe: second,
 })
 const mission = await devPost(`/api/corps/${demo.corp_id}/missions`, {
   requested_by: demo.alice_actor_id,
@@ -240,11 +213,11 @@ const mission = await devPost(`/api/corps/${demo.corp_id}/missions`, {
   source: lifecycleSource,
   title: 'Verify superseded runner fencing and active revocation.',
 })
-const launch = await devPost(
-  `/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`,
-  { requested_by: demo.alice_actor_id },
-)
-const assignment = await assignmentPromise
+const { launch, assignment } = await captureIdentityAssignment({
+  probe: second, corpId: demo.corp_id, missionId: mission.mission_id,
+  launch: () => devPost(`/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`,
+    { requested_by: demo.alice_actor_id }),
+})
 assert.equal(assignment.run_id, launch.run_id)
 assert.equal(
   (await devSnapshot(demo)).snapshot.runs.find((run) => run.id === assignment.run_id)?.runner_id,
@@ -364,6 +337,33 @@ const revoked = await connectRunner({
 assert.equal(revoked.payload.type, 'registration_rejected')
 revoked.socket.close()
 
+const lifecycleEvidence = {
+  checked_at: new Date().toISOString(),
+  probe_runner_id: runnerId,
+  assigned_runner_id: launch.runner_id,
+  readiness_previews: readinessPreviews,
+  source_model_selection: true,
+  provider_execution: false,
+  enrollment_rotated: rotatedCredential !== enrollment.body.enrollment_token,
+  enrollment_replay_rejected: true,
+  workload_credential_rotated: currentCredential !== rotatedCredential,
+  revocation_rejected: true,
+  superseded_runner_event_rejected: true,
+  wrong_assignment_token_rejected: true,
+  active_revocation_run_status: revokedRun.status,
+  active_revocation_task_status: revokedTask.status,
+  active_revocation_mission_status: revokedMission.status,
+  active_revocation_agent_status: revokedAgent.status,
+}
+assert.ok(lifecycleEvidence.enrollment_rotated && lifecycleEvidence.workload_credential_rotated,
+  'Native enrollment and workload credentials must rotate')
+if (config.lifecycleOnly) {
+  const report = { ...lifecycleEvidence, coverage: 'runner_identity_lifecycle_only', oidc_executed: false }
+  await fs.writeFile(config.output, `${JSON.stringify(report, null, 2)}\n`)
+  console.log(JSON.stringify(report, null, 2))
+  process.exit(0)
+}
+
 const link = await json(`${devServer}/api/demo/oidc-link`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
@@ -398,8 +398,6 @@ try {
     [
       '--bind',
       `127.0.0.1:${productionPort}`,
-      '--database-url',
-      databaseUrl,
       '--runner-startup-recovery',
       'false',
       '--mode',
@@ -407,13 +405,13 @@ try {
       '--oidc-issuer',
       issuer,
       '--allow-insecure-oidc',
-      '--secret-master-key-hex',
-      'a5c3f1458279dfb241239378dbefa6b8d2ab32703cba1768343712fd37ac1f04',
     ],
     {
       cwd: root,
       env: {
         ...process.env,
+        DATABASE_URL: databaseUrl,
+        CRONY_SECRET_MASTER_KEY_HEX: 'a5c3f1458279dfb241239378dbefa6b8d2ab32703cba1768343712fd37ac1f04',
         CRONY_OBJECT_STORE_BACKEND: 's3',
         CRONY_OBJECT_STORE_ENDPOINT: 'https://s3.invalid',
         CRONY_OBJECT_STORE_BUCKET: 'crony-identity-test',
@@ -491,26 +489,18 @@ try {
   assert.equal(replayReady.corp_id, demo.corp_id)
 
   const evidence = {
+    ...lifecycleEvidence,
     checked_at: new Date().toISOString(),
+    oidc_executed: true,
     oidc_missing_token_status: unauthenticated.response.status,
     oidc_authenticated_status: authenticated.response.status,
     actor_spoof_status: spoofedActor.response.status,
     unmapped_identity_status: unknownIdentity.response.status,
     cross_corp_status: otherCorp.response.status,
     websocket_authorized_before_replay: true,
-    enrollment_rotated: rotatedCredential !== enrollment.body.enrollment_token,
-    enrollment_replay_rejected: true,
-    workload_credential_rotated: currentCredential !== rotatedCredential,
-    revocation_rejected: true,
-    superseded_runner_event_rejected: true,
-    wrong_assignment_token_rejected: true,
-    active_revocation_run_status: revokedRun.status,
-    active_revocation_task_status: revokedTask.status,
-    active_revocation_mission_status: revokedMission.status,
-    active_revocation_agent_status: revokedAgent.status,
   }
   await fs.writeFile(
-    path.join(root, 'output', 'e2e-identity.json'),
+    config.output,
     `${JSON.stringify(evidence, null, 2)}\n`,
   )
   console.log(JSON.stringify(evidence, null, 2))
