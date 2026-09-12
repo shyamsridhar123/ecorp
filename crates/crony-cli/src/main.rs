@@ -3,7 +3,7 @@ mod publish;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use crony_domain::{DeliverableForm, DeliverableSpec, EntityLink};
+use crony_domain::{DeliverableForm, DeliverableSpec, EntityLink, MAX_TASK_ATTEMPTS};
 use crony_protocol::{
     ClaimLeaseRequest, CreateMissionRequest, CreateRoomMessageRequest, EmergencyStopRequest,
     InterruptRunRequest, LaunchMissionRequest, MissionSource, QueueMessageRequest,
@@ -60,6 +60,9 @@ enum Command {
         adapter: Option<String>,
         #[arg(long)]
         strategy: Option<String>,
+        /// Total attempts per task, chosen before execution; omission keeps planner defaults.
+        #[arg(long, value_parser = clap::value_parser!(i32).range(1..=i64::from(MAX_TASK_ATTEMPTS)))]
+        max_task_attempts: Option<i32>,
         #[arg(
             long,
             requires_all = ["source_base_ref", "source_base_commit"]
@@ -233,6 +236,7 @@ async fn main() -> Result<()> {
             actor_id,
             adapter,
             strategy,
+            max_task_attempts,
             source_repository,
             source_base_ref,
             source_base_commit,
@@ -253,6 +257,7 @@ async fn main() -> Result<()> {
                     preferred_model: None,
                     reasoning_effort: None,
                     strategy,
+                    max_task_attempts,
                     source: source_repository.map(|repository| MissionSource {
                         repository,
                         base_ref: source_base_ref.expect("clap requires the source base ref"),
@@ -661,6 +666,91 @@ mod tests {
                 command.drain(index..index + 2);
             }
             assert!(Args::try_parse_from(command).is_ok());
+        }
+    }
+
+    fn issue224_planning_command(subcommand: &str) -> Vec<String> {
+        if subcommand == "mission" {
+            return [
+                "crony",
+                "mission",
+                "00000000-0000-4000-8000-000000000011",
+                "00000000-0000-4000-8000-000000000022",
+                "Plan a bounded outcome",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        }
+        let mut command = copied_recovery_command("source-correction");
+        command[3] = subcommand.to_owned();
+        for flag in ["--verification-recovery", "--verification-recovery-reason"] {
+            let index = command.iter().position(|value| value == flag).unwrap();
+            command.drain(index..index + 2);
+        }
+        command
+    }
+
+    #[test]
+    fn issue224_planning_flags_are_optional_and_use_the_shared_ceiling() {
+        for subcommand in ["mission", "factory", "factory-watch"] {
+            for expected in
+                std::iter::once(None).chain((1..=crony_domain::MAX_TASK_ATTEMPTS).map(Some))
+            {
+                let mut command = issue224_planning_command(subcommand);
+                if let Some(value) = expected {
+                    command.push(format!("--max-task-attempts={value}"));
+                }
+                let parsed = Args::try_parse_from(command).unwrap();
+                let actual = match parsed.command {
+                    Command::Mission {
+                        max_task_attempts, ..
+                    } => max_task_attempts,
+                    Command::Factory { args } => args.max_task_attempts,
+                    Command::FactoryWatch { args } => args.factory.max_task_attempts,
+                    _ => panic!("expected a planning command"),
+                };
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn issue224_invalid_attempt_flags_fail_during_argument_parsing() {
+        for subcommand in ["mission", "factory", "factory-watch"] {
+            for value in [
+                "0".to_owned(),
+                "-1".to_owned(),
+                (crony_domain::MAX_TASK_ATTEMPTS + 1).to_string(),
+                "3.0".to_owned(),
+                "true".to_owned(),
+                "2147483648".to_owned(),
+            ] {
+                let mut command = issue224_planning_command(subcommand);
+                command.push(format!("--max-task-attempts={value}"));
+                assert!(Args::try_parse_from(command).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn issue224_launch_and_resume_have_no_attempt_override() {
+        for subcommand in ["launch", "resume"] {
+            let mut command = vec![
+                "crony".to_owned(),
+                subcommand.to_owned(),
+                Uuid::from_u128(1).to_string(),
+                Uuid::from_u128(2).to_string(),
+                Uuid::from_u128(3).to_string(),
+            ];
+            if subcommand == "resume" {
+                command.push("Continue the existing work".to_owned());
+            }
+            command.push(format!(
+                "--max-task-attempts={}",
+                crony_domain::MAX_TASK_ATTEMPTS
+            ));
+            assert!(Args::try_parse_from(command).is_err());
         }
     }
 }

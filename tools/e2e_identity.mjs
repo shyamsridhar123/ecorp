@@ -116,12 +116,40 @@ const demo = (
 ).body
 
 const runnerId = `identity-probe-${crypto.randomUUID()}`
-const fakeCapability = {
-  name: 'fake-process',
-  available: true,
-  detail: 'identity lifecycle probe',
-  models: [],
+const lifecycleModel = `identity-lifecycle-${crypto.randomUUID()}`
+const initial = await devSnapshot(demo)
+const workspace = initial.runners.filter((runner) => runner.connected)
+  .flatMap((runner) => runner.capabilities)
+  .find((capability) => capability.name === 'workspace-isolation' &&
+    capability.available && capability.workspace_connection_id == null)
+assert.ok(workspace?.source_repository && workspace.source_base_ref)
+assert.match(workspace.source_base_commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i)
+const lifecycleSource = {
+  repository: workspace.source_repository,
+  base_ref: workspace.source_base_ref,
+  base_commit: workspace.source_base_commit,
 }
+const fakeCapability = {
+  name: 'codex',
+  available: true,
+  detail: 'controlled identity protocol probe; no provider execution',
+  models: [{
+    id: lifecycleModel,
+    name: 'Controlled identity lifecycle fixture',
+    policy_state: 'enabled',
+    supports_vision: false,
+    supports_reasoning_effort: false,
+  }],
+}
+const lifecycleCapabilities = [fakeCapability, {
+  name: 'workspace-isolation',
+  available: true,
+  detail: 'controlled identity fixture source',
+  models: [],
+  source_repository: lifecycleSource.repository,
+  source_base_ref: lifecycleSource.base_ref,
+  source_base_commit: lifecycleSource.base_commit,
+}]
 const enrollment = await json(
   `${devServer}/api/corps/${demo.corp_id}/runners/enroll`,
   {
@@ -140,7 +168,7 @@ const first = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: enrollment.body.enrollment_token,
-  capabilities: [fakeCapability],
+  capabilities: lifecycleCapabilities,
 })
 assert.equal(first.payload.type, 'registered')
 const rotatedCredential = first.payload.credential
@@ -157,10 +185,38 @@ const second = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: rotatedCredential,
-  capabilities: [fakeCapability],
+  capabilities: lifecycleCapabilities,
 })
 assert.equal(second.payload.type, 'registered')
 const currentCredential = second.payload.credential
+
+// Registration/credential rotation precedes native dispatch readiness. Select
+// this protocol simulator by its unique model/source, never by runner ordering.
+const readyDeadline = Date.now() + 10_000
+let dispatchReady = false
+while (Date.now() < readyDeadline) {
+  const preview = await json(`${devServer}/api/corps/${demo.corp_id}/missions/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requested_by: demo.alice_actor_id,
+      title: 'Identity fixture dispatch readiness',
+      preferred_adapter: 'codex',
+      preferred_model: lifecycleModel,
+      source: lifecycleSource,
+    }),
+    signal: AbortSignal.timeout(Math.max(1, readyDeadline - Date.now())),
+  })
+  if (preview.response.ok) {
+    dispatchReady = true
+    break
+  }
+  assert.equal(preview.response.status, 400)
+  assert.equal(preview.body?.error,
+    'no connected runner can staff the selected mission runtime, model, and source')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+}
+assert.ok(dispatchReady, 'current identity fixture did not become dispatch-ready')
 
 const assignmentPromise = new Promise((resolve, reject) => {
   const timeout = setTimeout(
@@ -179,7 +235,9 @@ const assignmentPromise = new Promise((resolve, reject) => {
 })
 const mission = await devPost(`/api/corps/${demo.corp_id}/missions`, {
   requested_by: demo.alice_actor_id,
-  preferred_adapter: 'fake-process',
+  preferred_adapter: 'codex',
+  preferred_model: lifecycleModel,
+  source: lifecycleSource,
   title: 'Verify superseded runner fencing and active revocation.',
 })
 const launch = await devPost(
@@ -188,6 +246,10 @@ const launch = await devPost(
 )
 const assignment = await assignmentPromise
 assert.equal(assignment.run_id, launch.run_id)
+assert.equal(
+  (await devSnapshot(demo)).snapshot.runs.find((run) => run.id === assignment.run_id)?.runner_id,
+  runnerId,
+)
 
 first.socket.send(JSON.stringify({
   type: 'run_event',

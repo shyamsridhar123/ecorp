@@ -3,7 +3,8 @@ use std::{collections::HashMap, io::Write};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crony_gateways::{
-    ACP_PROTOCOL_VERSION, GatewayClient, JsonRpcRequest, acp_initialize, failure, success,
+    ACP_PROTOCOL_VERSION, GatewayClient, JsonRpcRequest, acp_initialize, failure,
+    reject_max_task_attempts, success, with_max_task_attempts,
 };
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -55,6 +56,11 @@ async fn handle(
     request: JsonRpcRequest,
 ) -> Value {
     let id = request.id.clone();
+    if request.method != "session/prompt"
+        && let Err(error) = reject_max_task_attempts(&request.params)
+    {
+        return failure(id, -32000, error.to_string());
+    }
     let result = match request.method.as_str() {
         "initialize" => {
             let requested = request
@@ -86,20 +92,11 @@ async fn prompt(
     params: &Value,
 ) -> Result<Value> {
     let session_id = parse_session_id(params)?;
-    let text = params
-        .get("prompt")
-        .and_then(Value::as_str)
-        .context("ACP prompt omitted prompt")?;
     let mission = client
         .request(
             Method::POST,
             &format!("/api/corps/{}/missions", client.corp_id),
-            Some(json!({
-                "requested_by":client.actor_id,
-                "title":text,
-                "preferred_adapter":params.get("adapter"),
-                "strategy":"single"
-            })),
+            Some(acp_mission_request(client.actor_id, params)?),
         )
         .await?;
     let mission_id = mission
@@ -128,6 +125,22 @@ async fn prompt(
     );
     Ok(
         json!({"stopReason":"end_turn","sessionId":session_id,"missionId":mission_id,"runId":run_id}),
+    )
+}
+
+fn acp_mission_request(actor_id: Uuid, params: &Value) -> Result<Value> {
+    let text = params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .context("ACP prompt omitted prompt")?;
+    with_max_task_attempts(
+        json!({
+            "requested_by":actor_id,
+            "title":text,
+            "preferred_adapter":params.get("adapter"),
+            "strategy":"single"
+        }),
+        params,
     )
 }
 
@@ -173,4 +186,66 @@ fn parse_session_id(params: &Value) -> Result<Uuid> {
         .and_then(Value::as_str)
         .context("ACP request omitted sessionId")
         .and_then(|value| Uuid::parse_str(value).context("ACP session id is invalid"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crony_domain::MAX_TASK_ATTEMPTS;
+
+    #[test]
+    fn issue224_acp_creation_keeps_legacy_shape_and_forwards_attempt_choice() {
+        let actor = Uuid::from_u128(1);
+        let mut params = json!({"prompt": "A bounded mission", "adapter": "fake-process"});
+        let legacy = acp_mission_request(actor, &params).unwrap();
+        assert!(legacy.get("max_task_attempts").is_none());
+        assert_eq!(legacy["strategy"], "single");
+        params["max_task_attempts"] = Value::Null;
+        assert_eq!(acp_mission_request(actor, &params).unwrap(), legacy);
+        for value in 1..=MAX_TASK_ATTEMPTS {
+            params["max_task_attempts"] = json!(value);
+            let mut body = acp_mission_request(actor, &params).unwrap();
+            assert_eq!(body["max_task_attempts"], value);
+            body.as_object_mut().unwrap().remove("max_task_attempts");
+            assert_eq!(body, legacy);
+        }
+    }
+
+    #[tokio::test]
+    async fn issue224_acp_invalid_or_postplanning_attempt_fields_leave_sessions_unchanged() {
+        let client = GatewayClient::new(
+            "invalid-unused-server".to_owned(),
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            None,
+        );
+        let session_id = Uuid::from_u128(3);
+        let mut sessions = HashMap::from([(session_id, Session::default())]);
+        for (method, value) in [
+            ("session/prompt", json!(MAX_TASK_ATTEMPTS + 1)),
+            ("session/new", Value::Null),
+            ("session/load", json!(MAX_TASK_ATTEMPTS)),
+            ("session/cancel", Value::Null),
+        ] {
+            let response = handle(
+                &client,
+                &mut sessions,
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_owned(),
+                    id: Some(json!(1)),
+                    method: method.to_owned(),
+                    params: json!({
+                        "sessionId": session_id, "prompt": "A bounded mission",
+                        "max_task_attempts": value,
+                    }),
+                },
+            )
+            .await;
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(message.contains("max_task_attempts") || message.contains("only be chosen"));
+            assert_eq!(sessions.len(), 1);
+            assert!(sessions[&session_id].mission_id.is_none());
+            assert!(sessions[&session_id].run_id.is_none());
+        }
+    }
 }

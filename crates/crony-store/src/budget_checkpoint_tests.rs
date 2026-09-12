@@ -6,6 +6,15 @@ use crony_domain::{DeliverableForm, DeliverableSpec, StoppedSourceCheckpoint};
 #[path = "checkpoint_cancellation_tests.rs"]
 mod cancellation_reconciliation;
 
+#[path = "checkpoint_correction_tests.rs"]
+mod source_correction;
+
+#[path = "checkpoint_correction_publication_tests.rs"]
+mod correction_publication;
+
+#[path = "retained_provider_receipt_tests.rs"]
+mod retained_receipts;
+
 const CORP: Uuid = Uuid::from_u128(1);
 const MISSION: Uuid = Uuid::from_u128(2);
 const TASK: Uuid = Uuid::from_u128(3);
@@ -41,6 +50,55 @@ fn gate() -> Value {
     json!({"type":"independent_review","roles":["owner","member"],"exclude_requester":true})
 }
 
+#[derive(Clone, Copy)]
+struct CheckpointFixtureProfile {
+    mission_tokens: i64,
+    mission_cost_microusd: i64,
+    run_tokens: i64,
+    run_cost_microusd: i64,
+    used_tokens: i64,
+    used_cost_microusd: i64,
+    attempt_count: i32,
+    max_attempts: i32,
+    expected_stage: &'static str,
+    workspace_connection_id: Option<Uuid>,
+    rolling_limits: Option<CheckpointRollingLimits>,
+    verification_failure: bool,
+    adapter: &'static str,
+    provider_session_id: &'static str,
+    native_outcome: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointRollingLimits {
+    actor_tokens: i64,
+    actor_cost_microusd: i64,
+    corp_tokens: i64,
+    corp_cost_microusd: i64,
+}
+
+impl Default for CheckpointFixtureProfile {
+    fn default() -> Self {
+        Self {
+            mission_tokens: 5_000,
+            mission_cost_microusd: 5_000_000,
+            run_tokens: 100_000,
+            run_cost_microusd: 1_000_000,
+            used_tokens: 6_000,
+            used_cost_microusd: 0,
+            attempt_count: 2,
+            max_attempts: 2,
+            expected_stage: "stop",
+            workspace_connection_id: None,
+            rolling_limits: None,
+            verification_failure: false,
+            adapter: "codex",
+            provider_session_id: "fixture-session",
+            native_outcome: None,
+        }
+    }
+}
+
 async fn fixture(pool: PgPool, needs_artifact: bool) -> PgStore {
     fixture_with_stop_request(pool, needs_artifact, false).await
 }
@@ -69,6 +127,25 @@ async fn fixture_with_publication_policy(
     deliverable: Option<DeliverableSpec>,
     publication_authorized: bool,
 ) -> PgStore {
+    fixture_with_profile(
+        pool,
+        needs_artifact,
+        explicit_stop,
+        deliverable,
+        publication_authorized,
+        CheckpointFixtureProfile::default(),
+    )
+    .await
+}
+
+async fn fixture_with_profile(
+    pool: PgPool,
+    needs_artifact: bool,
+    explicit_stop: bool,
+    deliverable: Option<DeliverableSpec>,
+    publication_authorized: bool,
+    profile: CheckpointFixtureProfile,
+) -> PgStore {
     sqlx::raw_sql(
         r#"
         INSERT INTO corps(id,slug,name) VALUES
@@ -86,13 +163,61 @@ async fn fixture_with_publication_policy(
           ('00000000-0000-0000-0000-000000000005','00000000-0000-0000-0000-000000000001',
            '00000000-0000-0000-0000-00000000000a','Worker','worker','codex','working',
            '00000000-0000-0000-0000-000000000004','#123456');
-        INSERT INTO missions(id,corp_id,room_id,requested_by,title,status,budget_tokens,
-                             original_budget_tokens,original_budget_cost_microusd) VALUES
-          ('00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001',
-           '00000000-0000-0000-0000-000000000006','00000000-0000-0000-0000-000000000009',
-           'Preserve completed source','running',5000,5000,5000000);
         "#,
     ).execute(&pool).await.unwrap();
+    if profile.adapter != "codex" {
+        sqlx::query("UPDATE agents SET adapter=$1 WHERE id=$2")
+            .bind(profile.adapter)
+            .bind(AGENT)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Establish immutable original authority before any usage or native stop.
+    sqlx::query(
+        "INSERT INTO missions(id,corp_id,room_id,requested_by,title,status,budget_tokens,
+                              original_budget_tokens,budget_cost_microusd,
+                              original_budget_cost_microusd)
+         VALUES($1,$2,$3,$4,'Preserve completed source','running',$5,$5,$6,$6)",
+    )
+    .bind(MISSION)
+    .bind(CORP)
+    .bind(ROOM)
+    .bind(OWNER)
+    .bind(profile.mission_tokens)
+    .bind(profile.mission_cost_microusd)
+    .execute(&pool)
+    .await
+    .unwrap();
+    if let Some(connection_id) = profile.workspace_connection_id {
+        // Synthetic connection metadata only; no native account or provider setup.
+        sqlx::query(
+            "INSERT INTO runner_nodes(id,corp_id,hostname,os,connection_epoch,status)
+             VALUES($1,$2,'checkpoint-fixture','test',$3,'connected')",
+        )
+        .bind(RUNNER)
+        .bind(CORP)
+        .bind(Uuid::from_u128(20))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workspace_connections(id,corp_id,room_id,created_by,runner_id,
+               label,agent,configuration,source_repository,source_base_ref,source_base_commit,status)
+             VALUES($1,$2,$3,$4,$5,'Synthetic checkpoint connection',$7,'{}',
+               'fixture/source','main',$6,'ready')",
+        )
+        .bind(connection_id)
+        .bind(CORP)
+        .bind(ROOM)
+        .bind(OWNER)
+        .bind(RUNNER)
+        .bind("a".repeat(40))
+        .bind(profile.adapter)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     let mut contract: TaskContract = serde_json::from_value(json!({
         "objective":"verify result.md", "expected_output":"result.md",
         "source_repository":"fixture/source", "source_base_ref":"main",
@@ -104,6 +229,7 @@ async fn fixture_with_publication_policy(
     }))
     .unwrap();
     contract.deliverable = deliverable;
+    contract.workspace_connection_id = profile.workspace_connection_id;
     let mut checks = vec![json!({"type":"file","path":"result.md","min_bytes":1})];
     if needs_artifact {
         checks.push(json!({"type":"artifact","min_bytes":1}));
@@ -113,7 +239,7 @@ async fn fixture_with_publication_policy(
     sqlx::query(
         "INSERT INTO tasks(id,corp_id,mission_id,title,objective,status,assigned_agent_id,
           required_adapter,plan_key,contract,verification_policy,attempt_count,max_attempts)
-         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,'codex','deliver',$5,$6,2,2)",
+         VALUES($1,$2,$3,'Deliver','verify result.md','running',$4,$8,'deliver',$5,$6,$7,$9)",
     )
     .bind(TASK)
     .bind(CORP)
@@ -121,6 +247,9 @@ async fn fixture_with_publication_policy(
     .bind(AGENT)
     .bind(serde_json::to_value(&contract).unwrap())
     .bind(serde_json::to_value(&policy).unwrap())
+    .bind(profile.attempt_count)
+    .bind(profile.adapter)
+    .bind(profile.max_attempts)
     .execute(&pool)
     .await
     .unwrap();
@@ -128,9 +257,10 @@ async fn fixture_with_publication_policy(
         "INSERT INTO runs(id,corp_id,task_id,agent_id,runner_id,assignment_token,status,
            workspace_run_id,provider_session_id,workspace_path,workspace_branch,
            workspace_base_ref,workspace_base_commit,workspace_disposition,
-           source_repository,source_base_ref,source_base_commit,model,reasoning_effort)
-         VALUES($1,$2,$3,$4,$5,$6,'running',$1,'fixture-session','fixture-worktree',
-           'crony/fixture','main',$7,'active','fixture/source','main',$7,'fixture-model','medium')",
+           source_repository,source_base_ref,source_base_commit,model,reasoning_effort,
+           budget_tokens_limit,workspace_connection_id,budget_cost_microusd_limit)
+         VALUES($1,$2,$3,$4,$5,$6,'running',$1,$11,'fixture-worktree',
+           'crony/fixture','main',$7,'active','fixture/source','main',$7,'fixture-model','medium',$8,$9,$10)",
     )
     .bind(SOURCE)
     .bind(CORP)
@@ -139,6 +269,10 @@ async fn fixture_with_publication_policy(
     .bind(RUNNER)
     .bind(TOKEN)
     .bind("a".repeat(40))
+    .bind(profile.run_tokens)
+    .bind(profile.workspace_connection_id)
+    .bind(profile.run_cost_microusd)
+    .bind(profile.provider_session_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -147,6 +281,9 @@ async fn fixture_with_publication_policy(
         "repository_allowlist":["fixture/source"], "write_scope":["result.md"],
         "allowed_tools":["filesystem"], "prohibited_actions":["no external effects"]
     });
+    if let Some(connection_id) = profile.workspace_connection_id {
+        factory_policy["workspace_connection_id"] = json!(connection_id);
+    }
     if let Some(deliverable) = &contract.deliverable {
         factory_policy["deliverable_form"] = json!(deliverable.form.as_str());
     }
@@ -170,17 +307,37 @@ async fn fixture_with_publication_policy(
     ).bind(ITEM).bind(CORP).bind(OWNER).bind(CLAIM).bind(MISSION).bind(factory_policy)
         .execute(&pool).await.unwrap();
     let store = PgStore { pool };
+    if let Some(limits) = profile.rolling_limits {
+        store
+            .set_budget_policy(
+                CORP,
+                OWNER,
+                limits.actor_tokens,
+                limits.actor_cost_microusd,
+                limits.corp_tokens,
+                limits.corp_cost_microusd,
+                8,
+                5,
+            )
+            .await
+            .unwrap();
+    }
     store
         .apply_runner_event(event(
             SOURCE,
             TOKEN,
             "run.usage",
-            json!({"input_tokens":6000,"output_tokens":0,"cost_microusd":0}),
+            json!({"input_tokens":profile.used_tokens,"output_tokens":0,
+                "cost_microusd":profile.used_cost_microusd}),
         ))
         .await
         .unwrap();
     let breaker = store.evaluate_circuit_breaker(CORP, SOURCE).await.unwrap();
-    assert_eq!(breaker.event.unwrap().payload["stage"], "stop");
+    if let Some(event) = breaker.event {
+        assert_eq!(event.payload["stage"], profile.expected_stage);
+    } else {
+        assert_eq!(profile.expected_stage, "healthy");
+    }
     if explicit_stop {
         let stopped = store
             .request_emergency_stop(CORP, AGENT, OWNER, "Stop this assignment explicitly")
@@ -194,10 +351,47 @@ async fn fixture_with_publication_policy(
             SOURCE,
             TOKEN,
             "run.session_terminated",
-            json!({"adapter":"codex","outcome":"cancelled","provider_process_alive":false}),
+            json!({"adapter":profile.adapter,
+                "outcome":profile.native_outcome.unwrap_or(
+                    if profile.verification_failure { "completed" } else { "cancelled" }),
+                "provider_process_alive":false}),
         ))
         .await
         .unwrap();
+    if profile.verification_failure {
+        assert!(needs_artifact);
+        assert_eq!(profile.expected_stage, "healthy");
+        for (kind, payload) in [
+            ("run.verification_started", json!({})),
+            (
+                "run.verification_evidence",
+                json!({"evidence_id":Uuid::new_v4(),"check_index":0,"kind":"file",
+                    "status":"passed","summary":"Fixture source file verified","payload":{}}),
+            ),
+            (
+                "run.verification_evidence",
+                json!({"evidence_id":Uuid::new_v4(),"check_index":1,"kind":"artifact",
+                    "status":"failed","summary":"Provider artifact missing","payload":{}}),
+            ),
+            (
+                "run.verification_failed",
+                json!({"error":"Provider artifact missing"}),
+            ),
+            (
+                "run.workspace_preserved",
+                json!({"workspace":"fixture-worktree","workspace_branch":"crony/fixture",
+                    "workspace_base_ref":"main","workspace_base_commit":"a".repeat(40),
+                    "workspace_fingerprint":"b".repeat(64),"head_commit":"a".repeat(40),
+                    "detail":"Native ordinary verification-failed source"}),
+            ),
+        ] {
+            store
+                .apply_runner_event(event(SOURCE, TOKEN, kind, payload))
+                .await
+                .unwrap();
+        }
+        return store;
+    }
     let proof = StoppedSourceCheckpoint {
         schema_version: 1,
         corp_id: CORP,

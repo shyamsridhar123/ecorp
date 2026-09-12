@@ -22,15 +22,19 @@ use uuid::Uuid;
 mod budget_checkpoint;
 mod budget_revision;
 mod checkpoint_cancellation;
+mod checkpoint_correction;
 mod checkpoint_publication;
 mod checkpoint_retention;
 pub use checkpoint_cancellation::ReconcileCheckpointCancellationInput;
 mod contract_revision;
+mod factory_attempt_policy;
 mod factory_controller;
 mod factory_run_failure;
 mod mission_context;
 mod publication;
+mod retained_provider_receipt;
 mod staffing;
+pub use staffing::FactoryPlanningSource;
 mod terminal_accounting;
 mod verification_dispatch;
 mod workspace_connections;
@@ -314,6 +318,8 @@ pub struct FactoryVerificationRecoveryContext {
     pub workspace_fingerprint: Option<String>,
     pub expected_head_commit: Option<String>,
     pub checkpoint_verification: bool,
+    pub checkpoint_source_correction: bool,
+    pub checkpoint_verification_available: bool,
     pub checkpoint_cancellation_event_id: Option<Uuid>,
 }
 
@@ -2999,7 +3005,8 @@ impl PgStore {
     ) -> Result<TaskGraphPlan> {
         normalize_mission_title(&input.title)?;
         normalize_mission_description(&input.description)?;
-        normalize_factory_operation_request(input.request)?;
+        let operation_request = normalize_factory_operation_request(input.request)?;
+        factory_attempt_policy::validate_request(&input.policy, &operation_request)?;
         let constrained_plan = preflight_factory_plan(
             &input.source_repository_owner,
             &input.source_repository_name,
@@ -4436,7 +4443,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT task.attempt_count, task.max_attempts,
-                   mission.budget_tokens, mission.budget_cost_microusd,
+                   mission.budget_tokens, mission.budget_cost_microusd, mission.requested_by,
                    source.id, source.breaker_stage,
                    EXISTS (
                      SELECT 1 FROM factory_verification_recoveries recovery
@@ -4461,22 +4468,58 @@ impl PgStore {
         .context("factory recovery context source run was not found")?;
         let mut checkpoint =
             source_workspace_checkpoint_tx(&mut tx, corp_id, source_run_id).await?;
+        // A failed provider correction retains checkpoint-family ancestry, not
+        // permission to verify its old checkpoint or substitute that old HEAD.
+        let provider_correction = checkpoint.execution_mode == "provider"
+            && !matches!(
+                row.get::<String, _>("breaker_stage").as_str(),
+                "suspend" | "stop"
+            )
+            && checkpoint_correction::requires_authority_tx(&mut tx, &work_item, source_run_id)
+                .await?;
         let checkpoint_verification = matches!(
             row.get::<String, _>("breaker_stage").as_str(),
             "suspend" | "stop"
-        ) || row.get::<bool, _>("checkpoint_recovery");
+        ) || row.get::<bool, _>("checkpoint_recovery")
+            || provider_correction;
         let mut checkpoint_cancellation_event_id = None;
-        if checkpoint_verification {
-            let authority = budget_checkpoint::source_authority_tx(
+        let mut checkpoint_verification_available = checkpoint_verification && !provider_correction;
+        let mut revised_correction_authority = None;
+        if checkpoint_verification && !provider_correction {
+            let authority = match budget_checkpoint::source_authority_tx(
                 &mut tx,
                 corp_id,
                 work_item_id,
                 source_run_id,
             )
-            .await?;
-            checkpoint_cancellation_event_id =
-                checkpoint_cancellation::cancellation_event_tx(&mut tx, &work_item, source_run_id)
-                    .await?;
+            .await
+            {
+                Ok(authority) => authority,
+                Err(error) if error.downcast_ref::<sqlx::Error>().is_some() => return Err(error),
+                Err(error) => {
+                    let Some(correction) = checkpoint_correction::revised_context_authority_tx(
+                        &mut tx,
+                        &work_item,
+                        source_run_id,
+                    )
+                    .await?
+                    else {
+                        return Err(error);
+                    };
+                    checkpoint_verification_available = false;
+                    let authority = correction.checkpoint.clone();
+                    revised_correction_authority = Some(correction);
+                    authority
+                }
+            };
+            if checkpoint_verification_available {
+                checkpoint_cancellation_event_id = checkpoint_cancellation::cancellation_event_tx(
+                    &mut tx,
+                    &work_item,
+                    source_run_id,
+                )
+                .await?;
+            }
             // A retry may have already exported its authorized verification
             // commit. Preserve that bound head; the provider origin remains
             // immutable authority, not the verifier's current checkout head.
@@ -4485,10 +4528,36 @@ impl PgStore {
             }
         } else {
             checkpoint.ensure_factory_terminal()?;
+            if provider_correction {
+                revised_correction_authority = checkpoint_correction::revised_context_authority_tx(
+                    &mut tx,
+                    &work_item,
+                    source_run_id,
+                )
+                .await?;
+            }
         }
         checkpoint.ensure_preserved()?;
         let (mission_tokens_used, mission_cost_used) =
             budget_revision::mission_usage_tx(&mut tx, corp_id, mission_id).await?;
+        let rolling =
+            rolling_budget_remaining_tx(&mut tx, corp_id, row.get("requested_by")).await?;
+        let checkpoint_source_correction = row.get::<i32, _>("attempt_count")
+            < row.get::<i32, _>("max_attempts")
+            && mission_tokens_used < row.get::<i64, _>("budget_tokens")
+            && mission_cost_used < row.get::<i64, _>("budget_cost_microusd")
+            && rolling.actor_tokens > 0
+            && rolling.actor_cost_microusd > 0
+            && rolling.corp_tokens > 0
+            && rolling.corp_cost_microusd > 0
+            && checkpoint_correction::context_eligible_tx(
+                &mut tx,
+                &work_item,
+                source_run_id,
+                viewer_actor_id,
+                revised_correction_authority.as_ref(),
+            )
+            .await?;
         let context = FactoryVerificationRecoveryContext {
             work_item,
             recoveries,
@@ -4506,6 +4575,8 @@ impl PgStore {
             workspace_fingerprint: checkpoint.fingerprint,
             expected_head_commit: checkpoint.expected_head_commit,
             checkpoint_verification,
+            checkpoint_source_correction,
+            checkpoint_verification_available,
             checkpoint_cancellation_event_id,
         };
         tx.commit().await?;
@@ -4640,6 +4711,7 @@ impl PgStore {
                     .context("idempotent factory recovery references a missing work item")?;
             let launch =
                 factory_verification_recovery_launch_tx(&mut tx, &recovery, &reason).await?;
+            checkpoint_correction::replay_authority_tx(&mut tx, &recovery).await?;
             tx.commit().await?;
             return Ok(FactoryVerificationRecoveryOutcome {
                 recovery,
@@ -4857,11 +4929,42 @@ impl PgStore {
             ));
         }
         let lineage = workspace_lineage_tx(&mut tx, input.corp_id, workspace_run_id).await?;
+        let source_correction_authority = if input.mode
+            == FactoryVerificationRecoveryMode::SourceCorrection
+            && (lineage
+                .iter()
+                .any(|candidate| candidate.get::<String, _>("breaker_stage") == "suspend")
+                || checkpoint_correction::requires_authority_tx(
+                    &mut tx,
+                    &work_item,
+                    input.source_run_id,
+                )
+                .await?)
+        {
+            Some(
+                checkpoint_correction::admit_tx(
+                    &mut tx,
+                    &work_item,
+                    input.source_run_id,
+                    input.contract_revision_id,
+                    input.actor_id,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         if lineage.iter().any(|candidate| {
             (matches!(
                 candidate.get::<String, _>("breaker_stage").as_str(),
                 "suspend" | "stop"
-            ) && !checkpoint_verification)
+            ) && !checkpoint_verification
+                && !source_correction_authority
+                    .as_ref()
+                    .is_some_and(|authority| {
+                        candidate.get::<Uuid, _>("id") == authority.checkpoint.checkpoint.run_id
+                            && candidate.get::<String, _>("breaker_stage") == "suspend"
+                    }))
                 || candidate
                     .get::<Option<String>, _>("workspace_disposition")
                     .as_deref()
@@ -5022,6 +5125,24 @@ impl PgStore {
         let recovery_id = Uuid::new_v4();
         let command_id = Uuid::new_v4();
         let assignment_token = Uuid::new_v4();
+        let retained_receipt = if let Some(authority) = &checkpoint_authority {
+            retained_provider_receipt::derive_tx(
+                &mut tx,
+                retained_provider_receipt::Admission {
+                    item: &work_item,
+                    authority,
+                    source_run_id: input.source_run_id,
+                    run_id,
+                    command_id,
+                    actor_id: input.actor_id,
+                    fingerprint: &input.expected_workspace_fingerprint,
+                    head: input.expected_head_commit.as_deref(),
+                },
+            )
+            .await?
+        } else {
+            None
+        };
         let execution_mode = if input.mode.is_verifier_only() {
             "verification_only"
         } else {
@@ -5155,11 +5276,11 @@ impl PgStore {
                 reason, idempotency_key, observed_source_revision,
                 reviewed_source_snapshot, contract_revision_id,
                 previous_verification_policy, replacement_verification_policy, request,
-                checkpoint_authority
+                checkpoint_authority, source_correction_authority
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, $11,
-                $12, $13, $14, $15, $16, $17, $18
+                $12, $13, $14, $15, $16, $17, $18, $19
             )
             "#,
         )
@@ -5182,6 +5303,12 @@ impl PgStore {
         .bind(&request)
         .bind(
             checkpoint_authority
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
+        .bind(
+            source_correction_authority
                 .as_ref()
                 .map(serde_json::to_value)
                 .transpose()?,
@@ -5238,7 +5365,7 @@ impl PgStore {
         } else {
             Vec::new()
         };
-        let command_payload = json!({
+        let mut command_payload = json!({
             "mode": input.mode,
             "corp_id": input.corp_id,
             "room_id": room_id,
@@ -5267,6 +5394,9 @@ impl PgStore {
             "secret_refs": command_secret_refs,
             "provider_artifact": provider_artifact,
         });
+        if let Some(receipt) = retained_receipt {
+            command_payload["retained_provider_receipt"] = serde_json::to_value(receipt)?;
+        }
         sqlx::query(
             r#"
             INSERT INTO runner_commands
@@ -5305,6 +5435,8 @@ impl PgStore {
                         "mode": input.mode,
                         "observed_source_revision": observed_source_revision,
                         "contract_revision_id": input.contract_revision_id,
+                        "source_correction_origin_run_id": source_correction_authority
+                            .as_ref().map(|authority| authority.checkpoint.checkpoint.run_id),
                         "reason": reason,
                     }),
                 )
@@ -5648,6 +5780,7 @@ impl PgStore {
             factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
                 .await?
                 .context("idempotent factory materialization references a missing work item")?;
+        factory_attempt_policy::validate_request(&work_item.policy, &operation_request)?;
         let mission_id = work_item
             .mission_id
             .context("idempotent factory materialization has no mission linkage")?;
@@ -5703,6 +5836,7 @@ impl PgStore {
                 factory_work_item_tx(&mut tx, input.corp_id, input.work_item_id, false)
                     .await?
                     .context("idempotent factory materialization references a missing work item")?;
+            factory_attempt_policy::validate_request(&work_item.policy, &operation_request)?;
             let mission_id = work_item
                 .mission_id
                 .context("idempotent factory materialization has no mission linkage")?;
@@ -5732,6 +5866,7 @@ impl PgStore {
             now,
         )?;
         let mut constrained_plan = plan.clone();
+        factory_attempt_policy::validate_request(&current.policy, &operation_request)?;
         apply_factory_source_constraints(&current, &mut constrained_plan)?;
         validate_factory_plan_against_policy(&current, &constrained_plan)?;
 
@@ -7038,32 +7173,21 @@ impl PgStore {
         artifact: StoredArtifact,
         staging_key: &str,
     ) -> Result<PreparedArtifactUpload> {
-        let RunnerEventInput {
-            event_id,
-            runner_id,
-            corp_id,
-            connection_epoch: _,
-            run_id,
-            agent_id,
-            assignment_token,
-            event_type,
-            ..
-        } = input;
-        let expected_role = match event_type.as_str() {
+        let expected_role = match input.event_type.as_str() {
             "run.artifact_upload" => "provider_evidence",
             "run.deliverable_upload" => "source_deliverable",
             _ => return Err(anyhow!("unsupported artifact upload event")),
         };
         if artifact.artifact_role != expected_role
-            || artifact.id != event_id
-            || artifact.corp_id != corp_id
-            || artifact.run_id != run_id
-            || artifact.producer_agent_id != agent_id
-            || artifact.producer_runner_id != runner_id
+            || artifact.id != input.event_id
+            || artifact.corp_id != input.corp_id
+            || artifact.run_id != input.run_id
+            || artifact.producer_agent_id != input.agent_id
+            || artifact.producer_runner_id != input.runner_id
         {
             return Err(anyhow!("artifact metadata does not match the runner event"));
         }
-        let expected_staging_key = format!("staging/corps/{corp_id}/{event_id}");
+        let expected_staging_key = format!("staging/corps/{}/{}", input.corp_id, input.event_id);
         if staging_key != expected_staging_key {
             return Err(anyhow!(
                 "artifact staging key does not match the runner event"
@@ -7071,6 +7195,16 @@ impl PgStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        let retained_upload =
+            retained_provider_receipt::prepare_tx(&mut tx, &input, &artifact).await?;
+        let RunnerEventInput {
+            runner_id,
+            corp_id,
+            run_id,
+            agent_id,
+            assignment_token,
+            ..
+        } = input;
         let row = sqlx::query(
             r#"
             SELECT r.task_id, r.breaker_stage, t.mission_id, m.room_id
@@ -7119,6 +7253,10 @@ impl PgStore {
         if let Some(row) = existing_by_id {
             let prepared = map_prepared_artifact(row)?;
             ensure_artifact_upload_matches(&prepared.artifact, &artifact, true)?;
+            if retained_upload {
+                retained_provider_receipt::validate_artifact_tx(&mut tx, &prepared.artifact, false)
+                    .await?;
+            }
             tx.commit().await?;
             return Ok(prepared);
         }
@@ -7143,6 +7281,10 @@ impl PgStore {
         if let Some(row) = existing_by_digest {
             let prepared = map_prepared_artifact(row)?;
             ensure_artifact_upload_matches(&prepared.artifact, &artifact, false)?;
+            if retained_upload {
+                retained_provider_receipt::validate_artifact_tx(&mut tx, &prepared.artifact, false)
+                    .await?;
+            }
             tx.commit().await?;
             return Ok(prepared);
         }
@@ -7193,13 +7335,33 @@ impl PgStore {
         artifact_id: Uuid,
     ) -> Result<Option<DomainEvent>> {
         let mut tx = self.pool.begin().await?;
-        let run_id: Uuid =
-            sqlx::query_scalar("SELECT run_id FROM artifacts WHERE id = $1 AND corp_id = $2")
-                .bind(artifact_id)
-                .bind(corp_id)
-                .fetch_one(&mut *tx)
-                .await
-                .context("staged artifact not found")?;
+        let scope = sqlx::query(
+            "SELECT run_id,artifact_role,metadata FROM artifacts WHERE id=$1 AND corp_id=$2",
+        )
+        .bind(artifact_id)
+        .bind(corp_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("staged artifact not found")?;
+        let run_id: Uuid = scope.get("run_id");
+        // Collector gates precede the existing run/task/mission/artifact rows.
+        let retained_upload = match retained_provider_receipt::fence_artifact_tx(
+            &mut tx,
+            corp_id,
+            run_id,
+            &scope.get::<String, _>("artifact_role"),
+            &scope.get::<Value, _>("metadata"),
+        )
+        .await
+        {
+            Ok(retained) => retained,
+            Err(error) if retained_provider_receipt::database_error(&error) => return Err(error),
+            Err(error) => {
+                retained_provider_receipt::reject_tx(&mut tx, corp_id, artifact_id, &error).await?;
+                tx.commit().await?;
+                return Err(error);
+            }
+        };
         sqlx::query("SELECT id FROM runs WHERE id = $1 AND corp_id = $2 FOR UPDATE")
             .bind(run_id)
             .bind(corp_id)
@@ -7232,11 +7394,7 @@ impl PgStore {
         .await
         .context("staged artifact not found")?;
         let status: String = row.get("status");
-        if status == "ready" {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        if status != "staged" {
+        if !matches!(status.as_str(), "staged" | "ready") {
             return Err(anyhow!("artifact cannot finalize from status {status}"));
         }
         let run_status: String = row.get("run_status");
@@ -7244,6 +7402,27 @@ impl PgStore {
         let mission_id: Uuid = row.get("mission_id");
         let room_id: Uuid = row.get("room_id");
         let artifact = map_stored_artifact(row);
+        let authority = if retained_upload {
+            retained_provider_receipt::validate_artifact_tx(&mut tx, &artifact, false).await
+        } else if artifact.metadata.get("retained_provider_receipt").is_some() {
+            Err(anyhow!(
+                "retained provider receipt artifact scope changed before finalization"
+            ))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = authority {
+            if retained_provider_receipt::database_error(&error) {
+                return Err(error);
+            }
+            retained_provider_receipt::reject_tx(&mut tx, corp_id, artifact_id, &error).await?;
+            tx.commit().await?;
+            return Err(error);
+        }
+        if status == "ready" {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let ready_event_type = if artifact.artifact_role == "source_deliverable" {
             "run.deliverable"
         } else {
@@ -11677,6 +11856,7 @@ fn validate_factory_plan_against_policy_parts(
     policy: &Value,
     plan: &TaskGraphPlan,
 ) -> Result<()> {
+    factory_attempt_policy::validate_plan(policy, plan)?;
     let connection_id = factory_workspace_connection_id(policy).map_err(anyhow::Error::msg)?;
     if let Some(task) = plan
         .tasks
@@ -12139,6 +12319,7 @@ fn normalize_factory_policy(policy: Value) -> Result<Value> {
         _ => return Err(anyhow!("factory policy snapshot must be a JSON object")),
     };
     let connection_id = factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
+    crony_domain::factory_max_task_attempts(&policy).map_err(anyhow::Error::msg)?;
     let policy_object = policy
         .as_object_mut()
         .context("factory policy snapshot must be a JSON object")?;
@@ -12243,6 +12424,7 @@ fn normalize_factory_operation_request(request: Value) -> Result<Value> {
             "factory operation request snapshot must be a JSON object"
         ));
     }
+    crony_domain::factory_max_task_attempts(&request).map_err(anyhow::Error::msg)?;
     if serde_json::to_vec(&request)?.len() > 65_536 {
         return Err(anyhow!(
             "factory operation request snapshot cannot exceed 65536 bytes"
@@ -16724,6 +16906,41 @@ mod tests {
             }],
         };
         (work_item, plan)
+    }
+
+    #[test]
+    fn issue224_factory_plan_preserves_legacy_and_explicit_attempt_limits() {
+        let (mut item, mut plan) = factory_policy_plan(None, None);
+        for attempts in 1..=2 {
+            plan.tasks[0].max_attempts = attempts;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+        }
+        plan.tasks[0].max_attempts = 3;
+        assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        for attempts in 1..=crony_domain::MAX_TASK_ATTEMPTS {
+            item.policy["max_task_attempts"] = json!(attempts);
+            plan.tasks[0].max_attempts = attempts;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_ok());
+            plan.tasks[0].max_attempts = attempts % 3 + 1;
+            assert!(validate_factory_plan_against_policy(&item, &plan).is_err());
+        }
+    }
+
+    #[test]
+    fn issue224_factory_policy_rejects_invalid_attempts_before_claiming() {
+        let (item, _) = factory_policy_plan(None, None);
+        let original = item.policy;
+        assert!(
+            normalize_factory_policy(original.clone())
+                .unwrap()
+                .get("max_task_attempts")
+                .is_none()
+        );
+        for value in [json!(0), json!(-1), json!(4), json!("3"), json!(3.0)] {
+            let mut policy = original.clone();
+            policy["max_task_attempts"] = value;
+            assert!(normalize_factory_policy(policy).is_err());
+        }
     }
 
     #[test]

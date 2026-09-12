@@ -1,46 +1,22 @@
-import { useEffect, useMemo, useState } from 'react'
-import {
-  currentMissionOrigin, missionOriginScope, startMissionOriginRead,
-} from './missionOriginContext'
+import { useMissionOriginContext } from './useMissionOriginContext'
+import type { MissionOriginRequest } from './useMissionOriginContext'
 import type {
-  MissionOriginApi, MissionOriginFallback, MissionOriginLoad,
+  MissionOriginFallback, MissionOriginLoad,
 } from './missionOriginContext'
 
-export type MissionOriginDetailsProps = {
-  corpId: string | null | undefined
-  actorId: string | null | undefined
-  missionId: string | null | undefined
-  roomId: string | null | undefined
-  actorRole: string
-  api: MissionOriginApi
+export type MissionOriginDetailsProps = MissionOriginRequest & {
   fallback: MissionOriginFallback
 }
 
-/** Replaces the origin paragraph inside the existing .mission-work-context container. */
-export function MissionOriginDetails({
-  corpId, actorId, missionId, roomId, actorRole, api, fallback,
-}: MissionOriginDetailsProps) {
-  const request = useMemo(() => {
-    // This is a UI guard only. The endpoint enforces human identity and current
-    // mission-room membership through the existing Operate authorization.
-    if (!['owner', 'admin', 'manager', 'member'].includes(actorRole)) return null
-    try {
-      return { scope: missionOriginScope(corpId, actorId, missionId, roomId), api }
-    } catch {
-      return null
-    }
-  }, [corpId, actorId, missionId, roomId, actorRole, api])
-  const [load, setLoad] = useState<MissionOriginLoad | null>(null)
-  useEffect(() => {
-    if (!request) return
-    return startMissionOriginRead(request.scope, request.api, setLoad)
-  }, [request])
-
-  // Object identity fences even the render before effect cleanup, and a reopened
-  // view with identical IDs. Snapshot refreshes alone neither cache nor retry a read.
-  const current = currentMissionOrigin(request?.scope ?? null, load)
+export function MissionOriginText({
+  current, pending, fallback, onRefresh,
+}: {
+  current: MissionOriginLoad | null
+  pending: boolean
+  fallback: MissionOriginFallback
+  onRefresh?: () => void
+}) {
   const origin = current?.status === 'ready' ? current.context.origin : null
-  const pending = Boolean(request && (!current || current.status === 'pending'))
   const label = origin?.kind === 'direct'
     ? 'Direct mission'
     : origin?.kind === 'factory' ? `From GitHub issue #${origin.source_issue_number}` : fallback.label
@@ -63,6 +39,15 @@ export function MissionOriginDetails({
       {detail}
       {pending ? ' Checking mission context.' : null}
       {current?.status === 'unavailable' ? ' Exact mission context could not be loaded.' : null}
+      {current?.status === 'unavailable' && onRefresh ? (
+        <> <button type="button" className="button button-secondary context-retry" onClick={onRefresh}>Refresh work context</button></>
+      ) : null}
     </p>
   )
+}
+
+/** Standalone origin paragraph; the cockpit also reuses its scoped hook. */
+export function MissionOriginDetails(props: MissionOriginDetailsProps) {
+  const { current, pending, refresh } = useMissionOriginContext(props)
+  return MissionOriginText({ current, pending, fallback: props.fallback, onRefresh: refresh })
 }

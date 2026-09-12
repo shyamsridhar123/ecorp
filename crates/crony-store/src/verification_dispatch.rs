@@ -35,6 +35,11 @@ impl PgStore {
         if !verification_command_identity_matches(command) {
             return Ok(false);
         }
+        if retained_provider_receipt::has_collection(&command.payload) {
+            return self
+                .retained_provider_receipt_dispatch_authorized(command)
+                .await;
+        }
         Ok(sqlx::query_scalar(
             r#"
             SELECT EXISTS (

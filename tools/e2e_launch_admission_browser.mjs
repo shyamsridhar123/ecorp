@@ -10,7 +10,7 @@ assert.equal(process.env.CRONY_ADMISSION_TEST, '1')
 assert.deepEqual(process.argv.slice(2, 3), ['--phase'])
 assert.equal(process.argv.length, 4)
 const phase = process.argv[3]
-assert.ok(['prepare', 'release'].includes(phase))
+assert.ok(['prepare', 'resume-prepare', 'release'].includes(phase))
 assert.ok(process.env.CRONY_ADMISSION_OUTPUT)
 function ownedOrigin(value, forbidden) {
   assert.ok(value, 'Explicit QA URL required')
@@ -95,7 +95,8 @@ if (phase === 'prepare') {
   }
 } else {
   checkpoint = JSON.parse(await readFile(checkpointPath, 'utf8'))
-  assert.equal(checkpoint.phase, 'prepared', 'Release only the existing prepared mission')
+  assert.equal(checkpoint.phase, phase === 'resume-prepare' ? 'created' : 'prepared',
+    'Continue only the exact existing mission at its recorded phase')
   assert.equal(checkpoint.server, server)
   assert.equal(checkpoint.web, web)
   assert.equal(checkpoint.corp_id, demo.corp_id)
@@ -140,7 +141,12 @@ try {
     checkpoint.phase = 'created'
     checkpoint.authority = authority(view(await snapshot(), checkpoint.mission_id))
     await save()
-    await page.locator(`[data-mission-id="${checkpoint.mission_id}"]`).getByText('Awaiting dispatch', { exact: true }).waitFor()
+  } else if (phase === 'resume-prepare') {
+    await page.getByRole('button').filter({ hasText: checkpoint.title }).click()
+  }
+  if (phase !== 'release') {
+    await page.locator(`[data-mission-id="${checkpoint.mission_id}"]`)
+      .locator('.status-chip-ready').filter({ hasText: 'Awaiting dispatch' }).waitFor()
     await assertHeld()
     await page.screenshot({ path: path.join(output, 'browser-held-before-restart.png'), fullPage: true })
     // Close the client before triggering unrelated work. The server must enforce the hold.
@@ -157,7 +163,7 @@ try {
   } else {
     await page.getByRole('button').filter({ hasText: checkpoint.title }).click()
     const card = page.locator(`[data-mission-id="${checkpoint.mission_id}"]`)
-    await card.getByText('Awaiting dispatch', { exact: true }).waitFor()
+    await card.locator('.status-chip-ready').filter({ hasText: 'Awaiting dispatch' }).waitFor()
     await page.screenshot({ path: path.join(output, 'browser-held-after-restart.png'), fullPage: true })
     await page.setViewportSize({ width: 390, height: 844 })
     const size = await page.evaluate(() => ({ width: innerWidth, content: document.documentElement.scrollWidth }))
@@ -166,7 +172,7 @@ try {
     await page.screenshot({ path: path.join(output, 'browser-held-mobile.png'), fullPage: true })
     const responsePromise = page.waitForResponse((response) =>
       response.url() === `${server}${api(`/missions/${checkpoint.mission_id}/launch`)}` && response.request().method() === 'POST')
-    await card.getByRole('button', { name: 'Dispatch mission', exact: true }).click()
+    await card.getByTestId('work-result-card').getByRole('button', { name: 'Start mission', exact: true }).click()
     const response = await responsePromise
     assert.equal(response.status(), 200)
     checkpoint.launch = await response.json()

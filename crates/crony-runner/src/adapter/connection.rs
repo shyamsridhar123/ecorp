@@ -10,6 +10,8 @@ mod process;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+use std::path::Path;
 use std::{
     path::PathBuf,
     sync::{
@@ -446,5 +448,20 @@ impl AgentAdapter for ProfileAdapter {
         session_id: &str,
     ) -> std::result::Result<UsageSnapshot, AdapterError> {
         self.0.inner_adapter().collect_usage(session_id).await
+    }
+
+    #[cfg(test)]
+    async fn collect_stopped_session_evidence(
+        &self,
+        workspace: &Path,
+        session_id: &str,
+        expected_account_sha256: &str,
+        read: super::StoppedSessionRead,
+    ) -> std::result::Result<serde_json::Value, AdapterError> {
+        self.0.scope.validate_workspace(workspace)?;
+        self.0
+            .inner_adapter()
+            .collect_stopped_session_evidence(workspace, session_id, expected_account_sha256, read)
+            .await
     }
 }

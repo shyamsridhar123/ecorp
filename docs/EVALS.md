@@ -71,6 +71,57 @@ Run only the explicitly owned `issue206_` SQLx lane for those cases; ordinary wo
 leave it ignored. A successful reconciliation is not application verification, review or
 publication, and a missing required artifact must still fail its persisted check.
 
+## Source correction after checkpoint verification
+
+The [#210 source-correction report](evidence/2026-09-09-checkpoint-source-correction.md)
+separates the reproduced native admission failure, actual-store regression checks,
+browser reproductions in the retained application, and final runtime acceptance.
+Its `issue210_` SQLx family uses only the approved disposable maintenance fixture;
+it must not be run against the application database. A source-only check or an
+admitted correction does not establish artifact creation, successful browser
+behavior, authorized outcome review or publication.
+
+## Planned task attempts and correction retry
+
+The [planned-attempt policy report](evidence/2026-09-10-planned-attempt-policy.md)
+records the prospective public option, 35 initial focused unit cases, three
+initial actual-store SQLx cases, and the later native-seal compatibility fix.
+That follow-up adds two pure guard cases and three actual-store regressions;
+its serial workspace gate passes 540 tests with 323 intentionally ignored.
+`tools/e2e_planned_attempts.mjs` describes the native public 1 -> 1 -> 2 -> 3
+sequence with unchanged checks, retained history and independent review.
+The September 12 [stack acceptance](evidence/2026-09-12-pr-stack-acceptance.md)
+completes the patched native sequence, unchanged checks, independent development
+review and Factory verification. It also passes 122 actual-migration SQLx cases,
+two-runner retention/replay and a separately preauthorized native publication
+through isolated local Git and the fake-GitHub boundary. The original failed
+diagnostic runs remain retained. The optional test-context publication policy
+is declared before claim; the default case still grants no publication authority.
+Vendor inference, production identity and real GitHub publication remain separate
+from this deterministic protocol-fixture acceptance.
+
+The [correction-retry report](evidence/2026-09-10-checkpoint-correction-retry.md)
+records eleven new actual-store cases, four exact compatibility controls, CLI/UI checks
+and ordinary native/browser regression. Its initial three-attempt fixture is not proof
+of public planning reachability: #224 remains required for complete public repeated-correction
+acceptance. Earlier failed runs are retained and ignored tests are not counted as passes.
+
+## Stopped-session native evidence compatibility
+
+The [#211 native-read report](evidence/2026-09-09-stopped-session-native-read.md)
+retains two real, separately selected missing-session failures for SDK 1.0.11 /
+CLI 1.0.79. The bounded reader and probe remain test-only, not a working
+production collector. Eleven pure/wire tests pass; real stopped-history
+retrieval, checkpoint artifact adoption, and application publication remain
+unproven. The established serial workspace gate passes, while the separately
+retained parallel runner failures are tracked in #213.
+
+The later [retained-receipt collection contract](evidence/2026-09-09-retained-provider-receipt.md)
+describes a separate in-progress path for an existing historical adapter
+receipt in the sealed worktree. It does not change either native-read failure.
+New collection code and fixtures are not application acceptance; current
+checks, signed-object validation, and independent outcome review remain required.
+
 ## First vertical-slice scenario
 
 1. Start Postgres, server, runner, and web client.
@@ -269,9 +320,13 @@ interrupt, emergency stop, usage persistence, run ancestry, and artifact hash ve
 and linked worktrees are distinct, verifies the configured checkout's HEAD and working state do not
 change, confirms dirty work is preserved, and confirms a clean evidence-only run removes both its
 worktree and branch.
-`tools/e2e_task_graph.mjs` validates a three-node graph with two parallel specialist roots and a
-dependency-gated synthesis task. The synthesis artifact must contain both verified specialist
-outputs, not merely their task names. The same test proves an always-failing task stops exactly at
+`tools/e2e_task_graph.mjs` validates a source-selected three-node graph with native
+mission-owned staffing, two parallel specialist roots and dependency-gated synthesis.
+It binds every task to the runner's advertised immutable source and chosen fixture
+runtime, without depending on an unavailable agent in the legacy demo roster.
+The synthesis artifact must contain both verified specialist outputs, not merely
+their task names. Windows additionally retains the original mixed-provider
+demo-roster case. The same test proves an always-failing task stops exactly at
 its retry limit.
 `tools/e2e_verification.mjs` proves all six automated verifier types, a missing-file failure that
 blocks completion, an owner approval gate, and an independent-review gate that rejects the
@@ -368,9 +423,18 @@ artifact, produced no completion or retry, removed the clean worktree, and rende
 failed state in desktop and mobile Chromium. See
 `docs/evidence/2026-09-02-real-provider-budget-stop.md`.
 
-The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
-through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
-completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
+On a Windows runner, `tools/e2e_external_adapters.mjs` runs one common sample
+through Claude Code and OpenCode normalization, verifying session, usage, signed
+artifact, and completion evidence. Linux/macOS instead must return the native
+unavailable-adapter denial without persisting a run or execution journal.
+The driver reads the connected fixture runner's OS; an optional
+`CRONY_TEST_RUNNER_PLATFORM` expectation must match it and cannot select a weaker
+test mode. The fixture requires exactly one connected runner.
+`node --test tools/e2e_external_adapters.test.mjs` checks the driver with synthetic
+HTTP responses, including wrong-platform, false-success, unrelated-denial, and
+child-cleanup negatives; it does not replace native integration acceptance.
+See `docs/evidence/2026-08-30-external-adapter-validation.md` and
+`docs/evidence/2026-09-12-pr234-platform-contract.md`.
 
 The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
 stream JSON. It verifies manual permission mode, the initialize response before the typed initial
@@ -670,7 +734,11 @@ S3-compatible backend. See `docs/evidence/2026-08-30-artifact-storage-validation
 
 `tools/e2e_artifact_staging.mjs` holds the run row, applies a hard breaker, and proves authoritative
 rejection occurs before staging while an accepted artifact with the same digest remains
-downloadable. It injects a Postgres reservation failure and proves no object bytes are written, then
+downloadable. Its controlled runner uses a unique fixture routing model and the
+actual immutable source tuple. A read-only source-selected mission preview must
+confirm dispatch readiness before creating work; registration alone is not
+readiness, and the ordinary runner must not receive the controlled assignment.
+It injects a Postgres reservation failure and proves no object bytes are written, then
 injects a metadata-finalization failure after both staged and final bytes exist and proves restart
 recovery completes the commit. The same recovery pass finalizes staged metadata, rejects an old row
 whose bytes fail validation, releases an old reservation whose staged and final objects are both

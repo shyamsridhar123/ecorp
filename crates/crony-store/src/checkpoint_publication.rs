@@ -3,8 +3,41 @@ use super::*;
 
 #[derive(Debug)]
 pub(super) struct CheckpointPublication {
-    pub origin_run_id: Uuid,
-    pub provenance: Value,
+    corp_id: Uuid,
+    item_id: Uuid,
+    selected_run_id: Uuid,
+    authority: budget_checkpoint::Authority,
+    provenance: Value,
+}
+
+impl CheckpointPublication {
+    pub(super) fn origin_run_id(&self) -> Uuid {
+        self.authority.checkpoint.run_id
+    }
+
+    pub(super) fn provenance(&self) -> &Value {
+        &self.provenance
+    }
+
+    /// This receipt is constructed only by current native validation below and
+    /// consumed in the same locked publication transaction. It is not a DTO.
+    pub(super) fn authority_for(
+        &self,
+        item: &FactoryWorkItem,
+        selected_run_id: Uuid,
+    ) -> Result<&budget_checkpoint::Authority> {
+        if self.corp_id != item.corp_id
+            || self.item_id != item.id
+            || self.selected_run_id != selected_run_id
+            || self.authority.checkpoint.corp_id != item.corp_id
+            || Some(self.authority.checkpoint.mission_id) != item.mission_id
+        {
+            return Err(anyhow!(
+                "publication checkpoint receipt belongs to another scope"
+            ));
+        }
+        Ok(&self.authority)
+    }
 }
 
 pub(super) async fn authority_tx(
@@ -84,7 +117,9 @@ pub(super) async fn authority_tx(
         ));
     }
     Ok(Some(CheckpointPublication {
-        origin_run_id: authority.checkpoint.run_id,
+        corp_id,
+        item_id,
+        selected_run_id: run_id,
         provenance: json!({
             "schema_version":1,
             "recovery_id":row.get::<Uuid, _>("id"),
@@ -99,6 +134,7 @@ pub(super) async fn authority_tx(
             "authority_sha256":hex::encode(Sha256::digest(serde_json::to_vec(&authority)?)),
             "execution_mode":"verification_only",
         }),
+        authority,
     }))
 }
 
