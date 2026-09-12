@@ -69,6 +69,7 @@ $preview = [ordered]@{
         'Start receipt-owned native server and runner using the existing local_stack.psm1 helpers.',
         'Execute Claude Code and OpenCode through deterministic protocol fixtures, never real accounts.',
         'Verify signed artifact download, session, usage and provider termination before completion.',
+        'Verify the original mixed Codex/Claude parallel graph, dependency artifacts and bounded retries.',
         'Stop only owned fixture processes and preserve all data, worktrees and evidence.'
     )
     services_started = $false
@@ -273,7 +274,7 @@ try {
         '--fake-agent-script', (Join-Path $repo 'scripts/fake-agent.mjs'),
         '--claude-command', $node, '--claude-command-arg', (Join-Path $repo 'scripts/fake-external-agent.mjs'),
         '--opencode-command', $node, '--opencode-command-arg', (Join-Path $repo 'scripts/fake-external-agent.mjs'),
-        '--codex-command', (Join-Path $private 'disabled-codex.exe'),
+        '--codex-command', $node, '--codex-command-arg', (Join-Path $repo 'scripts/fake-codex-app-server.mjs'),
         '--copilot-cli-path', (Join-Path $private 'disabled-copilot.exe'), '--copilot-home', (Join-Path $private 'copilot-home'),
         '--connections-directory', (Join-Path $private 'connections'), '--github-command', (Join-Path $private 'disabled-gh.exe')
     )
@@ -294,6 +295,15 @@ try {
     $testEnv.CRONY_EXTERNAL_ADAPTER_TEST = '1'; $testEnv.CRONY_SERVER_HTTP = $api
     $testEnv.CRONY_EXTERNAL_ADAPTER_OUTPUT = Join-Path $evidence 'e2e-external-adapters.json'
     Invoke-FixtureCommand 'contract' $node @((Join-Path $repo 'tools/e2e_external_adapters.mjs'), '--expect-windows') $testEnv 180 | Out-Null
+    $graphEnv = $childEnv.Clone()
+    $graphEnv.CRONY_TASK_GRAPH_TEST = '1'; $graphEnv.CRONY_SERVER_HTTP = $api
+    $graphEnv.CRONY_TASK_GRAPH_OUTPUT = Join-Path $evidence 'e2e-task-graph.json'
+    Invoke-FixtureCommand 'task-graph' $node @((Join-Path $repo 'tools/e2e_task_graph.mjs')) $graphEnv 180 | Out-Null
+    $graphReport = Get-Content -LiteralPath $graphEnv.CRONY_TASK_GRAPH_OUTPUT -Raw | ConvertFrom-Json
+    if (@(Compare-Object @('claude-code', 'codex') @($graphReport.parallel_graph.root_adapters)).Count) {
+        throw 'The Windows graph did not preserve mixed Codex/Claude adapter coverage.'
+    }
+    $report.cross_provider_graph = 'passed'
     $after = Invoke-FixtureCommand 'source-after' $git @('-C', $source, 'rev-parse', 'HEAD')
     $status = Invoke-FixtureCommand 'source-status' $git @('-C', $source, 'status', '--porcelain')
     if ($after -ne $report.fixture_source_commit -or $status) { throw 'The fixture source checkout changed.' }

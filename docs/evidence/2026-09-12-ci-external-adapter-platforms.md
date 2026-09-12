@@ -148,13 +148,76 @@ processes; neither test port remained listening. All 14 contract regressions
 passed again. This does not itself prove the elevated hosted-image case; the
 replacement hosted run remains the next gate.
 
+## Task-graph fixture follow-up
+
+Hosted run `34679761001` on `942720191574dc84c32ed582c5dc494f582a167d`
+passed quality, all three runner-platform jobs, Windows desktop, and the Windows
+external-adapter job. Its Unix external-adapter refusal step also passed.
+Integration then failed in the unchanged bounded task-graph fixture: the demo
+roster selected Codex and Claude on Linux, where Claude is intentionally unavailable.
+Changing only the preferred adapter cannot fix that roster: the planner swaps
+the preferred worker into slot zero and retains Claude in slot one.
+
+The approved follow-up changes only CI fixtures and this evidence record:
+
+- Linux prepares the two Windows-only demo agents as offline **before creating
+  any mission**. The helper requires the explicit Actions `integration` job,
+  Linux runner, fixed synthetic demo Corp, no mission/task/run history, and an
+  exact running `postgres:17-alpine` service-container identity. A bounded
+  serializable transaction rechecks history and idle/offline, non-retired,
+  run-free agents, scoped to the exact Corp and agent ID/adapter pairs.
+  Repeated preparation is idempotent; dry-run performs no database operation.
+- This is initial test-data preparation, not a production planner capability
+  fix or permission to rewrite a real factory roster. No production planner,
+  adapter, security guard, or migration is changed.
+- Linux retains the original three-node graph, two distinct adapters (Codex and
+  fake-process), two concurrent roots, separate worktrees, dependency ordering,
+  verified specialist artifacts, and bounded retry assertions. Planned adapters
+  must also be advertised available before launch.
+- Windows additionally executes the original Codex/Claude graph on the unaltered
+  demo roster, using the existing deterministic Codex app-server fixture. Its
+  supervisor explicitly asserts the two root adapter names. The provider paths
+  remain synthetic, with real GitHub/provider access disabled.
+- Both graph entry points now require an explicit owned endpoint and test opt-in.
+  Manual-stack ports are rejected outside Actions. The fixture supports a pure
+  `--dry-run`; the report records the roster preparation and actual root adapters.
+
+Validation on parent `9427201` plus this follow-up:
+
+- `node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs`:
+  29 passed, zero skipped. Cases include ownership/container/platform guards,
+  history and busy-agent refusal, exact SQL scope, no-effect previews, subprocess
+  failures, unexpected SQL results, and both CI graph lanes.
+- Node syntax checks, Windows supervisor AST parse, and `git diff --check` passed.
+- Migration check: 40 immutable migrations. Rust format and offline Clippy passed.
+- `cargo test --offline --workspace --quiet`: 452 passed, 200 opt-in database
+  tests ignored; ambient `DATABASE_URL` was removed for this command.
+- `pnpm build:web` and `pnpm lint:web` passed.
+- The isolated Windows runtime dry-run and execution passed in retained fixture
+  `ecorp-external-adapters-ci-20260912g`, using API `18437` and PostgreSQL `55437`.
+  It ran from `2026-09-12T07:51:42.9221189Z` to
+  `2026-09-12T07:52:20.2858857Z`; synthetic source commit:
+  `9c14d8d5f3b78be8539930a12d582492f4713e90`.
+- Graph mission `cee1f61a-e478-4738-ba3c-6b14202f2e9b` completed all three tasks
+  with root adapters `claude-code` and `codex`, two observed concurrent runs,
+  synthesis after both roots, and verified specialist output consumed.
+- Retry mission `2f07f1ae-ff58-4bf9-8295-5b32b6e820f8` reached its expected failed
+  state after exactly two allowed attempts. Both external-adapter lifecycles
+  passed in the same fixture before the graph test.
+- Source remained unchanged and all three owned QA processes were stopped.
+  No real provider call or GitHub mutation was performed by the fixture.
+- Retained `e2e-task-graph.json` SHA-256:
+  `0e1c1c1b4053b1a83f8fac6e65d94a84413607216fddca1ad1c6e907d4430b88`.
+- Retained `fixture-report.json` SHA-256:
+  `246659026beadeeb9e98b97419ca1ae87473c7a6572def6d923501f86320694d`.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence and unit-tested Unix admission
-logic. It is not real vendor inference, browser acceptance, or proof that the
-updated hosted Linux integration suite passed. A new hosted run must execute the
-corrected Unix step and all previously skipped integration steps. The new Windows
-job must also pass on the hosted image.
+logic. It is not real vendor inference or browser acceptance. The preceding
+hosted run proved both external-adapter lanes; a new run must validate the Linux
+roster SQL and graph, the added Windows graph, and the subsequent integration
+steps. Mocked SQL tests do not claim to have executed that transaction in Linux.
 
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review

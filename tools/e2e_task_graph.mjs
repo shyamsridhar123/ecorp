@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
-import path from 'node:path'
 import { downloadVerifiedArtifact } from './artifact_client.mjs'
+import { prepareUnixDemoRoster, taskGraphFixtureConfig } from './task_graph_fixture.mjs'
 
-const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
-const root = path.resolve(import.meta.dirname, '..')
+const config = taskGraphFixtureConfig(process.argv.slice(2), process.env)
+const server = config.server
+if (config.dryRun) {
+  console.log(JSON.stringify({ ...config, services_started: false, database_writes: false,
+    proposed: ['reset only the explicitly owned demo fixture',
+      ...(config.unixRoster ? ['mark only the two unavailable, idle Windows-only demo agents offline before any mission exists'] : []),
+      'verify the original three-node, two-adapter graph, concurrent roots, dependency artifacts and bounded retries'],
+  }, null, 2))
+  process.exit(0)
+}
 const activeStatuses = new Set([
   'provisioning',
   'starting',
@@ -68,6 +76,9 @@ async function waitForMission(demo, missionId, timeoutMs = 60_000) {
 
 async function parallelGraphScenario() {
   const demo = await post('/api/demo/reset', {})
+  const roster = config.unixRoster
+    ? await prepareUnixDemoRoster(await snapshot(demo), config)
+    : { scope: 'unaltered_demo_roster', disabled_agents: [] }
   const created = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
     preferred_adapter: 'codex',
@@ -105,6 +116,9 @@ async function parallelGraphScenario() {
     assert.ok(task.contract.write_scope.length)
     assert.ok(task.contract.budget_tokens > 0)
     assert.ok(task.max_attempts <= 3)
+    assert.ok(planned.runners.some(runner => runner.connected && runner.capabilities.some(capability =>
+      capability.name === task.required_adapter && capability.available && capability.workspace_connection_id == null)),
+    'Graph fixture planned an unavailable adapter: ' + task.required_adapter)
   }
 
   const launched = await post(
@@ -169,6 +183,8 @@ async function parallelGraphScenario() {
   }
 
   return {
+    roster_fixture: roster,
+    root_adapters: rootRuns.map(run => taskById.get(run.task_id).required_adapter).sort(),
     mission_id: created.mission_id,
     task_ids: created.task_ids,
     initial_run_ids: launched.run_ids,
@@ -220,12 +236,13 @@ async function retryBoundScenario() {
 }
 
 const report = {
+  schema_version: 2,
   checked_at: new Date().toISOString(),
   parallel_graph: await parallelGraphScenario(),
   retry_bound: await retryBoundScenario(),
 }
 await writeFile(
-  path.join(root, 'output', 'e2e-task-graph.json'),
+  config.output,
   `${JSON.stringify(report, null, 2)}\n`,
 )
 console.log(JSON.stringify(report, null, 2))
