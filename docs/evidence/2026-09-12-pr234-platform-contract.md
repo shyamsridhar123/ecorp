@@ -103,3 +103,23 @@ No production planner or adapter behavior is changed.
 
 This second test follow-up requires fresh native integration validation. Its
 JavaScript syntax and source review do not substitute for that result.
+
+Run `34670590211` on `b9afdb3b8e40fea522399783d1ff598442b13907` then passed
+the real task-graph/staffing/retry case, verifier cases, replay, leases, room
+isolation, reconnect and idempotency. Quality, all three runner platforms, and
+the Windows desktop build passed. Integration next failed because the controlled
+artifact-staging runner did not receive its first assignment.
+
+The registration handler sends `registered` before a one-second asynchronous
+reconciliation finishes. The old fixture immediately launched a generic
+fake-process task; the already-ready normal runner could take it. The repair
+advertises a unique, synthetic fixture routing model, retains the actual source
+tuple, waits for native source-selected preview readiness, and checks the stored
+assignment's runner ID. Its runner ID deliberately sorts after the ordinary
+runner, removing lexical priority as the routing mechanism. This changes only
+the storage test fixture; no model inference, production routing override,
+reconciliation bypass, or increased timeout is introduced.
+
+All prior storage, rollback, digest, event and restart assertions remain.
+The retained failing run is not relabelled as success; the repaired native
+storage E2E still needs a fresh result on its new head.

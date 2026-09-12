@@ -683,7 +683,11 @@ S3-compatible backend. See `docs/evidence/2026-08-30-artifact-storage-validation
 
 `tools/e2e_artifact_staging.mjs` holds the run row, applies a hard breaker, and proves authoritative
 rejection occurs before staging while an accepted artifact with the same digest remains
-downloadable. It injects a Postgres reservation failure and proves no object bytes are written, then
+downloadable. Its controlled runner uses a unique fixture routing model and the
+actual immutable source tuple. A read-only source-selected mission preview must
+confirm dispatch readiness before creating work; registration alone is not
+readiness, and the ordinary runner must not receive the controlled assignment.
+It injects a Postgres reservation failure and proves no object bytes are written, then
 injects a metadata-finalization failure after both staged and final bytes exist and proves restart
 recovery completes the commit. The same recovery pass finalizes staged metadata, rejects an old row
 whose bytes fail validation, releases an old reservation whose staged and final objects are both
