@@ -4,8 +4,6 @@ import { createHash } from 'node:crypto'
 import {
   copyFile,
   mkdir,
-  open,
-  readFile,
   rm,
   stat,
   writeFile,
@@ -16,6 +14,7 @@ import { promisify } from 'node:util'
 import {
   downloadVerifiedArtifact,
 } from './artifact_client.mjs'
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 
 const execFile = promisify(execFileCallback)
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
@@ -24,9 +23,6 @@ const databaseUrl =
 const root = path.resolve(import.meta.dirname, '..')
 const composeFile = path.join(root, 'deploy', 'compose', 'docker-compose.yml')
 const artifactRoot = path.join(root, 'output', 'artifact-objects')
-const pidPath =
-  process.env.CRONY_TEST_SERVER_PID_FILE ??
-  path.join(root, 'output', 'local-pids.json')
 let psqlMode
 
 async function request(pathname, init) {
@@ -267,7 +263,7 @@ async function psqlInvocation() {
   }
 }
 
-function connectRunner({ corpId, runnerId, credential }) {
+function connectRunner({ corpId, runnerId, credential, source, modelId }) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`${server.replace(/^http/, 'ws')}/ws/runner`)
     const connectionEpoch = crypto.randomUUID()
@@ -307,10 +303,25 @@ function connectRunner({ corpId, runnerId, credential }) {
           os: process.platform,
           capabilities: [
             {
-              name: 'fake-process',
+              name: 'codex',
               available: true,
               detail: 'controlled artifact staging runner',
+              models: [{
+                id: modelId,
+                name: 'Controlled artifact staging fixture',
+                policy_state: 'enabled',
+                supports_vision: false,
+                supports_reasoning_effort: false,
+              }],
+            },
+            {
+              name: 'workspace-isolation',
+              available: true,
+              detail: 'controlled storage fixture; no provider execution',
               models: [],
+              source_repository: source.repository,
+              source_base_ref: source.base_ref,
+              source_base_commit: source.base_commit,
             },
           ],
           active_runs: [],
@@ -325,6 +336,8 @@ function connectRunner({ corpId, runnerId, credential }) {
           socket,
           connectionEpoch,
           runnerId,
+          source,
+          modelId,
           credential: payload.credential,
           waitForAssignment(runId, timeoutMs = 10_000) {
             const index = assignments.findIndex(
@@ -383,7 +396,9 @@ function sendRunEvent(runner, assignment, eventType, payload, eventId) {
 async function controlledRun(demo, runner, title) {
   const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
-    preferred_adapter: 'fake-process',
+    preferred_adapter: 'codex',
+    preferred_model: runner.modelId,
+    source: runner.source,
     title,
   })
   const launch = await post(
@@ -392,6 +407,12 @@ async function controlledRun(demo, runner, title) {
   )
   const assignment = await runner.waitForAssignment(launch.run_id)
   assert.equal(assignment.run_id, launch.run_id)
+  const assigned = await snapshot(demo)
+  assert.equal(
+    assigned.snapshot.runs.find((run) => run.id === launch.run_id)?.runner_id,
+    runner.runnerId,
+    'Only the model-scoped controlled runner may receive storage-fixture work',
+  )
   sendRunEvent(runner, assignment, 'run.started', {
     workspace: 'controlled-artifact-workspace',
     station: 'terminal',
@@ -567,89 +588,31 @@ async function removeArtifactFinalizeFailure() {
 }
 
 async function restartLocalServer() {
-  const pidText = (await readFile(pidPath, 'utf8')).trim()
-  const jsonPidFile = pidText.startsWith('{')
-  const pidState = jsonPidFile
-    ? JSON.parse(pidText)
-    : { server: Number(pidText) }
-  const serverPid = Number(pidState.server)
-  assert.ok(Number.isSafeInteger(serverPid) && serverPid > 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const binary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const recoveryStdout = path.join(
-    root,
-    'output',
-    'artifact-recovery-server.stdout.log',
-  )
-  const recoveryStderr = path.join(
-    root,
-    'output',
-    'artifact-recovery-server.stderr.log',
-  )
-  await writeFile(recoveryStdout, '')
-  await writeFile(recoveryStderr, '')
-  const stdout = await open(recoveryStdout, 'a')
-  const stderr = await open(recoveryStderr, 'a')
-  const child = spawn(
-    binary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-      '--artifact-recovery-grace-secs',
-      '0',
-      '--artifact-recovery-interval-secs',
-      '1',
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout.fd, stderr.fd],
+  return restartOwnedTestServer({
+    root, server, databaseUrl, logPrefix: 'artifact-recovery-server',
+    environment: {
+      CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0',
+      CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1',
     },
-  )
-  await writeFile(
-    pidPath,
-    jsonPidFile
-      ? `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`
-      : `${child.pid}\n`,
-  )
-  child.unref()
-  await stdout.close()
-  await stderr.close()
-
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try {
-      const health = await fetch(`${server}/health`).then((response) =>
-        response.json(),
-      )
-      if (health.status === 'ok' && health.runners >= 1) return
-    } catch {
-      // Server recovery is still running.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  const recoveryError = await readFile(
-    recoveryStderr,
-    'utf8',
-  ).catch(() => '')
-  throw new Error(`server did not recover staged artifacts: ${recoveryError}`)
+  })
 }
 
 const demo = await post('/api/demo/reset', {})
-const runnerId = `aaa-artifact-staging-${crypto.randomUUID()}`
+const initial = await snapshot(demo)
+const sourceCapability = initial.runners
+  .filter((candidate) => candidate.connected)
+  .flatMap((candidate) => candidate.capabilities)
+  .find((capability) => capability.name === 'workspace-isolation' &&
+    capability.available && capability.workspace_connection_id == null)
+assert.ok(sourceCapability?.source_repository && sourceCapability.source_base_ref)
+assert.match(sourceCapability.source_base_commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i)
+const source = {
+  repository: sourceCapability.source_repository,
+  base_ref: sourceCapability.source_base_ref,
+  base_commit: sourceCapability.source_base_commit,
+}
+const runnerId = `zz-artifact-staging-${crypto.randomUUID()}`
+const modelId = `artifact-staging-${crypto.randomUUID()}`
 const enrollment = await post(`/api/corps/${demo.corp_id}/runners/enroll`, {
   actor_id: demo.alice_actor_id,
   runner_id: runnerId,
@@ -659,7 +622,42 @@ const runner = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: enrollment.enrollment_token,
+  source,
+  modelId,
 })
+
+// Registered acknowledges identity before native reconciliation enables
+// dispatch. A unique fixture model prevents the already-ready normal runner
+// from taking this work; source-selected preview proves the controlled runner
+// is actually selectable before any storage-fixture mission is created.
+const readyDeadline = Date.now() + 10_000
+let dispatchReady = false
+while (Date.now() < readyDeadline) {
+  const preview = await request(`/api/corps/${demo.corp_id}/missions/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      requested_by: demo.alice_actor_id,
+      title: 'Controlled artifact runner dispatch readiness',
+      preferred_adapter: 'codex',
+      preferred_model: modelId,
+      source,
+    }),
+    signal: AbortSignal.timeout(Math.max(1, readyDeadline - Date.now())),
+  })
+  if (preview.response.ok) {
+    dispatchReady = true
+    break
+  }
+  assert.equal(preview.response.status, 400, 'unexpected readiness denial')
+  assert.equal(
+    preview.body?.error,
+    'no connected runner can staff the selected mission runtime, model, and source',
+    'Only native reconciliation readiness is retryable; invalid fixture policy must fail immediately',
+  )
+  await new Promise((resolve) => setTimeout(resolve, 50))
+}
+assert.ok(dispatchReady, 'controlled artifact runner did not become dispatch-ready')
 
 const sharedBytes = Buffer.from(`shared digest ${crypto.randomUUID()}\n`, 'utf8')
 const accepted = await acceptedArtifact(

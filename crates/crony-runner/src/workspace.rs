@@ -1929,7 +1929,9 @@ mod tests {
         cleanup_physical_fixture(&root);
     }
 
-    #[cfg(unix)]
+    // Linux permits the raw filename needed to reach fingerprint rejection.
+    // macOS rejects its creation instead; that distinct boundary is tested below.
+    #[cfg(target_os = "linux")]
     #[test]
     fn fingerprint_rejects_lossy_non_utf8_path_names() {
         use std::os::unix::ffi::OsStringExt;
@@ -1942,6 +1944,21 @@ mod tests {
                 .to_string()
                 .contains("not UTF-8")
         );
+        cleanup_physical_fixture(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_non_utf8_fixture_names_before_fingerprinting() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (root, source) = physical_fixture();
+        let error = fs::write(source.join(OsString::from_vec(vec![b'a', 0xff])), "bytes\n")
+            .expect_err("macOS fixture filesystem must reject the non-UTF-8 filename");
+        // Darwin EILSEQ, observed on the macOS Actions filesystem. An unrelated
+        // I/O failure is not successful coverage, and no fingerprint branch ran.
+        assert_eq!(error.raw_os_error(), Some(92), "expected EILSEQ: {error}");
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
         cleanup_physical_fixture(&root);
     }
 
