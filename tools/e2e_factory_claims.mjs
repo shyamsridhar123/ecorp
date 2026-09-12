@@ -1,20 +1,18 @@
+import { readFixtureSourceIdentity } from './fixture_source_identity.mjs'
+import { restartOwnedTestServer } from './owned_test_stack.mjs'
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
-import {
-  existsSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
+const sourceRoot = path.resolve(process.env.ECORP_TEST_SOURCE_REPOSITORY ?? root)
+const fixtureSource = readFixtureSourceIdentity(sourceRoot)
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
 const sourceBaseCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-  cwd: root,
+  cwd: sourceRoot,
   encoding: 'utf8',
 }).trim()
 
@@ -63,75 +61,57 @@ async function waitForMission(demo, missionId, timeoutMs = 30_000) {
   throw new Error(`timed out waiting for factory mission ${missionId}`)
 }
 
-async function restartLocalServer() {
+async function restartLocalServer(demo) {
   if (process.env.CRONY_SKIP_SERVER_RESTART === '1') return false
-  const pidPath =
-    process.env.CRONY_TEST_SERVER_PID_FILE ??
-    path.join(root, 'output', 'local-pids.json')
-  if (!existsSync(pidPath)) {
-    throw new Error(`test-owned server PID file does not exist: ${pidPath}`)
-  }
-
-  const jsonPidFile = pidPath.endsWith('.json')
-  const pidState = jsonPidFile
-    ? JSON.parse(readFileSync(pidPath, 'utf8'))
-    : { server: Number(readFileSync(pidPath, 'utf8').trim()) }
-  const serverPid = Number(pidState.server)
-  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) {
-    throw new Error(`test-owned server PID is invalid: ${serverPid}`)
-  }
-
-  process.kill(serverPid, 0)
-  process.kill(serverPid)
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  const serverUrl = new URL(server)
-  const binary =
-    process.env.CRONY_TEST_SERVER_BINARY ??
-    path.join(
-      root,
-      'target',
-      'debug',
-      process.platform === 'win32' ? 'crony-server.exe' : 'crony-server',
-    )
-  const logDir = path.dirname(path.resolve(pidPath))
-  const stdout = openSync(path.join(logDir, 'factory-server-restart.stdout.log'), 'a')
-  const stderr = openSync(path.join(logDir, 'factory-server-restart.stderr.log'), 'a')
-  const child = spawn(
-    binary,
-    [
-      '--bind',
-      `${serverUrl.hostname}:${serverUrl.port}`,
-      '--database-url',
-      databaseUrl,
-    ],
-    {
-      cwd: root,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', stdout, stderr],
-    },
-  )
-  if (jsonPidFile) {
-    writeFileSync(pidPath, `${JSON.stringify({ ...pidState, server: child.pid }, null, 2)}\n`)
-  } else {
-    writeFileSync(pidPath, `${child.pid}\n`)
-  }
-  child.unref()
+  await restartOwnedTestServer({
+    root, server, databaseUrl, logPrefix: 'factory-server-restart',
+  })
 
   const deadline = Date.now() + 30_000
+  let lastReadinessError = 'server or runner is unavailable'
   while (Date.now() < deadline) {
     try {
-      const health = await fetch(`${server}/health`).then((response) =>
+      const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()))
+      const health = await fetch(`${server}/health`, { signal }).then((response) =>
         response.json(),
       )
-      if (health.status === 'ok' && health.runners >= 1) return true
-    } catch {
+      if (health.status === 'ok' && health.runners >= 1) {
+        // Connected runners may still be reconciling. A read-only preview checks
+        // dispatch readiness for the same adapter and immutable source tuple.
+        const preview = await fetch(
+          `${server}/api/corps/${demo.corp_id}/missions/preview`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              requested_by: demo.alice_actor_id,
+              title: 'Factory restart dispatch readiness',
+              preferred_adapter: 'fake-process',
+              strategy: 'single',
+              budget_tokens: 20_000,
+              budget_cost_microusd: 1_000_000,
+              source: {
+                repository: fixtureSource.repository,
+                base_ref: 'HEAD',
+                base_commit: sourceBaseCommit,
+              },
+            }),
+          },
+        )
+        const previewBody = await preview.json()
+        if (preview.ok) return true
+        lastReadinessError = `${preview.status}: ${JSON.stringify(previewBody)}`
+      }
+    } catch (error) {
       // The server is restarting or the runner has not reconnected yet.
+      lastReadinessError = error.message
     }
     await new Promise((resolve) => setTimeout(resolve, 200))
   }
-  throw new Error('server or runner did not recover after factory restart')
+  throw new Error(
+    `server or runner did not recover after factory restart: ${lastReadinessError}`,
+  )
 }
 
 const demo = await postOk('/api/demo/reset', {})
@@ -142,11 +122,11 @@ const claimRequest = {
   source_project_owner: 'shyamsridhar123',
   source_project_number: 3,
   source_project_item_id: `PVTI_FACTORY_E2E_${nonce}`,
-  source_repository_owner: 'shyamsridhar123',
-  source_repository_name: 'ecorp',
+  source_repository_owner: fixtureSource.owner,
+  source_repository_name: fixtureSource.name,
   source_issue_number: 59,
   source_issue_node_id: `I_FACTORY_E2E_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/59',
+  source_issue_url: `${fixtureSource.url}/issues/59`,
   source_title: 'Persist and fence dark-factory issue claims before mission dispatch',
   source_revision: '2026-09-01T00:00:00Z',
   idempotency_key: `factory-e2e-claim-${nonce}`,
@@ -155,7 +135,7 @@ const claimRequest = {
     schema_version: 1,
     source_of_truth: 'github_project',
     project_status: 'Todo',
-    repository_allowlist: ['shyamsridhar123/ecorp'],
+    repository_allowlist: [fixtureSource.repository],
     source_base_ref: 'HEAD',
     source_base_commit: sourceBaseCommit,
     adapter_allowlist: ['fake-process'],
@@ -194,16 +174,16 @@ assert.ok(claim.claim_token)
 const mixedCaseReplay = await postOk(claimPath, {
   ...claimRequest,
   source_project_owner: 'ShYaMsRiDhAr123',
-  source_repository_owner: 'SHYAMSRIDHAR123',
-  source_repository_name: 'ECorp',
-  source_issue_url: 'https://github.com/SHYAMSRIDHAR123/ECorp/issues/59',
+  source_repository_owner: fixtureSource.owner.toUpperCase(),
+  source_repository_name: fixtureSource.name.toUpperCase(),
+  source_issue_url: `https://github.com/${fixtureSource.repository.toUpperCase()}/issues/59`,
   idempotency_key: `factory-e2e-mixed-case-${nonce}`,
 })
 assert.equal(mixedCaseReplay.work_item.id, claim.work_item.id)
 assert.equal(mixedCaseReplay.claim_token, claim.claim_token)
 assert.equal(mixedCaseReplay.work_item.source_project_owner, 'shyamsridhar123')
-assert.equal(mixedCaseReplay.work_item.source_repository_owner, 'shyamsridhar123')
-assert.equal(mixedCaseReplay.work_item.source_repository_name, 'ecorp')
+assert.equal(mixedCaseReplay.work_item.source_repository_owner, fixtureSource.owner)
+assert.equal(mixedCaseReplay.work_item.source_repository_name, fixtureSource.name)
 
 const unauthorized = await post(claimPath, {
   ...claimRequest,
@@ -255,7 +235,7 @@ const duplicateActive = await post(claimPath, {
 })
 assert.equal(duplicateActive.response.status, 409)
 
-const restarted = await restartLocalServer()
+const restarted = await restartLocalServer(demo)
 
 const renewPath = `/api/corps/${demo.corp_id}/factory/work-items/${claim.work_item.id}/renew`
 const renewRequest = {
@@ -314,7 +294,7 @@ const materializeRequest = {
     ],
     allowed_tools: ['filesystem', 'shell'],
     prohibited_actions: ['merge or deploy without a separate current authorization'],
-    references: ['https://github.com/shyamsridhar123/ecorp/issues/59'],
+    references: [`${fixtureSource.url}/issues/59`],
     write_scope: ['crates/**', 'db/migrations/**', 'tools/**', 'docs/**'],
   },
 }
@@ -325,7 +305,7 @@ async function assertRejectedMaterialization(suffix, patch) {
     source_project_item_id: `PVTI_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
     source_issue_number: issueNumber,
     source_issue_node_id: `I_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
-    source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${issueNumber}`,
+    source_issue_url: `${fixtureSource.url}/issues/${issueNumber}`,
     source_title: `Reject invalid factory materialization ${suffix}`,
     source_revision: `2026-09-03T19:${String(30 + suffix).padStart(2, '0')}:00Z`,
     idempotency_key: `factory-e2e-rejected-claim-${suffix}-${nonce}`,
@@ -409,13 +389,13 @@ const linkedTask = afterMaterialize.snapshot.tasks.find(
   (task) => task.id === materialized[0].task_id,
 )
 assert.match(linkedTask.contract.objective, /linked GitHub issue/)
-assert.equal(linkedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(linkedTask.contract.source_repository, fixtureSource.repository)
 assert.equal(linkedTask.contract.source_base_ref, 'HEAD')
 assert.equal(linkedTask.contract.source_base_commit, sourceBaseCommit)
 assert.deepEqual(linkedTask.contract.write_scope, materializeRequest.contract.write_scope)
 assert.ok(
   linkedTask.contract.references.includes(
-    'https://github.com/shyamsridhar123/ecorp/issues/59',
+    `${fixtureSource.url}/issues/59`,
   ),
 )
 
@@ -479,24 +459,57 @@ const forgedVerified = await post(transitionPath, {
   state: 'verified',
 })
 assert.equal(forgedVerified.response.status, 409)
+assert.match(
+  JSON.stringify(forgedVerified.body),
+  /cannot enter verified before its mission and task verification pass/,
+)
 
 const completed = await waitForMission(demo, materialized[0].mission_id)
 assert.equal(completed.mission.status, 'completed')
 const run = completed.state.snapshot.runs.find((item) => item.id === launch.run_id)
 assert.equal(run.status, 'completed')
-const verified = await postOk(transitionPath, {
+assert.equal(run.verification_status, 'passed')
+const completedTask = completed.state.snapshot.tasks.find(
+  (item) => item.id === materialized[0].task_id,
+)
+assert.equal(completedTask.status, 'completed')
+assert.equal(completedTask.verification_status, 'passed')
+// Accepted completion reconciles Factory in the same transaction. Read that
+// result before testing stale controller requests; do not verify it a second time.
+const verified = completed.state.snapshot.factory_work_items.find(
+  (item) => item.id === claim.work_item.id,
+)
+assert.ok(verified, 'completed mission is missing its factory work item')
+assert.equal(verified.state, 'verified')
+assert.equal(verified.version, 5)
+assert.equal(verified.mission_id, materialized[0].mission_id)
+assert.equal(verified.failure_detail, null)
+const verifiedEvents = completed.state.snapshot.events.filter(
+  (event) => event.aggregate_id === verified.id && event.type === 'factory.verified',
+)
+assert.equal(verifiedEvents.length, 1)
+assert.equal(verifiedEvents[0].aggregate_version, verified.version)
+assert.equal(verifiedEvents[0].correlation_id, materialized[0].mission_id)
+assert.equal(verifiedEvents[0].causation_id, launch.run_id)
+assert.deepEqual(verifiedEvents[0].payload, {
+  previous_state: 'running',
+  state: 'verified',
+  mission_id: materialized[0].mission_id,
+  run_id: launch.run_id,
+})
+const staleVerified = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
   expected_version: running.work_item.version,
-  idempotency_key: `factory-e2e-verified-${nonce}`,
+  idempotency_key: `factory-e2e-stale-verified-${nonce}`,
   state: 'verified',
 })
-assert.equal(verified.work_item.state, 'verified')
-assert.equal(verified.work_item.version, 5)
+assert.equal(staleVerified.response.status, 409)
+assert.match(JSON.stringify(staleVerified.body), /factory work item version is 5, not 4/)
 const forgedPublished = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-forged-published-${nonce}`,
   state: 'published',
 })
@@ -504,7 +517,7 @@ assert.equal(forgedPublished.response.status, 400)
 const invalidRegression = await post(transitionPath, {
   actor_id: demo.alice_actor_id,
   claim_token: claim.claim_token,
-  expected_version: verified.work_item.version,
+  expected_version: verified.version,
   idempotency_key: `factory-e2e-invalid-regression-${nonce}`,
   state: 'running',
 })
@@ -513,7 +526,7 @@ const finalState = await snapshot(demo)
 const finalFactoryItem = finalState.snapshot.factory_work_items.find(
   (item) => item.id === claim.work_item.id,
 )
-assert.equal(finalFactoryItem.state, 'verified')
+assert.deepEqual(finalFactoryItem, verified)
 const finalFactoryEvents = finalState.snapshot.events.filter(
   (event) => event.aggregate_id === claim.work_item.id,
 )
@@ -524,8 +537,13 @@ assert.deepEqual(
     'factory.claim_renewed',
     'factory.mission_linked',
     'factory.state_changed',
-    'factory.state_changed',
+    'factory.verified',
   ],
+)
+assert.ok(
+  finalFactoryEvents.every(
+    (event) => !JSON.stringify(event.payload).includes(claim.claim_token),
+  ),
 )
 const finalGuestSnapshot = await request(
   `/api/corps/${demo.corp_id}/snapshot?actor_id=${demo.eve_actor_id}`,
@@ -549,7 +567,7 @@ const blockedClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_BLOCKED_${nonce}`,
   source_issue_number: 60,
   source_issue_node_id: `I_FACTORY_BLOCKED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/60',
+  source_issue_url: `${fixtureSource.url}/issues/60`,
   source_title: 'Consume eligible ECorp Build issues into governed missions',
   source_revision: '2026-09-01T00:01:00Z',
   idempotency_key: `factory-e2e-blocked-claim-${nonce}`,
@@ -573,7 +591,7 @@ const expiredClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_EXPIRED_CLAIMED_${nonce}`,
   source_issue_number: 61,
   source_issue_node_id: `I_FACTORY_EXPIRED_CLAIMED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/61',
+  source_issue_url: `${fixtureSource.url}/issues/61`,
   source_title: 'Recover an expired claimed factory item',
   source_revision: '2026-09-01T00:01:30Z',
   idempotency_key: `factory-e2e-expired-claimed-${nonce}`,
@@ -691,7 +709,7 @@ const failoverMaterialize = await postOk(
       acceptance_tests: ['the original work item is reused'],
       allowed_tools: ['filesystem', 'shell'],
       prohibited_actions: ['merge or deploy without a separate current authorization'],
-      references: ['https://github.com/shyamsridhar123/ecorp/issues/60'],
+      references: [`${fixtureSource.url}/issues/60`],
       write_scope: claimRequest.policy.write_scope,
     },
   },
@@ -720,6 +738,8 @@ const report = {
   policy_widening_rejected: true,
   tool_and_secret_widening_rejected: true,
   pre_verification_transition_rejected: true,
+  completion_automatically_verified_factory: true,
+  stale_post_completion_transition_rejected: true,
   publication_state_requires_dedicated_operation: true,
   invalid_state_regression_rejected: true,
   expired_reclaim_policy_widening_rejected: true,
