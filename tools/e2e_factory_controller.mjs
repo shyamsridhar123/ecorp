@@ -831,6 +831,14 @@ assert.deepEqual(dryRun.preflight, {
   task_count: 1,
   budget_tokens: 20_000,
   budget_cost_microusd: 1_000_000,
+  tasks: [{
+    key: 'deliver',
+    title: 'Produce the mission outcome',
+    budget_tokens: 20_000,
+    budget_cost_microusd: 1_000_000,
+    depends_on: [],
+    max_attempts: 2,
+  }],
 })
 assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
 
