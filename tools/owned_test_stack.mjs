@@ -188,16 +188,25 @@ async function stopVerified(context, manifest, identity) {
       root: context.root, server: context.server, binary: context.binary })
     return
   }
-  process.kill(manifest.server)
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline) {
-    try { process.kill(manifest.server, 0) } catch (error) {
-      if (error.code === 'ESRCH') return
-      throw error
-    }
-    await pause(100)
-  }
-  throw new Error('Owned server did not exit; no replacement or force-stop was attempted.')
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    '$processId = [int]$env:ECORP_QA_PROCESS_ID',
+    '$process = Get-Process -Id $processId -ErrorAction Stop',
+    '[void]$process.Handle',
+    "if ($process.HasExited) { throw 'Owned server already exited during verification' }",
+    '$currentPath = [IO.Path]::GetFullPath($process.Path)',
+    '$expectedPath = [IO.Path]::GetFullPath($env:ECORP_QA_PROCESS_EXE)',
+    '$currentTicks = $process.StartTime.ToUniversalTime().Ticks',
+    '$expectedTicks = ([DateTimeOffset]$env:ECORP_QA_PROCESS_CREATION).UtcTicks',
+    "if (!([string]::Equals($currentPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) -or $currentTicks -ne $expectedTicks) { throw 'QA process ownership changed or is unverifiable; refusing server restart.' }",
+    '$process.Kill()',
+    "if (!$process.WaitForExit(30000)) { throw 'Owned server did not exit; no replacement or force-stop was attempted.' }",
+  ].join('\n')
+  await execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true, timeout: 40_000,
+    env: { ...process.env, ECORP_QA_PROCESS_ID: String(manifest.server),
+      ECORP_QA_PROCESS_EXE: identity.executable, ECORP_QA_PROCESS_CREATION: identity.creation },
+  })
 }
 
 function sameDatabase(context, manifest) {

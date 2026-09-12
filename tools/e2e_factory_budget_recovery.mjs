@@ -24,6 +24,7 @@ const runnerId = 'runner-qa-issue50'
 const { execute, overrun, missingCheckpoint } = fixtureMode(process.argv.slice(2))
 const referenceUrl = referenceSnapshotUrl(process.env.ECORP_ISSUE50_REFERENCE_SNAPSHOT_URL, api)
 const source = path.join(qa, 'source')
+const sourceReadme = '# Synthetic issue 50 source\nNo real application or credentials.\n'
 const pgData = path.join(qa, 'pg-data')
 const stamp = new Date().toISOString().replace(/[^0-9]/g, '')
 const attempt = path.join(qa, 'attempts', stamp)
@@ -69,6 +70,28 @@ async function start(name, program, args, extraEnv = {}) {
   assert.equal(path.resolve(owned.receipt.executable).toLowerCase(), path.resolve(program).toLowerCase())
   await json(path.join(attempt, 'processes.json'), children.map(c => ({name:c.name,...c.receipt})))
   return child
+}
+async function stopVerifiedChild(owned) {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    '$pid = [int]$env:ECORP_QA_PID',
+    '$process = Get-Process -Id $pid -ErrorAction Stop',
+    '[void]$process.Handle',
+    "if ($process.HasExited) { throw 'Recorded QA process already exited' }",
+    '$currentPath = [IO.Path]::GetFullPath($process.Path)',
+    '$expectedPath = [IO.Path]::GetFullPath($env:ECORP_QA_EXE)',
+    '$currentTicks = $process.StartTime.ToUniversalTime().Ticks',
+    '$expectedTicks = ([DateTimeOffset]$env:ECORP_QA_CREATION).UtcTicks',
+    "if (!([string]::Equals($currentPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) -or $currentTicks -ne $expectedTicks) { throw 'Process identity changed; preserve unknown process' }",
+    '$process.Kill()',
+    "if (!$process.WaitForExit(30000)) { throw 'Verified QA process did not exit' }",
+  ].join('\n')
+  await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: {
+    ...env,
+    ECORP_QA_PID: String(owned.child.pid),
+    ECORP_QA_EXE: owned.receipt.executable,
+    ECORP_QA_CREATION: owned.receipt.creation,
+  } })
 }
 async function until(label, check, ms = 60000) {
   const deadline = Date.now() + ms
@@ -151,12 +174,18 @@ try {
   assert.equal(await exists(path.join(pgData,'postmaster.pid')), false, 'Retained QA postmaster receipt exists; inspect before reuse')
   if (!(await exists(source))) {
     await mkdir(source)
-    await writeFile(path.join(source,'README.md'), '# Synthetic issue 50 source\nNo real application or credentials.\n')
+    await writeFile(path.join(source,'README.md'), sourceReadme)
     await run('git',['init','--initial-branch=main',source])
     await run('git',['-C',source,'add','README.md'])
     await run('git',['-C',source,'-c','user.name=ECorp QA','-c','user.email=qa@example.invalid','commit','-m','Synthetic recovery fixture'])
     await run('git',['-C',source,'remote','add','origin','https://github.com/All-The-Vibes/ecorp.git'])
   }
+  assert.equal((await realpath(source)).toLowerCase(),path.resolve(source).toLowerCase(),'Fixture source path must not redirect outside QA root')
+  const sourceRelative = path.relative(qa, path.resolve(source))
+  assert.ok(sourceRelative && !sourceRelative.startsWith('..') && !path.isAbsolute(sourceRelative), 'Fixture source must remain inside QA root')
+  assert.equal((await readFile(path.join(source,'README.md'),'utf8')), sourceReadme, 'Fixture source README must remain synthetic')
+  assert.equal((await run('git',['-C',source,'remote','get-url','origin'])).stdout.trim(), 'https://github.com/All-The-Vibes/ecorp.git')
+  assert.equal((await run('git',['-C',source,'ls-files'])).stdout.trim(), 'README.md')
   assert.equal((await run('git',['-C',source,'status','--porcelain'])).stdout.trim(), '')
   report.fixture_source_commit = (await run('git',['-C',source,'rev-parse','HEAD'])).stdout.trim()
   const pgChild = await start('postgres',path.join(pgBin,'postgres.exe'), ['-D',pgData,'-p',String(pgPort),'-h','127.0.0.1'])
@@ -381,7 +410,7 @@ try {
       assert.deepEqual(current,owned.receipt,'Process identity changed; preserve unknown process')
       if(owned.name==='postgres') {
         await run(path.join(pgBin,'pg_ctl.exe'),['-D',pgData,'stop','-m','fast','-w','-t','30'])
-      } else { owned.child.kill() }
+      } else await stopVerifiedChild(owned)
       await until(`${owned.name} stopped`,async()=> !(await identity(owned.child.pid)),30000)
       report.cleanup.push({name:owned.name,status:'stopped_verified_qa_process',pid:owned.child.pid})
     }catch(error){report.cleanup.push({name:owned.name,status:'unverified_preserved',error:error.message});process.exitCode=1}
