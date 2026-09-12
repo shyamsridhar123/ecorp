@@ -1,5 +1,9 @@
 # Evaluation and real-world testing
 
+The [September 12 scheduler acceptance](evidence/2026-09-12-scheduler-standalone-acceptance.md)
+records PR #179's main-based source gate separately from the combined recovery
+and two-runner runtime acceptance. Earlier failed attempts remain retained.
+
 ## Evidence rule
 
 An implementation claim needs evidence at the same scope:

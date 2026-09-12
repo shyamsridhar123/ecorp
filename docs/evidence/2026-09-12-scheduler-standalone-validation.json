@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-12T17:16:43.6926081+00:00",
+  "pull_request": 179,
+  "main": "b28fd4d26309794f38c0455bbf42d22aedf7cfd1",
+  "tested_tree": "ec2bcf1b06b3d8b4cfb9bfd8228fe61e2ea6cc3f",
+  "reviewed_fixture_dependency": "bb3a38f4174c15c592f073dd12f799eca0a4310c",
+  "source_objects": {
+    "crates": "c97772fb5965918e7eb667ac5da378c9137dd762",
+    "apps": "3f574ebbf7e50bffc8e25d55ba44c6a358e64805",
+    "db": "ac130f8788174a3887506f58f3616e5c9164d4f1",
+    "Cargo.toml": "bbc8cb67bc274da51598f67f689555133456b1c5",
+    "Cargo.lock": "150f154c2682ffd36a3be1b8e01e61c52ac6f475",
+    "pnpm-lock.yaml": "5393186a13e97d16ad8ced5d52cd14be883af16d",
+    "crates/crony-server/src/main.rs": "239061df8284afd0ffbb266c98ae0cac4f27d28e"
+  },
+  "gates": {
+    "rust_workspace": {
+      "passed": 459,
+      "failed": 0,
+      "ignored": 200,
+      "test_threads": 1
+    },
+    "scheduler_cases": 16,
+    "frontend": {
+      "passed": 194,
+      "failed": 0,
+      "files": 13,
+      "recursive": true
+    },
+    "fixture_tests": {
+      "passed": 65,
+      "failed": 0
+    },
+    "migrations": 40,
+    "clippy_all_targets": "passed",
+    "format": "passed",
+    "web_build": "passed",
+    "web_lint": "passed"
+  },
+  "log_hashes": [
+    {
+      "name": "pr179-rust-tests.log",
+      "sha256": "82702a4d94ebed86c2f4f9b08264472496c6d65004f55982e0389349035c8d9a"
+    },
+    {
+      "name": "pr179-clippy.log",
+      "sha256": "6b00d31057e5773858385855a602dc0ae32639907145a07c03673de028fad935"
+    },
+    {
+      "name": "pr179-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "pr179-migrations.log",
+      "sha256": "e48b66f4e3371b5fd74812931fecbc60e002699cd8d5f167ccd0626ec555f37f"
+    },
+    {
+      "name": "pr179-web-tests-recursive.log",
+      "sha256": "3dc430a5a33c4265869dcfedd5c4aee94378115b64dec565f110484e903fd4d1"
+    },
+    {
+      "name": "pr179-web-build.log",
+      "sha256": "5fd3c59bc410ded93cd1233986f75cbbab39e223dbf30175fc4a69d307cd0ccf"
+    },
+    {
+      "name": "pr179-web-lint.log",
+      "sha256": "5823d97b1d9c0de697db98b615a003ba8ad126325c1c98193ebdb5b7e475b5b3"
+    },
+    {
+      "name": "pr179-shared-fixture-tests.log",
+      "sha256": "9ff0a68a8933e56abe57bcb893c4e28f8834d6bcc4fc4f80715c467c068a7495"
+    }
+  ],
+  "combined_runtime": {
+    "source_tree": "b2f0771599e5ec56ac611d1746058ebda5903fce",
+    "server_sha256": "0aec104ac2ee4ddbb3c2cb7168a8f8102c672e1ecd2df5e44bf737ae1983e02e",
+    "receipt": "2026-09-12-pr-stack-validation.json",
+    "scope": "Two-runner retention and replay on the combined recovery and unchanged scheduler candidate; separate from the standalone source gate."
+  },
+  "limitations": [
+    "The ordinary workspace excludes its 200 opt-in tests.",
+    "Native protocol fixtures do not claim fresh vendor inference or production identity.",
+    "September 7 transport-denied evidence is retained as failed.",
+    "Hosted results belong to their actual PR heads.",
+    "Mirrored install preserved the repository lockfile; pnpm metadata warning is retained."
+  ]
+}
