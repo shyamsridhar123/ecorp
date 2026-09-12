@@ -1,5 +1,9 @@
 # Source correction after failed checkpoint verification
 
+> September 12 follow-up: the patched public recovery sequence and publication
+> acceptance now pass. See [current stack acceptance](2026-09-12-pr-stack-acceptance.md).
+> The dated failures below remain historical evidence.
+
 Date: September 9, 2026. Issue: #210. Parent acceptance: #206 / #145 / #164 / #63.
 
 ## Scope and status

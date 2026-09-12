@@ -90,13 +90,15 @@ That follow-up adds two pure guard cases and three actual-store regressions;
 its serial workspace gate passes 540 tests with 323 intentionally ignored.
 `tools/e2e_planned_attempts.mjs` describes the native public 1 -> 1 -> 2 -> 3
 sequence with unchanged checks, retained history and independent review.
-After explicit approval, the isolated QA stack started and three diagnostic
-drills ran. They found an omitted native controller step in the driver and an
-actual historical-verifier-seal mismatch in repeated correction. The native
-failure and browser observation remain retained. The corrected source passes
-its local gates, but the host denied the subsequent QA-only restart before
-process creation; patched runtime and final application acceptance remain
-unproven. #224 and #221 remain open.
+The September 12 [stack acceptance](evidence/2026-09-12-pr-stack-acceptance.md)
+completes the patched native sequence, unchanged checks, independent development
+review and Factory verification. It also passes 122 actual-migration SQLx cases,
+two-runner retention/replay and a separately preauthorized native publication
+through isolated local Git and the fake-GitHub boundary. The original failed
+diagnostic runs remain retained. The optional test-context publication policy
+is declared before claim; the default case still grants no publication authority.
+Vendor inference, production identity and real GitHub publication remain separate
+from this deterministic protocol-fixture acceptance.
 
 The [correction-retry report](evidence/2026-09-10-checkpoint-correction-retry.md)
 records eleven new actual-store cases, four exact compatibility controls, CLI/UI checks

@@ -1,5 +1,9 @@
 # Checkpoint-derived correction retry — September 10, 2026
 
+> September 12 follow-up: the patched public recovery sequence and publication
+> acceptance now pass. See [current stack acceptance](2026-09-12-pr-stack-acceptance.md).
+> The dated failures below remain historical evidence.
+
 ## Scope and remaining acceptance
 
 This repairs #221 for a valid stored task policy with remaining attempts. It
