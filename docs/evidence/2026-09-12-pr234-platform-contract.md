@@ -167,3 +167,15 @@ Windows QA restart or alternate route around a previous denial was executed.
 The combined fixture guards pass **65/65** Node tests; JavaScript and workflow
 YAML checks pass. This is parser/ownership-guard evidence, not a live Linux
 restart. Native acceptance is still required on the new CI head.
+
+Run `34678144506` on `a51e73f3d1f98b8c2368af3b522c636bb9d4b17d`
+passed the owned Linux restart paths, Factory claims/controller, and the
+complete idempotent publication/recovery step. The identity fixture then
+exposed the same registration-before-dispatch race as the storage simulator.
+
+The identity simulator now uses a unique synthetic Codex model and the actual
+source tuple across both credential epochs, waits for native readiness before
+mission creation, and checks the persisted assigned runner. Existing stale
+epoch, bad assignment token, active revocation, and production-mode OIDC/RBAC
+assertions remain intact. No credential, epoch, model, or authorization
+validation was weakened. The failing run is retained; fresh CI is still needed.
