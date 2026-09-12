@@ -358,6 +358,12 @@ const compiledComponent = ts.transpileModule(componentSource, {
   },
 })
 assert.deepEqual(compiledComponent.diagnostics, [])
+const hookSource = await readFile(new URL('./useMissionOriginContext.ts', import.meta.url), 'utf8')
+const compiledHook = ts.transpileModule(hookSource, {
+  fileName: 'useMissionOriginContext.ts', reportDiagnostics: true,
+  compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.CommonJS },
+})
+assert.deepEqual(compiledHook.diagnostics, [])
 
 function componentFixture(overrides = {}) {
   const hooks = [], effects = [], calls = [], scopes = [], clock = fakeClock()
@@ -365,6 +371,7 @@ function componentFixture(overrides = {}) {
   const different = (previous, next) =>
     !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const react = {
+    useCallback(callback, deps) { return react.useMemo(() => callback, deps) },
     useMemo(create, deps) {
       const index = cursor++
       if (different(hooks[index]?.deps, deps)) hooks[index] = { deps, value: create() }
@@ -401,6 +408,11 @@ function componentFixture(overrides = {}) {
   const require = (name) => {
     if (name === 'react') return react
     if (name === 'react/jsx-runtime') return jsxRuntime
+    if (name === './useMissionOriginContext') {
+      const hooks = {}
+      new Function('require', 'exports', compiledHook.outputText)(require, hooks)
+      return hooks
+    }
     assert.equal(name, './missionOriginContext')
     return {
       ...reader,
@@ -532,6 +544,45 @@ test('failed exact reads preserve #185 positive or unknown fallback without inve
       assert.doesNotMatch(view.html, /Direct mission|<a |hidden\.test|private source|#199|Checking mission context/)
       view.unmount()
     }
+  }
+})
+
+function findElement(node, predicate) {
+  if (!node || typeof node !== 'object') return null
+  if (predicate(node)) return node
+  for (const child of [node.props?.children].flat(Infinity)) {
+    const found = findElement(child, predicate)
+    if (found) return found
+  }
+  return null
+}
+
+test('a failed origin lookup can be retried explicitly without changing the work identities', async () => {
+  for (const failure of ['denial', 'timeout']) {
+    const view = componentFixture()
+    view.update()
+    await view.flush()
+    if (failure === 'timeout') view.clock.fire()
+    else view.calls[0].response.reject(new Error('temporary failure'))
+    await view.flush()
+    assert.match(view.html, /Refresh work context/)
+    const originalScope = view.scopes[0]
+    const retry = findElement(view.tree, (node) =>
+      node.type === 'button' && node.props.children === 'Refresh work context')
+    assert.ok(retry)
+    retry.props.onClick()
+    view.update()
+    await view.flush()
+    assert.equal(view.calls.length, 2, 'retry is one additional read, not an automatic loop')
+    assert.notEqual(view.scopes[1], originalScope, 'retry gets a fresh request generation')
+    assert.equal(view.scopes[1].key, originalScope.key, 'the operator and work-item identities stay fixed')
+    assert.match(view.html, /Checking mission context/)
+    view.calls[1].response.resolve(factory)
+    await view.flush()
+    assert.match(view.html, /From GitHub issue #199/)
+    assert.doesNotMatch(view.html, /Refresh work context|could not be loaded|Checking mission context/)
+    assert.equal(view.calls.length, 2)
+    view.unmount()
   }
 })
 

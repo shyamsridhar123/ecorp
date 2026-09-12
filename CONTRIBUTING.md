@@ -176,6 +176,34 @@ GitHub Copilot is the recommended real-provider path for contributor factory wor
 providers can have different isolation and process-lifecycle assurance; check current Project #3
 issues before treating them as equivalent.
 
+### Choose attempts when planning new work
+
+Routine work needs no additional setting. The `single`, `parallel-specialists`, and
+`studio-swarm` strategies still default to two total attempts per task; deterministic
+verification/review fixture strategies retain their one-attempt defaults.
+
+For new work that needs explicit correction headroom, add `--max-task-attempts 3`
+to the native `mission`, `factory`, or `factory-watch` command. Valid values are
+integers 1 through 3 and include the initial execution, not just retries. The
+choice applies to every task in the new plan. It does not increase model budgets,
+grant tool permissions, or replace the coding harness's internal retries.
+
+HTTP planning requests use the optional top-level `max_task_attempts` field. For
+Factory intake, the same explicit value must be present in the initial policy and
+preflight/materialization request. Preview responses show the actual per-task
+`max_attempts`. Omission preserves the old serialized policy and request shape.
+
+Existing work retains its recorded allowance. Omit this flag when continuing an
+existing Factory item to reuse its policy; a conflicting explicit value is rejected.
+Launch, resume, recovery, and contract/budget revision requests are not attempt
+setters. A nested `contract.max_task_attempts`, including `null`, is also rejected
+at the revision boundary rather than silently ignored. Never edit attempts or
+reset spend in the database to make a recovery proceed.
+
+See the [scoped planning report](docs/evidence/2026-09-10-planned-attempt-policy.md).
+The complete public two-correction runtime drill remains an explicit acceptance
+gate, not a conclusion from unit tests.
+
 ### Coordinate independent factories
 
 Personal factory hosts do not create personal backlogs. Every contributor must use the same Project

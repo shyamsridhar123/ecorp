@@ -488,6 +488,23 @@ tests, allowed tools, prohibited actions, references, write scope, token budget,
 escalation path. Validation rejects unknown agents, adapter mismatches, missing contract fields,
 cycles, excessive depth, node fan-out, retry counts, and budgets.
 
+The optional creation-time `max_task_attempts` request selects a total allowance
+from the existing 1-3 planner range. The registry applies it to every task before
+the existing graph validation. Omission preserves each strategy's prior default;
+there is no separate retry engine or provider-session behavior. Direct preview,
+creation, CLI, MCP, ACP and A2A use the same choice.
+
+Factory policy records an explicit choice before the claim. Preflight and
+materialization must agree with that immutable policy, and persistence repeats
+the comparison under the existing claim gates. The actual constrained task
+allowances are returned in Factory preflight as well as direct mission preview.
+The HTTP materializer checks a conflicting explicit setting through the current
+authorized planning-source read before generic claim-failure compensation.
+Legacy omission does not add a null field to durable operation snapshots.
+Continuation reuses the recorded policy; no post-creation endpoint changes
+`tasks.max_attempts` or `attempt_count`. Verifier-only recovery keeps its existing
+separate attempt-accounting rules.
+
 Interactive mission creation presents the structured workspace identities advertised by connected
 runners. The operator must select and confirm one exact repository, symbolic ref, and immutable
 commit before launch. The server matches that tuple to a connected runner, copies it into every
@@ -591,6 +608,22 @@ through the generic transition endpoint.
   metadata but cannot change the manual gate, check count/kinds, source, secrets, model, budgets,
   deliverable authority, or widen tools and write scope.
 
+For a valid stored policy with remaining attempts, a failed checkpoint-derived correction can
+continue through another current revision. Bounded historical reconstruction validates every
+native correction and revision edge without rewriting old schema-1 grants. Historical policy
+is not current execution authority. The latest provider's fingerprint and nullable exported
+head remain current; family membership alone grants no checkpoint operation. The public
+pre-execution attempt option and its remaining runtime acceptance are tracked in
+#224; see the [planned-attempt report](evidence/2026-09-10-planned-attempt-policy.md).
+
+Native verifier cleanup emits its exact authorized fingerprint only after checking
+both fingerprint and assigned HEAD, but its preservation event can omit the
+redundant `head_commit` field. Historical correction validation accepts that
+omission only for an exactly bound verification-only checkpoint. The authorized
+HEAD is retained, explicit invalid or conflicting heads still fail, and the
+native origin authority is independently reconstructed afterward. A provider with
+a required HEAD receives no such omission exception.
+
 Recovery authorization and its runner command are idempotent and durable. The operation stores the
 reviewed GitHub issue revision and snapshot, prior and replacement verifier policies, source and
 replacement run IDs, actor, reason, and contract revision. Runner command acknowledgment prevents
@@ -605,6 +638,23 @@ runner's exact source/policy-bound checkpoint. It creates a `verification_only` 
 existing `VerifyRun` command, with no model, provider session, provider secrets, model-token
 allocation, or model-cost allocation. Original provider attempts and all consumed usage remain
 unchanged. A later separately authorized verifier retry remains tied to the original checkpoint.
+
+When that checkpoint verifier finds work still to correct, an explicit `source_correction`
+may continue the exact preserved provider session after a measured **suspension**, provided
+ordinary remaining mission/requester/Corp limits and provider attempts still allow it.
+This is not the zero-provider operation above. A separate `source_correction_authority`
+record binds the failed checkpoint verifier, native suspension/termination/checkpoint proof,
+original policy, current contract revision, saved execution connection and provider session.
+Only that historical suspension is admitted; stops, unrelated suspensions, loop failures
+and quarantine remain protected. Dispatch repeats current authority and connection admission
+before and after secret resolution, and ordinary publication revalidates the correction's
+origin. A temporary authorization database failure leaves the durable command pending.
+
+Recovery context distinguishes checkpoint-family history, currently available source-only
+checks, and currently available provider correction. A valid revised policy may allow the
+latter without permitting the former. The browser uses this exact context for its controls
+and revision source; it does not silently choose an older provider from the run list.
+See [the correction evidence](evidence/2026-09-09-checkpoint-source-correction.md).
 
 Legacy controller catch-up could project that recoverable suspension as a terminal Factory
 `cancelled` item. The exact recovery-context endpoint now returns a

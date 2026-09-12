@@ -61,6 +61,10 @@ export async function waitForControlledRunnerDispatch({ request, demo, runner },
 } = {}) {
   const source = runner.readinessSource
   assert.ok(source?.repository && source.base_ref && source.base_commit)
+  const adapter = runner.adapter ?? 'fake-process'
+  const supportsRuntime = candidate => candidate.capabilities.some(cap => cap.name === adapter && cap.available &&
+    cap.workspace_connection_id == null && (!runner.modelId || cap.models?.some(model =>
+      model.id === runner.modelId && model.policy_state !== 'disabled')))
   const prefix = `/api/corps/${demo.corp_id}`
   const snapshotRoute = `${prefix}/snapshot?actor_id=${demo.alice_actor_id}`
   const deadline = now() + 30_000
@@ -68,20 +72,20 @@ export async function waitForControlledRunnerDispatch({ request, demo, runner },
   while (now() < deadline) {
     const { response, body: state } = await request(snapshotRoute)
     assert.equal(response.status, 200, 'Cannot verify controlled runner identity')
-    const candidates = state.runners.filter(candidate => candidate.connected && candidate.corp_id === demo.corp_id &&
+    const candidates = state.runners.filter(candidate => candidate.connected && candidate.corp_id === demo.corp_id && supportsRuntime(candidate) &&
       candidate.capabilities.some(cap => cap.name === 'workspace-isolation' && cap.available &&
         cap.workspace_connection_id == null && cap.source_repository === source.repository &&
         cap.source_base_ref === source.base_ref && cap.source_base_commit === source.base_commit))
     assert.deepEqual(candidates.map(candidate => candidate.id), [runner.runnerId],
       'The readiness marker must identify exactly the controlled runner')
-    assert.ok(candidates[0].capabilities.some(cap => cap.name === 'fake-process' && cap.available &&
-      cap.workspace_connection_id == null), 'The controlled fixture adapter must be available')
+    assert.ok(supportsRuntime(candidates[0]), 'The controlled fixture adapter/model must be available')
     for (const collection of ['missions', 'tasks', 'runs']) {
       assert.equal(state.snapshot[collection].length, 0, 'Readiness must precede all fixture work')
     }
     const preview = await request(`${prefix}/missions/preview`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ requested_by: demo.alice_actor_id, preferred_adapter: 'fake-process',
+      body: JSON.stringify({ requested_by: demo.alice_actor_id, preferred_adapter: adapter,
+        ...(runner.modelId ? { preferred_model: runner.modelId } : {}),
         title: 'Preview controlled fixture runner readiness only.', source }),
     })
     previews++
@@ -99,7 +103,7 @@ export function assertControlledAssignment(launch, runner) {
 }
 
 export function selectFixtureRunnerForSource(state, demo, expected) {
-  assert.ok(expected.repository && expected.base_ref && /^[0-9a-f]{40}$/u.test(expected.base_commit),
+  assert.ok(expected.repository && expected.base_ref && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expected.base_commit),
     'The fixture must declare its expected immutable checkout')
   const matches = state.runners.filter(runner => runner.connected && runner.corp_id === demo.corp_id)
     .flatMap(runner => runner.capabilities.filter(cap => cap.name === 'workspace-isolation' && cap.available &&

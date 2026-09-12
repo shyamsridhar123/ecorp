@@ -28,7 +28,7 @@ jobs:
       - name: Test platform-specific CI fixture contracts
         env:
           ECORP_OWNED_PROCESS_TEST: '1'
-        run: node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs tools/identity_fixture.test.mjs tools/ci_runner_tests.test.mjs
+        run: node --test tools/e2e_external_adapters.test.mjs tools/e2e_external_adapters_http.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs tools/owned_test_stack.test.mjs tools/ci_owned_test_server.test.mjs tools/identity_fixture.test.mjs tools/ci_runner_tests.test.mjs tools/fixture_source_identity.test.mjs tools/budget_fixture.test.mjs
       - name: Test native Linux process ownership
         run: python3 -B tools/owned_test_process_linux_test.py -v
       - run: node tools/check_migrations.mjs
@@ -155,8 +155,6 @@ jobs:
         env:
           CRONY_TASK_GRAPH_TEST: '1'
           CRONY_SERVER_HTTP: http://127.0.0.1:18471
-          ECORP_CI_UNIX_DEMO_ROSTER: '1'
-          ECORP_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
           node tools/e2e_task_graph.mjs --dry-run
           node tools/e2e_task_graph.mjs
@@ -198,7 +196,13 @@ jobs:
       - name: Verify durable risky-action approvals and exactly-once decision effects
         run: node tools/e2e_approvals.mjs
       - name: Verify budget and loop circuit-breaker stages
-        run: node tools/e2e_budgets.mjs
+        env:
+          CRONY_BUDGET_TEST: '1'
+          CRONY_BUDGET_RUNNER_ID: runner-local
+          CRONY_BUDGET_OUTPUT: ${{ github.workspace }}/output/e2e-budgets.json
+        run: |
+          node tools/e2e_budgets.mjs --dry-run
+          node tools/e2e_budgets.mjs
       - name: Verify terminal provider cleanup and off-shift agent state
         run: node tools/e2e_idle_cleanup.mjs
       - name: Run the versioned 100-scenario deterministic evaluation lane
@@ -251,6 +255,8 @@ jobs:
             output/factory-server-restart.stderr.log
             output/server-restart.stdout.log
             output/server-restart.stderr.log
+            output/*restart*.stdout.log
+            output/*restart*.stderr.log
             output/artifact-recovery-server.stdout.log
             output/artifact-recovery-server.stderr.log
             output/runner-ci.log

@@ -4,10 +4,11 @@ import path from 'node:path'
 import net from 'node:net'
 import os from 'node:os'
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
-import { assertOwnedRestart, assertTestEndpoint, restartOwnedTestServer, startOwnedTestServer, stopOwnedTestServer } from './owned_test_stack.mjs'
+import { assertOwnedRestart, assertTestEndpoint, ownedServerEnvironment, restartOwnedTestServer, startOwnedTestServer, stopOwnedTestServer } from './owned_test_stack.mjs'
 
-const root = path.resolve('fixture-root')
-const binary = path.join(root, 'crony-server.exe')
+// Pure fixtures: no process discovery, signals, services, or filesystem mutation.
+const root = 'C:\\fixture-root'
+const binary = `${root}\\crony-server.exe`
 const server = 'http://127.0.0.1:18965'
 const manifest = {
   test_owned: true, workspace: root, server_url: server, server: 4242,
@@ -16,13 +17,31 @@ const manifest = {
 const identity = { platform: 'win32', pid: manifest.server, executable: binary, creation: manifest.server_creation, port_owned: true }
 const context = { root, server, binary, platform: 'win32' }
 
+test('upstream restart environment remains bounded and cannot override database authority', () => {
+  const inherited = { PATH: 'fixture', DATABASE_URL: 'old-private-value' }
+  const changed = ownedServerEnvironment({ CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0',
+    CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1' }, 'new-private-value', inherited)
+  assert.deepEqual(changed, { PATH: 'fixture', DATABASE_URL: 'new-private-value',
+    CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0', CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1' })
+  assert.equal(inherited.DATABASE_URL, 'old-private-value')
+  for (const environment of [null, [], { DATABASE_URL: 'canary' }, { NODE_OPTIONS: '--require=canary' },
+    { CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '0' }, { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '3601' },
+    { CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: 1 }, { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '-1' },
+    { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '00' }, { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '1.5' }]) {
+    assert.throws(() => ownedServerEnvironment(environment, 'private-value'), /refusing/u)
+  }
+})
+
 test('owned server requires matching executable, creation, endpoint, and workspace', () => {
   assert.doesNotThrow(() => assertOwnedRestart(manifest, identity, context))
   for (const changed of [
-    { ...identity, executable: path.join(root, 'other-server.exe') },
+    { ...identity, executable: `${root}\\other-server.exe` },
     { ...identity, creation: '2026-09-06T22:00:01.000Z' },
     { ...identity, creation: 'invalid' },
     { ...identity, port_owned: false },
+    { ...identity, port_owned: 'true' },
+    { ...identity, port: 18966 },
+    { ...identity, pid: 4243 },
   ]) {
     assert.throws(() => assertOwnedRestart(manifest, changed, context), /refusing/u)
   }
@@ -33,7 +52,7 @@ test('manual, remote, stale, or non-owned manifests never authorize restart', ()
     { ...manifest, test_owned: false },
     { ...manifest, server: 0 },
     { ...manifest, server_creation: null },
-    { ...manifest, workspace: path.resolve('other-workspace') },
+    { ...manifest, workspace: 'C:\\other-workspace' },
     { ...manifest, server_url: 'http://127.0.0.1:8791' },
   ]) {
     assert.throws(() => assertOwnedRestart(changed, identity, context), /refusing/u)

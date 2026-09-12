@@ -72,6 +72,7 @@ $preview = [ordered]@{
         'Verify the original mixed Codex/Claude parallel graph, dependency artifacts and bounded retries.',
         'Verify controlled-runner readiness and exact assignment using one synthetic artifact; no fault injection or restart.',
         'Verify synthetic runner identity readiness, rotation, replay fencing and active revocation; no OIDC service.',
+        'Verify the upstream native budget-stop suite, including the physical retained late-completion source.',
         'Stop only owned fixture processes and preserve all data, worktrees and evidence.'
     )
     services_started = $false
@@ -302,7 +303,9 @@ try {
     $graphEnv.CRONY_TASK_GRAPH_OUTPUT = Join-Path $evidence 'e2e-task-graph.json'
     Invoke-FixtureCommand 'task-graph' $node @((Join-Path $repo 'tools/e2e_task_graph.mjs')) $graphEnv 180 | Out-Null
     $graphReport = Get-Content -LiteralPath $graphEnv.CRONY_TASK_GRAPH_OUTPUT -Raw | ConvertFrom-Json
-    if (@(Compare-Object @('claude-code', 'codex') @($graphReport.parallel_graph.root_adapters)).Count) {
+    if (!$graphReport.parallel_graph.source_selected -or
+        @(Compare-Object @('fake-process', 'fake-process') @($graphReport.parallel_graph.root_adapters)).Count -or
+        @(Compare-Object @('claude-code', 'codex') @($graphReport.legacy_mixed_provider_graph.root_adapters)).Count) {
         throw 'The Windows graph did not preserve mixed Codex/Claude adapter coverage.'
     }
     $report.cross_provider_graph = 'passed'
@@ -322,6 +325,20 @@ try {
         $identityReport.probe_runner_id -ne $identityReport.assigned_runner_id -or
         $identityReport.active_revocation_run_status -ne 'lost') { throw 'Identity lifecycle evidence is incomplete or overstated.' }
     $report.identity_lifecycle = 'passed'
+    $budgetEnv = $childEnv.Clone()
+    $budgetEnv.CRONY_BUDGET_TEST = '1'; $budgetEnv.CRONY_SERVER_HTTP = $api
+    $budgetEnv.DATABASE_URL = $serverEnv.DATABASE_URL
+    $budgetEnv.CRONY_BUDGET_RUNNER_ID = $runnerId
+    $budgetEnv.CRONY_BUDGET_OUTPUT = Join-Path $evidence 'e2e-budgets.json'
+    Invoke-FixtureCommand 'budget-preview' $node @((Join-Path $repo 'tools/e2e_budgets.mjs'), '--dry-run') $budgetEnv | Out-Null
+    Invoke-FixtureCommand 'budgets' $node @((Join-Path $repo 'tools/e2e_budgets.mjs')) $budgetEnv 180 | Out-Null
+    $budgetReport = Get-Content -LiteralPath $budgetEnv.CRONY_BUDGET_OUTPUT -Raw | ConvertFrom-Json
+    if ($budgetReport.late_completion_status -ne 'cancelled' -or
+        $budgetReport.late_completion_provider_outcome -ne 'completed' -or
+        !$budgetReport.late_completion_source_retained -or
+        $budgetReport.late_completion_artifact_events -ne 0 -or
+        $budgetReport.late_completion_accepted_events -ne 0) { throw 'Budget late-completion evidence is incomplete.' }
+    $report.budget_breakers = 'passed'
     $after = Invoke-FixtureCommand 'source-after' $git @('-C', $source, 'rev-parse', 'HEAD')
     $status = Invoke-FixtureCommand 'source-status' $git @('-C', $source, 'status', '--porcelain')
     if ($after -ne $report.fixture_source_commit -or $status) { throw 'The fixture source checkout changed.' }

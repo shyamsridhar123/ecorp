@@ -19,8 +19,6 @@ import {
 import {
   artifactStagingFixtureConfig,
   assertControlledAssignment,
-  controlledReadinessCapability,
-  controlledReadinessSource,
   waitForControlledRunnerDispatch,
 } from './controlled_runner_fixture.mjs'
 
@@ -283,11 +281,10 @@ async function psqlInvocation() {
   }
 }
 
-function connectRunner({ corpId, runnerId, credential }) {
+function connectRunner({ corpId, runnerId, credential, source, modelId }) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`${server.replace(/^http/, 'ws')}/ws/runner`)
     const connectionEpoch = crypto.randomUUID()
-    const readinessSource = controlledReadinessSource(runnerId, connectionEpoch)
     const assignments = []
     const waiters = []
     const timeout = setTimeout(() => {
@@ -324,12 +321,26 @@ function connectRunner({ corpId, runnerId, credential }) {
           os: process.platform,
           capabilities: [
             {
-              name: 'fake-process',
+              name: 'codex',
               available: true,
               detail: 'controlled artifact staging runner',
-              models: [],
+              models: [{
+                id: modelId,
+                name: 'Controlled artifact staging fixture',
+                policy_state: 'enabled',
+                supports_vision: false,
+                supports_reasoning_effort: false,
+              }],
             },
-            controlledReadinessCapability(readinessSource),
+            {
+              name: 'workspace-isolation',
+              available: true,
+              detail: 'controlled storage fixture; no provider execution',
+              models: [],
+              source_repository: source.repository,
+              source_base_ref: source.base_ref,
+              source_base_commit: source.base_commit,
+            },
           ],
           active_runs: [],
         }),
@@ -343,7 +354,10 @@ function connectRunner({ corpId, runnerId, credential }) {
           socket,
           connectionEpoch,
           runnerId,
-          readinessSource,
+          source,
+          modelId,
+          readinessSource: source,
+          adapter: 'codex',
           credential: payload.credential,
           waitForAssignment(runId, timeoutMs = 10_000) {
             const index = assignments.findIndex(
@@ -402,7 +416,9 @@ function sendRunEvent(runner, assignment, eventType, payload, eventId) {
 async function controlledRun(demo, runner, title) {
   const mission = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
-    preferred_adapter: 'fake-process',
+    preferred_adapter: 'codex',
+    preferred_model: runner.modelId,
+    source: runner.source,
     title,
   })
   const launch = await post(
@@ -412,6 +428,12 @@ async function controlledRun(demo, runner, title) {
   assertControlledAssignment(launch, runner)
   const assignment = await runner.waitForAssignment(launch.run_id)
   assert.equal(assignment.run_id, launch.run_id)
+  const assigned = await snapshot(demo)
+  assert.equal(
+    assigned.snapshot.runs.find((run) => run.id === launch.run_id)?.runner_id,
+    runner.runnerId,
+    'Only the model-scoped controlled runner may receive storage-fixture work',
+  )
   sendRunEvent(runner, assignment, 'run.started', {
     workspace: 'controlled-artifact-workspace',
     station: 'terminal',
@@ -587,12 +609,31 @@ async function removeArtifactFinalizeFailure() {
 }
 
 async function restartLocalServer() {
-  await restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'artifact-recovery-server',
-    environment: { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0', CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1' } })
+  return restartOwnedTestServer({
+    root, server, databaseUrl, logPrefix: 'artifact-recovery-server',
+    environment: {
+      CRONY_ARTIFACT_RECOVERY_GRACE_SECS: '0',
+      CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: '1',
+    },
+  })
 }
 
 const demo = await post('/api/demo/reset', {})
-const runnerId = `aaa-artifact-staging-${crypto.randomUUID()}`
+const initial = await snapshot(demo)
+const sourceCapability = initial.runners
+  .filter((candidate) => candidate.connected)
+  .flatMap((candidate) => candidate.capabilities)
+  .find((capability) => capability.name === 'workspace-isolation' &&
+    capability.available && capability.workspace_connection_id == null)
+assert.ok(sourceCapability?.source_repository && sourceCapability.source_base_ref)
+assert.match(sourceCapability.source_base_commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i)
+const source = {
+  repository: sourceCapability.source_repository,
+  base_ref: sourceCapability.source_base_ref,
+  base_commit: sourceCapability.source_base_commit,
+}
+const runnerId = `zz-artifact-staging-${crypto.randomUUID()}`
+const modelId = `artifact-staging-${crypto.randomUUID()}`
 const enrollment = await post(`/api/corps/${demo.corp_id}/runners/enroll`, {
   actor_id: demo.alice_actor_id,
   runner_id: runnerId,
@@ -602,8 +643,13 @@ const runner = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: enrollment.enrollment_token,
+  source,
+  modelId,
 })
 const readinessPreviews = await waitForControlledRunnerDispatch({ request, demo, runner })
+
+// The shared bounded preview barrier above selects this exact model/source.
+// Registration and runner ordering are not dispatch authority.
 
 const sharedBytes = Buffer.from(`shared digest ${crypto.randomUUID()}\n`, 'utf8')
 const accepted = await acceptedArtifact(

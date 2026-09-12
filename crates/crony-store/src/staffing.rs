@@ -1,5 +1,13 @@
 use super::*;
 
+pub struct FactoryPlanningSource {
+    pub repository: String,
+    pub base_ref: String,
+    pub base_commit: String,
+    pub workspace_connection_id: Option<Uuid>,
+    pub max_task_attempts: Option<i32>,
+}
+
 pub(super) fn validate_staffing(plan: &TaskGraphPlan) -> Result<()> {
     if plan.staffing.len() > 8 || plan.staffing.len() > plan.tasks.len() {
         return Err(anyhow!("mission staffing exceeds the bounded task graph"));
@@ -335,6 +343,23 @@ impl PgStore {
         work_item_id: Uuid,
         actor_id: Uuid,
     ) -> Result<(String, String, String, Option<Uuid>)> {
+        let source = self
+            .factory_planning_source(corp_id, work_item_id, actor_id)
+            .await?;
+        Ok((
+            source.repository,
+            source.base_ref,
+            source.base_commit,
+            source.workspace_connection_id,
+        ))
+    }
+
+    pub async fn factory_planning_source(
+        &self,
+        corp_id: Uuid,
+        work_item_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<FactoryPlanningSource> {
         let mut tx = self.pool.begin().await?;
         assert_mission_operator_tx(&mut tx, corp_id, actor_id).await?;
         let row = sqlx::query(
@@ -361,22 +386,25 @@ impl PgStore {
         let policy: Value = row.get("policy");
         let workspace_connection_id =
             factory_workspace_connection_id(&policy).map_err(anyhow::Error::msg)?;
+        let max_task_attempts =
+            crony_domain::factory_max_task_attempts(&policy).map_err(anyhow::Error::msg)?;
         let base_ref = policy["source_base_ref"]
             .as_str()
             .context("factory source ref missing")?;
         let base_commit = policy["source_base_commit"]
             .as_str()
             .context("factory source commit missing")?;
-        let result = (
-            format!(
+        let result = FactoryPlanningSource {
+            repository: format!(
                 "{}/{}",
                 row.get::<String, _>("source_repository_owner"),
                 row.get::<String, _>("source_repository_name")
             ),
-            base_ref.to_owned(),
-            base_commit.to_owned(),
+            base_ref: base_ref.to_owned(),
+            base_commit: base_commit.to_owned(),
             workspace_connection_id,
-        );
+            max_task_attempts,
+        };
         tx.commit().await?;
         Ok(result)
     }

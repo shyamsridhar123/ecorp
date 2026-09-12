@@ -30,6 +30,48 @@ const epoch = '00000000-0000-4000-8000-000000000002'
 const source = controlledReadinessSource(runnerId, epoch)
 const runner = { runnerId, readinessSource: source }
 
+test('model-scoped readiness selects its probe despite another runner with the same source', async () => {
+  const actual = { repository: 'all-the-vibes/ecorp', base_ref: 'HEAD', base_commit: 'b'.repeat(40) }
+  const probe = { runnerId: 'zz-controlled-probe', readinessSource: actual, adapter: 'codex', modelId: 'controlled-model' }
+  const workspace = { name: 'workspace-isolation', available: true, source_repository: actual.repository,
+    source_base_ref: actual.base_ref, source_base_commit: actual.base_commit }
+  const capability = id => ({ name: 'codex', available: true, models: [{ id, policy_state: 'enabled' }] })
+  const state = { runners: [
+    { id: 'aaa-normal-runner', connected: true, corp_id: demo.corp_id, capabilities: [workspace, capability('normal-model')] },
+    { id: probe.runnerId, connected: true, corp_id: demo.corp_id, capabilities: [workspace, capability(probe.modelId)] },
+  ], snapshot: { missions: [], tasks: [], runs: [] } }
+  let previews = 0
+  const request = async (_route, init) => {
+    if (!init) return { response: { status: 200 }, body: state }
+    previews++
+    const body = JSON.parse(init.body)
+    assert.equal(body.preferred_adapter, 'codex')
+    assert.equal(body.preferred_model, probe.modelId)
+    assert.deepEqual(body.source, actual)
+    return { response: { status: 200 }, body: {} }
+  }
+  assert.equal(await waitForControlledRunnerDispatch({ request, demo, runner: probe }), 1)
+  assert.equal(previews, 1)
+  state.runners[0].capabilities[1] = capability(probe.modelId)
+  await assert.rejects(waitForControlledRunnerDispatch({ request, demo, runner: probe }))
+  assert.equal(previews, 1, 'Ambiguity must reject before another preview')
+})
+
+test('a missing or disabled probe model cannot borrow another runtime or source', async () => {
+  const probe = { runnerId, readinessSource: source, adapter: 'codex', modelId: 'probe-model' }
+  for (const models of [[], [{ id: 'other-model' }], [{ id: probe.modelId, policy_state: 'disabled' }]]) {
+    let previews = 0
+    const request = async (_route, init) => {
+      if (init) { previews++; throw new Error('Must reject before a preview') }
+      return { response: { status: 200 }, body: { runners: [{ id: runnerId, connected: true, corp_id: demo.corp_id,
+        capabilities: [controlledReadinessCapability(source), { name: 'codex', available: true, models }] }],
+      snapshot: { missions: [], tasks: [], runs: [] } } }
+    }
+    await assert.rejects(waitForControlledRunnerDispatch({ request, demo, runner: probe }))
+    assert.equal(previews, 0)
+  }
+})
+
 test('artifact smoke requires explicit owned opt-in, loopback origin and output', () => {
   const config = artifactStagingFixtureConfig(['--readiness-smoke', '--dry-run'], smokeEnv)
   assert.equal(config.readinessSmoke, true)

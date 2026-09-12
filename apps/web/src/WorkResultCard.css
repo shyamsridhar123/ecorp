@@ -1,0 +1,152 @@
+/* Result-first controls use ECorp's existing light paper and restrained red. */
+.app-shell .work-result-card {
+  --result-accent: #64716b;
+  min-inline-size: 0;
+  margin-block: 16px;
+  padding: 18px 20px;
+  color: #182c24;
+  background: #fff;
+  border: 1px solid #bac8c0;
+  border-inline-start: 4px solid var(--result-accent);
+  border-radius: 4px;
+  box-shadow: 3px 3px 0 #182c2408;
+  text-align: start;
+}
+
+.app-shell .work-result-success { --result-accent: #18794e; }
+.app-shell .work-result-working { --result-accent: #315976; }
+.app-shell .work-result-attention { --result-accent: #896218; }
+
+.work-result-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.work-result-heading > div { min-inline-size: 0; flex: 1 1 210px; }
+.app-shell .work-result-eyebrow { display: block; color: #52635a; font-size: 12px; font-weight: 650; line-height: 1.5; }
+.app-shell .work-result-card h4 { margin: 5px 0 0; color: #182c24; font-size: 22px; line-height: 1.3; overflow-wrap: anywhere; }
+.app-shell .work-result-status { flex: 0 1 auto; padding: 5px 9px; color: #344b3f; background: #eff4f0; border: 1px solid #c3d3c8; border-radius: 3px; font-size: 12px; line-height: 1.5; font-weight: 700; }
+.app-shell .work-result-attention .work-result-status { color: #65470f; background: #fff6de; border-color: #dcc78e; }
+.app-shell .work-result-working .work-result-status { color: #294d68; background: #edf3f8; border-color: #bbcbd7; }
+.app-shell .work-result-description { margin: 12px 0 0; max-inline-size: 68ch; color: #465a50; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; }
+.work-result-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-block-start: 16px; }
+.app-shell .work-result-actions :is(a, button) { min-block-size: 44px; max-inline-size: 100%; min-inline-size: 0; padding: 10px 15px; font-size: 15px; line-height: 1.4; font-weight: 650; white-space: normal; overflow-wrap: anywhere; }
+.app-shell .work-result-actions .button-primary { color: #fff; background: #96122d; border-color: #96122d; text-decoration: none; }
+.app-shell .work-result-actions .button-primary:hover { color: #fff; background: #741024; }
+.app-shell .work-result-actions .button-secondary { color: #253b31; background: #fff; border-color: #82948a; text-decoration: none; }
+.app-shell .work-result-actions .button-secondary:hover { background: #edf3ee; }
+.app-shell .work-result-actions :is(a, button):focus-visible,
+.app-shell .work-result-details > summary:focus-visible { outline: 3px solid #9c1027; outline-offset: 3px; }
+.app-shell .work-result-actions :disabled { cursor: not-allowed; opacity: 0.6; }
+
+.app-shell .work-result-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  margin: 18px 0 0;
+  padding: 14px 0 0;
+  border-block-start: 1px solid #dce4de;
+}
+.app-shell .work-result-facts > div { min-inline-size: 0; flex: 1 1 130px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.app-shell .work-result-facts dt { margin: 0; color: #52635a; font-size: 12px; font-weight: 500; line-height: 1.5; }
+.app-shell .work-result-facts dd { margin: 3px 0 0; color: #182c24; font-size: 14px; line-height: 1.5; font-weight: 650; overflow-wrap: anywhere; }
+.app-shell .work-result-details { margin-block-start: 12px; color: #30483b; }
+.app-shell .work-result-details > summary { min-block-size: 44px; align-content: center; padding-block: 10px; color: #30483b; font-size: 14px; font-weight: 650; cursor: pointer; }
+.app-shell .work-result-details > div { padding: 12px; color: #30483b; background: #f5f7f4; border: 1px solid #dce4de; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.app-shell .work-result-details :is(p, small, code, dt, dd) { color: inherit; font-size: inherit; line-height: inherit; }
+.app-shell .work-result-details p { margin-block: 4px 10px; }
+.app-shell .work-result-notice { margin: 12px 0 0; color: #536059; font-size: 13px; line-height: 1.55; }
+
+@media (max-width: 480px) {
+  .app-shell .work-result-card { padding: 16px 14px; }
+  .app-shell .work-result-card h4 { font-size: 20px; }
+  .work-result-heading { gap: 8px; }
+  .work-result-actions { align-items: stretch; }
+  .work-result-actions :is(a, button) { flex: 1 1 100%; text-align: center; }
+  .app-shell .work-result-facts > div { flex-basis: 100%; }
+}
+
+/* The current work remains visible in the app's narrow side pane. */
+.app-shell .work-quick-switch { display: none; }
+.app-shell :is(.mission-selector, .factory-queue) { max-block-size: min(70vh, 44rem); overflow-y: auto; overscroll-behavior: contain; }
+.app-shell :is(.mission-selector, .factory-queue) button { min-block-size: 64px; }
+.app-shell .mission-selector button > strong { font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+.app-shell .mission-selector button > :is(span, small) { font-size: 12px; line-height: 1.5; }
+.app-shell .factory-queue-copy :is(strong, span, small) { font-size: 13px; line-height: 1.5; }
+.app-shell #factory .factory-workbench { min-inline-size: 0; min-block-size: 0; padding: 12px; background: #f5f7f4; }
+.app-shell #factory .factory-dossier-stage { min-inline-size: 0; min-block-size: 0; padding: 18px; color: #182c24; background: #fff; background-image: none; border: 1px solid #bac8c0; border-radius: 4px; box-shadow: none; }
+.app-shell #factory .factory-dossier-stage > h3 { margin-block: 12px; font-size: 22px; line-height: 1.4; }
+.app-shell #factory .factory-dossier-stage > h3 a { color: #243e30; }
+.app-shell #factory .factory-dossier-top :is(small, .factory-source) { font-size: 13px; line-height: 1.5; color: #53645a; }
+.app-shell #factory .factory-dossier-stage > p { color: #52635a; font-size: 14px; line-height: 1.55; }
+.app-shell #factory .factory-facts { margin-block: 14px; }
+.app-shell #factory .factory-dossier-footer { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.app-shell #factory .factory-intake-details { grid-column: 1 / -1; min-inline-size: 0; }
+.app-shell #factory .factory-intake-details > summary,
+.app-shell #factory .manual-work-links > summary { min-block-size: 44px; align-content: center; color: #30483b; font-size: 14px; font-weight: 650; cursor: pointer; }
+.app-shell #factory .factory-control-help { grid-column: 1 / -1; margin: 0; color: #52635a; font-size: 13px; line-height: 1.5; }
+.app-shell #factory .manual-work-links { padding: 6px 18px; }
+.app-shell #factory .manual-work-links[open] { padding-block-end: 14px; }
+.app-shell #factory .factory-controller-strip { gap: 12px; padding: 14px; }
+.app-shell :is(.mission-result-surface, .mission-evidence-context, .mission-approval-list, .verification-actions):focus {
+  outline: 3px solid #9c1027;
+  outline-offset: 4px;
+  scroll-margin-block: 20px;
+}
+.mission-result-surface { min-inline-size: 0; }
+
+/* Retain the office presentation; compact repeated chrome only in work views. */
+.app-shell:is(.view-missions, .view-factory) { display: flex; flex-direction: column; gap: 12px; }
+.app-shell:not(.view-floor) .topbar { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; min-block-size: 0; padding: 12px 18px; gap: 12px; }
+.app-shell:not(.view-floor) .brand-lockup { flex: 0 0 auto; }
+.app-shell:not(.view-floor) .operator-console { display: flex; flex-direction: row; flex-wrap: wrap; flex: 1 1 360px; inline-size: auto; justify-content: flex-end; }
+.app-shell:not(.view-floor) .operator-console .operations-identity { flex: 0 1 230px; inline-size: 230px; max-inline-size: 100%; }
+.app-shell:not(.view-floor) .brand-kicker { display: none; }
+.app-shell:not(.view-floor) .brand-row h1 { font-size: 25px; line-height: 1.2; }
+.app-shell:not(.view-floor) .operator-console { gap: 10px; }
+.app-shell:not(.view-floor) .operations-identity { gap: 3px; }
+.app-shell:not(.view-floor) .operations-identity > small { font-size: 11px; }
+.app-shell:not(.view-floor) .arcade-command-deck { min-block-size: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 16px; margin-block: 12px; }
+.app-shell:not(.view-floor) .arcade-command-focus { min-block-size: 0; flex: 1 1 130px; padding: 0; border: 0; }
+.app-shell:not(.view-floor) .arcade-command-focus > span,
+.app-shell:not(.view-floor) .arcade-command-focus > small { display: none; }
+.app-shell:not(.view-floor) .arcade-command-focus > strong { font-size: 16px; line-height: 1.5; }
+.app-shell:not(.view-floor) .arcade-command-meters { flex: 2 1 360px; min-inline-size: 0; gap: 0; padding: 0; }
+.app-shell:not(.view-floor) .arcade-command-meters button { min-block-size: 44px; padding: 6px 12px; }
+.app-shell:not(.view-floor) .arcade-command-meters button > strong { font-size: 21px; }
+.app-shell:is(.view-missions, .view-factory) > .arcade-command-deck { display: none; }
+.app-shell #missions > .operations-mission-toolbar { padding: 10px 16px; }
+.app-shell #missions > .operations-mission-toolbar p { display: none; }
+.app-shell #missions .mission-card > h3 { font-size: 21px; line-height: 1.4; margin-block: 6px; }
+
+@media (max-width: 1000px) {
+  .app-shell #missions .mission-console,
+  .app-shell #factory .factory-console { display: block; margin: 12px; }
+  .app-shell #missions .mission-selector,
+  .app-shell #factory .factory-queue { display: none; }
+  .app-shell .work-quick-switch { display: grid; gap: 6px; min-inline-size: 0; padding: 12px 14px; border-block-end: 1px solid #ced8d1; background: #f5f7f4; }
+  .app-shell .work-quick-switch label { color: #334d3d; font-size: 13px; font-weight: 700; }
+  .app-shell .work-quick-switch select { inline-size: 100%; min-inline-size: 0; max-inline-size: 100%; min-block-size: 44px; padding: 8px 10px; color: #182c24; background: #fff; border: 1px solid #82948a; border-radius: 3px; font-size: 14px; }
+  .app-shell #missions .mission-list { padding: 10px; }
+  .app-shell #factory .factory-workbench { padding: 10px; }
+}
+
+@media (max-width: 480px) {
+  .app-shell:not(.view-floor) .topbar { padding: 12px; }
+  .app-shell:not(.view-floor) .operator-console { gap: 7px; }
+  .app-shell:not(.view-floor) .arcade-command-deck { padding: 8px 10px; }
+  .app-shell:not(.view-floor) .arcade-command-focus { display: none; }
+  .app-shell:not(.view-floor) .arcade-command-meters { flex-basis: 100%; }
+  .app-shell:not(.view-floor) .arcade-command-meters button { padding: 6px 4px; font-size: 12px; }
+  .app-shell #missions .mission-console,
+  .app-shell #factory .factory-console { margin: 8px; }
+  .app-shell #missions .mission-list,
+  .app-shell #factory .factory-workbench { padding: 6px; }
+  .app-shell #factory .factory-dossier-stage { padding: 12px; }
+  .app-shell #factory .factory-dossier-stage > h3 { font-size: 19px; }
+  .app-shell .work-quick-switch { padding: 10px; }
+  .app-shell:not(.view-floor) .operator-console .operations-identity { flex-basis: 100%; inline-size: 100%; }
+}

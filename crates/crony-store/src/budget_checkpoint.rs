@@ -66,6 +66,19 @@ pub(super) async fn source_authority_tx(
     work_item_id: Uuid,
     source_run_id: Uuid,
 ) -> Result<Authority> {
+    source_authority_with_contract_tx(tx, corp_id, work_item_id, source_run_id, None).await
+}
+
+/// A source-correction grant may validate historical proof against the immutable
+/// previous contract in its authorized revision. Ordinary checkpoint verification
+/// always uses the current contract; callers cannot supply this through the API.
+pub(super) async fn source_authority_with_contract_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    source_run_id: Uuid,
+    archived: Option<(&TaskContract, &VerificationPolicy)>,
+) -> Result<Authority> {
     let source = sqlx::query(
         r#"
         SELECT run.id, run.task_id, task.mission_id, mission.room_id, run.execution_mode, run.status,
@@ -274,8 +287,13 @@ pub(super) async fn source_authority_tx(
         &termination_payload,
     )
     .await?;
-    let contract: TaskContract = serde_json::from_value(source.get("contract"))?;
-    let policy: VerificationPolicy = serde_json::from_value(source.get("verification_policy"))?;
+    let (contract, policy) = match archived {
+        Some((contract, policy)) => (contract.clone(), policy.clone()),
+        None => (
+            serde_json::from_value::<TaskContract>(source.get("contract"))?,
+            serde_json::from_value::<VerificationPolicy>(source.get("verification_policy"))?,
+        ),
+    };
     if proof.schema_version != 1
         || proof.corp_id != corp_id
         || proof.mission_id != source.get::<Uuid, _>("mission_id")
@@ -347,6 +365,39 @@ pub(super) async fn validate_lineage_tx(
     workspace_run_id: Uuid,
     authority: &Authority,
 ) -> Result<()> {
+    validate_lineage_prefix_tx(tx, corp_id, work_item_id, workspace_run_id, authority, None).await
+}
+
+/// Validate only the immutable checkpoint prefix of a separately authorized
+/// correction. Its caller must validate the replacement and all later stop and
+/// quarantine state independently; this is not a checkpoint-mode exemption.
+pub(super) async fn validate_lineage_until_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    workspace_run_id: Uuid,
+    authority: &Authority,
+    source_run_id: Uuid,
+) -> Result<()> {
+    validate_lineage_prefix_tx(
+        tx,
+        corp_id,
+        work_item_id,
+        workspace_run_id,
+        authority,
+        Some(source_run_id),
+    )
+    .await
+}
+
+async fn validate_lineage_prefix_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    corp_id: Uuid,
+    work_item_id: Uuid,
+    workspace_run_id: Uuid,
+    authority: &Authority,
+    through_run_id: Option<Uuid>,
+) -> Result<()> {
     ensure_no_explicit_stop_tx(tx, corp_id, workspace_run_id).await?;
     let rows = sqlx::query(
         r#"
@@ -363,6 +414,10 @@ pub(super) async fn validate_lineage_tx(
          AND recovery.task_id=run.task_id AND recovery.factory_work_item_id=$4
          AND recovery.mode='checkpoint_verification' AND recovery.status='failed'
         WHERE run.corp_id=$1 AND run.workspace_run_id=$2
+          AND ($5::uuid IS NULL OR (run.created_at,run.id) <= (
+              SELECT boundary.created_at,boundary.id FROM runs boundary
+              WHERE boundary.id=$5 AND boundary.corp_id=$1 AND boundary.workspace_run_id=$2
+          ))
         ORDER BY run.created_at, run.id LIMIT 65
         "#,
     )
@@ -370,6 +425,7 @@ pub(super) async fn validate_lineage_tx(
     .bind(workspace_run_id)
     .bind(authority.checkpoint.run_id)
     .bind(work_item_id)
+    .bind(through_run_id)
     .fetch_all(&mut **tx)
     .await?;
     if rows.is_empty() || rows.len() > 64 {

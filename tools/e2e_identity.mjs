@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { controlledReadinessCapability, controlledReadinessSource } from './controlled_runner_fixture.mjs'
 import { captureIdentityAssignment, identityFixtureConfig, identityFixturePreview, waitForIdentityProbe } from './identity_fixture.mjs'
 
 const config = identityFixtureConfig(process.argv.slice(2), process.env)
@@ -45,12 +44,10 @@ function connectRunner({
   credential,
   capabilities = [],
   activeRuns = [],
-  withReadinessSource = false,
 }) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`${devServer.replace(/^http/, 'ws')}/ws/runner`)
     const connectionEpoch = crypto.randomUUID()
-    const readinessSource = withReadinessSource ? controlledReadinessSource(runnerId, connectionEpoch) : null
     const timeout = setTimeout(() => {
       socket.close()
       reject(new Error('timed out waiting for runner registration'))
@@ -68,7 +65,7 @@ function connectRunner({
         connection_epoch: connectionEpoch,
         hostname: 'identity-test',
         os: process.platform,
-        capabilities: [...capabilities, ...(readinessSource ? [controlledReadinessCapability(readinessSource)] : [])],
+        capabilities,
         active_runs: activeRuns,
       }))
     }
@@ -81,7 +78,7 @@ function connectRunner({
           reject(new Error('Identity registration returned a different runner'))
           return
         }
-        resolve({ socket, payload, connectionEpoch, runnerId, readinessSource })
+        resolve({ socket, payload, connectionEpoch, runnerId })
       }
     }
   })
@@ -128,13 +125,41 @@ const demo = (
   })
 ).body
 
-const runnerId = `aaa-identity-probe-${crypto.randomUUID()}`
-const fakeCapability = {
-  name: 'fake-process',
-  available: true,
-  detail: 'identity lifecycle probe',
-  models: [],
+const runnerId = `identity-probe-${crypto.randomUUID()}`
+const lifecycleModel = `identity-lifecycle-${crypto.randomUUID()}`
+const initial = await devSnapshot(demo)
+const workspace = initial.runners.filter((runner) => runner.connected)
+  .flatMap((runner) => runner.capabilities)
+  .find((capability) => capability.name === 'workspace-isolation' &&
+    capability.available && capability.workspace_connection_id == null)
+assert.ok(workspace?.source_repository && workspace.source_base_ref)
+assert.match(workspace.source_base_commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i)
+const lifecycleSource = {
+  repository: workspace.source_repository,
+  base_ref: workspace.source_base_ref,
+  base_commit: workspace.source_base_commit,
 }
+const fakeCapability = {
+  name: 'codex',
+  available: true,
+  detail: 'controlled identity protocol probe; no provider execution',
+  models: [{
+    id: lifecycleModel,
+    name: 'Controlled identity lifecycle fixture',
+    policy_state: 'enabled',
+    supports_vision: false,
+    supports_reasoning_effort: false,
+  }],
+}
+const lifecycleCapabilities = [fakeCapability, {
+  name: 'workspace-isolation',
+  available: true,
+  detail: 'controlled identity fixture source',
+  models: [],
+  source_repository: lifecycleSource.repository,
+  source_base_ref: lifecycleSource.base_ref,
+  source_base_commit: lifecycleSource.base_commit,
+}]
 const enrollment = await json(
   `${devServer}/api/corps/${demo.corp_id}/runners/enroll`,
   {
@@ -153,8 +178,7 @@ const first = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: enrollment.body.enrollment_token,
-  capabilities: [fakeCapability],
-  withReadinessSource: true,
+  capabilities: lifecycleCapabilities,
 })
 assert.equal(first.payload.type, 'registered')
 const rotatedCredential = first.payload.credential
@@ -171,18 +195,22 @@ const second = await connectRunner({
   corpId: demo.corp_id,
   runnerId,
   credential: rotatedCredential,
-  capabilities: [fakeCapability],
-  withReadinessSource: true,
+  capabilities: lifecycleCapabilities,
 })
 assert.equal(second.payload.type, 'registered')
 const currentCredential = second.payload.credential
 
+second.readinessSource = lifecycleSource
+second.adapter = 'codex'
+second.modelId = lifecycleModel
 const readinessPreviews = await waitForIdentityProbe({
   request: (pathname, init) => json(`${devServer}${pathname}`, init), demo, probe: second,
 })
 const mission = await devPost(`/api/corps/${demo.corp_id}/missions`, {
   requested_by: demo.alice_actor_id,
-  preferred_adapter: 'fake-process',
+  preferred_adapter: 'codex',
+  preferred_model: lifecycleModel,
+  source: lifecycleSource,
   title: 'Verify superseded runner fencing and active revocation.',
 })
 const { launch, assignment } = await captureIdentityAssignment({
@@ -191,6 +219,10 @@ const { launch, assignment } = await captureIdentityAssignment({
     { requested_by: demo.alice_actor_id }),
 })
 assert.equal(assignment.run_id, launch.run_id)
+assert.equal(
+  (await devSnapshot(demo)).snapshot.runs.find((run) => run.id === assignment.run_id)?.runner_id,
+  runnerId,
+)
 
 first.socket.send(JSON.stringify({
   type: 'run_event',
@@ -310,7 +342,8 @@ const lifecycleEvidence = {
   probe_runner_id: runnerId,
   assigned_runner_id: launch.runner_id,
   readiness_previews: readinessPreviews,
-  source_marker_preview_only: true,
+  source_model_selection: true,
+  provider_execution: false,
   enrollment_rotated: rotatedCredential !== enrollment.body.enrollment_token,
   enrollment_replay_rejected: true,
   workload_credential_rotated: currentCredential !== rotatedCredential,

@@ -13,6 +13,9 @@ export function externalAdapterConfig(args, env) {
     'Unknown external-adapter fixture option')
   const modes = args.filter(arg => arg !== '--dry-run')
   assert.equal(modes.length, 1, 'Select exactly one of --expect-windows or --expect-unix')
+  const expectedRunnerPlatform = env.CRONY_TEST_RUNNER_PLATFORM
+  assert.ok(expectedRunnerPlatform === undefined || ['win32', 'linux', 'darwin'].includes(expectedRunnerPlatform),
+    'unsupported external-adapter test runner platform')
   assert.equal(env.CRONY_EXTERNAL_ADAPTER_TEST, '1',
     'Set CRONY_EXTERNAL_ADAPTER_TEST=1 only for an owned disposable fixture')
   assert.ok(env.CRONY_SERVER_HTTP, 'An explicit owned CRONY_SERVER_HTTP is required')
@@ -26,16 +29,21 @@ export function externalAdapterConfig(args, env) {
   return {
     server: endpoint.origin,
     expectedPlatform: modes[0] === '--expect-windows' ? 'windows' : 'unix',
+    expectedRunnerPlatform,
     dryRun: args.includes('--dry-run'),
     output: path.resolve(env.CRONY_EXTERNAL_ADAPTER_OUTPUT ?? path.join(root, 'output', 'e2e-external-adapters.json')),
   }
 }
 
-export function assertExternalRunner(state, expectedPlatform) {
+export function assertExternalRunner(state, expectedPlatform, expectedRunnerPlatform) {
   assert.ok(['windows', 'unix'].includes(expectedPlatform), 'Unknown platform expectation')
   const runners = state.runners.filter(runner => runner.connected)
   assert.equal(runners.length, 1, 'This fixture requires exactly one connected runner')
   const runner = runners[0]
+  if (expectedRunnerPlatform !== undefined) {
+    const observed = { windows: 'win32', linux: 'linux', macos: 'darwin' }[runner.os]
+    assert.equal(expectedRunnerPlatform, observed, 'test expectation does not match the connected runner platform')
+  }
   // The runner's OS is authoritative, not the HTTP client's process.platform.
   assert.ok(expectedPlatform === 'windows' ? runner.os === 'windows' : ['linux', 'macos'].includes(runner.os),
     `Expected ${expectedPlatform} execution, observed runner OS ${runner.os}`)
@@ -61,17 +69,20 @@ export function assertUnavailableLaunch({ adapter, missionId, before, after, lau
   assert.equal(tasks.length, 1, 'The common sample must contain one task')
   assert.equal(tasks[0].required_adapter, adapter)
   assert.equal(launch.status, 409, 'Unsupported execution must be rejected, not skipped')
-  assert.ok(launch.body.error?.includes('mission dispatch incomplete (0 new runs dispatched)'))
-  assert.ok(launch.body.error?.includes(`task ${tasks[0].id} requires adapter ${adapter}, but that adapter is unavailable`))
+  assert.ok(launch.body.error?.includes('mission dispatch incomplete (0 new runs dispatched)'), `unexpected ${adapter} refusal`)
+  assert.ok(launch.body.error?.includes(`task ${tasks[0].id} requires adapter ${adapter}, but that adapter is unavailable`), `unexpected ${adapter} refusal`)
   assert.deepEqual(after.snapshot.runs.map(run => run.id).sort(), before.snapshot.runs.map(run => run.id).sort(),
     'A rejected launch must not allocate a run or fall back to another adapter')
   assert.equal(after.snapshot.runs.some(run => run.task_id === tasks[0].id), false)
+  assert.equal(after.snapshot.events.filter(event => event.type.startsWith('run.') &&
+    (event.correlation_id === missionId || event.aggregate_id === tasks[0].id)).length, 0,
+  'Unsupported adapter dispatch must not journal provider execution')
   const mission = after.snapshot.missions.find(candidate => candidate.id === missionId)
   assert.equal(mission?.status, 'ready', 'Rejected work must remain held')
   assert.equal(after.snapshot.tasks.find(task => task.id === tasks[0].id)?.status, tasks[0].status)
 }
 
-export async function runExternalAdapterContract({ server, expectedPlatform }, {
+export async function runExternalAdapterContract({ server, expectedPlatform, expectedRunnerPlatform }, {
   fetchImpl = fetch,
   downloadArtifact = downloadVerifiedArtifact,
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
@@ -97,7 +108,7 @@ export async function runExternalAdapterContract({ server, expectedPlatform }, {
   const prefix = `/api/corps/${demo.corp_id}`
   const snapshot = () => ok(`${prefix}/snapshot?actor_id=${demo.alice_actor_id}`)
   const initial = await snapshot()
-  const runner = assertExternalRunner(initial, expectedPlatform)
+  const runner = assertExternalRunner(initial, expectedPlatform, expectedRunnerPlatform)
   assert.equal(initial.snapshot.runs.length, 0, 'Reset fixture unexpectedly contains prior runs')
   const results = []
   for (const adapter of adapters) {
@@ -125,7 +136,7 @@ export async function runExternalAdapterContract({ server, expectedPlatform }, {
         if (preview.status === 200) { ready = true; break }
         assert.equal(preview.status, 400, JSON.stringify(preview))
         assert.match(preview.body.error ?? '', /no connected runner can staff|no matching runner was selectable/u)
-        assert.equal(assertExternalRunner(await snapshot(), expectedPlatform).id, runner.id)
+        assert.equal(assertExternalRunner(await snapshot(), expectedPlatform, expectedRunnerPlatform).id, runner.id)
         await wait(100)
       }
       assert.ok(ready, 'Timed out waiting for read-only native dispatch readiness')
@@ -136,9 +147,9 @@ export async function runExternalAdapterContract({ server, expectedPlatform }, {
       { requested_by: demo.alice_actor_id })
     if (expectedPlatform === 'unix') {
       const after = await snapshot()
-      assertExternalRunner(after, expectedPlatform)
+      assertExternalRunner(after, expectedPlatform, expectedRunnerPlatform)
       assertUnavailableLaunch({ adapter, missionId: mission.mission_id, before, after, launch })
-      results.push({ adapter, outcome: 'unsupported_rejected', mission_id: mission.mission_id,
+      results.push({ adapter, outcome: 'unsupported_rejected', dispatched: false, mission_id: mission.mission_id,
         launch_status: launch.status, runs_created: 0 })
       continue
     }
@@ -162,7 +173,7 @@ export async function runExternalAdapterContract({ server, expectedPlatform }, {
         assert.equal(terminated?.payload.provider_process_alive, false)
         assert.ok(completed && terminated.seq < completed.seq, 'Provider must terminate before accepted completion')
         result = {
-          adapter, outcome: 'completed', run_id: run.id, provider_session_id: run.provider_session_id,
+          adapter, outcome: 'completed', dispatched: true, run_id: run.id, provider_session_id: run.provider_session_id,
           artifact_sha256: run.artifact_sha256, input_tokens: run.input_tokens, output_tokens: run.output_tokens,
           provider_process_alive: false, terminal_event_seq: terminated.seq, completion_event_seq: completed.seq,
           readiness_previews: readinessPreviews,
@@ -183,6 +194,8 @@ export async function runExternalAdapterContract({ server, expectedPlatform }, {
   return {
     schema_version: 2, checked_at: new Date().toISOString(), expected_platform: expectedPlatform,
     runner_os: runner.os, runner_id: runner.id,
+    runner_platform: { windows: 'win32', linux: 'linux', macos: 'darwin' }[runner.os],
+    execution_supported: expectedPlatform === 'windows',
     coverage: expectedPlatform === 'windows' ? 'fixture_lifecycle' : 'unsupported_admission',
     common_sample: expectedPlatform === 'windows', real_provider_inference: false, providers: results,
   }

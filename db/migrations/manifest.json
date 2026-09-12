@@ -200,6 +200,11 @@
       "version": 40,
       "file": "0040_workspace_connections.sql",
       "sha384": "a9a3b61e8832b875d32ae693dd641aeb8da8343509c63489d9621b4e42340f8a45b804f00876d043481912184bca3522"
+    },
+    {
+      "version": 41,
+      "file": "0041_checkpoint_source_correction.sql",
+      "sha384": "adccc2f328f18234b6013d1ef268cee08d2e14a717dac407c7cfe6800c901fdf9a60834ff2275704175f38238b939a34"
     }
   ]
 }

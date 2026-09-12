@@ -576,3 +576,11 @@ restart recovery on Windows.
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review
 work; no merge, auto-merge, deployment or issue closure is authorized by these tests.
+
+## Later main synchronization
+
+The dated checkpoint above precedes main `b2523964`. The subsequent
+[main-sync validation](2026-09-12-main-sync-ci-validation.md) preserves these
+historical results, adopts the upstream budget/model-source/staffing corrections,
+and records fresh local tests and owned native QA. It also documents which
+earlier fixture mechanisms were superseded and which hosted gates remain pending.

@@ -45,9 +45,13 @@ async function waitFor(demo, predicate, timeoutMs = 30_000) {
 
 async function restartServer() {
   if (process.env.CRONY_SKIP_SERVER_RESTART === '1') return false
-  if (!process.env.CRONY_TEST_SERVER_PID_FILE) return false
-  await restartOwnedTestServer({ root, server, databaseUrl: process.env.DATABASE_URL,
-    logPrefix: 'server-restart' })
+  const pidPath = process.env.CRONY_TEST_SERVER_PID_FILE
+  if (!pidPath) return false
+  const databaseUrl = process.env.DATABASE_URL
+  if (!databaseUrl) {
+    throw new Error('DATABASE_URL is required for the approval restart test')
+  }
+  await restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'approval-restart' })
   return true
 }
 

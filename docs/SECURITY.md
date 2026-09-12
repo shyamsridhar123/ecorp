@@ -60,6 +60,14 @@ The persisted factory policy is enforced again during mission materialization. A
 cannot widen its repository, adapter, strategy, model, reasoning effort, tools, secrets, required
 prohibitions, write scope, token budget, or cost budget. Factory `verified` state requires
 authoritative completed mission and passing task-verification records.
+An explicit `max_task_attempts` is also prospective, immutable Factory policy.
+The shared ceiling remains three; omitted legacy policy cannot newly authorize
+a third planned attempt. Preflight/materialization requests must preserve the
+recorded choice, including omission. Existing launch, resume, recovery and
+revision endpoints reject unsupported attempt settings. Contract revision
+decoding specifically rejects nested `contract.max_task_attempts`, including
+null, while preserving unrelated `TaskContract` decoding compatibility.
+No request resets attempts, spend, historical outcomes, or protected stops.
 Non-null policy model and reasoning settings are mandatory on every materialized task; omission is
 rejected rather than interpreted as permission to use a provider default.
 An optional saved execution-connection ID is part of the immutable Factory policy.
@@ -309,6 +317,29 @@ lineage remain ineligible. A controller operation-key pattern identifies provena
 authentication. Reconciliation grants no claim token, provider execution or publication right,
 and replay repeats current authorization. It does not rewrite original runs, task contracts,
 source evidence, attempts or accounting.
+
+Provider source-correction after failed checkpoint verification has separate, versioned
+origin provenance. It never receives a checkpoint-verification model-budget exemption.
+Admission requires the exact native failed verifier and a current explicit resume contract
+revision, and can recognize only its original measured `suspend`—never `stop`, an explicit
+stop request, another suspension, a loop failure or quarantined lineage. Original proof is
+checked against immutable historical policy, separately from the authorized replacement.
+Original usage and attempts remain; a correction consumes a normal provider attempt and
+positive remaining allocation.
+
+The pending correction command repeats current actor/room, Factory, assignment, source,
+policy, saved connection and remaining-budget checks before and after secret resolution.
+Native mutation gates are acquired before row waits, and command state is re-read before
+commit. Unavailable database reads do not turn into a failed provider attempt. Missing or
+changed correction-origin provenance denies replay and publication through ordinary errors;
+it does not authorize a fresh provider, artifact, merge or deployment.
+
+Historical native verifier seals may omit a redundant `head_commit` only when
+the source is verification-only and its fingerprint exactly matches the valid
+authorized verifier guard. The retained authorized HEAD and independently
+reconstructed checkpoint authority remain mandatory. When a HEAD is required,
+explicit null, malformed or contradictory values still fail; provider sources
+cannot use this compatibility exception. No historical event or grant is rewritten.
 
 Checkpoint retention distinguishes the original authorization HEAD from an exact runner-owned
 verification commit. Ready-artifact joins bind the new head to its run, producer, source,

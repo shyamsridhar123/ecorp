@@ -77,7 +77,7 @@ test('missing, multiple, ambiguous and connection-bound capabilities cannot sati
 function refusal() {
   const before = { snapshot: {
     tasks: [{ id: 'task-1', mission_id: 'mission-1', required_adapter: 'claude-code', status: 'ready' }],
-    missions: [{ id: 'mission-1', status: 'ready' }], runs: [],
+    missions: [{ id: 'mission-1', status: 'ready' }], runs: [], events: [],
   } }
   return {
     adapter: 'claude-code', missionId: 'mission-1', before, after: structuredClone(before),
@@ -93,6 +93,8 @@ test('a platform refusal must prove the exact task, zero allocations and held wo
     input => { input.launch.body.error = 'another conflict' },
     input => { input.launch.body.error = input.launch.body.error.replace('task-1', 'different-task') },
     input => { input.after.snapshot.runs.push({ id: 'fallback', task_id: 'task-1' }) },
+    input => { input.after.snapshot.events.push({ type: 'run.requested', correlation_id: 'mission-1' }) },
+    input => { input.after.snapshot.events.push({ type: 'run.started', aggregate_id: 'task-1' }) },
     input => { input.after.snapshot.missions[0].status = 'running' },
     input => { input.after.snapshot.tasks[0].status = 'running' },
     input => { input.before.snapshot.tasks[0].required_adapter = 'fake-process' },

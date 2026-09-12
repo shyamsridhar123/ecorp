@@ -3,16 +3,20 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { controlledReadinessCapability, controlledReadinessSource } from './controlled_runner_fixture.mjs'
-import { assertIdentityAssignment, assertIdentityProbePriority, captureIdentityAssignment,
+import { assertIdentityAssignment, assertIdentityProbeSelection, captureIdentityAssignment,
   identityFixtureConfig, identityFixturePreview, waitForIdentityProbe } from './identity_fixture.mjs'
 
 const root = path.resolve(import.meta.dirname, '..')
 const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const demo = { corp_id: id(1), alice_actor_id: id(2) }
-const runnerId = 'aaa-identity-probe-' + id(3)
-const source = controlledReadinessSource(runnerId, id(4))
+const runnerId = 'identity-probe-' + id(3)
+const source = { repository: 'all-the-vibes/ecorp', base_ref: 'HEAD', base_commit: 'a'.repeat(40) }
+const modelId = 'identity-lifecycle-' + id(4)
 const fake = { name: 'fake-process', available: true }
-const probe = { runnerId, readinessSource: source }
+const probe = { runnerId, readinessSource: source, adapter: 'codex', modelId }
+const probeCapabilities = [{ name: 'codex', available: true, models: [{ id: modelId, policy_state: 'enabled' }] },
+  { name: 'workspace-isolation', available: true, source_repository: source.repository,
+    source_base_ref: source.base_ref, source_base_commit: source.base_commit }]
 const localEnv = { CRONY_IDENTITY_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18449',
   CRONY_IDENTITY_OUTPUT: path.join(root, 'output', 'e2e-identity-lifecycle.json') }
 const actionsEnv = { CRONY_IDENTITY_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18471',
@@ -24,7 +28,7 @@ const actionsEnv = { CRONY_IDENTITY_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.
 function snapshot() {
   return { runners: [
     { id: 'runner-fixture', connected: true, corp_id: demo.corp_id, capabilities: [fake] },
-    { id: runnerId, connected: true, corp_id: demo.corp_id, capabilities: [fake, controlledReadinessCapability(source)] },
+    { id: runnerId, connected: true, corp_id: demo.corp_id, capabilities: structuredClone(probeCapabilities) },
   ], snapshot: { missions: [], tasks: [], runs: [] } }
 }
 
@@ -73,30 +77,35 @@ test('full identity/OIDC conformance stays confined to the exact hosted integrat
 })
 
 test('identity markers are per-connection preview-only data, without changing artifact markers', () => {
-  assert.notDeepEqual(source, controlledReadinessSource(runnerId, id(5)))
-  assert.equal(source.base_ref, 'readiness-only')
-  assert.equal(controlledReadinessSource('aaa-artifact-staging-' + id(3), id(4)).base_commit, source.base_commit)
-  assert.match(controlledReadinessCapability(source).detail, /preview only, not checkout evidence/u)
+  const legacyId = 'aaa-identity-probe-' + id(3)
+  const marker = controlledReadinessSource(legacyId, id(4))
+  assert.notDeepEqual(marker, controlledReadinessSource(legacyId, id(5)))
+  assert.equal(marker.base_ref, 'readiness-only')
+  assert.equal(controlledReadinessSource('aaa-artifact-staging-' + id(3), id(4)).base_commit, marker.base_commit)
+  assert.match(controlledReadinessCapability(marker).detail, /preview only, not checkout evidence/u)
   assert.throws(() => controlledReadinessSource('runner-local', id(4)))
 })
 
-test('probe priority rejects another candidate, wrong scope, missing capabilities and prior work', () => {
-  assert.doesNotThrow(() => assertIdentityProbePriority(snapshot(), demo, probe))
+test('model/source selection rejects ambiguity, wrong scope, missing capabilities and prior work', () => {
+  assert.doesNotThrow(() => assertIdentityProbeSelection(snapshot(), demo, probe))
   for (const change of [
     state => { state.runners[1].connected = false },
     state => { state.runners[1].corp_id = id(99) },
     state => { state.runners[1].capabilities = [] },
-    state => { state.runners[0].id = 'aaa-before-probe' },
+    state => { state.runners[0].capabilities = structuredClone(probeCapabilities) },
+    state => { state.runners[1].capabilities[0].models[0].id = 'different-model' },
+    state => { state.runners[1].capabilities[0].models[0].policy_state = 'disabled' },
+    state => { state.runners[1].capabilities[1].source_base_commit = 'b'.repeat(40) },
     state => { state.runners.push(structuredClone(state.runners[1])) },
     state => { state.snapshot.missions.push({ id: id(6) }) },
     state => { state.snapshot.tasks.push({ id: id(6) }) },
     state => { state.snapshot.runs.push({ id: id(6) }) },
-  ]) { const state = snapshot(); change(state); assert.throws(() => assertIdentityProbePriority(state, demo, probe)) }
+  ]) { const state = snapshot(); change(state); assert.throws(() => assertIdentityProbeSelection(state, demo, probe)) }
   const state = snapshot()
   state.runners.unshift({ id: 'aaa-foreign', connected: true, corp_id: id(99), capabilities: [fake] })
   state.runners.unshift({ id: 'aaa-connection', connected: true, corp_id: demo.corp_id,
     capabilities: [{ ...fake, workspace_connection_id: id(7) }] })
-  assert.doesNotThrow(() => assertIdentityProbePriority(state, demo, probe))
+  assert.doesNotThrow(() => assertIdentityProbeSelection(state, demo, probe))
 })
 
 test('identity readiness retries only native read-only previews before any mission or launch', async () => {
@@ -106,6 +115,8 @@ test('identity readiness retries only native read-only previews before any missi
     assert.ok(route.endsWith('/missions/preview'))
     assert.equal(init.method, 'POST')
     assert.deepEqual(JSON.parse(init.body).source, source)
+    assert.equal(JSON.parse(init.body).preferred_model, modelId)
+    assert.equal(JSON.parse(init.body).preferred_adapter, 'codex')
     previews++
     return previews === 1 ? { response: { status: 400 }, body: { error: 'no matching runner was selectable' } }
       : { response: { status: 200 }, body: {} }
@@ -114,19 +125,19 @@ test('identity readiness retries only native read-only previews before any missi
 })
 
 const launch = { runner_id: runnerId, run_id: id(10) }
-const expected = { corpId: demo.corp_id, missionId: id(11) }
+const expected = { corpId: demo.corp_id, missionId: id(11), probe }
 function assignment() {
   return { type: 'start_run', run_id: launch.run_id, corp_id: expected.corpId, mission_id: expected.missionId,
-    task_id: id(12), agent_id: id(13), assignment_token: id(14), adapter: 'fake-process', secrets: [],
-    source_repository: null, source_base_ref: null, source_base_commit: null }
+    task_id: id(12), agent_id: id(13), assignment_token: id(14), adapter: 'codex', model: modelId, secrets: [],
+    source_repository: source.repository, source_base_ref: source.base_ref, source_base_commit: source.base_commit }
 }
 
-test('assignment binds exact scope without promoting the preview source or leaking secrets', () => {
+test('assignment binds exact source/model, scope and fence without leaking secrets', () => {
   assert.doesNotThrow(() => assertIdentityAssignment(assignment(), launch, expected))
   for (const changed of [
-    { run_id: id(99) }, { corp_id: id(99) }, { mission_id: id(99) }, { adapter: 'codex' },
-    { workspace_connection_id: id(99) }, { source_repository: source.repository },
-    { source_base_ref: source.base_ref }, { source_base_commit: source.base_commit },
+    { run_id: id(99) }, { corp_id: id(99) }, { mission_id: id(99) }, { adapter: 'fake-process' }, { model: 'other-model' },
+    { workspace_connection_id: id(99) }, { source_repository: 'other/source' },
+    { source_base_ref: 'other-ref' }, { source_base_commit: 'b'.repeat(40) },
     { task_id: null }, { agent_id: null }, { assignment_token: null },
     { secrets: [{ value: 'must-not-be-reflected' }] },
   ]) {
@@ -151,7 +162,7 @@ function clock() {
 async function capture(launchRequest) {
   const socket = new Socket(), timer = clock()
   const options = { schedule: timer.schedule.bind(timer), unschedule: timer.unschedule.bind(timer) }
-  const result = captureIdentityAssignment({ probe: { ...probe, socket }, ...expected,
+  const result = captureIdentityAssignment({ ...expected, probe: { ...probe, socket },
     launch: () => launchRequest(socket, timer) }, options)
   return { result, socket, timer }
 }

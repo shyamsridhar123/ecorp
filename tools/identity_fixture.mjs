@@ -49,17 +49,21 @@ export function identityFixturePreview(config) {
         : 'run the existing full OIDC, Corp RBAC and WebSocket authorization assertions'] }
 }
 
-export function assertIdentityProbePriority(state, demo, probe) {
-  // The real lifecycle mission remains source-unbound as before. Its synthetic
-  // marker is PREVIEW ONLY, not checkout evidence. Once the probe is ready, its
-  // prefix must win the native lexicographic selection over all other connected
-  // legacy fake-process candidates in this disposable fixture.
-  assert.match(probe.runnerId, /^aaa-identity-probe-[0-9a-f-]{36}$/u)
+export function assertIdentityProbeSelection(state, demo, probe) {
+  // Reuse upstream's exact model/source selection. Runner ordering is not
+  // authority, and this protocol simulator does not execute a real provider.
+  assert.match(probe.runnerId, /^identity-probe-[0-9a-f-]{36}$/u)
+  assert.equal(probe.adapter, 'codex')
+  assert.match(probe.modelId, /^identity-lifecycle-[0-9a-f-]{36}$/u)
+  const source = probe.readinessSource
+  assert.ok(source?.repository && source.base_ref && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(source.base_commit))
   const candidates = state.runners.filter(runner => runner.connected && runner.corp_id === demo.corp_id &&
-    runner.capabilities.some(cap => cap.name === 'fake-process' && cap.available && cap.workspace_connection_id == null))
-    .map(runner => runner.id).sort()
-  assert.equal(candidates[0], probe.runnerId, 'The identity probe must be the first compatible fixture candidate')
-  assert.equal(new Set(candidates).size, candidates.length, 'Ambiguous fixture runner identities')
+    runner.capabilities.some(cap => cap.name === probe.adapter && cap.available && cap.workspace_connection_id == null &&
+      cap.models?.some(model => model.id === probe.modelId && model.policy_state !== 'disabled')) &&
+    runner.capabilities.some(cap => cap.name === 'workspace-isolation' && cap.available && cap.workspace_connection_id == null &&
+      cap.source_repository === source.repository && cap.source_base_ref === source.base_ref && cap.source_base_commit === source.base_commit))
+    .map(runner => runner.id)
+  assert.deepEqual(candidates, [probe.runnerId], 'The explicit model/source must select only the identity probe')
   for (const collection of ['missions', 'tasks', 'runs']) {
     assert.equal(state.snapshot[collection].length, 0, 'Identity readiness must precede all fixture work')
   }
@@ -69,19 +73,20 @@ export async function waitForIdentityProbe({ request, demo, probe }) {
   const previews = await waitForControlledRunnerDispatch({ request, demo, runner: probe })
   const { response, body } = await request(`/api/corps/${demo.corp_id}/snapshot?actor_id=${demo.alice_actor_id}`)
   assert.equal(response.status, 200, 'Cannot verify identity probe selection order')
-  assertIdentityProbePriority(body, demo, probe)
+  assertIdentityProbeSelection(body, demo, probe)
   return previews
 }
 
-export function assertIdentityAssignment(assignment, launch, { corpId, missionId }) {
+export function assertIdentityAssignment(assignment, launch, { corpId, missionId, probe }) {
   assert.equal(assignment.type, 'start_run')
   assert.equal(assignment.run_id, launch.run_id, 'Identity assignment must belong to the launched run')
   assert.equal(assignment.corp_id, corpId, 'Identity assignment must remain in the expected Corp')
   assert.equal(assignment.mission_id, missionId, 'Identity assignment must remain in the expected mission')
-  assert.equal(assignment.adapter, 'fake-process')
+  assert.equal(assignment.adapter, probe.adapter)
+  assert.equal(assignment.model, probe.modelId)
   assert.ok(assignment.workspace_connection_id == null, 'Identity fixture uses the legacy synthetic connection')
-  assert.ok(assignment.source_repository == null && assignment.source_base_ref == null && assignment.source_base_commit == null,
-    'The readiness-only source marker must not become execution/checkout evidence')
+  assert.deepEqual({ repository: assignment.source_repository, base_ref: assignment.source_base_ref,
+    base_commit: assignment.source_base_commit }, probe.readinessSource, 'Identity assignment must retain its exact source tuple')
   for (const field of ['task_id', 'agent_id', 'assignment_token']) {
     assert.ok(uuid.test(assignment[field] ?? ''), 'Identity assignment omitted a native identifier/fence')
   }
@@ -113,7 +118,7 @@ export async function captureIdentityAssignment({ probe, corpId, missionId, laun
     const result = await launch()
     assertControlledAssignment(result, probe)
     const assignment = await pending
-    assertIdentityAssignment(assignment, result, { corpId, missionId })
+    assertIdentityAssignment(assignment, result, { corpId, missionId, probe })
     return { launch: result, assignment }
   } finally {
     unschedule(timer)

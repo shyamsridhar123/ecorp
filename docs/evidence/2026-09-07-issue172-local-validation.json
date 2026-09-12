@@ -1,0 +1,384 @@
+{
+  "schema_version": 1,
+  "issue": 172,
+  "observed_at": "2026-09-07T23:19:38.140Z",
+  "status": "implementation_locally_validated_final_runtime_incomplete",
+  "source_base_commit": "bb98a0de0f6e5651e2aed0b96e629873376e17c3",
+  "product_files": [
+    {
+      "path": "crates/crony-server/src/main.rs",
+      "sha256": "02f0c68d50a85ac2edefd23e5d7d76f19a1402af5fb2107996abfadd880ecca1"
+    }
+  ],
+  "source_review": {
+    "finding": "Unvisited singleton pruning can reset per-Corp runner rotation during batching/churn",
+    "correction": "Prune disappeared Corps immediately; prune singleton cursor only on an actual current Corp visit; preserve progress for stale candidates",
+    "original_focused_test_bodies_preserved": true
+  },
+  "focused_results": {
+    "first_runner_algorithm_red": {
+      "exit_code": 101,
+      "expected_failure": "healthy runner was starved; attempted a-failing four times"
+    },
+    "review_churn_red": {
+      "exit_code": 101,
+      "passed": 0,
+      "failed": 1,
+      "actual": [
+        "001-a-failing",
+        "001-a-failing"
+      ],
+      "expected": [
+        "001-a-failing",
+        "001-b-healthy"
+      ]
+    },
+    "reviewed_issue172": {
+      "passed": 7,
+      "failed": 0
+    },
+    "existing_issue171": {
+      "passed": 9,
+      "failed": 0
+    }
+  },
+  "workspace_tests": {
+    "rust": {
+      "passed": 358,
+      "failed": 0,
+      "ignored": 62
+    },
+    "frontend": {
+      "passed": 99,
+      "failed": 0
+    },
+    "ignored_sqlx_executed": false
+  },
+  "local_gates": [
+    {
+      "name": "migrations",
+      "exit_code": 0,
+      "seconds": 0.665,
+      "log": "migrations.log"
+    },
+    {
+      "name": "format",
+      "exit_code": 0,
+      "seconds": 5.459,
+      "log": "format.log"
+    },
+    {
+      "name": "clippy",
+      "exit_code": 0,
+      "seconds": 47.996,
+      "log": "clippy.log"
+    },
+    {
+      "name": "rust",
+      "exit_code": 0,
+      "seconds": 372.671,
+      "log": "rust.log"
+    },
+    {
+      "name": "web-tests",
+      "exit_code": 0,
+      "seconds": 0.953,
+      "log": "web-tests.log"
+    },
+    {
+      "name": "web-build",
+      "exit_code": 0,
+      "seconds": 20.14,
+      "log": "web-build.log"
+    },
+    {
+      "name": "web-lint",
+      "exit_code": 0,
+      "seconds": 4.13,
+      "log": "web-lint.log"
+    },
+    {
+      "name": "diff",
+      "exit_code": 0,
+      "seconds": 0.198,
+      "log": "diff.log"
+    }
+  ],
+  "normal_server_build": {
+    "observed_at": "2026-09-07T23:13:43.3371483Z",
+    "command": "cargo build -p crony-server",
+    "source_sha256": "02F0C68D50A85AC2EDEFD23E5D7D76F19A1402AF5FB2107996ABFADD880ECCA1",
+    "exit_code": 0,
+    "seconds": 36.75
+  },
+  "reviewed_candidate": {
+    "executable": "crony-server-issue172-reviewed.exe",
+    "executable_sha256": "42AA254FCECE86FF0FE19786DB59522A31813C7ED54DD979205BC7F57D3BFC7C",
+    "source_sha256": "02f0c68d50a85ac2edefd23e5d7d76f19a1402af5fb2107996abfadd880ecca1"
+  },
+  "post_reboot_pre_review_runtime": {
+    "observed_at": "2026-09-07T22:57:28.662Z",
+    "result": "PASS",
+    "server_executable": "crony-server-issue172.exe",
+    "server_executable_sha256": "66D6E15C1EF39820E00E56B99C4C49202D3FAF5EA9C029E86B3D29D687B7B6B8",
+    "server_source_sha256": "4BA283CBC343430EA178E1909B79245667E9BB31365BA0AB1CCDC11D122F1DAC",
+    "mission_id": "d561cc2b-8d5e-44c9-b9da-ae6060af78b3",
+    "factory_id": "c860fb2b-9b67-46a5-ba46-3db0360c7fd2",
+    "factory_state": "verified",
+    "factory_version": 11,
+    "complete_tasks": 4,
+    "original_runs": 6,
+    "original_failures": 2,
+    "history_accounting_checks_and_review_unchanged": true,
+    "routine_approvals": 0,
+    "source_base_commit": "e3dc3d669b1a99832e2e7af9be16f7f39842586d",
+    "runner_connections": [
+      {
+        "id": "a-issue172-peer",
+        "corp_id": "00000000-0000-4000-8000-000000000001",
+        "connected": true,
+        "status": "connected",
+        "last_seen_at": "2026-09-07T22:57:20.268897+00:00",
+        "available_capabilities": [
+          "fake-process",
+          "workspace-isolation",
+          "durable-control-v1",
+          "verification-artifact-transfer-v1",
+          "secret-delivery"
+        ]
+      },
+      {
+        "id": "issue169-ack-real-copilot-fixed",
+        "corp_id": "00000000-0000-4000-8000-000000000001",
+        "connected": true,
+        "status": "connected",
+        "last_seen_at": "2026-09-07T22:57:19.542902+00:00",
+        "available_capabilities": [
+          "fake-process",
+          "github-copilot",
+          "workspace-isolation",
+          "durable-control-v1",
+          "verification-artifact-transfer-v1",
+          "secret-delivery"
+        ]
+      }
+    ],
+    "signed_source_downloads": [
+      {
+        "artifact_id": "49445ad5-50f1-4e3b-9a31-ff1638244f25",
+        "run_id": "b6f9e47e-4b49-42d5-9467-4772381456b0",
+        "bytes": 28134,
+        "sha256": "df27c00e28af64e4ab2ddc561ea96c634e480dce4d49f853263b9fdf48c4446a",
+        "verification_sha256": "142a1c6c68bd1709b88381d408e7351798ddae53b392296271ff16293a792c22",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      },
+      {
+        "artifact_id": "3b655f4b-5e84-4564-8913-2926c817c0d4",
+        "run_id": "70660159-a8ea-4f62-99d8-c65c308f94e1",
+        "bytes": 11877,
+        "sha256": "114ad22a4e0c1c485288a81dfd6be38c890f747ba515ab167868be91ee5e926f",
+        "verification_sha256": "77c39ed0abadadedc7574556f5e1293c066f8c512b178f7e301be463c357afa4",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      },
+      {
+        "artifact_id": "ff1e0026-e02a-40fd-9c0c-18dc766f10b4",
+        "run_id": "58333c7a-2360-499b-b580-9697410b7d77",
+        "bytes": 11877,
+        "sha256": "e8fcec88c4d55686fcb7042fc159ea2c72c71588a0d8bebc5c6882bdec3a1978",
+        "verification_sha256": "e53038fd4ee58c8a983361a17785ce15cecc5db1381d2d94e165184398f473aa",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      },
+      {
+        "artifact_id": "db1a7529-1553-4812-a67a-8c8ac6e20e72",
+        "run_id": "3d3db10a-b443-4f5b-b66b-a0685be60a6e",
+        "bytes": 11173,
+        "sha256": "e333aa023b653306065956813fd6e2d284b648a1c67a1f2bb5eb49f14cc67e1a",
+        "verification_sha256": "3ae6e63867d8aa6e83bda2f433aec2c0cc144a6dfdff6bb4563ea673e266e794",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      },
+      {
+        "artifact_id": "d489af01-a4b3-4d59-a879-4a7112ec15a1",
+        "run_id": "2f49d631-9e60-4177-a8ec-dfc3b88e5dff",
+        "bytes": 10549,
+        "sha256": "a01fae2e9aac7ebda9e13fd7662389b41c81a19a756736d33dd76fcc7b4feefa",
+        "verification_sha256": "6760849046ed967fa7079a2b91f7561fbe8370a0ed460395329dfd7e5a6352c6",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      },
+      {
+        "artifact_id": "5fc6a50c-bb98-4fb4-941a-51d7550ff033",
+        "run_id": "38ff0719-0208-434e-bd5c-1baa1d16b1f9",
+        "bytes": 11333,
+        "sha256": "6c47677a158ae605a094cb1585098e975aa59e2a9caab936e78a099a7da055b7",
+        "verification_sha256": "13f4e1f102fd37cdc224308678afb3af60fa715fb18ed3d4730021bb40b0cc2a",
+        "role_header_matched": true,
+        "original_signature_matched": true,
+        "download_status": 200
+      }
+    ]
+  },
+  "final_reviewed_runtime": {
+    "observed_at": "2026-09-07T23:17:54.7270656Z",
+    "verifier_exit_code": 1,
+    "result": "INCOMPLETE",
+    "required_connected_runners": [
+      "a-issue172-peer",
+      "issue169-ack-real-copilot-fixed"
+    ],
+    "observed_connected_runners": [
+      "a-issue172-peer"
+    ],
+    "reviewed_server_health": "ok",
+    "qa_ack_bridge_health_http": 503,
+    "qa_ack_bridge_health": "failed",
+    "tool_policy_rejected_bridge_restart": true,
+    "workaround_attempted": false,
+    "original_history_assertions_passed_before_connection_failure": true,
+    "signed_download_checks_reached": false,
+    "temporary_peer_retired": false,
+    "temporary_peer_credentials_removed": false
+  },
+  "remaining": [
+    "Complete authorized recovery of the failed-closed QA ACK bridge without alternate routes or policy circumvention.",
+    "Run the unchanged final two-runner verifier against the reviewed source/binary.",
+    "Observe reviewed-binary acceptance in the ECorp browser and retire only the owned temporary peer and its credentials.",
+    "Keep issue 172 open/In Progress and PR 170 draft until remaining acceptance is complete."
+  ],
+  "limits": [
+    "Persistent command-failure fairness is proven by native server regression closures, not a live injected command failure.",
+    "Public connected/heartbeat/capability state is not direct observation of the internal dispatch_ready flag.",
+    "No new live Copilot build, model concurrency, production GitHub login, global deadlock freedom or exported-game preview is claimed.",
+    "No merge, auto-merge, generated-application publication, deployment or hosted Actions success is claimed."
+  ],
+  "retained_local_evidence": [
+    {
+      "path": "red-issue172.log",
+      "bytes": 1088,
+      "sha256": "67d8b331c234b15d780d1c9fac7d4557fb6dcb8c26d6b20ca6f69203f93d65fa"
+    },
+    {
+      "path": "green-issue172.log",
+      "bytes": 928,
+      "sha256": "650b59b14525b2c96ff747b8fdf0a86312701faffaadf15844e894f7be68918d"
+    },
+    {
+      "path": "validation-reviewed/results.json",
+      "bytes": 3742,
+      "sha256": "7ef49f775f63104c57af998ac9ee511b86c0c0bb204975409bcae0f1ddd2d2e2"
+    },
+    {
+      "path": "validation-reviewed/rust.log",
+      "bytes": 44833,
+      "sha256": "7838809a0f7b48d509fc968bb1f180d831e3aba5750326a31497040466a87d57"
+    },
+    {
+      "path": "validation-reviewed/web-tests.log",
+      "bytes": 9407,
+      "sha256": "7751ee372d180bd5879adf467d3bbde96132b35cecaa1f7bd952c91f11ca6bb8"
+    },
+    {
+      "path": "normal-build-reviewed.json",
+      "bytes": 228,
+      "sha256": "b3453f74491bdb37f451421339b98bd31f74fafd9466f940894a406f9547e637"
+    },
+    {
+      "path": "normal-build-reviewed.log",
+      "bytes": 202,
+      "sha256": "1c9c4a3e1a307f600826e3ee8cb91ba26658cd64c566901e9ce62301a7fb9398"
+    },
+    {
+      "path": "runtime-post-reboot.json",
+      "bytes": 5251,
+      "sha256": "fac14962a06652a6cdf6af3142896e154a6b5d8d935c2af55e99a64bfc1bbb3a"
+    },
+    {
+      "path": "runtime-final-attempt.json",
+      "bytes": 384,
+      "sha256": "c82ee1b19a69d86b4c0f22cdbeac3ad04453e564ea1ede56d3dfdde0007a34fd"
+    },
+    {
+      "path": "runtime-final-attempt.log",
+      "bytes": 686,
+      "sha256": "355e4759f75e9b2283b0f29f148c2d1a59b7978539ebd051b12a26e780942ee0"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-01-new-test-red.outcome.json",
+      "bytes": 967,
+      "sha256": "9420db515af89f4bad8af8f499779d8b8dc683aa541b446bb9f6be563ef0fa73"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-01-new-test-red.stderr.log",
+      "bytes": 696,
+      "sha256": "d6d3b50473809a62173d5cfe5ec75daacbcad62aa109297e0b9f012861373df3"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-01-new-test-red.stdout.log",
+      "bytes": 295,
+      "sha256": "d727c8158ecad8dadfaba38bca0c0778385ac62f18d1135dade828f14c2ed16f"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-02-rustfmt-check.outcome.json",
+      "bytes": 862,
+      "sha256": "6f9c8748c7b20b34ee934875c7e8d6fa81daa444d2d6450c2e89457ac771c2ad"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-02-rustfmt-check.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-02-rustfmt-check.stdout.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-03-issue172-green.outcome.json",
+      "bytes": 1018,
+      "sha256": "aba012e45c368a9d08a76275c0a05e467f59492a2d49e86e66dff22439aa7c2d"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-03-issue172-green.stderr.log",
+      "bytes": 290,
+      "sha256": "41e0cd5d8dada59d18fdc605b443d0164a9a6445036c7ca98f38259043e09f2f"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-03-issue172-green.stdout.log",
+      "bytes": 704,
+      "sha256": "c9ce7542adbb5b78ebc8e7f49faf2a0f5281872884d78630499bd8deba68ca2c"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-04-issue171-existing.outcome.json",
+      "bytes": 1024,
+      "sha256": "2ca6e860a7126632fbfeceaeb14f3be2ce92c108537bd4079fe5dbe06ce7ae1e"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-04-issue171-existing.stderr.log",
+      "bytes": 162,
+      "sha256": "977bca6b0beeaee86b3a219e7f308fa6ea48f7b424a56e8a4acd95cb3668ed44"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-04-issue171-existing.stdout.log",
+      "bytes": 850,
+      "sha256": "41d46fe889997f9a0deba4c903529c2d113a28db270979d398b8bf9a7bdb1890"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-05-handoff-audit.json",
+      "bytes": 8281,
+      "sha256": "b8d9f0e5c0c6b37c6d15306a7717bc6ffeaf309a58dca8f8c058da17149c1af1"
+    },
+    {
+      "path": "review-correction/20260907-6214276d-baseline.json",
+      "bytes": 2589,
+      "sha256": "51f8f1cb7aa03ea4c4e0240aaa0452accb3185036de08d9e17e2a425d97ca73d"
+    }
+  ]
+}

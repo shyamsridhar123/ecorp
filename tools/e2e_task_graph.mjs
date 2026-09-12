@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { downloadVerifiedArtifact } from './artifact_client.mjs'
-import { prepareUnixDemoRoster, taskGraphFixtureConfig } from './task_graph_fixture.mjs'
+import { graphFixtureSource, taskGraphFixtureConfig } from './task_graph_fixture.mjs'
 
 const config = taskGraphFixtureConfig(process.argv.slice(2), process.env)
 const server = config.server
 if (config.dryRun) {
   console.log(JSON.stringify({ ...config, services_started: false, database_writes: false,
     proposed: ['reset only the explicitly owned demo fixture',
-      ...(config.unixRoster ? ['mark only the two unavailable, idle Windows-only demo agents offline before any mission exists'] : []),
-      'verify the original three-node, two-adapter graph, concurrent roots, dependency artifacts and bounded retries'],
+      'verify native source-selected staffing, concurrent roots, dependency artifacts and bounded retries',
+      'also verify the original mixed Codex/Claude graph on Windows; no roster SQL mutations'],
   }, null, 2))
   process.exit(0)
 }
@@ -74,16 +74,23 @@ async function waitForMission(demo, missionId, timeoutMs = 60_000) {
   throw new Error(`timed out waiting for mission ${missionId}`)
 }
 
-async function parallelGraphScenario() {
+async function parallelGraphScenario({ sourceSelected = false } = {}) {
   const demo = await post('/api/demo/reset', {})
-  const roster = config.unixRoster
-    ? await prepareUnixDemoRoster(await snapshot(demo), config)
-    : { scope: 'unaltered_demo_roster', disabled_agents: [] }
+  const initial = await snapshot(demo)
+  const connected = initial.runners.filter((runner) => runner.connected)
+  assert.equal(connected.length, 1, 'task-graph E2E needs its single owned fixture runner')
+  const [runner] = connected
+  const adapter = sourceSelected ? 'fake-process' : 'codex'
+  let source
+  if (sourceSelected) {
+    source = graphFixtureSource(initial, demo.corp_id).source
+  }
   const created = await post(`/api/corps/${demo.corp_id}/missions`, {
     requested_by: demo.alice_actor_id,
-    preferred_adapter: 'codex',
+    preferred_adapter: adapter,
     strategy: 'parallel-specialists',
     title: '[graph-slow] Build a bounded dependency-aware task graph.',
+    ...(source ? { source } : {}),
   })
   assert.equal(created.strategy, 'parallel-specialists')
   assert.equal(created.task_ids.length, 3)
@@ -116,10 +123,21 @@ async function parallelGraphScenario() {
     assert.ok(task.contract.write_scope.length)
     assert.ok(task.contract.budget_tokens > 0)
     assert.ok(task.max_attempts <= 3)
-    assert.ok(planned.runners.some(runner => runner.connected && runner.capabilities.some(capability =>
+    assert.ok(planned.runners.some(candidate => candidate.connected && candidate.capabilities.some(capability =>
       capability.name === task.required_adapter && capability.available && capability.workspace_connection_id == null)),
     'Graph fixture planned an unavailable adapter: ' + task.required_adapter)
+    if (sourceSelected) {
+      assert.equal(task.required_adapter, adapter)
+      assert.deepEqual({
+        repository: task.contract.source_repository,
+        base_ref: task.contract.source_base_ref,
+        base_commit: task.contract.source_base_commit,
+      }, source, 'Every task must retain the selected immutable source')
+      const worker = planned.snapshot.agents.find((agent) => agent.id === task.assigned_agent_id)
+      assert.equal(worker?.mission_id, created.mission_id, 'Use native mission-owned staffing')
+    }
   }
+  assert.equal(new Set(tasks.map((task) => task.assigned_agent_id)).size, 3)
 
   const launched = await post(
     `/api/corps/${demo.corp_id}/missions/${created.mission_id}/launch`,
@@ -149,10 +167,15 @@ async function parallelGraphScenario() {
     (run) => taskById.get(run.task_id)?.depth === 0,
   )
   assert.equal(rootRuns.length, 2)
-  assert.equal(
-    new Set(rootRuns.map((run) => taskById.get(run.task_id)?.required_adapter)).size,
-    2,
-  )
+  if (sourceSelected) {
+    assert.ok(rootRuns.every((run) => taskById.get(run.task_id)?.required_adapter === adapter))
+    assert.equal(new Set(rootRuns.map((run) => run.agent_id)).size, 2)
+  } else {
+    assert.equal(
+      new Set(rootRuns.map((run) => taskById.get(run.task_id)?.required_adapter)).size,
+      2,
+    )
+  }
   const events = result.state.snapshot.events
   const synthesisRequested = events.find(
     (event) =>
@@ -183,9 +206,11 @@ async function parallelGraphScenario() {
   }
 
   return {
-    roster_fixture: roster,
     root_adapters: rootRuns.map(run => taskById.get(run.task_id).required_adapter).sort(),
     mission_id: created.mission_id,
+    runner_os: runner.os,
+    source_selected: sourceSelected,
+    source: source ?? null,
     task_ids: created.task_ids,
     initial_run_ids: launched.run_ids,
     all_run_ids: result.runs.map((run) => run.id),
@@ -235,10 +260,17 @@ async function retryBoundScenario() {
   }
 }
 
+// The normal cross-platform path staffs distinct workers for the selected
+// source/runtime. Keep the original heterogeneous demo-roster case on Windows,
+// where its external-CLI worker is supported; Unix refusal is tested separately.
+const parallelGraph = await parallelGraphScenario({ sourceSelected: true })
 const report = {
   schema_version: 2,
   checked_at: new Date().toISOString(),
-  parallel_graph: await parallelGraphScenario(),
+  parallel_graph: parallelGraph,
+  legacy_mixed_provider_graph: parallelGraph.runner_os === 'windows'
+    ? await parallelGraphScenario()
+    : null,
   retry_bound: await retryBoundScenario(),
 }
 await writeFile(

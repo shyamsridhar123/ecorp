@@ -1,0 +1,257 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-08T02:03:53.509Z",
+  "result": "PASS: normal ECorp runtime and real-Copilot planning readiness",
+  "product_code_commit": "034abd3899ff85530b11f7ba23b6d9fba6f05089",
+  "backend_source_commit": "eeb1dbdefe0e992970615854878683b64a4edb9e",
+  "standard_addresses": {
+    "api": "http://127.0.0.1:18962",
+    "ui": "http://127.0.0.1:15491"
+  },
+  "existing_container_id": "97561d4b4210ddadf9d10d5fa2d69832b31651caf034daa865d65a78988f8e68",
+  "containers_created": 0,
+  "databases_created": 0,
+  "runner_reenrollments": 0,
+  "unrelated_reused_pid_untouched": true,
+  "restored_services": [
+    {
+      "role": "server",
+      "executable": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue48-staffing-20260906\\live\\bin\\crony-server-current-42AA254FCECE.exe",
+      "pid": 41628,
+      "started_utc": "2026-09-08T01:28:42.9393220Z"
+    },
+    {
+      "role": "web",
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "pid": 54412,
+      "started_utc": "2026-09-08T01:29:05.2488010Z"
+    },
+    {
+      "role": "arcade_copilot_runner",
+      "executable": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue48-staffing-20260906\\live\\bin\\crony-runner.exe",
+      "pid": 54332,
+      "started_utc": "2026-09-08T01:28:51.5509770Z"
+    },
+    {
+      "role": "enterprise_copilot_runner",
+      "pid": 29568,
+      "executable": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue48-staffing-20260906\\live\\bin\\crony-runner.exe",
+      "started_utc": "2026-09-08T01:46:46.8666217Z"
+    },
+    {
+      "role": "factory_controller",
+      "pid": 31680,
+      "executable": "C:\\Users\\shyamsridhar\\.codex\\dogfood\\issue48-staffing-20260906\\live\\bin\\crony-cli.exe",
+      "started_utc": "2026-09-08T01:45:10.1459047Z"
+    }
+  ],
+  "completed_missions": [
+    {
+      "id": "32d82858-0e38-43db-bf77-eb431ba0bda8",
+      "title": "GitHub #3: Demo: Incident Arcade enterprise training with three Copilot specialists",
+      "status": "completed"
+    },
+    {
+      "id": "03f0acfa-1278-44db-910b-b1a0acde0bcf",
+      "title": "GitHub #1: Build VendorDesk enterprise onboarding with three real Copilot agents",
+      "status": "completed"
+    },
+    {
+      "id": "8b92a3b3-6908-4402-80b0-dcbd268bcf28",
+      "title": "Build a playable retro brick-breaker game",
+      "status": "completed"
+    }
+  ],
+  "retained_run_count": 16,
+  "source_runners": [
+    {
+      "runner_id": "enterprise-copilot-qa",
+      "repository": "shyamsridhar123/ecorp-enterprise-lab",
+      "ref": "main",
+      "commit": "e3dc3d669b1a99832e2e7af9be16f7f39842586d",
+      "real_copilot_available": true
+    },
+    {
+      "runner_id": "issue48-real-copilot",
+      "repository": "shyamsridhar123/ecorp-arcade-lab",
+      "ref": "main",
+      "commit": "d6343f598280e986c43a32082e7f361a9af9ce22",
+      "real_copilot_available": true
+    }
+  ],
+  "controller": {
+    "id": "00000000-0000-4000-8000-000000000051",
+    "status": "watching",
+    "desired_state": "paused",
+    "repository": "shyamsridhar123/ecorp-enterprise-lab",
+    "active_work_item_id": null
+  },
+  "signed_source_downloads": [
+    {
+      "run_id": "800bb260-7071-43bc-ace0-c45a4e98e231",
+      "artifact_id": "ce06caf6-35a8-43ba-be62-70eb690718ed",
+      "sha256": "8e9c6db1c36829d8d7db80c9eb70a9077d0821f1d5d4e91726fede7fdd84f80d",
+      "bytes": 1269329,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "0fda7111-2752-480b-be74-1f8e4d34bbfd",
+      "artifact_id": "c998feca-f2c7-4e7b-99f6-d1fcc3f7ec54",
+      "sha256": "d084fd6ca30b983ab0a96c428943c03aa0dcfbc5398d8ff69006c3bc31a9d30b",
+      "bytes": 12215,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "87271290-4647-4ed1-b9fb-5a1a77fd9a4a",
+      "artifact_id": "fb77fe18-9ca4-454d-ae39-2bb380f1c534",
+      "sha256": "540cc240ce1a6fb68502b86769a30a41795370f8a9e5ca837ee98e5b785fc1dc",
+      "bytes": 11763,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "89fe1354-13ed-492f-b6b8-72a71ed81d0c",
+      "artifact_id": "e0c52845-a355-4a8e-84de-b5d9a7758785",
+      "sha256": "3c47c465fd82a651f7a3dc3b977c302508e5ea96a98740a06090a31f294d4cce",
+      "bytes": 11523,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "eb7efe49-235c-456e-a834-9b02c85b898b",
+      "artifact_id": "95ecd6f7-0bb5-40fe-bed5-eb871d9fa7e3",
+      "sha256": "485a09bfa883c83f96dc89061cbe415fbe70527fed98890bb5527243ecd9223e",
+      "bytes": 12055,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "132394c6-0758-46f3-8cbf-00d2d8bea10e",
+      "artifact_id": "ef69e7c3-847c-4d27-a6f0-7ddd435cc168",
+      "sha256": "0c4b45a48a95823dd4834f01e5fd7ba54f77ed141b8017a09bbb6912f372a61c",
+      "bytes": 11523,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "c00ae112-b40d-41ed-b0a0-2719d391846c",
+      "artifact_id": "84bc63cf-bfc6-4c54-892a-21fb7aa41951",
+      "sha256": "5647c11fd48fde623b5e8539e80daf78a0a98424fba4601ae5ee703f1cbd1581",
+      "bytes": 11763,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "4072693c-b13d-4fe1-a193-48428cff9da3",
+      "artifact_id": "129de787-e5ad-41c2-8732-85c75762099d",
+      "sha256": "930465c97dcd35287820d0eac1ba340bf68dbb16f401b1b12fe4cedd10dbe7b1",
+      "bytes": 12139,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "488a7163-75fa-42cf-b767-259b1f90a48f",
+      "artifact_id": "aa5bf9ae-de32-433b-8f3a-ce270efb43b0",
+      "sha256": "3dc45e704a208498eb45e8c9b729495c2a54e611c8c3d45006dd51a7b005fa7e",
+      "bytes": 12627,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "88981b01-7146-4a5e-b36e-815565d876aa",
+      "artifact_id": "7533cb5a-42cc-458c-8188-315f12beddb8",
+      "sha256": "ab46c68cb75b2137d987c5fb5ff1de196076f8f101c9d9a883919457bd28b0eb",
+      "bytes": 12123,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "bfdef88c-f7f8-440c-b426-03972ff4cdf8",
+      "artifact_id": "c9e8eb5e-637e-42b8-89a7-435a4c9c4d0f",
+      "sha256": "7f1cd57f93691f153ebc1f43ea86ebe50014b88b5e3660b3c97d8156f46e82be",
+      "bytes": 281188,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "127853f0-4720-4d2c-9ddf-9fe46dfb18da",
+      "artifact_id": "533363cd-38c4-46a8-bf59-20f4fb737b5d",
+      "sha256": "68062bb4a7898d519ebeccbfbfd647ca85430f822b54032be0f5d0882a94b6e4",
+      "bytes": 13475,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "bee3c66e-3606-4dd4-b769-f0a4013a0e7b",
+      "artifact_id": "ae6278a6-a1e6-463f-aa7e-974151485dac",
+      "sha256": "0d0f03fc1cc3a0ab54fc208f091fca4392288b4146bd7c259f5694961b65647c",
+      "bytes": 13903,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "c210fb8b-ac43-47f7-9286-608e7920b91d",
+      "artifact_id": "04a3ba35-f942-45cf-a20a-ac8346d56855",
+      "sha256": "c1166b0f10ef4ce24aef028bc61802894499f818ef4723ff37391f258540a986",
+      "bytes": 12331,
+      "signature_header_matched": true
+    },
+    {
+      "run_id": "fabec3ed-6ae9-461d-882f-04e431808ac1",
+      "artifact_id": "4a0d47df-9756-4208-9012-ef2eacdc9cfd",
+      "sha256": "398a04810f082b9682e7deab4d272dff0bb28abf65ef84fdcc03aed6457d8bd4",
+      "bytes": 116877,
+      "signature_header_matched": true
+    }
+  ],
+  "post_readiness_state_fingerprints": {
+    "missions": {
+      "count": 3,
+      "sha256": "11f0166aaadfc5e30bd34d0eba285960a17dccc0c54e34178ff3f6ed83460273"
+    },
+    "tasks": {
+      "count": 9,
+      "sha256": "96c58d47e2017e2eb6fb9552fc3247ec6cf51ae17363de400fa5e5d1c279d688"
+    },
+    "runs": {
+      "count": 16,
+      "sha256": "6dcfb304e7e6b6aae16904c77fc51e27903ffb47cde7e7120e5fc02af85a7afd"
+    },
+    "verification_evidence": {
+      "count": 68,
+      "sha256": "a4937c10ff9ee4d6e3385a07fef3a80bb5db4d461d02bfd7477272ad558fa540"
+    },
+    "verification_requests": {
+      "count": 5,
+      "sha256": "6e9a4521aa98eb8bc6c9f1b25434b23c76ca0f5a8a7da82c3f4d92b4fc0fcdd0"
+    },
+    "action_approvals": {
+      "count": 0,
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    "source_deliverables": {
+      "count": 15,
+      "sha256": "f8721112e6c8d9e0155b8e23d786c5a1ef1c82ff144431c0ed0b4ef2f141e36d"
+    },
+    "factory_work_items": {
+      "count": 2,
+      "sha256": "f360c1805e7c4e8e9fd611378acac2e9b976a877d6ffabd431ae8c337fc4dade"
+    }
+  },
+  "no_saved_work_changed_by_readiness_test": true,
+  "browser": {
+    "real_github_copilot": true,
+    "studio_task_allocations": [
+      150000,
+      150000,
+      150000,
+      550000
+    ],
+    "build_enabled": true,
+    "build_clicked": false,
+    "readiness_draft_cleared": true
+  },
+  "limits": [
+    "This restores existing services/results and proves planning readiness, not a new application build or vendor-session resume.",
+    "Existing Factory pause was preserved. No intake, publication, merge or deployment was enabled.",
+    "Separate issue172 QA bridge restart remains denied and was not retried or bypassed.",
+    "VendorDesk standalone preview restoration was also rejected before command execution; port15501 remains offline and no alternate host/path was used.",
+    "Incident Arcade was neither executed nor previewed; only stored source bytes/provenance were read.",
+    "Development principals/default development keys remain development-only.",
+    "No full repository tests were rerun for this operation: exact tested source/binary identities from the prior gates were reused."
+  ],
+  "retained_operator_errors": [
+    "The first controller guard rejected stale Arcade metadata; current persisted Enterprise policy and its actual process record were used instead.",
+    "A readback probe assumed every record had an id; verification requests use run_id. Sorted row-JSON fingerprints corrected the probe without data edits."
+  ],
+  "follow_up_issue": 174
+}

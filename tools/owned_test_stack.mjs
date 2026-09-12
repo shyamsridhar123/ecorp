@@ -41,6 +41,7 @@ export function assertOwnedRestart(manifest, identity, { root, server, binary, p
     !samePath(identity.executable, binary) ||
     Math.abs(Date.parse(identity.creation) - Date.parse(manifest.server_creation)) > 20 ||
     identity.port_owned !== true ||
+    (identity.port !== undefined && identity.port !== Number(new URL(server).port)) ||
     (manifest.server_state !== undefined && manifest.server_state !== 'running')) {
     throw new Error(refusal)
   }
@@ -81,7 +82,7 @@ async function serverIdentity(pid, context) {
     "$ErrorActionPreference = 'Stop'",
     '$processId = [int]$env:ECORP_QA_PROCESS_ID',
     '$port = [int]$env:ECORP_QA_PROCESS_PORT',
-    '$process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId"',
+    '$process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -Property ProcessId,ExecutablePath,CreationDate',
     "if (!$process) { throw 'Recorded QA server is absent' }",
     '$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)',
     "@{ platform='win32'; pid=$processId; executable=$process.ExecutablePath; creation=$process.CreationDate.ToUniversalTime().ToString('o');",
@@ -94,6 +95,16 @@ async function serverIdentity(pid, context) {
   return JSON.parse(stdout)
 }
 
+export function ownedServerEnvironment(environment = {}, databaseUrl, inherited = process.env) {
+  const bounds = { CRONY_ARTIFACT_RECOVERY_GRACE_SECS: [0, 3600], CRONY_ARTIFACT_RECOVERY_INTERVAL_SECS: [1, 3600] }
+  if (!environment || Array.isArray(environment) || typeof environment !== 'object') throw new Error(refusal)
+  for (const [key, value] of Object.entries(environment)) {
+    if (!Object.hasOwn(bounds, key) || typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/u.test(value) ||
+      Number(value) < bounds[key][0] || Number(value) > bounds[key][1]) throw new Error(refusal)
+  }
+  return { ...inherited, ...environment, DATABASE_URL: databaseUrl }
+}
+
 function options({ root, server, databaseUrl, binary = process.env.CRONY_TEST_SERVER_BINARY,
   manifestPath = process.env.CRONY_TEST_SERVER_PID_FILE, logPrefix = 'owned-server-restart',
   args = [], environment = {}, minimumRunners = 1 }) {
@@ -104,6 +115,7 @@ function options({ root, server, databaseUrl, binary = process.env.CRONY_TEST_SE
     throw new Error('Owned restart requires explicit binary, database, and JSON process manifest.')
   }
   assertTestEndpoint(server)
+  ownedServerEnvironment(environment, databaseUrl, {})
   if (!['win32', 'linux'].includes(process.platform)) throw new Error('Unsupported owned test platform.')
   let database
   try { database = new URL(databaseUrl) } catch { throw new Error('Invalid PostgreSQL test database URL; its value was not disclosed.') }
@@ -211,7 +223,7 @@ async function launch(context, previous, previousRaw) {
   const stdout = openSync(path.join(logRoot, `${context.logPrefix}.stdout.log`), 'a', 0o600)
   const stderr = openSync(path.join(logRoot, `${context.logPrefix}.stderr.log`), 'a', 0o600)
   const child = spawn(context.binary, [...context.args, '--bind', `${endpoint.hostname}:${endpoint.port}`], {
-    cwd: context.root, env: { ...process.env, ...context.environment, DATABASE_URL: context.databaseUrl },
+    cwd: context.root, env: ownedServerEnvironment(context.environment, context.databaseUrl),
     detached: true, windowsHide: true, stdio: ['ignore', stdout, stderr],
   })
   try {

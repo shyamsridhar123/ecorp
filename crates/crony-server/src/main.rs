@@ -9,7 +9,11 @@ mod staffing;
 mod workspace_connections;
 
 use std::{
-    collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use anyhow::Context;
@@ -35,7 +39,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crony_domain::{
     DeliverableSpec, DomainEvent, FactoryVerificationRecoveryMode, ManualVerificationGate,
-    TaskGraphPlan, TaskSecretReference, VerificationPolicy,
+    RetainedProviderReceiptGrant, TaskGraphPlan, TaskSecretReference, VerificationPolicy,
 };
 use crony_protocol::{
     ActionApprovalDecisionRequest, ActionApprovalDecisionResponse, BrowserSocketMessage,
@@ -414,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(StdDuration::from_secs(3));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut scheduling_cursor = None;
+        let mut scheduling_cursor = CorpScheduleCursor::default();
         loop {
             interval.tick().await;
             match retirement_state
@@ -1406,9 +1410,17 @@ impl ReadyCorpSchedule {
     }
 }
 
+#[derive(Default)]
+struct CorpScheduleCursor {
+    after_corp: Option<Uuid>,
+    // Retire rotation only after a current singleton visit or Corp disappearance.
+    // A global tick number would alias when a Corp is visited every Nth tick.
+    after_runner: HashMap<Uuid, String>,
+}
+
 async fn reconcile_ready_corps<F, Fut>(
     runners: &DashMap<String, RunnerConnection>,
-    after_corp: &mut Option<Uuid>,
+    cursor: &mut CorpScheduleCursor,
     mut reconcile: F,
 ) -> Vec<(Uuid, anyhow::Error)>
 where
@@ -1425,20 +1437,48 @@ where
         })
         .collect::<Vec<_>>();
     scopes.sort_unstable_by(|a, b| (a.corp_id, &a.runner_id).cmp(&(b.corp_id, &b.runner_id)));
-    scopes.dedup_by_key(|scope| scope.corp_id);
-    if let Some(after) = *after_corp {
-        let split = scopes.partition_point(|scope| scope.corp_id <= after);
-        scopes.rotate_left(split);
+    let mut ready_corps = HashSet::new();
+    let mut multi_runner_corps = HashSet::new();
+    let mut representatives = Vec::new();
+    for peers in scopes.chunk_by(|a, b| a.corp_id == b.corp_id) {
+        let corp_id = peers[0].corp_id;
+        ready_corps.insert(corp_id);
+        if peers.len() > 1 {
+            multi_runner_corps.insert(corp_id);
+        }
+        let next = cursor.after_runner.get(&corp_id).map_or(0, |last| {
+            peers.partition_point(|scope| scope.runner_id <= *last) % peers.len()
+        });
+        representatives.push(peers[next].clone());
     }
-    // Round-robin across ticks rather than starving Corps beyond the first batch.
-    scopes.truncate(100);
-    if let Some(last) = scopes.last() {
-        *after_corp = Some(last.corp_id);
+    // Prune disappeared Corps immediately, but retain unvisited singletons:
+    // their other peers can rejoin before the next actual visit.
+    cursor
+        .after_runner
+        .retain(|corp_id, _| ready_corps.contains(corp_id));
+    if let Some(after) = cursor.after_corp {
+        let split = representatives.partition_point(|scope| scope.corp_id <= after);
+        representatives.rotate_left(split);
+    }
+    // At most one command drain/scheduling attempt per Corp, and 100 Corps per
+    // tick. A failing representative never expands this bound to all its peers.
+    representatives.truncate(100);
+    if let Some(last) = representatives.last() {
+        cursor.after_corp = Some(last.corp_id);
     }
     let mut failures = Vec::new();
-    for scope in scopes {
+    for scope in representatives {
+        // Advance even on failure or a stale snapshot; the next native tick
+        // must give the next peer a chance without bypassing command fences.
+        cursor
+            .after_runner
+            .insert(scope.corp_id, scope.runner_id.clone());
         if !scope.is_current(runners) {
             continue;
+        }
+        // A stale singleton candidate must not reset the next peer's turn.
+        if !multi_runner_corps.contains(&scope.corp_id) {
+            cursor.after_runner.remove(&scope.corp_id);
         }
         let corp_id = scope.corp_id;
         if let Err(error) = reconcile(scope).await {
@@ -1597,7 +1637,10 @@ async fn dispatch_pending_runner_commands_for_epoch(
             let outgoing = match decoded {
                 Ok(Some(outgoing)) => outgoing,
                 Ok(None) => continue,
-                Err(error) if command.command_kind == "factory_verification_recovery" => {
+                Err(error)
+                    if command.command_kind == "factory_verification_recovery"
+                        && !factory_recovery_failure_is_retryable(&error) =>
+                {
                     let detail = factory_recovery_dispatch_failure_detail(&error);
                     for event in state
                         .store
@@ -1673,6 +1716,8 @@ struct FactoryRecoveryRunnerCommandPayload {
     #[serde(default)]
     secret_refs: Vec<TaskSecretReference>,
     provider_artifact: Option<VerificationArtifactReference>,
+    #[serde(default)]
+    retained_provider_receipt: Option<RetainedProviderReceiptGrant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1713,8 +1758,12 @@ async fn decode_recovery_runner_command(
                     "factory recovery runner command identity mismatch"
                 ));
             }
+            validate_retained_provider_receipt_command(command, &payload)?;
             match payload.mode {
                 FactoryVerificationRecoveryMode::SourceCorrection => {
+                    if !source_correction_authority_is_current(state, command).await? {
+                        return Ok(None);
+                    }
                     let secrets = resolve_secret_refs(
                         state,
                         payload.corp_id,
@@ -1725,6 +1774,9 @@ async fn decode_recovery_runner_command(
                     )
                     .await?;
                     if !recovery_command_can_dispatch(state, command).await? {
+                        return Ok(None);
+                    }
+                    if !source_correction_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
                     Ok(Some(ServerToRunner::ResumeRun {
@@ -1775,6 +1827,15 @@ async fn decode_recovery_runner_command(
                             "verifier-only recovery cannot receive provider secrets"
                         ));
                     }
+                    if payload.retained_provider_receipt.is_some()
+                        && !state.runners.get(&command.runner_id).is_some_and(|runner| {
+                            supports_retained_provider_receipt(&runner.capabilities)
+                        })
+                    {
+                        return Err(anyhow::anyhow!(
+                            "runner does not support historical receipt collection; update the connected runner"
+                        ));
+                    }
                     if !verification_recovery_authority_is_current(state, command).await? {
                         return Ok(None);
                     }
@@ -1815,6 +1876,7 @@ async fn decode_recovery_runner_command(
                         write_scope: payload.write_scope,
                         deliverable: payload.deliverable,
                         provider_artifact: payload.provider_artifact,
+                        retained_provider_receipt: payload.retained_provider_receipt.map(Box::new),
                     }))
                 }
             }
@@ -1870,6 +1932,43 @@ fn supports_checkpoint_verification(capabilities: &[crony_protocol::RunnerCapabi
         .any(|capability| capability.name == "checkpoint-verification-v1" && capability.available)
 }
 
+fn supports_retained_provider_receipt(capabilities: &[crony_protocol::RunnerCapability]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.name == "retained-provider-receipt-v1" && capability.available)
+}
+
+fn validate_retained_provider_receipt_command(
+    command: &PendingRunnerCommand,
+    payload: &FactoryRecoveryRunnerCommandPayload,
+) -> anyhow::Result<()> {
+    let Some(grant) = payload.retained_provider_receipt.as_ref() else {
+        return Ok(());
+    };
+    grant.validate().map_err(anyhow::Error::msg)?;
+    if payload.mode != FactoryVerificationRecoveryMode::CheckpointVerification
+        || payload.provider_artifact.is_some()
+        || payload.provider_session_id.is_some()
+        || payload.model.is_some()
+        || payload.reasoning_effort.is_some()
+        || !payload.secret_refs.is_empty()
+        || command.id != grant.collection_id
+        || command.corp_id != grant.corp_id
+        || command.run_id != grant.run_id
+        || payload.corp_id != grant.corp_id
+        || payload.task_id != grant.task_id
+        || payload.run_id != grant.run_id
+        || payload.workspace_run_id != grant.workspace_run_id
+        || payload.expected_workspace_fingerprint != grant.expected_workspace_fingerprint
+        || payload.expected_head_commit.as_deref() != Some(grant.expected_head_commit.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "historical receipt collection does not match the exact provider-free checkpoint command"
+        ));
+    }
+    Ok(())
+}
+
 async fn verification_recovery_authority_is_current(
     state: &AppState,
     command: &PendingRunnerCommand,
@@ -1887,6 +1986,31 @@ async fn verification_recovery_authority_is_current(
     Err(anyhow::anyhow!(
         "current recovery authorization is unavailable; no verifier command was dispatched"
     ))
+}
+
+async fn source_correction_authority_is_current(
+    state: &AppState,
+    command: &PendingRunnerCommand,
+) -> anyhow::Result<bool> {
+    if state
+        .store
+        .source_correction_command_authorized(command)
+        .await?
+    {
+        return Ok(true);
+    }
+    if !recovery_command_can_dispatch(state, command).await? {
+        return Ok(false);
+    }
+    Err(anyhow::anyhow!(
+        "current source-correction authorization is unavailable; no provider command was dispatched"
+    ))
+}
+
+fn factory_recovery_failure_is_retryable(error: &anyhow::Error) -> bool {
+    // An unavailable database must leave the durable command pending, not
+    // consume the final provider attempt as a new execution failure.
+    error.downcast_ref::<sqlx::Error>().is_some()
 }
 
 async fn recovery_command_can_dispatch(
@@ -2287,6 +2411,7 @@ struct MissionPlanInput<'a> {
     secret_refs: &'a [TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
+    max_task_attempts: Option<i32>,
     deliverable: Option<&'a crony_domain::DeliverableSpec>,
     contract: Option<&'a FactoryMissionContract>,
     verification_policy: Option<&'a VerificationPolicy>,
@@ -2308,6 +2433,7 @@ impl<'a> MissionPlanInput<'a> {
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: request.contract.as_ref(),
             verification_policy: request.verification_policy.as_ref(),
@@ -2458,6 +2584,7 @@ async fn plan_mission(
                 secret_refs: input.secret_refs,
                 budget_tokens: input.budget_tokens,
                 budget_cost_microusd: input.budget_cost_microusd,
+                max_task_attempts: input.max_task_attempts,
                 deliverable: input.deliverable,
                 handoff_root: handoff_root.as_deref(),
             },
@@ -3256,6 +3383,8 @@ async fn get_factory_verification_recovery_context(
         workspace_fingerprint: context.workspace_fingerprint,
         expected_head_commit: context.expected_head_commit,
         checkpoint_verification: context.checkpoint_verification,
+        checkpoint_source_correction: context.checkpoint_source_correction,
+        checkpoint_verification_available: Some(context.checkpoint_verification_available),
         checkpoint_cancellation_event_id: context.checkpoint_cancellation_event_id,
     }))
 }
@@ -3372,6 +3501,7 @@ fn factory_materialization_operation_request(
     preferred_model: Option<&str>,
     reasoning_effort: Option<&str>,
     strategy: Option<&str>,
+    max_task_attempts: Option<i32>,
     secret_refs: &[TaskSecretReference],
     budget_tokens: Option<i64>,
     budget_cost_microusd: Option<i64>,
@@ -3379,7 +3509,7 @@ fn factory_materialization_operation_request(
     contract: &FactoryMissionContract,
     verification_policy: Option<&VerificationPolicy>,
 ) -> serde_json::Value {
-    json!({
+    let mut request = json!({
         "title": title,
         "description": description,
         "preferred_adapter": preferred_adapter,
@@ -3392,7 +3522,31 @@ fn factory_materialization_operation_request(
         "deliverable": deliverable,
         "contract": contract,
         "verification_policy": verification_policy
-    })
+    });
+    // Keep old operation snapshots byte-equivalent when this optional planning
+    // choice is absent; adding a null field would break existing replay.
+    if let Some(max_task_attempts) = max_task_attempts {
+        request["max_task_attempts"] = json!(max_task_attempts);
+    }
+    request
+}
+
+fn validate_factory_requested_attempts(
+    allowed: Option<i32>,
+    requested: Option<i32>,
+) -> Result<(), ApiError> {
+    if requested.is_some_and(|value| !(1..=planning::MAX_TASK_ATTEMPTS).contains(&value)) {
+        return Err(ApiError::bad_request(format!(
+            "max_task_attempts must be between 1 and {}",
+            planning::MAX_TASK_ATTEMPTS
+        )));
+    }
+    if allowed != requested {
+        return Err(ApiError::bad_request(
+            "max_task_attempts must match the claimed planning policy; choose it before claiming work",
+        ));
+    }
+    Ok(())
 }
 
 fn factory_materialization_failure_detail(rejection: &str) -> String {
@@ -3471,6 +3625,10 @@ async fn preflight_factory_mission(
         Permission::Operate,
     )
     .await?;
+    validate_factory_requested_attempts(
+        crony_domain::factory_max_task_attempts(&request.policy).map_err(ApiError::bad_request)?,
+        request.max_task_attempts,
+    )?;
     let workspace_connection_id = crony_domain::factory_workspace_connection_id(&request.policy)
         .map_err(ApiError::bad_request)?;
     let staffing_source = if workspace_connection_id.is_some()
@@ -3511,6 +3669,7 @@ async fn preflight_factory_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: Some(&request.contract),
             verification_policy: request.verification_policy.as_ref(),
@@ -3525,6 +3684,7 @@ async fn preflight_factory_mission(
         request.preferred_model.as_deref(),
         request.reasoning_effort.as_deref(),
         request.strategy.as_deref(),
+        request.max_task_attempts,
         &request.secret_refs,
         request.budget_tokens,
         request.budget_cost_microusd,
@@ -3549,12 +3709,14 @@ async fn preflight_factory_mission(
         )
         .await
         .map_err(map_store_error)?;
+    let preview = mission_preview_response(&constrained_plan);
     Ok(Json(PreflightFactoryMissionResponse {
         valid: true,
-        strategy: constrained_plan.strategy,
-        task_count: constrained_plan.tasks.len(),
-        budget_tokens: constrained_plan.budget_tokens,
-        budget_cost_microusd: constrained_plan.budget_cost_microusd,
+        strategy: preview.strategy,
+        task_count: preview.tasks.len(),
+        budget_tokens: preview.budget_tokens,
+        budget_cost_microusd: preview.budget_cost_microusd,
+        tasks: preview.tasks,
     }))
 }
 
@@ -3580,6 +3742,21 @@ async fn materialize_factory_mission(
         Permission::Operate,
     )
     .await?;
+    // A new planning option cannot mutate an existing claim as a side effect
+    // of rejection. Read the same authorized source/policy projection before
+    // the generic post-claim failure-compensation path. Old requests retain
+    // their existing replay order and representation.
+    let explicit_planning_source = if request.max_task_attempts.is_some() {
+        let source = state
+            .store
+            .factory_planning_source(corp_id, work_item_id, actor_id)
+            .await
+            .map_err(map_store_error)?;
+        validate_factory_requested_attempts(source.max_task_attempts, request.max_task_attempts)?;
+        Some(source)
+    } else {
+        None
+    };
     let operation_request = factory_materialization_operation_request(
         &request.title,
         &request.description,
@@ -3587,6 +3764,7 @@ async fn materialize_factory_mission(
         request.preferred_model.as_deref(),
         request.reasoning_effort.as_deref(),
         request.strategy.as_deref(),
+        request.max_task_attempts,
         &request.secret_refs,
         request.budget_tokens,
         request.budget_cost_microusd,
@@ -3630,30 +3808,35 @@ async fn materialize_factory_mission(
     }
     // Read the source and connection together from the immutable claimed policy.
     // A materialization request cannot substitute its own account or machine.
-    let (repository, base_ref, base_commit, workspace_connection_id) = match state
-        .store
-        .factory_staffing_source(corp_id, work_item_id, actor_id)
-        .await
-    {
-        Ok(source) => source,
-        Err(error) => {
-            return Err(reject_factory_materialization_error(
-                &state,
-                &materialize_input,
-                map_store_error(error),
-            )
-            .await);
-        }
+    let source = match explicit_planning_source {
+        Some(source) => source,
+        None => match state
+            .store
+            .factory_planning_source(corp_id, work_item_id, actor_id)
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                return Err(reject_factory_materialization_error(
+                    &state,
+                    &materialize_input,
+                    map_store_error(error),
+                )
+                .await);
+            }
+        },
     };
+    validate_factory_requested_attempts(source.max_task_attempts, request.max_task_attempts)?;
+    let workspace_connection_id = source.workspace_connection_id;
     let staffing_source = (workspace_connection_id.is_some()
         || needs_factory_staffing_source(
             request.strategy.as_deref(),
             request.preferred_adapter.as_deref(),
         ))
     .then_some(MissionSource {
-        repository,
-        base_ref,
-        base_commit,
+        repository: source.repository,
+        base_ref: source.base_ref,
+        base_commit: source.base_commit,
     });
     let plan = match plan_mission(
         &state,
@@ -3671,6 +3854,7 @@ async fn materialize_factory_mission(
             secret_refs: &request.secret_refs,
             budget_tokens: request.budget_tokens,
             budget_cost_microusd: request.budget_cost_microusd,
+            max_task_attempts: request.max_task_attempts,
             deliverable: request.deliverable.as_ref(),
             contract: Some(&request.contract),
             verification_policy: request.verification_policy.as_ref(),
@@ -6201,10 +6385,9 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     );
                     continue;
                 }
-                let deliverable_ack_sha = (event_type == "run.deliverable_upload")
-                    .then(|| payload.get("sha256").and_then(serde_json::Value::as_str))
-                    .flatten()
-                    .map(str::to_owned);
+                let retained_receipt_upload = event_type == "run.artifact_upload"
+                    && payload.get("retained_provider_receipt").is_some();
+                let artifact_ack = artifact_upload_ack(&event_type, &payload);
                 let input = RunnerEventInput {
                     event_id,
                     runner_id: runner_id.clone(),
@@ -6223,6 +6406,11 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                     "run.artifact_upload" | "run.deliverable_upload"
                 ) && let Err(error) = &result
                 {
+                    if retained_receipt_upload && retained_receipt_upload_error_is_retryable(error)
+                    {
+                        warn!(%error, %run_id, "historical receipt upload deferred for bounded retry");
+                        continue;
+                    }
                     let reason = format!("artifact upload rejected: {error}");
                     warn!(%error, %run_id, "artifact upload failed verification");
                     applied_event_type = "run.failed".to_owned();
@@ -6248,7 +6436,8 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                             related_events,
                         } = outcome;
                         if let Some(event) = event {
-                            if event.event_type == "run.deliverable"
+                            if (event.event_type == "run.deliverable"
+                                || (retained_receipt_upload && event.event_type == "run.artifact"))
                                 && let (Some(artifact_id), Some(artifact_role), Some(sha256)) = (
                                     event
                                         .payload
@@ -6361,30 +6550,33 @@ async fn runner_socket(socket: WebSocket, state: AppState) {
                                     }
                                 });
                             }
-                        } else {
-                            if let Some(sha256) = deliverable_ack_sha {
-                                match state
-                                    .store
-                                    .ready_artifact_for_run_role_digest(
-                                        corp_id,
+                        } else if applied_event_type == event_type
+                            && let Some((artifact_role, sha256)) = artifact_ack
+                        {
+                            // Only a successfully authorized duplicate upload
+                            // can acknowledge an existing object. A rejection
+                            // converted to run.failed must never reach this path.
+                            match state
+                                .store
+                                .ready_artifact_for_run_role_digest(
+                                    corp_id,
+                                    run_id,
+                                    artifact_role,
+                                    &sha256,
+                                )
+                                .await
+                            {
+                                Ok(Some(artifact)) => {
+                                    let _ = command_tx.send(ServerToRunner::ArtifactStored {
                                         run_id,
-                                        "source_deliverable",
-                                        &sha256,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(artifact)) => {
-                                        let _ = command_tx.send(ServerToRunner::ArtifactStored {
-                                            run_id,
-                                            artifact_id: artifact.id,
-                                            artifact_role: artifact.artifact_role,
-                                            sha256: artifact.sha256,
-                                        });
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        warn!(%error, %run_id, "deliverable acknowledgment lookup failed")
-                                    }
+                                        artifact_id: artifact.id,
+                                        artifact_role: artifact.artifact_role,
+                                        sha256: artifact.sha256,
+                                    });
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(%error, %run_id, "artifact acknowledgment lookup failed")
                                 }
                             }
                         }
@@ -6472,19 +6664,30 @@ async fn process_runner_event(
             input.assignment_token,
         )
         .await?;
+    let retained_receipt = state
+        .store
+        .retained_provider_receipt_grant_for_upload(&input)
+        .await?;
     let retention_until = Utc::now() + ChronoDuration::days(state.artifact_retention_days);
-    let staged = state.artifacts.prepare_staging(
-        ArtifactIdentity {
-            id: input.event_id,
-            corp_id: input.corp_id,
-            task_id: context.task_id,
-            run_id: input.run_id,
-            agent_id: input.agent_id,
-            runner_id: &input.runner_id,
-        },
-        &input.payload,
-        retention_until,
-    )?;
+    let identity = ArtifactIdentity {
+        id: input.event_id,
+        corp_id: input.corp_id,
+        task_id: context.task_id,
+        run_id: input.run_id,
+        agent_id: input.agent_id,
+        runner_id: &input.runner_id,
+    };
+    let staged = match retained_receipt.as_ref() {
+        Some(grant) => state.artifacts.prepare_retained_provider_receipt_staging(
+            identity,
+            &input.payload,
+            retention_until,
+            grant,
+        )?,
+        None => state
+            .artifacts
+            .prepare_staging(identity, &input.payload, retention_until)?,
+    };
     let prepared = state
         .store
         .prepare_artifact_upload(input, staged.artifact.clone(), &staged.staging_key)
@@ -6561,6 +6764,34 @@ async fn process_runner_event(
         }
         status => Err(anyhow::anyhow!("unknown prepared artifact status {status}")),
     }
+}
+
+fn artifact_upload_ack(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<(&'static str, String)> {
+    let role = match event_type {
+        "run.deliverable_upload" => "source_deliverable",
+        "run.artifact_upload"
+            if payload.get("retained_provider_receipt").is_some()
+                && payload
+                    .get("artifact_role")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("provider_evidence") =>
+        {
+            "provider_evidence"
+        }
+        _ => return None,
+    };
+    let digest = payload.get("sha256")?.as_str()?.to_ascii_lowercase();
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((role, digest))
+}
+
+fn retained_receipt_upload_error_is_retryable(error: &anyhow::Error) -> bool {
+    !artifact_error_is_permanent(error)
+        && (error.downcast_ref::<sqlx::Error>().is_some()
+            || error.downcast_ref::<object_store::Error>().is_some())
 }
 
 async fn recover_pending_artifacts(
@@ -6801,15 +7032,198 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        MissionPlanInput, ReadyCorpSchedule, RunnerConnection, RunnerRequirements,
-        apply_mission_contract, apply_mission_description, apply_mission_source,
-        artifact_content_disposition, capability_satisfies_requirement,
+        CorpScheduleCursor, MissionPlanInput, ReadyCorpSchedule, RunnerConnection,
+        RunnerRequirements, apply_mission_contract, apply_mission_description,
+        apply_mission_source, artifact_content_disposition, capability_satisfies_requirement,
         enable_runner_after_reconciliation, enable_runner_dispatch, enforce_factory_manual_gate,
         factory_materialization_failure_detail, mission_preview_response, reconcile_ready_corps,
         reconnect_preserved_run_ids, runner_epoch_is_ready, runner_requirement_mismatch,
         schedule_after_runner_commands, select_ready_runner, send_command_to_current_runner,
         validate_verification_artifact_reference,
     };
+
+    fn retained_receipt_command_fixture() -> crony_store::PendingRunnerCommand {
+        let corp = Uuid::from_u128(1);
+        let task = Uuid::from_u128(2);
+        let run = Uuid::from_u128(3);
+        let workspace = Uuid::from_u128(4);
+        let command = Uuid::from_u128(5);
+        let grant = crony_domain::RetainedProviderReceiptGrant {
+            schema_version: 1,
+            collection_id: command,
+            corp_id: corp,
+            task_id: task,
+            run_id: run,
+            workspace_run_id: workspace,
+            source_run_id: Uuid::from_u128(10),
+            checkpoint_run_id: Uuid::from_u128(10),
+            provider_session_id: Uuid::from_u128(11).to_string(),
+            historical_run_id: workspace,
+            historical_termination_event_id: Uuid::from_u128(12),
+            historical_checkpoint_event_id: Uuid::from_u128(13),
+            source_checkpoint_event_id: Uuid::from_u128(14),
+            expected_workspace_fingerprint: "b".repeat(64),
+            expected_head_commit: "a".repeat(40),
+            historical_model: Some("test-model".to_owned()),
+            historical_reasoning_effort: None,
+        };
+        let mut payload = json!({
+            "mode": "checkpoint_verification",
+            "corp_id": corp,
+            "room_id": Uuid::from_u128(6),
+            "mission_id": Uuid::from_u128(7),
+            "task_id": task,
+            "run_id": run,
+            "workspace_run_id": workspace,
+            "agent_id": Uuid::from_u128(8),
+            "assignment_token": Uuid::from_u128(9),
+            "adapter": "github-copilot",
+            "provider_session_id": null,
+            "prompt": "",
+            "model": null,
+            "reasoning_effort": null,
+        });
+        let source = json!({
+            "source_repository": "owner/lab",
+            "source_base_ref": "main",
+            "source_base_commit": "a".repeat(40),
+            "workspace_base_commit": "a".repeat(40),
+            "expected_workspace_fingerprint": "b".repeat(64),
+            "expected_head_commit": "a".repeat(40),
+            "verification_policy": VerificationPolicy {
+                checks: Vec::new(),
+                manual_gate: None,
+            },
+            "write_scope": ["application/**"],
+            "deliverable": null,
+            "provider_artifact": null,
+            "retained_provider_receipt": grant,
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(source.as_object().unwrap().clone());
+        crony_store::PendingRunnerCommand {
+            id: command,
+            corp_id: corp,
+            run_id: run,
+            runner_id: "receipt-test".to_owned(),
+            command_kind: "factory_verification_recovery".to_owned(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_binds_exact_provider_free_command() {
+        let command = retained_receipt_command_fixture();
+        let decoded = serde_json::from_value(command.payload.clone()).unwrap();
+        super::validate_retained_provider_receipt_command(&command, &decoded).unwrap();
+        for (pointer, value) in [
+            ("/mode", json!("source_correction")),
+            ("/mode", json!("verifier_only")),
+            ("/model", json!("new-provider-model")),
+            ("/reasoning_effort", json!("high")),
+            ("/provider_session_id", json!(Uuid::new_v4())),
+            ("/run_id", json!(Uuid::new_v4())),
+            ("/corp_id", json!(Uuid::new_v4())),
+            ("/task_id", json!(Uuid::new_v4())),
+            ("/workspace_run_id", json!(Uuid::new_v4())),
+            ("/expected_head_commit", json!("c".repeat(40))),
+            ("/expected_workspace_fingerprint", json!("d".repeat(64))),
+            (
+                "/retained_provider_receipt/collection_id",
+                json!(Uuid::new_v4()),
+            ),
+        ] {
+            let mut candidate = retained_receipt_command_fixture();
+            *candidate.payload.pointer_mut(pointer).unwrap() = value;
+            let decoded = serde_json::from_value(candidate.payload.clone()).unwrap();
+            assert!(
+                super::validate_retained_provider_receipt_command(&candidate, &decoded).is_err(),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_does_not_send_private_upload_binding() {
+        let mut command = retained_receipt_command_fixture();
+        command.payload["retained_provider_receipt_upload"] =
+            json!({"sha256": "e".repeat(64), "bytes": 256});
+        let decoded: super::FactoryRecoveryRunnerCommandPayload =
+            serde_json::from_value(command.payload.clone()).unwrap();
+        super::validate_retained_provider_receipt_command(&command, &decoded).unwrap();
+        let receipt = decoded.retained_provider_receipt.unwrap();
+        let grant = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            serde_json::to_value(Box::new(receipt)).unwrap(),
+            grant,
+            "boxing the optional wire field must not change its JSON"
+        );
+        assert!(grant.get("retained_provider_receipt_upload").is_none());
+        assert!(grant.get("sha256").is_none());
+    }
+
+    #[test]
+    fn issue211_retained_dispatch_requires_its_own_available_capability() {
+        let capability = |name: &str, available| RunnerCapability {
+            name: name.to_owned(),
+            available,
+            detail: None,
+            models: Vec::new(),
+            workspace_connection_id: None,
+            source_repository: None,
+            source_base_ref: None,
+            source_base_commit: None,
+        };
+        assert!(!super::supports_retained_provider_receipt(&[]));
+        assert!(!super::supports_retained_provider_receipt(&[
+            capability("checkpoint-verification-v1", true),
+            capability("retained-provider-receipt-v1", false),
+        ]));
+        assert!(super::supports_retained_provider_receipt(&[capability(
+            "retained-provider-receipt-v1",
+            true
+        ),]));
+    }
+
+    #[test]
+    fn issue211_retained_receipt_ack_uses_exact_role_and_digest() {
+        let sha = "a".repeat(64);
+        let payload = json!({
+            "artifact_role": "provider_evidence",
+            "retained_provider_receipt": {"kind": "historical_copilot_receipt_v1"},
+            "sha256": sha
+        });
+        assert_eq!(
+            super::artifact_upload_ack("run.artifact_upload", &payload),
+            Some(("provider_evidence", sha.clone()))
+        );
+        assert_eq!(
+            super::artifact_upload_ack("run.deliverable_upload", &json!({"sha256": sha})),
+            Some(("source_deliverable", sha))
+        );
+        assert!(
+            super::artifact_upload_ack("run.artifact_upload", &json!({"sha256": "a".repeat(64)}))
+                .is_none()
+        );
+        let mut foreign = payload;
+        foreign["artifact_role"] = json!("source_deliverable");
+        assert!(super::artifact_upload_ack("run.artifact_upload", &foreign).is_none());
+        foreign["artifact_role"] = json!("provider_evidence");
+        foreign["sha256"] = json!("invalid");
+        assert!(super::artifact_upload_ack("run.artifact_upload", &foreign).is_none());
+    }
+
+    #[test]
+    fn issue211_retained_receipt_db_error_is_retryable_but_authority_denial_is_not() {
+        let database =
+            anyhow::Error::new(sqlx::Error::PoolTimedOut).context("receipt finalization");
+        assert!(super::retained_receipt_upload_error_is_retryable(&database));
+        assert!(!super::retained_receipt_upload_error_is_retryable(
+            &anyhow::anyhow!("retained provider receipt: authorization changed")
+        ));
+    }
 
     #[tokio::test]
     async fn checkpoint_denial_retires_only_the_command_and_store_errors_remain_retryable() {
@@ -6863,6 +7277,19 @@ mod tests {
         ]));
         capability.available = true;
         assert!(super::supports_checkpoint_verification(&[capability]));
+    }
+
+    #[test]
+    fn issue210_transient_authorization_reads_do_not_terminalize_recovery() {
+        let unavailable = anyhow::Error::new(sqlx::Error::PoolTimedOut)
+            .context("source-correction authority read");
+        assert!(super::factory_recovery_failure_is_retryable(&unavailable));
+        assert!(!super::factory_recovery_failure_is_retryable(
+            &anyhow::anyhow!("current source-correction authorization is unavailable")
+        ));
+        assert!(!super::factory_recovery_failure_is_retryable(
+            &anyhow::anyhow!("source-correction command omitted provider session")
+        ));
     }
 
     fn mission_preview_test_request() -> CreateMissionRequest {
@@ -6936,6 +7363,7 @@ mod tests {
         assert_eq!(input.secret_refs, request.secret_refs.as_slice());
         assert_eq!(input.budget_tokens, request.budget_tokens);
         assert_eq!(input.budget_cost_microusd, request.budget_cost_microusd);
+        assert_eq!(input.max_task_attempts, request.max_task_attempts);
         assert!(std::ptr::eq(
             input.deliverable.unwrap(),
             request.deliverable.as_ref().unwrap()
@@ -6970,10 +7398,71 @@ mod tests {
         assert!(input.secret_refs.is_empty());
         assert!(input.budget_tokens.is_none());
         assert!(input.budget_cost_microusd.is_none());
+        assert!(input.max_task_attempts.is_none());
         assert!(input.deliverable.is_none());
         assert!(input.contract.is_none());
         assert!(input.verification_policy.is_none());
         assert!(!input.require_factory_manual_gate);
+    }
+
+    #[test]
+    fn issue224_attempt_request_must_match_the_pre_execution_factory_policy() {
+        assert!(super::validate_factory_requested_attempts(None, None).is_ok());
+        for value in 1..=super::planning::MAX_TASK_ATTEMPTS {
+            assert!(super::validate_factory_requested_attempts(Some(value), Some(value)).is_ok());
+        }
+        for (allowed, requested) in [
+            (None, Some(3)),
+            (Some(3), None),
+            (Some(3), Some(2)),
+            (Some(2), Some(3)),
+            (Some(0), Some(0)),
+            (Some(4), Some(4)),
+        ] {
+            assert!(super::validate_factory_requested_attempts(allowed, requested).is_err());
+        }
+    }
+
+    #[test]
+    fn issue224_factory_operation_snapshots_keep_legacy_omission() {
+        let contract = FactoryMissionContract::default();
+        let operation = |attempts| {
+            super::factory_materialization_operation_request(
+                "Legacy materialization",
+                "",
+                Some("codex"),
+                None,
+                None,
+                Some("single"),
+                attempts,
+                &[],
+                Some(10_000),
+                Some(1_000_000),
+                None,
+                &contract,
+                None,
+            )
+        };
+        let legacy = operation(None);
+        assert!(legacy.get("max_task_attempts").is_none());
+        let explicit = operation(Some(3));
+        assert_eq!(explicit["max_task_attempts"], json!(3));
+        let mut without_option = explicit;
+        without_option
+            .as_object_mut()
+            .unwrap()
+            .remove("max_task_attempts");
+        assert_eq!(without_option, legacy);
+    }
+
+    #[test]
+    fn issue224_planning_input_keeps_the_exact_requested_attempt_allowance() {
+        for attempts in [None, Some(1), Some(3)] {
+            let mut request = mission_preview_test_request();
+            request.max_task_attempts = attempts;
+            let input = MissionPlanInput::from_create_request(&request, request.requested_by);
+            assert_eq!(input.max_task_attempts, attempts);
+        }
     }
 
     #[test]
@@ -6998,6 +7487,7 @@ mod tests {
                         secret_refs: &[],
                         budget_tokens: request.budget_tokens,
                         budget_cost_microusd: request.budget_cost_microusd,
+                        max_task_attempts: request.max_task_attempts,
                         deliverable: request.deliverable.as_ref(),
                         handoff_root: Some("handoffs"),
                     },
@@ -7281,7 +7771,7 @@ mod tests {
             let schedules = &std::cell::Cell::new(0);
             let dispatched = &std::cell::Cell::new(0);
             let runner_ref = &runners;
-            let mut cursor = None;
+            let mut cursor = CorpScheduleCursor::default();
             for tick in 1..=2 {
                 // No lifecycle events and no reconnect between these two ticks.
                 let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
@@ -7330,7 +7820,7 @@ mod tests {
                 runners.insert(format!("runner-{id}"), connection);
             }
             let visited = std::cell::RefCell::new(Vec::new());
-            let mut cursor = None;
+            let mut cursor = CorpScheduleCursor::default();
             let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
                 visited.borrow_mut().push(scope.corp_id);
                 // The next candidate was ready in the snapshot but no longer
@@ -7361,7 +7851,7 @@ mod tests {
         let (mut duplicate, _received) = reconnect_test_connection(Uuid::new_v4());
         duplicate.dispatch_ready = true;
         runners.insert("z-duplicate-corp-one".to_owned(), duplicate);
-        let mut cursor = None;
+        let mut cursor = CorpScheduleCursor::default();
         let mut all = HashSet::new();
         for _ in 0..2 {
             let batch = std::cell::RefCell::new(Vec::new());
@@ -7394,20 +7884,305 @@ mod tests {
             runners.insert(format!("runner-{id}"), connection);
         }
         let visited = std::cell::RefCell::new(Vec::new());
-        let failures = reconcile_ready_corps(&runners, &mut None, |scope| {
-            visited.borrow_mut().push(scope.corp_id);
-            std::future::ready(if scope.corp_id == Uuid::from_u128(1) {
-                Err(anyhow::anyhow!("transient scheduling failure"))
-            } else {
-                Ok(true)
+        let failures =
+            reconcile_ready_corps(&runners, &mut CorpScheduleCursor::default(), |scope| {
+                visited.borrow_mut().push(scope.corp_id);
+                std::future::ready(if scope.corp_id == Uuid::from_u128(1) {
+                    Err(anyhow::anyhow!("transient scheduling failure"))
+                } else {
+                    Ok(true)
+                })
             })
-        })
-        .await;
+            .await;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].0, Uuid::from_u128(1));
         assert_eq!(
             *visited.borrow(),
             vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue172_repeated_failure_cannot_starve_same_corp_healthy_runner() {
+        let runners = DashMap::new();
+        for (name, epoch) in [("a-failing", 1), ("b-healthy", 2)] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::from_u128(epoch));
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let attempts = &std::cell::RefCell::new(Vec::new());
+        let dispatched = &std::cell::Cell::new(0);
+        let runner_ref = &runners;
+        let mut cursor = CorpScheduleCursor::default();
+        for _ in 0..4 {
+            // No reconnect, lifecycle event, or permission change between ticks.
+            let _ = reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
+                attempts.borrow_mut().push(scope.runner_id.clone());
+                schedule_after_runner_commands(
+                    runner_ref,
+                    &scope,
+                    async {
+                        if scope.runner_id == "a-failing" {
+                            return Err(anyhow::anyhow!("owned runner command failure"));
+                        }
+                        Ok(())
+                    },
+                    async {
+                        assert_eq!(scope.runner_id, "b-healthy");
+                        dispatched.set(dispatched.get() + 1);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+            .await;
+        }
+        assert!(
+            dispatched.get() > 0,
+            "healthy runner was starved; attempted {:?}",
+            attempts.borrow()
+        );
+        assert!(attempts.borrow().iter().any(|name| name == "a-failing"));
+        assert!(attempts.borrow().iter().any(|name| name == "b-healthy"));
+    }
+
+    #[tokio::test]
+    async fn issue172_all_failing_peers_remain_bounded_and_each_get_a_turn() {
+        let runners = DashMap::new();
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            let (mut connection, _received) =
+                reconnect_test_connection(Uuid::from_u128(index as u128 + 1));
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let attempted = std::cell::RefCell::new(Vec::new());
+        for _ in 0..6 {
+            let before = attempted.borrow().len();
+            let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                attempted.borrow_mut().push(scope.runner_id);
+                std::future::ready(Err(anyhow::anyhow!("still unavailable")))
+            })
+            .await;
+            assert_eq!(attempted.borrow().len() - before, 1);
+            assert_eq!(failures.len(), 1);
+        }
+        assert_eq!(*attempted.borrow(), ["a", "b", "c", "a", "b", "c"]);
+        assert_eq!(cursor.after_runner.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn issue172_corp_batching_does_not_alias_runner_rotation() {
+        let runners = DashMap::new();
+        for corp in 1..=200 {
+            for suffix in ["a-failing", "b-healthy"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp:03}-{suffix}"), connection);
+            }
+        }
+        let visits = std::cell::RefCell::new(std::collections::HashMap::<Uuid, Vec<String>>::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for tick in 0..4 {
+            let batch = std::cell::RefCell::new(HashSet::new());
+            let failures = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                assert!(batch.borrow_mut().insert(scope.corp_id));
+                visits
+                    .borrow_mut()
+                    .entry(scope.corp_id)
+                    .or_default()
+                    .push(scope.runner_id.clone());
+                std::future::ready(if scope.runner_id.ends_with("a-failing") {
+                    Err(anyhow::anyhow!("representative remains unavailable"))
+                } else {
+                    Ok(true)
+                })
+            })
+            .await;
+            assert_eq!(batch.borrow().len(), 100);
+            assert_eq!(failures.len(), if tick < 2 { 100 } else { 0 });
+        }
+        assert_eq!(visits.borrow().len(), 200);
+        for peers in visits.borrow().values() {
+            assert_eq!(peers.len(), 2);
+            assert!(peers[0].ends_with("a-failing"));
+            assert!(peers[1].ends_with("b-healthy"));
+        }
+        assert_eq!(cursor.after_runner.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn issue172_unvisited_singleton_churn_preserves_runner_rotation() {
+        let runners = DashMap::new();
+        for corp in 1..=200 {
+            for suffix in ["a-failing", "b-healthy"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp:03}-{suffix}"), connection);
+            }
+        }
+        let corp_id = Uuid::from_u128(1);
+        let visits = std::cell::RefCell::new(Vec::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for tick in 0..4 {
+            // The failing peer is unready only on ticks that do not visit this
+            // Corp. Its healthy peer remains ready throughout the churn.
+            runners.get_mut("001-a-failing").unwrap().dispatch_ready = tick % 2 == 0;
+            let batch = std::cell::RefCell::new(HashSet::new());
+            let _ = reconcile_ready_corps(&runners, &mut cursor, |scope| {
+                assert!(scope.is_current(&runners));
+                assert!(batch.borrow_mut().insert(scope.corp_id));
+                if scope.corp_id == corp_id {
+                    visits.borrow_mut().push(scope.runner_id.clone());
+                }
+                std::future::ready(if scope.runner_id.ends_with("a-failing") {
+                    Err(anyhow::anyhow!("representative remains unavailable"))
+                } else {
+                    Ok(true)
+                })
+            })
+            .await;
+            assert_eq!(batch.borrow().len(), 100);
+            assert_eq!(batch.borrow().contains(&corp_id), tick % 2 == 0);
+        }
+        assert_eq!(*visits.borrow(), ["001-a-failing", "001-b-healthy"]);
+        assert_eq!(
+            cursor.after_runner.get(&corp_id).map(String::as_str),
+            Some("001-b-healthy")
+        );
+
+        // A singleton visit may now discard its cursor. A fully disappeared
+        // Corp must be pruned immediately even outside this tick's batch.
+        runners.remove("200-a-failing");
+        runners.remove("200-b-healthy");
+        let batch = std::cell::RefCell::new(HashSet::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            assert!(scope.is_current(&runners));
+            assert!(batch.borrow_mut().insert(scope.corp_id));
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(batch.borrow().len(), 100);
+        assert!(batch.borrow().contains(&corp_id));
+        assert!(!cursor.after_runner.contains_key(&corp_id));
+        assert!(!cursor.after_runner.contains_key(&Uuid::from_u128(200)));
+    }
+
+    #[tokio::test]
+    async fn issue172_epoch_replacement_during_commands_cannot_schedule_or_pin_the_corp() {
+        let runners = DashMap::new();
+        for name in ["a", "b"] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let runner_ref = &runners;
+        let scheduled = &std::cell::RefCell::new(Vec::new());
+        let mut cursor = CorpScheduleCursor::default();
+        for _ in 0..2 {
+            assert!(
+                reconcile_ready_corps(&runners, &mut cursor, |scope| async move {
+                    schedule_after_runner_commands(
+                        runner_ref,
+                        &scope,
+                        async {
+                            if scope.runner_id == "a" {
+                                runner_ref.get_mut("a").unwrap().connection_epoch = Uuid::new_v4();
+                            }
+                            Ok(())
+                        },
+                        async {
+                            scheduled.borrow_mut().push(scope.runner_id.clone());
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+                .await
+                .is_empty()
+            );
+        }
+        assert_eq!(*scheduled.borrow(), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn issue172_removed_representative_does_not_reset_other_corps_or_accumulate_state() {
+        let runners = DashMap::new();
+        for corp in 1..=2 {
+            for suffix in ["a", "b", "c"] {
+                let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+                connection.corp_id = Uuid::from_u128(corp);
+                connection.dispatch_ready = true;
+                runners.insert(format!("{corp}-{suffix}"), connection);
+            }
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let first = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            first.borrow_mut().push(scope.runner_id);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*first.borrow(), ["1-a", "2-a"]);
+        runners.remove("1-a");
+        runners.remove("2-a");
+        runners.remove("2-c");
+        let second = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            second.borrow_mut().push(scope.runner_id);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*second.borrow(), ["1-b", "2-b"]);
+        assert_eq!(cursor.after_runner.len(), 1);
+        assert!(cursor.after_runner.contains_key(&Uuid::from_u128(1)));
+        runners.clear();
+        let mut called = false;
+        reconcile_ready_corps(&runners, &mut cursor, |_| {
+            called = true;
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert!(!called);
+        assert!(cursor.after_runner.is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue172_snapshot_fencing_skips_a_peer_moved_to_another_corp() {
+        let runners = DashMap::new();
+        for (name, corp) in [("1-a", 1), ("1-b", 1), ("2-a", 2), ("2-b", 2)] {
+            let (mut connection, _received) = reconnect_test_connection(Uuid::new_v4());
+            connection.corp_id = Uuid::from_u128(corp);
+            connection.dispatch_ready = true;
+            runners.insert(name.to_owned(), connection);
+        }
+        let mut cursor = CorpScheduleCursor::default();
+        let first = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            first.borrow_mut().push(scope.runner_id);
+            runners.get_mut("2-a").unwrap().corp_id = Uuid::from_u128(3);
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(*first.borrow(), ["1-a"]);
+        let second = std::cell::RefCell::new(Vec::new());
+        reconcile_ready_corps(&runners, &mut cursor, |scope| {
+            assert!(scope.is_current(&runners));
+            second.borrow_mut().push((scope.corp_id, scope.runner_id));
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert!(
+            second
+                .borrow()
+                .contains(&(Uuid::from_u128(2), "2-b".to_owned()))
+        );
+        assert!(
+            !second
+                .borrow()
+                .contains(&(Uuid::from_u128(2), "2-a".to_owned()))
         );
     }
 
