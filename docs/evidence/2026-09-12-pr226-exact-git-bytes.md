@@ -125,8 +125,10 @@ git diff --cached --ignore-space-at-eol --exit-code -- scenarios/factory-live-ca
   original scenario files.
 
 These local tests are **not** the eight persisted native checks in #225.
-This scoped change does not add CI wiring; run the explicit regression command
-after staging or in a fresh checkout whose index matches the candidate.
+This scoped change adds CI wiring that runs the same local canary regressions in
+`.github/workflows/ci.yml`; those checks still do not replace the eight
+persisted native checks and records. You can also run the explicit regression
+command after staging or in a fresh checkout whose index matches the candidate.
 No Cargo, SQLx, web build/lint, hosted rerun, or full-stack validation was run.
 
 ## Bounded historical evidence audit
@@ -160,10 +162,10 @@ not substitutes for the missing records.
 | Watcher restart | Before/after watcher identity or epoch, reconnect/reconciliation records, and unchanged work-item/mission/run/publication identities. |
 | Corrected-head acceptance | Verification, applicable scope, independent review, export, and publication evidence for the exact corrected commit. Old `ec1700d` evidence cannot attest the repaired bytes. |
 
-The native pipeline was not recreated or replaced. PR #226 is therefore **not
-declared merge-ready**: corrected-head publication/evidence, resolution of the
-changes-requested review, and required CI remain outside this completed local
-byte-repair proof.
+The native pipeline was not recreated or replaced. This local byte-repair proof
+therefore does **not** establish corrected-head acceptance, native publication,
+native replay, watcher restart, or the required persisted native records for
+PR #226.
 
 ## Sanitized local artifacts
 
