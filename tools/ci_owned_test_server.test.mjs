@@ -5,6 +5,7 @@ import test from 'node:test'
 import { ciOwnedServerConfig, ciOwnedServerPreview } from './ci_owned_test_server.mjs'
 
 const root = path.resolve(import.meta.dirname, '..')
+const ownedCleanupStep = /Stop the ownership-verified CI server\r?\n[ \t]+if: always\(\)\r?\n[ \t]+run: node tools\/ci_owned_test_server\.mjs --stop\r?$/mu
 const env = {
   GITHUB_ACTIONS: 'true', CI: 'true', RUNNER_OS: 'Linux', GITHUB_JOB: 'integration',
   GITHUB_RUN_ID: '12345', GITHUB_WORKSPACE: root, ECORP_CI_OWNED_SERVER: '1',
@@ -43,6 +44,24 @@ test('CI server refuses missing scope, legacy/manual targets and unexpected data
   ]) assert.throws(() => ciOwnedServerConfig(['--dry-run'], { ...env, [key]: value }))
 })
 
+test('owned cleanup wiring accepts LF and CRLF but still requires unconditional exact cleanup', () => {
+  const lines = [
+    '      - name: Stop the ownership-verified CI server',
+    '        if: always()',
+    '        run: node tools/ci_owned_test_server.mjs --stop',
+  ]
+  for (const ending of ['\n', '\r\n']) {
+    const valid = lines.join(ending) + ending
+    assert.match(valid, ownedCleanupStep)
+    for (const invalid of [
+      valid.replace('if: always()', 'if: failure()'),
+      valid.replace('        if: always()' + ending, ''),
+      valid.replace('--stop', '--start'),
+      valid.replace('--stop', '--stop-now'),
+    ]) assert.doesNotMatch(invalid, ownedCleanupStep)
+  }
+})
+
 test('all CI restart fixtures consume the same explicit ownership manifest without numeric-PID fallbacks', () => {
   const workflow = readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8')
   const integration = workflow.split('  integration:')[1].split('  external-adapters-windows:')[0]
@@ -52,7 +71,7 @@ test('all CI restart fixtures consume the same explicit ownership manifest witho
   assert.match(integration, /55471:5432/u)
   assert.match(integration, /e2e_smoke\.ps1 -Server \$env:CRONY_SERVER_HTTP/u)
   assert.ok(integration.indexOf('ci_owned_test_server.mjs --dry-run') < integration.indexOf('ci_owned_test_server.mjs --start'))
-  assert.match(integration, /Stop the ownership-verified CI server\n\s+if: always\(\)\n\s+run: node tools\/ci_owned_test_server\.mjs --stop/u)
+  assert.match(integration, ownedCleanupStep)
   assert.doesNotMatch(integration, /8791|54329|server-ci\.pid|--database-url|target\/debug\/crony-server \\/u)
   for (const file of ['e2e_artifact_staging.mjs', 'e2e_factory_claims.mjs', 'e2e_factory_publication.mjs', 'e2e_approvals.mjs']) {
     const code = readFileSync(path.join(root, 'tools', file), 'utf8')

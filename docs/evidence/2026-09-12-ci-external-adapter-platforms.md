@@ -443,6 +443,40 @@ startup/restart chain is **not yet locally verified**. The new Linux-native Node
 lifecycle tests and full integration recovery sequence remain hosted-CI gates.
 No green hosted result is claimed for this unpublished correction.
 
+## Hosted ownership proof and Windows line-ending follow-up
+
+Hosted run `34700475404` on `d7ed00a86690bafdb7328f7b97d3afc6d1e7a078`
+proved the new Linux Node-to-Python ownership lifecycle, native pidfd tests,
+actual ECorp startup, artifact recovery, factory claims, Project-controller
+scenarios, full publication/restart recovery and ownership-verified cleanup.
+The previous publication restart-manifest failure is resolved.
+
+The Windows owned-server startup/two-restart/idempotent-stop test also passed
+on the hosted runner. Its job failed a separate static workflow assertion:
+Git checked out `ci.yml` with CRLF, while the assertion required LF-only newline
+characters. The runtime and the cleanup step were not failing. A read-only
+reproduction returned `current_rule_lf: true` and `current_rule_crlf: false`.
+
+The follow-up changes only that test and this evidence. The assertion accepts
+LF and CRLF but still requires `if: always()` and the exact `--stop` command.
+New negative cases reject conditional-only cleanup, a missing condition, the
+wrong operation and an operation suffix. No runtime ownership check is relaxed.
+
+Local revalidation on parent `d7ed00a` plus the line-ending follow-up passed all
+56 Node regression tests with zero skips, including the Windows native
+lifecycle. The full required gates passed again: 40 immutable migrations, Rust
+format, Clippy, 452 Rust tests with 200 explicitly ignored database cases,
+web build and web lint. Ambient `DATABASE_URL` was removed. The four pending
+recovery files and configured source checkout remain unchanged.
+
+The same hosted run exposed the next independent integration failure in
+`e2e_identity.mjs:167`: `timed out waiting for lifecycle assignment`. The script
+registers a synthetic identity probe and waits for its socket assignment,
+without an explicit source-bound selection/readiness barrier. This is a
+diagnostic lead, not yet a verified fix; the identity fixture and production
+authentication/authorization code are unchanged. OIDC, secret, approval, budget
+and later integration results must not be inferred from publication success.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence, native ownership-unit
@@ -450,9 +484,11 @@ evidence and unit-tested Unix admission logic. It is not real vendor inference
 or browser acceptance. Hosted runs have proved both external-adapter lanes,
 Linux roster SQL, both graph variants, artifact staging/restart, factory claims
 with native automatic verification, and the full Project-controller suite.
-The next run must validate the new ownership-manifest startup/restart chain,
-publication recovery and later integration steps. The local readiness smoke
-does not claim SQL fault injection or artifact restart recovery on Windows.
+The ownership-manifest startup/restart chain and publication recovery are now
+hosted-verified. The next run must verify the Windows CRLF assertion correction;
+the identity lifecycle failure and later integration steps remain unresolved.
+The local readiness smoke does not claim SQL fault injection or artifact
+restart recovery on Windows.
 
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review
