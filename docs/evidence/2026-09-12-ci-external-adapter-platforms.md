@@ -265,14 +265,59 @@ Local validation on parent `a7855a2` plus this follow-up:
 - `fixture-report.json` SHA-256:
   `aaa9355649d4eeb3adcc4461963a778a21f6ecbae8104c1bcf4f94d06b908f11`.
 
+## ATV immutable-source fixture alignment
+
+Hosted run `34682748305` on `4b939c57c6216d5ccfb27b58a3722a0a8f1ee00a`
+passed the complete Linux artifact-staging/restart suite and all six other jobs,
+including the Windows controlled-runner readiness smoke. The next integration
+step, factory claims, correctly refused to dispatch a mission bound to the stale
+`shyamsridhar123/ecorp` identity: the checkout belongs to `All-The-Vibes/ecorp`.
+The failing task required old-repository commit
+`47d5d6472f054b27c36f870bf35f19f6a4eefeff` (the CI merge checkout), which no runner
+advertised under that old repository name. HTTP 409 allocated zero runs.
+
+This repository-scoped follow-up retargets only the positive source identities in
+`e2e_factory_claims.mjs`, `e2e_factory_controller.mjs` and
+`e2e_factory_publication.mjs`. Their policies, issue/PR fixture URLs, fake GitHub
+state, normalized effect keys and identity assertions now use ATV consistently.
+Lowercase and mixed/uppercase forms are retained for case-normalization coverage.
+Deliberately unrelated `acme/widget` repositories, synthetic Project identities,
+fake GitHub CLI transport, and local bare publication remotes remain unchanged.
+No live Project, repository remote, database configuration or runner is migrated.
+
+The claim fixture also reuses the tested native read-only preview barrier before
+claim creation and immediately after its existing CI restart. A pure selector
+first verifies exactly one connected runner in the expected Corp with the exact
+repository, `HEAD` ref and locally resolved immutable commit. It never adopts an
+arbitrary advertised checkout to make a test pass. The preview precedes all
+mission/task/run history; the source-fencing and authorization assertions remain.
+
+Validation on parent `4b939c5` plus this follow-up:
+
+- Four Node regression files: 45 passed, zero skipped, including wrong-repository,
+  wrong-ref/commit, foreign/ambiguous runner, case normalization, fake transport,
+  immutable-source assertions and preservation of all three full factory lanes.
+- All three changed E2E files passed Node syntax checking; `git diff --check`
+  passed. No Rust, UI or migration source file changed.
+- Migration check: 40 immutable migrations. Rust format, offline Clippy and
+  offline Rust tests passed (452 passed, 200 explicitly ignored database tests,
+  ambient `DATABASE_URL` removed). Web build and lint passed.
+- The four pending terminal-recovery files remained byte-identical and unstaged.
+  No local service, factory scenario, SQL fault or publication fixture was run for
+  this metadata-only alignment. The previous isolated fixture remains stopped.
+
+The updated factory-claim, controller and publication runtime results remain a
+hosted-CI gate at this pre-publication checkpoint; static regressions are not a
+claim that those full runtime suites have already passed.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence and unit-tested Unix admission
-logic. It is not real vendor inference or browser acceptance. Hosted run
-`34682044685` proved both external-adapter lanes, Linux roster SQL and both graph
-variants. A new run must validate the corrected full artifact-staging suite and
-the later integration steps. The local readiness smoke does not claim that
-SQL fault injection or restart recovery executed on Windows.
+logic. It is not real vendor inference or browser acceptance. Hosted runs have
+now proved both external-adapter lanes, Linux roster SQL, both graph variants,
+and the full Linux artifact-staging/restart suite. The next run must validate the
+ATV-aligned factory fixtures and remaining integration steps. The local readiness
+smoke does not claim SQL fault injection or restart recovery on Windows.
 
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review

@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
       - name: Test platform-specific CI fixture contracts
-        run: node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs
+        run: node --test tools/e2e_external_adapters.test.mjs tools/task_graph_fixture.test.mjs tools/controlled_runner_fixture.test.mjs tools/ci_factory_repository.test.mjs
       - run: node tools/check_migrations.mjs
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings

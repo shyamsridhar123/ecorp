@@ -8,6 +8,7 @@ import {
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { selectFixtureRunnerForSource, waitForControlledRunnerDispatch } from './controlled_runner_fixture.mjs'
 
 const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
 const root = path.resolve(import.meta.dirname, '..')
@@ -48,6 +49,13 @@ async function snapshot(demo) {
     throw new Error(`${result.response.status}: ${JSON.stringify(result.body)}`)
   }
   return result.body
+}
+
+async function waitForFixtureSource(demo) {
+  const runner = selectFixtureRunnerForSource(await snapshot(demo), demo, {
+    repository: 'all-the-vibes/ecorp', base_ref: 'HEAD', base_commit: sourceBaseCommit,
+  })
+  return waitForControlledRunnerDispatch({ request, demo, runner })
 }
 
 async function waitForMission(demo, missionId, timeoutMs = 30_000) {
@@ -135,18 +143,19 @@ async function restartLocalServer() {
 }
 
 const demo = await postOk('/api/demo/reset', {})
+const initialReadinessPreviews = await waitForFixtureSource(demo)
 const nonce = crypto.randomUUID()
 const claimPath = `/api/corps/${demo.corp_id}/factory/work-items/claim`
 const claimRequest = {
   actor_id: demo.alice_actor_id,
-  source_project_owner: 'shyamsridhar123',
+  source_project_owner: 'all-the-vibes',
   source_project_number: 3,
   source_project_item_id: `PVTI_FACTORY_E2E_${nonce}`,
-  source_repository_owner: 'shyamsridhar123',
+  source_repository_owner: 'all-the-vibes',
   source_repository_name: 'ecorp',
   source_issue_number: 59,
   source_issue_node_id: `I_FACTORY_E2E_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/59',
+  source_issue_url: 'https://github.com/all-the-vibes/ecorp/issues/59',
   source_title: 'Persist and fence dark-factory issue claims before mission dispatch',
   source_revision: '2026-09-01T00:00:00Z',
   idempotency_key: `factory-e2e-claim-${nonce}`,
@@ -155,7 +164,7 @@ const claimRequest = {
     schema_version: 1,
     source_of_truth: 'github_project',
     project_status: 'Todo',
-    repository_allowlist: ['shyamsridhar123/ecorp'],
+    repository_allowlist: ['all-the-vibes/ecorp'],
     source_base_ref: 'HEAD',
     source_base_commit: sourceBaseCommit,
     adapter_allowlist: ['fake-process'],
@@ -193,16 +202,16 @@ assert.equal(claim.work_item.version, 1)
 assert.ok(claim.claim_token)
 const mixedCaseReplay = await postOk(claimPath, {
   ...claimRequest,
-  source_project_owner: 'ShYaMsRiDhAr123',
-  source_repository_owner: 'SHYAMSRIDHAR123',
+  source_project_owner: 'AlL-tHe-ViBeS',
+  source_repository_owner: 'ALL-THE-VIBES',
   source_repository_name: 'ECorp',
-  source_issue_url: 'https://github.com/SHYAMSRIDHAR123/ECorp/issues/59',
+  source_issue_url: 'https://github.com/ALL-THE-VIBES/ECorp/issues/59',
   idempotency_key: `factory-e2e-mixed-case-${nonce}`,
 })
 assert.equal(mixedCaseReplay.work_item.id, claim.work_item.id)
 assert.equal(mixedCaseReplay.claim_token, claim.claim_token)
-assert.equal(mixedCaseReplay.work_item.source_project_owner, 'shyamsridhar123')
-assert.equal(mixedCaseReplay.work_item.source_repository_owner, 'shyamsridhar123')
+assert.equal(mixedCaseReplay.work_item.source_project_owner, 'all-the-vibes')
+assert.equal(mixedCaseReplay.work_item.source_repository_owner, 'all-the-vibes')
 assert.equal(mixedCaseReplay.work_item.source_repository_name, 'ecorp')
 
 const unauthorized = await post(claimPath, {
@@ -256,6 +265,7 @@ const duplicateActive = await post(claimPath, {
 assert.equal(duplicateActive.response.status, 409)
 
 const restarted = await restartLocalServer()
+const restartReadinessPreviews = await waitForFixtureSource(demo)
 
 const renewPath = `/api/corps/${demo.corp_id}/factory/work-items/${claim.work_item.id}/renew`
 const renewRequest = {
@@ -314,7 +324,7 @@ const materializeRequest = {
     ],
     allowed_tools: ['filesystem', 'shell'],
     prohibited_actions: ['merge or deploy without a separate current authorization'],
-    references: ['https://github.com/shyamsridhar123/ecorp/issues/59'],
+    references: ['https://github.com/all-the-vibes/ecorp/issues/59'],
     write_scope: ['crates/**', 'db/migrations/**', 'tools/**', 'docs/**'],
   },
 }
@@ -325,7 +335,7 @@ async function assertRejectedMaterialization(suffix, patch) {
     source_project_item_id: `PVTI_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
     source_issue_number: issueNumber,
     source_issue_node_id: `I_FACTORY_E2E_REJECTED_${suffix}_${nonce}`,
-    source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${issueNumber}`,
+    source_issue_url: `https://github.com/all-the-vibes/ecorp/issues/${issueNumber}`,
     source_title: `Reject invalid factory materialization ${suffix}`,
     source_revision: `2026-09-03T19:${String(30 + suffix).padStart(2, '0')}:00Z`,
     idempotency_key: `factory-e2e-rejected-claim-${suffix}-${nonce}`,
@@ -409,13 +419,13 @@ const linkedTask = afterMaterialize.snapshot.tasks.find(
   (task) => task.id === materialized[0].task_id,
 )
 assert.match(linkedTask.contract.objective, /linked GitHub issue/)
-assert.equal(linkedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(linkedTask.contract.source_repository, 'all-the-vibes/ecorp')
 assert.equal(linkedTask.contract.source_base_ref, 'HEAD')
 assert.equal(linkedTask.contract.source_base_commit, sourceBaseCommit)
 assert.deepEqual(linkedTask.contract.write_scope, materializeRequest.contract.write_scope)
 assert.ok(
   linkedTask.contract.references.includes(
-    'https://github.com/shyamsridhar123/ecorp/issues/59',
+    'https://github.com/all-the-vibes/ecorp/issues/59',
   ),
 )
 
@@ -549,7 +559,7 @@ const blockedClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_BLOCKED_${nonce}`,
   source_issue_number: 60,
   source_issue_node_id: `I_FACTORY_BLOCKED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/60',
+  source_issue_url: 'https://github.com/all-the-vibes/ecorp/issues/60',
   source_title: 'Consume eligible ECorp Build issues into governed missions',
   source_revision: '2026-09-01T00:01:00Z',
   idempotency_key: `factory-e2e-blocked-claim-${nonce}`,
@@ -573,7 +583,7 @@ const expiredClaimRequest = {
   source_project_item_id: `PVTI_FACTORY_EXPIRED_CLAIMED_${nonce}`,
   source_issue_number: 61,
   source_issue_node_id: `I_FACTORY_EXPIRED_CLAIMED_${nonce}`,
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/61',
+  source_issue_url: 'https://github.com/all-the-vibes/ecorp/issues/61',
   source_title: 'Recover an expired claimed factory item',
   source_revision: '2026-09-01T00:01:30Z',
   idempotency_key: `factory-e2e-expired-claimed-${nonce}`,
@@ -691,7 +701,7 @@ const failoverMaterialize = await postOk(
       acceptance_tests: ['the original work item is reused'],
       allowed_tools: ['filesystem', 'shell'],
       prohibited_actions: ['merge or deploy without a separate current authorization'],
-      references: ['https://github.com/shyamsridhar123/ecorp/issues/60'],
+      references: ['https://github.com/all-the-vibes/ecorp/issues/60'],
       write_scope: claimRequest.policy.write_scope,
     },
   },
@@ -700,6 +710,10 @@ assert.equal(failoverMaterialize.work_item.state, 'mission_created')
 
 const report = {
   checked_at: new Date().toISOString(),
+  source_repository: 'all-the-vibes/ecorp',
+  source_base_commit: sourceBaseCommit,
+  initial_readiness_previews: initialReadinessPreviews,
+  restart_readiness_previews: restartReadinessPreviews,
   source_issue: claim.work_item.source_issue_url,
   work_item_id: claim.work_item.id,
   mission_id: materialized[0].mission_id,

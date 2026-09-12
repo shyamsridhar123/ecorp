@@ -97,3 +97,16 @@ export function assertControlledAssignment(launch, runner) {
   assert.equal(launch.runner_id, runner.runnerId, 'Artifact fixture assignment went to a different runner')
   assert.ok(launch.run_id, 'Artifact fixture launch omitted the assigned run')
 }
+
+export function selectFixtureRunnerForSource(state, demo, expected) {
+  assert.ok(expected.repository && expected.base_ref && /^[0-9a-f]{40}$/u.test(expected.base_commit),
+    'The fixture must declare its expected immutable checkout')
+  const matches = state.runners.filter(runner => runner.connected && runner.corp_id === demo.corp_id)
+    .flatMap(runner => runner.capabilities.filter(cap => cap.name === 'workspace-isolation' && cap.available &&
+      cap.workspace_connection_id == null && cap.source_repository?.toLowerCase() === expected.repository.toLowerCase() &&
+      cap.source_base_ref === expected.base_ref && cap.source_base_commit === expected.base_commit)
+      .map(cap => ({ runnerId: runner.id, readinessSource: { repository: cap.source_repository,
+        base_ref: cap.source_base_ref, base_commit: cap.source_base_commit } })))
+  assert.equal(matches.length, 1, 'Expected exactly one owned runner advertising the declared immutable checkout')
+  return matches[0]
+}

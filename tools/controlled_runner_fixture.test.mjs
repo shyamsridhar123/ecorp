@@ -7,6 +7,7 @@ import {
   assertControlledAssignment,
   controlledReadinessCapability,
   controlledReadinessSource,
+  selectFixtureRunnerForSource,
   waitForControlledRunnerDispatch,
 } from './controlled_runner_fixture.mjs'
 
@@ -147,6 +148,30 @@ test('every artifact launch must belong to the controlled runner before waiting 
   assertControlledAssignment({ run_id: 'run-fixture', runner_id: runnerId }, runner)
   assert.throws(() => assertControlledAssignment({ run_id: 'run-fixture', runner_id: 'runner-local' }, runner), /different runner/)
   assert.throws(() => assertControlledAssignment({ runner_id: runnerId }, runner), /omitted/)
+})
+
+test('source-bound fixture readiness verifies the expected repository, ref, commit, Corp and unique runner', () => {
+  const expected = { repository: 'all-the-vibes/ecorp', base_ref: 'HEAD', base_commit: 'a'.repeat(40) }
+  const cap = { ...controlledReadinessCapability(expected), source_repository: 'All-The-Vibes/ecorp' }
+  const state = { runners: [{ id: 'runner-local', corp_id: demo.corp_id, connected: true, capabilities: [cap] }] }
+  const selected = selectFixtureRunnerForSource(state, demo, expected)
+  assert.equal(selected.runnerId, 'runner-local')
+  assert.equal(selected.readinessSource.repository, 'All-The-Vibes/ecorp')
+  for (const changed of [
+    { repository: 'shyamsridhar123/ecorp' }, { base_ref: 'main' }, { base_commit: 'b'.repeat(40) },
+    { base_commit: '' },
+  ]) assert.throws(() => selectFixtureRunnerForSource(state, demo, { ...expected, ...changed }))
+  for (const change of [
+    value => { value.runners[0].connected = false },
+    value => { value.runners[0].corp_id = 'other-corp' },
+    value => { value.runners[0].capabilities[0].available = false },
+    value => { value.runners[0].capabilities[0].workspace_connection_id = 'another-connection' },
+    value => { value.runners.push(structuredClone(value.runners[0])) },
+  ]) {
+    const changed = structuredClone(state)
+    change(changed)
+    assert.throws(() => selectFixtureRunnerForSource(changed, demo, expected))
+  }
 })
 
 test('Linux keeps the full artifact suite and Windows smoke cannot claim fault or restart coverage', () => {

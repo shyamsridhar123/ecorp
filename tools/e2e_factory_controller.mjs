@@ -94,7 +94,7 @@ function factoryPolicy({
     project_status: 'Todo',
     required_label: 'factory:ready',
     dependencies: [],
-    repository_allowlist: ['shyamsridhar123/ecorp'],
+    repository_allowlist: ['all-the-vibes/ecorp'],
     source_base_ref: 'HEAD',
     source_base_commit: sourceBaseCommit,
     source_commit_upgrade_required: false,
@@ -130,11 +130,11 @@ async function createHistoricalFactoryItems(demo, count) {
           source_project_owner: 'acme',
           source_project_number: 7,
           source_project_item_id: `PVTI_FAKE_FACTORY_HISTORY_${suffix}`,
-          source_repository_owner: 'shyamsridhar123',
+          source_repository_owner: 'all-the-vibes',
           source_repository_name: 'ecorp',
           source_issue_number: 20_000 + index,
           source_issue_node_id: `I_FAKE_FACTORY_HISTORY_${suffix}`,
-          source_issue_url: `https://github.com/shyamsridhar123/ecorp/issues/${20_000 + index}`,
+          source_issue_url: `https://github.com/all-the-vibes/ecorp/issues/${20_000 + index}`,
           source_title: `Historical factory work item ${suffix}`,
           source_revision: `2026-08-31T${String(Math.floor(index / 60) % 24).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
           idempotency_key: `factory-history-${suffix}`,
@@ -153,7 +153,7 @@ function controllerInvocation(
   {
     actorId = demo.alice_actor_id,
     leaseSeconds = 300,
-    repository = 'ShyamSridhar123/ECorp',
+    repository = 'All-The-Vibes/ECorp',
     strategy = 'single',
     githubTimeoutMs,
     sourceRepositoryPath = sourceRoot,
@@ -407,7 +407,7 @@ Run one governed issue through ECorp and produce verified evidence.
 
 No blockers.
 `,
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9001',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9001',
   state: 'OPEN',
   createdAt: '2026-09-01T14:00:00Z',
   updatedAt: '2026-09-01T14:00:00Z',
@@ -418,7 +418,7 @@ const recoveryBaseIssue = {
   id: 'I_FAKE_FACTORY_9097',
   number: 9097,
   title: 'Preview the persisted publication base during recovery',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9097',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9097',
   createdAt: '2026-09-01T13:59:00Z',
   updatedAt: '2026-09-02T00:09:07Z',
 }
@@ -426,7 +426,7 @@ await writeFile(
   statePath,
   `${JSON.stringify(
     {
-      repository: 'shyamsridhar123/ecorp',
+      repository: 'all-the-vibes/ecorp',
       project: {
         id: 'PVT_FAKE_FACTORY',
         number: 7,
@@ -446,7 +446,7 @@ await writeFile(
           content: {
             body: issue.body,
             number: issue.number,
-            repository: 'shyamsridhar123/ecorp',
+            repository: 'all-the-vibes/ecorp',
             title: issue.title,
             type: 'Issue',
             url: issue.url,
@@ -458,7 +458,7 @@ await writeFile(
           content: {
             body: recoveryBaseIssue.body,
             number: recoveryBaseIssue.number,
-            repository: 'shyamsridhar123/ecorp',
+            repository: 'all-the-vibes/ecorp',
             title: recoveryBaseIssue.title,
             type: 'Issue',
             url: recoveryBaseIssue.url,
@@ -660,11 +660,11 @@ const controlCharacterPolicyResponse = await fetch(
     source_project_owner: 'acme',
     source_project_number: 7,
     source_project_item_id: 'PVTI_FAKE_FACTORY_CONTROL_REF',
-    source_repository_owner: 'shyamsridhar123',
+    source_repository_owner: 'all-the-vibes',
     source_repository_name: 'ecorp',
     source_issue_number: 9098,
     source_issue_node_id: 'I_FAKE_FACTORY_CONTROL_REF',
-    source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/9098',
+    source_issue_url: 'https://github.com/all-the-vibes/ecorp/issues/9098',
     source_title: 'Reject control characters in publication base policy',
     source_revision: '2026-09-02T00:00:00Z',
     idempotency_key: 'factory-control-ref-rejected',
@@ -673,7 +673,7 @@ const controlCharacterPolicyResponse = await fetch(
       ...factoryPolicy(),
       publication: {
         allowed: true,
-        repository_allowlist: ['shyamsridhar123/ecorp'],
+        repository_allowlist: ['all-the-vibes/ecorp'],
         base_ref: 'main\tbad',
         branch_prefix: 'ecorp/',
         status_before: 'In Progress',
@@ -709,7 +709,7 @@ assert.equal(preValidationSnapshot.snapshot.factory_work_items.length, 0)
 assert.equal(JSON.parse(await readFile(statePath, 'utf8')).item_edits, 0)
 
 const releaseSourceRepository = await createSourceFixture(
-  'shyamsridhar123/ecorp',
+  'all-the-vibes/ecorp',
 )
 await execFile('git', ['branch', 'release', 'HEAD'], {
   cwd: releaseSourceRepository,
@@ -728,7 +728,7 @@ const recoveryClaim = await post(
     source_project_owner: 'acme',
     source_project_number: 7,
     source_project_item_id: 'PVTI_FAKE_FACTORY_9097',
-    source_repository_owner: 'shyamsridhar123',
+    source_repository_owner: 'all-the-vibes',
     source_repository_name: 'ecorp',
     source_issue_number: recoveryBaseIssue.number,
     source_issue_node_id: recoveryBaseIssue.id,
@@ -742,7 +742,7 @@ const recoveryClaim = await post(
       source_base_ref: 'release',
       publication: {
         allowed: true,
-        repository_allowlist: ['shyamsridhar123/ecorp'],
+        repository_allowlist: ['all-the-vibes/ecorp'],
         base_ref: 'main',
         branch_prefix: 'ecorp/',
         status_before: 'In Progress',
@@ -841,11 +841,11 @@ const materializationClaimRequest = {
   source_project_owner: 'acme',
   source_project_number: 7,
   source_project_item_id: 'PVTI_FAKE_FACTORY_9099',
-  source_repository_owner: 'shyamsridhar123',
+  source_repository_owner: 'all-the-vibes',
   source_repository_name: 'ecorp',
   source_issue_number: 9099,
   source_issue_node_id: 'I_FAKE_FACTORY_9099',
-  source_issue_url: 'https://github.com/shyamsridhar123/ecorp/issues/9099',
+  source_issue_url: 'https://github.com/all-the-vibes/ecorp/issues/9099',
   source_title: 'Recover a rejected factory materialization',
   source_revision: '2026-09-03T19:30:00Z',
   idempotency_key: 'factory-materialization-rejection-claim',
@@ -879,7 +879,7 @@ const rejectedMaterializationResponse = await fetch(`${server}${materializationP
       acceptance_tests: ['the original factory work item remains recoverable'],
       allowed_tools: ['filesystem', 'shell'],
       prohibited_actions: materializationPolicy.prohibited_actions,
-      references: ['https://github.com/shyamsridhar123/ecorp/issues/128'],
+      references: ['https://github.com/all-the-vibes/ecorp/issues/128'],
       write_scope: ['crates/**'],
     },
   }),
@@ -972,7 +972,7 @@ const secondRejectedMaterializationResponse = await fetch(
         acceptance_tests: ['the rejection idempotency key is claim-generation scoped'],
         allowed_tools: ['filesystem', 'shell'],
         prohibited_actions: materializationPolicy.prohibited_actions,
-        references: ['https://github.com/shyamsridhar123/ecorp/issues/128'],
+        references: ['https://github.com/all-the-vibes/ecorp/issues/128'],
         write_scope: ['crates/**'],
       },
     }),
@@ -1046,7 +1046,7 @@ const fencedMission = fencedState.snapshot.missions.find(
   (mission) => mission.id === first.mission_id,
 )
 assert.equal(fencedMission.description, issue.body.trim())
-assert.equal(fencedTask.contract.source_repository, 'shyamsridhar123/ecorp')
+assert.equal(fencedTask.contract.source_repository, 'all-the-vibes/ecorp')
 assert.equal(fencedTask.contract.source_base_ref, 'HEAD')
 assert.equal(fencedTask.contract.source_base_commit, sourceBaseCommit)
 assert.deepEqual(fencedTask.contract.deliverable, {
@@ -1085,7 +1085,7 @@ const taskIds = new Set(
 const runs = finalState.snapshot.runs.filter((run) => taskIds.has(run.task_id))
 assert.equal(runs.length, 1)
 assert.equal(runs[0].status, 'completed')
-assert.equal(runs[0].source_repository, 'shyamsridhar123/ecorp')
+assert.equal(runs[0].source_repository, 'all-the-vibes/ecorp')
 assert.equal(runs[0].source_base_ref, 'HEAD')
 assert.equal(runs[0].source_base_commit, sourceBaseCommit)
 const sourceDeliverables = finalState.snapshot.source_deliverables.filter(
@@ -1112,7 +1112,7 @@ const queuedIssue = {
   id: 'I_FAKE_FACTORY_9003',
   number: 9003,
   title: 'Advance to the next eligible issue after verification',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9003',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9003',
   createdAt: '2026-09-01T14:02:00Z',
   updatedAt: '2026-09-01T14:02:00Z',
 }
@@ -1122,7 +1122,7 @@ fakeState.items.push({
   content: {
     body: queuedIssue.body,
     number: queuedIssue.number,
-    repository: 'shyamsridhar123/ecorp',
+    repository: 'all-the-vibes/ecorp',
     title: queuedIssue.title,
     type: 'Issue',
     url: queuedIssue.url,
@@ -1143,7 +1143,7 @@ const interruptionIssue = {
   id: 'I_FAKE_FACTORY_9013',
   number: 9013,
   title: 'Recover a controller interrupted after claim',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9013',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9013',
   createdAt: '2026-09-03T19:32:00Z',
   updatedAt: '2026-09-03T19:32:00Z',
 }
@@ -1151,7 +1151,7 @@ await writeFile(
   statePath,
   `${JSON.stringify(
     {
-      repository: 'shyamsridhar123/ecorp',
+      repository: 'all-the-vibes/ecorp',
       project: fakeState.project,
       items: [
         {
@@ -1160,7 +1160,7 @@ await writeFile(
           content: {
             body: interruptionIssue.body,
             number: interruptionIssue.number,
-            repository: 'shyamsridhar123/ecorp',
+            repository: 'all-the-vibes/ecorp',
             title: interruptionIssue.title,
             type: 'Issue',
             url: interruptionIssue.url,
@@ -1268,7 +1268,7 @@ const recoveryIssue = {
   id: 'I_FAKE_FACTORY_9002',
   number: 9002,
   title: 'Recover a factory mission after Project status synchronization fails',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9002',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9002',
   createdAt: '2026-09-01T14:01:00Z',
   updatedAt: '2026-09-01T14:01:00Z',
 }
@@ -1279,7 +1279,7 @@ fakeState.items = [
     content: {
       body: recoveryIssue.body,
       number: recoveryIssue.number,
-      repository: 'shyamsridhar123/ecorp',
+      repository: 'all-the-vibes/ecorp',
       title: recoveryIssue.title,
       type: 'Issue',
       url: recoveryIssue.url,
@@ -1351,7 +1351,7 @@ const paginationIssue = {
   id: 'I_FAKE_FACTORY_9020',
   number: 9020,
   title: 'Recover an authoritative factory item beyond the snapshot limit',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9020',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9020',
   createdAt: '2026-09-01T14:20:00Z',
   updatedAt: '2026-09-01T14:20:00Z',
 }
@@ -1363,7 +1363,7 @@ const paginationSourceMarker = [
   `SOURCE REVISION: ${paginationIssue.updatedAt}`,
 ].join('\n')
 const paginationState = {
-  repository: 'shyamsridhar123/ecorp',
+  repository: 'all-the-vibes/ecorp',
   project: recoveredFakeState.project,
   items: [
     {
@@ -1372,7 +1372,7 @@ const paginationState = {
       content: {
         body: paginationIssue.body,
         number: paginationIssue.number,
-        repository: 'shyamsridhar123/ecorp',
+        repository: 'all-the-vibes/ecorp',
         title: paginationIssue.title,
         type: 'Issue',
         url: paginationIssue.url,
@@ -1400,7 +1400,7 @@ const crossProjectCollision = await post(
     source_project_owner: 'other',
     source_project_number: 8,
     source_project_item_id: 'PVTI_FAKE_FACTORY_9020',
-    source_repository_owner: 'shyamsridhar123',
+    source_repository_owner: 'all-the-vibes',
     source_repository_name: 'ecorp',
     source_issue_number: paginationIssue.number,
     source_issue_node_id: paginationIssue.id,
@@ -1595,12 +1595,12 @@ const timeoutIssue = {
   id: 'I_FAKE_FACTORY_9011',
   number: 9011,
   title: 'Bound a stalled GitHub Project mutation',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9011',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9011',
   createdAt: '2026-09-01T14:11:00Z',
   updatedAt: '2026-09-01T14:11:00Z',
 }
 const timeoutState = {
-  repository: 'shyamsridhar123/ecorp',
+  repository: 'all-the-vibes/ecorp',
   project: recoveredFakeState.project,
   items: [
     {
@@ -1609,7 +1609,7 @@ const timeoutState = {
       content: {
         body: timeoutIssue.body,
         number: timeoutIssue.number,
-        repository: 'shyamsridhar123/ecorp',
+        repository: 'all-the-vibes/ecorp',
         title: timeoutIssue.title,
         type: 'Issue',
         url: timeoutIssue.url,
@@ -1653,7 +1653,7 @@ const failureIssue = {
   id: 'I_FAKE_FACTORY_9004',
   number: 9004,
   title: '[always-fail] Persist a terminal factory failure',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9004',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9004',
   createdAt: '2026-09-01T14:03:00Z',
   updatedAt: '2026-09-01T14:03:00Z',
 }
@@ -1664,7 +1664,7 @@ recoveredFakeState.items = [
     content: {
       body: failureIssue.body,
       number: failureIssue.number,
-      repository: 'shyamsridhar123/ecorp',
+      repository: 'all-the-vibes/ecorp',
       title: failureIssue.title,
       type: 'Issue',
       url: failureIssue.url,
@@ -1698,7 +1698,7 @@ const verificationFailureIssue = {
   id: 'I_FAKE_FACTORY_9005',
   number: 9005,
   title: 'Persist a factory verification failure',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9005',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9005',
   createdAt: '2026-09-01T14:04:00Z',
   updatedAt: '2026-09-01T14:04:00Z',
 }
@@ -1709,7 +1709,7 @@ recoveredFakeState.items = [
     content: {
       body: verificationFailureIssue.body,
       number: verificationFailureIssue.number,
-      repository: 'shyamsridhar123/ecorp',
+      repository: 'all-the-vibes/ecorp',
       title: verificationFailureIssue.title,
       type: 'Issue',
       url: verificationFailureIssue.url,
@@ -1774,12 +1774,12 @@ const approvalIssue = {
   id: 'I_FAKE_FACTORY_9012',
   number: 9012,
   title: 'Require substantive independent factory verification',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9012',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9012',
   createdAt: '2026-09-01T14:12:00Z',
   updatedAt: '2026-09-01T14:12:00Z',
 }
 const approvalState = {
-  repository: 'shyamsridhar123/ecorp',
+  repository: 'all-the-vibes/ecorp',
   project: recoveredFakeState.project,
   items: [
     {
@@ -1788,7 +1788,7 @@ const approvalState = {
       content: {
         body: approvalIssue.body,
         number: approvalIssue.number,
-        repository: 'shyamsridhar123/ecorp',
+        repository: 'all-the-vibes/ecorp',
         title: approvalIssue.title,
         type: 'Issue',
         url: approvalIssue.url,
@@ -1905,12 +1905,12 @@ const sourceChangedIssue = {
   id: 'I_FAKE_FACTORY_9007',
   number: 9007,
   title: 'Block dispatch when the claimed issue changes',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9007',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9007',
   createdAt: '2026-09-01T14:06:00Z',
   updatedAt: '2026-09-01T14:06:00Z',
 }
 const sourceChangeState = {
-  repository: 'shyamsridhar123/ecorp',
+  repository: 'all-the-vibes/ecorp',
   project: recoveredFakeState.project,
   items: [
     {
@@ -1919,7 +1919,7 @@ const sourceChangeState = {
       content: {
         body: sourceChangedIssue.body,
         number: sourceChangedIssue.number,
-        repository: 'shyamsridhar123/ecorp',
+        repository: 'all-the-vibes/ecorp',
         title: sourceChangedIssue.title,
         type: 'Issue',
         url: sourceChangedIssue.url,
@@ -1978,7 +1978,7 @@ const dependencyChangedIssue = {
 
 Blocked by #9009.
 `,
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9008',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9008',
   createdAt: '2026-09-01T14:07:00Z',
   updatedAt: '2026-09-01T14:07:00Z',
 }
@@ -1988,14 +1988,14 @@ const reopenedDependency = {
   number: 9009,
   title: 'Dependency that reopens before launch',
   body: 'Dependency fixture.',
-  url: 'https://github.com/shyamsridhar123/ecorp/issues/9009',
+  url: 'https://github.com/all-the-vibes/ecorp/issues/9009',
   state: 'CLOSED',
   createdAt: '2026-09-01T14:08:00Z',
   updatedAt: '2026-09-01T14:08:00Z',
   labels: [],
 }
 const dependencyChangeState = {
-  repository: 'shyamsridhar123/ecorp',
+  repository: 'all-the-vibes/ecorp',
   project: recoveredFakeState.project,
   items: [
     {
@@ -2004,7 +2004,7 @@ const dependencyChangeState = {
       content: {
         body: dependencyChangedIssue.body,
         number: dependencyChangedIssue.number,
-        repository: 'shyamsridhar123/ecorp',
+        repository: 'all-the-vibes/ecorp',
         title: dependencyChangedIssue.title,
         type: 'Issue',
         url: dependencyChangedIssue.url,

@@ -169,7 +169,7 @@ async function runController(demo, issueNumber) {
       '--project-number',
       '7',
       '--repository',
-      'shyamsridhar123/ecorp',
+      'all-the-vibes/ecorp',
       '--source-repository-path',
       sourceRoot,
       '--source-base-ref',
@@ -621,7 +621,7 @@ async function seedNewerPublicationContextRows(
           'source_project_item_id', 'PVTI_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
           'source_issue_number', 50000 + generated.sequence,
           'source_issue_node_id', 'I_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
-          'source_issue_url', 'https://github.com/shyamsridhar123/ecorp/issues/' || (50000 + generated.sequence)::text,
+          'source_issue_url', 'https://github.com/all-the-vibes/ecorp/issues/' || (50000 + generated.sequence)::text,
           'source_title', 'Publication context history ' || generated.sequence::text,
           'source_revision', (clock_timestamp() + generated.sequence * interval '1 millisecond')::text,
           'state', 'verified',
@@ -672,7 +672,7 @@ async function seedNewerPublications(publication, seed, count = 501) {
           'task_id', md5(${sqlLiteral(taskPrefix)} || generated.sequence::text)::uuid,
           'run_id', md5(${sqlLiteral(runPrefix)} || generated.sequence::text)::uuid,
           'source_issue_number', 50000 + generated.sequence,
-          'source_issue_url', 'https://github.com/shyamsridhar123/ecorp/issues/' || (50000 + generated.sequence)::text,
+          'source_issue_url', 'https://github.com/all-the-vibes/ecorp/issues/' || (50000 + generated.sequence)::text,
           'branch', 'ecorp/publication-history-' || generated.sequence::text || '-${nonce}',
           'authorization_id', md5(${sqlLiteral(authorizationPrefix)} || generated.sequence::text)::uuid,
           'effect_key', 'publication-context-effect-' || generated.sequence::text || '-${nonce}',
@@ -687,7 +687,7 @@ async function seedNewerPublications(publication, seed, count = 501) {
           'branch_pushed_at', clock_timestamp(),
           'pull_request_number', 50000 + generated.sequence,
           'pull_request_node_id', 'PR_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
-          'pull_request_url', 'https://github.com/shyamsridhar123/ecorp/pull/' || (50000 + generated.sequence)::text,
+          'pull_request_url', 'https://github.com/all-the-vibes/ecorp/pull/' || (50000 + generated.sequence)::text,
           'pull_request_state', 'OPEN',
           'pull_request_draft', false,
           'project_item_id', 'PVTI_PUBLICATION_CONTEXT_' || generated.sequence::text || '_${nonce}',
@@ -898,7 +898,7 @@ Produce one verified commit/branch deliverable and publish it for review.
 
 No blockers.
 `,
-  url: `https://github.com/shyamsridhar123/ecorp/issues/${issueNumber}`,
+  url: `https://github.com/all-the-vibes/ecorp/issues/${issueNumber}`,
   state: 'OPEN',
   createdAt: '2026-09-02T02:00:00Z',
   updatedAt: '2026-09-02T02:00:00Z',
@@ -921,7 +921,7 @@ Prove the trusted publisher refuses to push directly to the resolved base branch
 
 No blockers.
 `,
-  url: `https://github.com/shyamsridhar123/ecorp/issues/${collisionIssueNumber}`,
+  url: `https://github.com/all-the-vibes/ecorp/issues/${collisionIssueNumber}`,
   state: 'OPEN',
   createdAt: '2026-09-02T01:59:00Z',
   updatedAt: '2026-09-02T01:59:00Z',
@@ -931,8 +931,8 @@ await writeFile(
   statePath,
   `${JSON.stringify(
     {
-      repository: 'shyamsridhar123/ecorp',
-      canonical_repository: 'ShyamSridhar123/ECorp',
+      repository: 'all-the-vibes/ecorp',
+      canonical_repository: 'All-The-Vibes/ECorp',
       project: {
         id: 'PVT_PUBLICATION',
         number: 7,
@@ -953,7 +953,7 @@ await writeFile(
           content: {
             body: collisionIssue.body,
             number: collisionIssue.number,
-            repository: 'shyamsridhar123/ecorp',
+            repository: 'all-the-vibes/ecorp',
             title: collisionIssue.title,
             type: 'Issue',
             url: collisionIssue.url,
@@ -965,7 +965,7 @@ await writeFile(
           content: {
             body: issue.body,
             number: issue.number,
-            repository: 'shyamsridhar123/ecorp',
+            repository: 'all-the-vibes/ecorp',
             title: issue.title,
             type: 'Issue',
             url: issue.url,
@@ -1197,7 +1197,7 @@ await runPublisher(demo, collisionWorkItem.id, {
   bodyFile: collisionBodyPath,
   omitAuthorizationId: true,
   title: `  ${collisionCustomTitle}  `,
-  repository: 'ShyamSridhar123/ECorp',
+  repository: 'All-The-Vibes/ECorp',
   publisherId: 'trusted-publication-host-a',
   authorizationReason: 'Host A authorizes the first recoverable publication attempt.',
   leaseSeconds: 5,
@@ -1232,7 +1232,7 @@ const collisionPublication = (await snapshot(demo)).snapshot.pull_request_public
 )
 assert.equal(collisionPublication.branch, collisionRecoveryBranch)
 assert.equal(collisionPublication.title, collisionCustomTitle)
-assert.equal(collisionPublication.target_repository, 'shyamsridhar123/ecorp')
+assert.equal(collisionPublication.target_repository, 'all-the-vibes/ecorp')
 assert.equal(collisionPublication.publisher_id, 'trusted-publication-host-b')
 assert.equal(collisionPublication.attempt_count, 2)
 assert.equal(
@@ -1345,10 +1345,10 @@ const projectFillers = Array.from({ length: 1001 }, (_, index) => ({
   content: {
     body: '',
     number: 60000 + index,
-    repository: 'shyamsridhar123/ecorp',
+    repository: 'all-the-vibes/ecorp',
     title: `Publication filler ${index}`,
     type: 'Issue',
-    url: `https://github.com/shyamsridhar123/ecorp/issues/${60000 + index}`,
+    url: `https://github.com/all-the-vibes/ecorp/issues/${60000 + index}`,
   },
 }))
 const expandedProjectItems = [...projectFillers, ...projectItems]
@@ -1387,11 +1387,11 @@ Implements ${issue.url}
 Closes #${issueNumber}
 
 Auto-merge, merge, and deployment are not authorized by this publication.`
-const effectKey = `github-pr:${workItem.id}:${source.id}:shyamsridhar123/ecorp:${branch}`
+const effectKey = `github-pr:${workItem.id}:${source.id}:all-the-vibes/ecorp:${branch}`
 const forkPullRequest = {
   number: 7,
   id: 'PR_FAKE_FORK_7',
-  url: 'https://github.com/shyamsridhar123/ecorp/pull/7',
+  url: 'https://github.com/all-the-vibes/ecorp/pull/7',
   state: 'OPEN',
   isDraft: false,
   headRefName: branch,
@@ -1410,7 +1410,7 @@ await setFakeState({
 const publicationRequest = {
   actor_id: demo.alice_actor_id,
   source_deliverable_id: source.id,
-  target_repository: 'shyamsridhar123/ecorp',
+  target_repository: 'all-the-vibes/ecorp',
   base_ref: 'HEAD',
   branch,
   title: issue.title,
@@ -1838,13 +1838,13 @@ await failPublicationAttempt(
 const unauthorizedContentPullRequest = {
   number: 8,
   id: 'PR_FAKE_UNAUTHORIZED_CONTENT_8',
-  url: 'https://github.com/shyamsridhar123/ecorp/pull/8',
+  url: 'https://github.com/all-the-vibes/ecorp/pull/8',
   state: 'OPEN',
   isDraft: false,
   headRefName: branch,
   baseRefName: resolvedPublicationBase,
   headRefOid: source.head_commit,
-  headRepositoryOwner: { login: 'shyamsridhar123' },
+  headRepositoryOwner: { login: 'all-the-vibes' },
   isCrossRepository: false,
   autoMergeRequest: null,
   title: 'Unauthorized replacement title',
@@ -1882,7 +1882,7 @@ assert.equal(
 assert.equal(publicationSnapshot.publication.pull_request_head_sha, source.head_commit)
 assert.equal(
   publicationSnapshot.publication.pull_request_head_repository_owner,
-  'shyamsridhar123',
+  'all-the-vibes',
 )
 assert.equal(
   publicationSnapshot.publication.pull_request_is_cross_repository,
@@ -1897,10 +1897,10 @@ const authorizedPullRequest = fakeState.pull_requests.find(
 )
 assert.equal(authorizedPullRequest.number, 41)
 assert.equal(authorizedPullRequest.headRefOid, source.head_commit)
-assert.equal(authorizedPullRequest.headRepositoryOwner.login, 'shyamsridhar123')
+assert.equal(authorizedPullRequest.headRepositoryOwner.login, 'all-the-vibes')
 assert.equal(
   authorizedPullRequest.url,
-  'https://github.com/ShyamSridhar123/ECorp/pull/41',
+  'https://github.com/All-The-Vibes/ECorp/pull/41',
 )
 assert.notEqual(publicationSnapshot.publication.pull_request_number, forkPullRequest.number)
 assert.equal(
@@ -2101,7 +2101,7 @@ assert.equal(publication.state, 'published')
 assert.equal(publication.pull_request_number, 41)
 assert.equal(publication.pull_request_url, authorizedPullRequest.url)
 assert.equal(publication.pull_request_head_sha, source.head_commit)
-assert.equal(publication.pull_request_head_repository_owner, 'shyamsridhar123')
+assert.equal(publication.pull_request_head_repository_owner, 'all-the-vibes')
 assert.equal(publication.pull_request_is_cross_repository, false)
 assert.equal(publication.project_status_after, 'In Review')
 assert.equal(publication.auto_merge_enabled, false)
@@ -2267,10 +2267,10 @@ const report = {
   invalid_git_branches_rejected_before_start: true,
   custom_title_normalized: collisionPublication.title === collisionCustomTitle,
   mixed_case_repository_normalized:
-    collisionPublication.target_repository === 'shyamsridhar123/ecorp',
+    collisionPublication.target_repository === 'all-the-vibes/ecorp',
   mixed_case_pull_request_url_accepted:
     publication.pull_request_url ===
-    'https://github.com/ShyamSridhar123/ECorp/pull/41',
+    'https://github.com/All-The-Vibes/ECorp/pull/41',
   implicit_authorization_retry_stable: true,
   cross_publisher_default_start_recovery:
     collisionPublication.publisher_id === 'trusted-publication-host-b' &&
