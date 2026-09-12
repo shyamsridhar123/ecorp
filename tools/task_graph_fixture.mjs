@@ -27,7 +27,7 @@ export function taskGraphFixtureConfig(args, env) {
       /^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? '') &&
       /^[0-9a-f]{64}$/u.test(env.ECORP_TEST_POSTGRES_CONTAINER ?? ''),
     'Unix roster preparation is restricted to the explicit Actions integration service container')
-    assert.equal(endpoint.origin, 'http://127.0.0.1:8791')
+    assert.equal(endpoint.origin, 'http://127.0.0.1:18471')
   }
   return {
     server: endpoint.origin,

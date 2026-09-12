@@ -20,14 +20,14 @@ export function artifactStagingFixtureConfig(args, env) {
     assert.ok(env.CRONY_ARTIFACT_STAGING_OUTPUT && path.isAbsolute(env.CRONY_ARTIFACT_STAGING_OUTPUT),
       'The readiness smoke requires an explicit owned output file')
   } else {
-    // The legacy full suite injects SQL faults and restarts a PID-recorded server.
+    // The full suite injects SQL faults and restarts an ownership-verified server.
     // Keep those effects confined to its existing disposable hosted CI stack.
     assert.ok(env.GITHUB_ACTIONS === 'true' && env.CI === 'true' && env.RUNNER_OS === 'Linux' &&
       env.GITHUB_JOB === 'integration' && /^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? ''),
     'Full artifact fault injection is restricted to the Actions integration fixture')
     assert.equal(path.resolve(env.GITHUB_WORKSPACE ?? ''), root, 'Unexpected Actions workspace')
-    assert.equal(endpoint.origin, 'http://127.0.0.1:8791')
-    assert.equal(env.CRONY_TEST_SERVER_PID_FILE, path.join(root, 'output', 'server-ci.pid'))
+    assert.equal(endpoint.origin, 'http://127.0.0.1:18471')
+    assert.equal(env.CRONY_TEST_SERVER_PID_FILE, path.join(root, 'output', 'server-ci.json'))
     assert.ok(env.DATABASE_URL, 'The owned Actions service database must be explicit')
   }
   return {

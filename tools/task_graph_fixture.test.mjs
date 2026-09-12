@@ -14,7 +14,7 @@ const container = 'a'.repeat(64)
 const localEnv = { CRONY_TASK_GRAPH_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18437' }
 const actionsEnv = {
   ...localEnv,
-  CRONY_SERVER_HTTP: 'http://127.0.0.1:8791',
+  CRONY_SERVER_HTTP: 'http://127.0.0.1:18471',
   ECORP_CI_UNIX_DEMO_ROSTER: '1',
   ECORP_TEST_POSTGRES_CONTAINER: container,
   GITHUB_ACTIONS: 'true', CI: 'true', RUNNER_OS: 'Linux', GITHUB_JOB: 'integration', GITHUB_RUN_ID: '12345',

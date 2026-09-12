@@ -348,15 +348,111 @@ Local validation on parent `8a0d7bf` plus this fixture-only correction:
   pending recovery file changed. The updated full factory runtime assertions
   remain pending the next hosted run at this pre-publication checkpoint.
 
+## Owned Linux CI startup and restart receipts
+
+Hosted run `34684275416` on `622b0665e008dc8ed113d6e0477f6dc8d74df266`
+passed six jobs, including both external-adapter lanes. Integration passed the
+full artifact-staging, factory-claim/automatic-verification and Project-controller
+suites, then failed in `e2e_factory_publication.mjs`:
+
+```text
+Owned restart requires explicit binary, database, and JSON process manifest.
+```
+
+This is a CI supervision contract mismatch, not a failure of the hosted
+PostgreSQL container. Startup wrote a legacy PID-only file, omitted the explicit
+server binary, and used manual-stack API port `8791`. The publication helper
+requires ownership receipts and previously supported Windows inspection only.
+The earlier artifact/claim restart fixtures also overwrote PID records, and the
+later approval fixture still parsed a plain PID.
+
+Native capability and adapter decision:
+
+- The observed hosted runtime is Node `22.23.2`. Its `child_process` API provides
+  spawning, but not a stable Linux pidfd for a later independent CI step to
+  signal a receipt-recorded process without a PID-reuse race.
+- CPython exposes native `os.pidfd_open` and `signal.pidfd_send_signal` in its
+  standard library (Python 3.9+). A small test-only bridge acquires the kernel
+  handle before inspection, validates the receipt while it is live, sends
+  `SIGTERM` through that handle, and waits at most 30 seconds. Missing kernel/API
+  support, stale identity, foreign listeners and timeouts have no numeric-kill
+  or force-stop fallback. This is not a new production execution harness.
+- Receipts include exact boot ID/start ticks, executable, working directory,
+  user ID, network namespace and loopback-listener ownership. Linux paths are
+  case-sensitive. Windows retains its executable/creation/listener checks.
+
+The explicit Actions-only startup entry point now supports a non-mutating
+`--dry-run`, captures a fresh child receipt at startup, and refuses existing or
+legacy records instead of adopting PIDs. API `18471` and PostgreSQL `55471` are
+dedicated CI ports. Every integration fixture receives the same binary, URL,
+database and JSON manifest configuration; the PowerShell smoke gets the explicit
+API address as well.
+
+Artifact, claim, publication and approval restarts all use the shared helper.
+Artifact recovery retains its native zero-grace/one-second-interval settings.
+An exclusive operation lock and atomic compare-before-replace manifest updates
+preserve stale or concurrently changed records. Database target changes are
+refused. Stop is recorded before replacement; the new child must pass health,
+runner-reconnection and renewed ownership checks before it is recorded running.
+Cleanup stops only the ownership-verified CI server and retains its receipt.
+
+An initial inert Windows lifecycle test exposed a delay between process exit
+and socket release. The helper now waits at most ten seconds for release only
+after its verified stop. It never stops another listener to acquire the port.
+The failed test's receipt/logs were retained outside the repository; a read-only
+check found the recorded child absent and the port released. Subsequent complete
+startup/two-restart/idempotent-stop tests passed and cleaned up their own children.
+
+Database URLs are delivered only through the child environment, not command
+arguments or receipts. Preview/error output does not disclose the value.
+Environment-only delivery remains reduced assurance. No private operator
+database URL, existing runner credential, provider identity or live factory
+configuration is used by these unit fixtures.
+
+Local validation on parent `622b066` plus this CI-only correction:
+
+- Six Node regression files: 55 passed, zero skipped, on Windows Node `24.19.0`.
+  This includes native Windows startup, two restarts and idempotent stop using
+  inert HTTP children, plus stale/legacy records, lock preservation, database
+  drift, foreign listeners, reserved ports, Linux identity and CI-wiring checks.
+- Nine native Linux tests passed in the existing WSL Ubuntu environment, using
+  CPython `3.14.4` and kernel `6.18.33.2-microsoft-standard-WSL2`. Real pidfds
+  exercised inspection, receipt-matched stop, foreign-listener/stale-identity
+  refusal, missing-native-support refusal, and no-force-stop timeout behavior.
+  Only disposable Python/socket children were created; no database was used.
+- CI startup `--dry-run` reported zero services started, zero database writes
+  and no database URL disclosure. Changed Node files passed syntax checking;
+  workflow YAML and environment mappings parsed with the installed YAML parser;
+  `git diff --check` passed.
+- All required migration/Rust/web gates passed: 40 immutable migrations, Rust
+  format, Clippy, 452 passing Rust tests with 200 explicitly ignored database
+  cases and ambient `DATABASE_URL` removed, web build and web lint.
+- The four pending recovery files remain byte-identical and unstaged. The
+  configured source checkout remains clean at `971445e`. No local ECorp,
+  PostgreSQL, Docker, provider, enrollment, dispatch or GitHub mutation was
+  performed by these checks. WSL was used only for isolated test tooling.
+
+Docker CLI `29.7.2` is installed locally, but its selected `desktop-linux` engine
+was not reachable and the Docker service was stopped. An explicit existing
+`DATABASE_URL` bypasses Docker Compose in native local startup, so Docker is not
+a requirement for the operator's existing native PostgreSQL setup. Local Docker
+state cannot cause a GitHub-hosted job's restart-manifest mismatch.
+
+WSL has no Node installation, so the complete Node-to-Python-to-ECorp Linux
+startup/restart chain is **not yet locally verified**. The new Linux-native Node
+lifecycle tests and full integration recovery sequence remain hosted-CI gates.
+No green hosted result is claimed for this unpublished correction.
+
 ## Remaining boundary
 
-This is Windows deterministic full-stack evidence and unit-tested Unix admission
-logic. It is not real vendor inference or browser acceptance. Hosted runs have
-now proved both external-adapter lanes, Linux roster SQL, both graph variants,
-and the full Linux artifact-staging/restart suite. The ATV factory claim now
-dispatches and completes its governed run. The next run must validate the updated
-automatic-verification assertions and remaining factory/integration steps. The local readiness
-smoke does not claim SQL fault injection or restart recovery on Windows.
+This is Windows deterministic full-stack evidence, native ownership-unit
+evidence and unit-tested Unix admission logic. It is not real vendor inference
+or browser acceptance. Hosted runs have proved both external-adapter lanes,
+Linux roster SQL, both graph variants, artifact staging/restart, factory claims
+with native automatic verification, and the full Project-controller suite.
+The next run must validate the new ownership-manifest startup/restart chain,
+publication recovery and later integration steps. The local readiness smoke
+does not claim SQL fault injection or artifact restart recovery on Windows.
 
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review

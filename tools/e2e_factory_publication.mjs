@@ -323,7 +323,7 @@ async function runPublisher(
 }
 
 async function restartLocalServer() {
-  return restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'publication-restart' })
+  return restartOwnedTestServer({ root, server, databaseUrl, logPrefix: 'publication-server-restart' })
 }
 
 async function psql(sql) {

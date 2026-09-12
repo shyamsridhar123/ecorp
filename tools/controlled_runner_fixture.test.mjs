@@ -18,10 +18,10 @@ const smokeEnv = {
   CRONY_ARTIFACT_STAGING_OUTPUT: path.join(root, 'output', 'controlled-readiness-test.json'),
 }
 const actionsEnv = {
-  CRONY_ARTIFACT_STAGING_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:8791',
+  CRONY_ARTIFACT_STAGING_TEST: '1', CRONY_SERVER_HTTP: 'http://127.0.0.1:18471',
   GITHUB_ACTIONS: 'true', CI: 'true', RUNNER_OS: 'Linux', GITHUB_JOB: 'integration',
   GITHUB_RUN_ID: '12345', GITHUB_WORKSPACE: root,
-  CRONY_TEST_SERVER_PID_FILE: path.join(root, 'output', 'server-ci.pid'),
+  CRONY_TEST_SERVER_PID_FILE: path.join(root, 'output', 'server-ci.json'),
   DATABASE_URL: 'synthetic-fixture-database-not-disclosed',
 }
 const demo = { corp_id: '00000000-0000-4000-8000-000000000001', alice_actor_id: 'owner-fixture' }
