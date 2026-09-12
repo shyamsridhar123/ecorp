@@ -9,7 +9,7 @@ mod process;
 mod storage;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -271,7 +271,8 @@ impl ConnectionManager {
                 if command.expires_at <= Utc::now() {
                     return Err(anyhow!("native setup operation expired"));
                 }
-                self.update(|state| begin_operation(state, &command))?;
+                let active = flights.keys().copied().collect();
+                self.update(|state| reserve_operation(state, &command, &active, Utc::now()))?;
                 let (done, receiver) = watch::channel(None);
                 let (code_sender, code_receiver) = mpsc::channel(1);
                 let flight = Arc::new(Flight {
@@ -1440,6 +1441,64 @@ fn require_same_command(left: &WorkspaceSetupCommand, right: &WorkspaceSetupComm
         ));
     }
     Ok(())
+}
+
+fn reserve_operation(
+    state: &mut Registry,
+    command: &WorkspaceSetupCommand,
+    active: &HashSet<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    // A still-retained UUID must match exactly, even at capacity. The server
+    // retries its immutable stored command (including expiry), never a new
+    // payload under an old UUID. Evicted exact replays therefore fail closed.
+    if state.operations.contains_key(&command.operation_id) {
+        return begin_operation(state, command);
+    }
+    if command.expires_at <= now {
+        return Err(anyhow!("native setup operation expired"));
+    }
+    if state.operations.len() >= MAX_OPERATIONS {
+        let mut protected = active.clone();
+        for connection in state.connections.values() {
+            protected.insert(connection.current_operation);
+        }
+        for (id, operation) in &state.operations {
+            if let Some(key) = &operation.candidate {
+                let connection = operation
+                    .command
+                    .action
+                    .connection_id()
+                    .and_then(|id| state.connections.get(&id));
+                if connection.is_none_or(|connection| {
+                    connection.active_snapshot.as_ref() == Some(key)
+                        || connection.source_snapshot.as_ref() == Some(key)
+                        || connection.snapshots.contains_key(key)
+                }) {
+                    protected.insert(*id);
+                }
+            }
+        }
+        // Retire at most one oldest eligible entry per admission. Unknown,
+        // active, unacknowledged, still-valid and snapshot-bound receipts stay.
+        let id = state
+            .operations
+            .iter()
+            .filter(|(id, operation)| {
+                !protected.contains(*id)
+                    && operation.command.expires_at <= now
+                    && operation.acknowledged.is_some()
+                    && operation
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| report.status.terminal() && report.sign_in.is_none())
+            })
+            .min_by_key(|(id, operation)| (operation.command.expires_at, **id))
+            .map(|(id, _)| *id)
+            .context("native setup receipt retention bound reached")?;
+        state.operations.remove(&id);
+    }
+    begin_operation(state, command)
 }
 
 fn immutable_configuration_matches(

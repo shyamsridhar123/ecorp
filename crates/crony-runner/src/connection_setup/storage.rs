@@ -284,6 +284,10 @@ mod tests {
     fn canonical_roots_keep_native_workspace_path_representation() {
         let root = std::env::temp_dir().join(format!("ecorp-canonical-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
+        // macOS temporary directories can have linked ancestors. Resolve only this
+        // freshly created, owned fixture; product inputs must still reject links.
+        #[cfg(target_os = "macos")]
+        let root = fs::canonicalize(root).expect("resolve owned macOS fixture root");
         let canonical = canonical_directory(&root).unwrap();
         assert_eq!(canonical_directory(&canonical).unwrap(), canonical);
         assert!(reject_user_path(&canonical).is_ok());
