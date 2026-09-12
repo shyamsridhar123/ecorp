@@ -16,9 +16,26 @@ import { promisify } from 'node:util'
 import {
   downloadVerifiedArtifact,
 } from './artifact_client.mjs'
+import {
+  artifactStagingFixtureConfig,
+  assertControlledAssignment,
+  controlledReadinessCapability,
+  controlledReadinessSource,
+  waitForControlledRunnerDispatch,
+} from './controlled_runner_fixture.mjs'
 
 const execFile = promisify(execFileCallback)
-const server = process.env.CRONY_SERVER_HTTP ?? 'http://127.0.0.1:8791'
+const config = artifactStagingFixtureConfig(process.argv.slice(2), process.env)
+const server = config.server
+if (config.dryRun) {
+  console.log(JSON.stringify({ ...config, services_started: false, database_writes: false,
+    proposed: config.readinessSmoke
+      ? ['reset the owned fixture, verify read-only controlled-runner readiness, assignment identity and artifact acceptance',
+        'close the synthetic runner; no SQL faults, file removal or server restart']
+      : ['run the complete artifact staging, fault-injection and restart suite on the existing Actions fixture'],
+  }, null, 2))
+  process.exit(0)
+}
 const databaseUrl =
   process.env.DATABASE_URL ?? 'postgres://crony:crony@127.0.0.1:54329/crony'
 const root = path.resolve(import.meta.dirname, '..')
@@ -30,7 +47,9 @@ const pidPath =
 let psqlMode
 
 async function request(pathname, init) {
-  const response = await fetch(`${server}${pathname}`, init)
+  const response = await fetch(`${server}${pathname}`, {
+    ...init, redirect: 'error', signal: AbortSignal.timeout(10_000),
+  })
   const body = response.status === 204 ? null : await response.json()
   return { response, body }
 }
@@ -271,6 +290,7 @@ function connectRunner({ corpId, runnerId, credential }) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`${server.replace(/^http/, 'ws')}/ws/runner`)
     const connectionEpoch = crypto.randomUUID()
+    const readinessSource = controlledReadinessSource(runnerId, connectionEpoch)
     const assignments = []
     const waiters = []
     const timeout = setTimeout(() => {
@@ -312,6 +332,7 @@ function connectRunner({ corpId, runnerId, credential }) {
               detail: 'controlled artifact staging runner',
               models: [],
             },
+            controlledReadinessCapability(readinessSource),
           ],
           active_runs: [],
         }),
@@ -325,6 +346,7 @@ function connectRunner({ corpId, runnerId, credential }) {
           socket,
           connectionEpoch,
           runnerId,
+          readinessSource,
           credential: payload.credential,
           waitForAssignment(runId, timeoutMs = 10_000) {
             const index = assignments.findIndex(
@@ -390,6 +412,7 @@ async function controlledRun(demo, runner, title) {
     `/api/corps/${demo.corp_id}/missions/${mission.mission_id}/launch`,
     { requested_by: demo.alice_actor_id },
   )
+  assertControlledAssignment(launch, runner)
   const assignment = await runner.waitForAssignment(launch.run_id)
   assert.equal(assignment.run_id, launch.run_id)
   sendRunEvent(runner, assignment, 'run.started', {
@@ -660,6 +683,7 @@ const runner = await connectRunner({
   runnerId,
   credential: enrollment.enrollment_token,
 })
+const readinessPreviews = await waitForControlledRunnerDispatch({ request, demo, runner })
 
 const sharedBytes = Buffer.from(`shared digest ${crypto.randomUUID()}\n`, 'utf8')
 const accepted = await acceptedArtifact(
@@ -671,6 +695,20 @@ const accepted = await acceptedArtifact(
 )
 const acceptedDownload = await downloadVerifiedArtifact(server, demo, accepted.run)
 assert.deepEqual(acceptedDownload, sharedBytes)
+if (config.readinessSmoke) {
+  runner.socket.close()
+  const report = {
+    schema_version: 1, coverage: 'controlled_runner_readiness_only',
+    runner_id: runner.runnerId, assigned_runner_id: accepted.run.runner_id,
+    readiness_previews: readinessPreviews, run_id: accepted.run.id,
+    run_status: accepted.run.status, artifact_sha256: accepted.sha256,
+    artifact_verified: true, fault_injection_executed: false, server_restarted: false,
+  }
+  assert.equal(report.assigned_runner_id, runner.runnerId)
+  await writeFile(config.output, `${JSON.stringify(report, null, 2)}\n`)
+  console.log(JSON.stringify(report, null, 2))
+  process.exit(0)
+}
 assert.equal(
   await psql(
     `SELECT count(*) FROM artifacts WHERE run_id = ` +
@@ -1037,6 +1075,8 @@ assert.equal(await exists(cleanupFinalPath), true)
 
 const report = {
   checked_at: new Date().toISOString(),
+  controlled_runner_id: runner.runnerId,
+  readiness_previews: readinessPreviews,
   accepted_shared_digest: {
     run_id: accepted.run.id,
     artifact_id: accepted.run.artifact_id,
@@ -1082,7 +1122,7 @@ const report = {
   },
 }
 await writeFile(
-  path.join(root, 'output', 'e2e-artifact-staging.json'),
+  config.output,
   `${JSON.stringify(report, null, 2)}\n`,
 )
 console.log(JSON.stringify(report, null, 2))

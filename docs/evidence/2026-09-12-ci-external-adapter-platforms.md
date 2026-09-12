@@ -211,13 +211,68 @@ Validation on parent `9427201` plus this follow-up:
 - Retained `fixture-report.json` SHA-256:
   `246659026beadeeb9e98b97419ca1ae87473c7a6572def6d923501f86320694d`.
 
+## Controlled artifact-runner readiness follow-up
+
+Hosted run `34682044685` on `a7855a22f44369a28775c3927b0325676207f5f4`
+passed both graph lanes, including the real Linux roster SQL, and all six other
+jobs. Integration passed verification, replay, control fencing, rooms, runner
+reconnection and idempotency, then failed in `e2e_artifact_staging.mjs`:
+`timed out waiting for assignment 3e7b6884-d709-42fc-9ee0-44982ecbe740`.
+
+The existing controlled runner resolved its connection promise on `Registered`
+and immediately created/launched a mission. Native server code intentionally
+keeps that connection non-dispatchable until current-epoch reconciliation and its
+one-second finalization delay finish. Another ready runner can therefore receive
+the unbound mission; the fixture did not check the returned runner ID.
+
+The CI-only correction waits for the existing source-bound, read-only mission
+preview to admit the controlled runner, using a unique per-connection synthetic
+source marker. That marker is explicitly **preview-only**, never persisted as an
+execution source or presented as evidence of an actual Git checkout. The helper
+checks the exact connected runner, Corp, marker and available fake-process
+capability, with zero mission/task/run history. It retries only narrowly
+classified readiness refusals, with a 30-second bound. Every effectful launch now
+asserts its returned runner ID before waiting for the assignment. No production
+registration, dispatch, reconciliation, authorization or completion guard changes.
+
+Linux retains the complete original SQL-fault, staged-byte, duplicate-digest,
+breaker-refusal, restart and periodic-recovery assertions. Full execution now
+requires the explicit existing Actions integration workspace, endpoint, PID file
+and database configuration. Windows adds a separately labeled readiness smoke
+that exits after one accepted, verified artifact; it cannot claim SQL fault or
+restart coverage. Manual-stack ports are refused by that smoke mode.
+
+Local validation on parent `a7855a2` plus this follow-up:
+
+- All three Node regression files: 37 passed, zero skipped. Node syntax,
+  PowerShell AST, migration check, Rust format, offline Clippy, web build and lint
+  passed. Offline Rust tests again passed 452 cases with 200 explicitly ignored
+  database cases and no ambient `DATABASE_URL`.
+- Pure readiness and supervisor previews made no changes.
+- Retained fixture `ecorp-external-adapters-ci-20260912h` passed from
+  `2026-09-12T08:10:04.9054492Z` to `2026-09-12T08:10:46.3739470Z`, using only
+  QA API `18437` and PostgreSQL `55437`. Its synthetic source commit remained
+  `c29732e2abd4b5bb2bd72b566fdb74cb5060457e`.
+- The smoke made eight native readiness previews. Controlled runner
+  `aaa-artifact-staging-8f970f79-8918-4fdd-873c-197d7410b229` received and completed
+  run `922ac2c7-56fa-4eab-ae68-e16d412f8b87`; artifact SHA-256 was
+  `a47e8ab1dea707ba3a06aab4db7c40a45a0a5c0afea4d69dda554b88e0ec2172`.
+- Both external-adapter lifecycles and the Codex/Claude graph passed again.
+  The report confirms unchanged synthetic source, zero real provider/GitHub
+  effects, and verified shutdown of the owned runner, server and PostgreSQL.
+- `e2e-controlled-runner-readiness.json` SHA-256:
+  `ac4b737c73d7bef73219e7a854268be68114994a1efa192d64208e3d24257e8c`.
+- `fixture-report.json` SHA-256:
+  `aaa9355649d4eeb3adcc4461963a778a21f6ecbae8104c1bcf4f94d06b908f11`.
+
 ## Remaining boundary
 
 This is Windows deterministic full-stack evidence and unit-tested Unix admission
-logic. It is not real vendor inference or browser acceptance. The preceding
-hosted run proved both external-adapter lanes; a new run must validate the Linux
-roster SQL and graph, the added Windows graph, and the subsequent integration
-steps. Mocked SQL tests do not claim to have executed that transaction in Linux.
+logic. It is not real vendor inference or browser acceptance. Hosted run
+`34682044685` proved both external-adapter lanes, Linux roster SQL and both graph
+variants. A new run must validate the corrected full artifact-staging suite and
+the later integration steps. The local readiness smoke does not claim that
+SQL fault injection or restart recovery executed on Windows.
 
 The live factory, original runner identity, paused work, budgets and pending #50
 terminal-recovery cases remain outside this correction. PR #237 remains review

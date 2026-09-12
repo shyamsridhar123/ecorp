@@ -70,6 +70,7 @@ $preview = [ordered]@{
         'Execute Claude Code and OpenCode through deterministic protocol fixtures, never real accounts.',
         'Verify signed artifact download, session, usage and provider termination before completion.',
         'Verify the original mixed Codex/Claude parallel graph, dependency artifacts and bounded retries.',
+        'Verify controlled-runner readiness and exact assignment using one synthetic artifact; no fault injection or restart.',
         'Stop only owned fixture processes and preserve all data, worktrees and evidence.'
     )
     services_started = $false
@@ -304,6 +305,12 @@ try {
         throw 'The Windows graph did not preserve mixed Codex/Claude adapter coverage.'
     }
     $report.cross_provider_graph = 'passed'
+    $controlledEnv = $childEnv.Clone()
+    $controlledEnv.CRONY_ARTIFACT_STAGING_TEST = '1'; $controlledEnv.CRONY_SERVER_HTTP = $api
+    $controlledEnv.CRONY_ARTIFACT_STAGING_OUTPUT = Join-Path $evidence 'e2e-controlled-runner-readiness.json'
+    Invoke-FixtureCommand 'controlled-runner-preview' $node @((Join-Path $repo 'tools/e2e_artifact_staging.mjs'), '--readiness-smoke', '--dry-run') $controlledEnv | Out-Null
+    Invoke-FixtureCommand 'controlled-runner-readiness' $node @((Join-Path $repo 'tools/e2e_artifact_staging.mjs'), '--readiness-smoke') $controlledEnv 90 | Out-Null
+    $report.controlled_runner_readiness = 'passed'
     $after = Invoke-FixtureCommand 'source-after' $git @('-C', $source, 'rev-parse', 'HEAD')
     $status = Invoke-FixtureCommand 'source-status' $git @('-C', $source, 'status', '--porcelain')
     if ($after -ne $report.fixture_source_commit -or $status) { throw 'The fixture source checkout changed.' }
