@@ -26,6 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
       - run: node tools/check_migrations.mjs
+      - name: Verify external-adapter E2E expectations cannot hide runtime failures
+        run: node --test tools/e2e_external_adapters.test.mjs
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -133,7 +135,7 @@ jobs:
         run: node tools/e2e_portable_deliverables.mjs
       - name: Verify Codex start, steer, resume, interrupt, stop, usage, and evidence
         run: node tools/e2e_codex.mjs
-      - name: Verify Claude Code and OpenCode normalized lifecycle evidence
+      - name: Verify external-CLI platform admission and supported lifecycle evidence
         run: node tools/e2e_external_adapters.mjs
       - name: Verify GitHub Copilot harness, model discovery, selection, and resume
         run: node tools/e2e_copilot.mjs

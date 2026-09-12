@@ -368,9 +368,18 @@ artifact, produced no completion or retry, removed the clean worktree, and rende
 failed state in desktop and mobile Chromium. See
 `docs/evidence/2026-09-02-real-provider-budget-stop.md`.
 
-The external-adapter conformance test and `tools/e2e_external_adapters.mjs` run one common sample
-through Claude Code and OpenCode normalization, verifying equivalent session, usage, artifact, and
-completion evidence. See `docs/evidence/2026-08-30-external-adapter-validation.md`.
+On a Windows runner, `tools/e2e_external_adapters.mjs` runs one common sample
+through Claude Code and OpenCode normalization, verifying session, usage, signed
+artifact, and completion evidence. Linux/macOS instead must return the native
+unavailable-adapter denial without persisting a run or execution journal.
+The driver reads the connected fixture runner's OS; an optional
+`CRONY_TEST_RUNNER_PLATFORM` expectation must match it and cannot select a weaker
+test mode. The fixture requires exactly one connected runner.
+`node --test tools/e2e_external_adapters.test.mjs` checks the driver with synthetic
+HTTP responses, including wrong-platform, false-success, unrelated-denial, and
+child-cleanup negatives; it does not replace native integration acceptance.
+See `docs/evidence/2026-08-30-external-adapter-validation.md` and
+`docs/evidence/2026-09-12-pr234-platform-contract.md`.
 
 The Claude external-adapter permission suite drives a protocol-faithful fake CLI over bidirectional
 stream JSON. It verifies manual permission mode, the initialize response before the typed initial
