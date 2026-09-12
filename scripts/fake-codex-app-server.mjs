@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { writeCheckpointApplication } from './checkpoint-application-fixture.mjs'
 
@@ -176,7 +176,11 @@ function startTurn(message) {
     writeCheckpointApplication(workspace)
   }
 
-  if (prompt.includes('[budget-queued-completion]')) {
+  if (resumed && prompt.includes('[budget-recovery-finish]')) {
+    // An explicit synthetic finish avoids replaying the original budget marker
+    // retained in the native resume contract. Existing stream cases are unchanged.
+    completionTimer = setTimeout(() => finish('completed'), 300)
+  } else if (prompt.includes('[budget-queued-completion]')) {
     // Isolated #193 race candidate: base.txt already exists. Emit both usage
     // frames and completion in THIS turn, before reading another control frame.
     // The native adapter may enqueue its artifact before hard control arrives.
@@ -185,6 +189,27 @@ function startTurn(message) {
     emitUsage(3_000, 0)
     emitUsage(3_000, 0)
     finish('completed')
+  } else if (!resumed && prompt.includes('[checkpoint-read-lock]')) {
+    // Host-side QA holds the unchanged README with FileShare.None. Its marker
+    // makes the native checkpoint read fail without editing any database proof.
+    emitUsageOnFinish = false
+    const deadline = Date.now() + 20_000
+    const awaitLock = () => {
+      if (terminal) return
+      if (existsSync(`${workspace}/.qa-checkpoint-lock-ready`)) {
+        emitUsage(3_000, 0)
+        completionTimer = setTimeout(() => {
+          if (terminal) return
+          emitUsage(3_000, 0)
+          completionTimer = setTimeout(() => finish('completed'), 1_000)
+        }, 80)
+      } else if (Date.now() >= deadline) {
+        finish('failed', 'QA checkpoint read-lock was not established')
+      } else {
+        completionTimer = setTimeout(awaitLock, 25)
+      }
+    }
+    awaitLock()
   } else if (prompt.includes('[budget-stream]') || prompt.includes('[budget-stream-ui]')) {
     // The browser's smallest normal preset is 500K. Keep its real request
     // unchanged and scale only this deterministic fixture's reported usage.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
@@ -11,7 +11,7 @@ import { runInNewContext } from 'node:vm'
 
 const script = fileURLToPath(new URL('../scripts/fake-codex-app-server.mjs', import.meta.url))
 
-async function observe(marker, interrupt = false) {
+async function observe(marker, interrupt = false, resumed = false, signalReadLock = false) {
   const temp = await realpath(os.tmpdir())
   const root = await mkdtemp(path.join(temp, 'ecorp-budget-protocol-'))
   const child = spawn(process.execPath, [script], {
@@ -36,14 +36,17 @@ async function observe(marker, interrupt = false) {
         const message = JSON.parse(line)
         messages.push(message)
         if (message.id === 1) {
-          send({ id: 2, method: 'thread/start', params: { cwd: root } })
+          send({ id: 2, method: resumed ? 'thread/resume' : 'thread/start', params: { cwd: root, threadId: 'fixture-resume-thread' } })
         } else if (message.id === 2) {
           send({
             id: 3, method: 'turn/start',
             params: { threadId: message.result.thread.id, input: [{ type: 'text', text: marker }] },
           })
+        } else if (message.id === 3 && signalReadLock) {
+          // Protocol handshake only. The full QA harness owns the OS read lock.
+          writeFileSync(path.join(root, '.qa-checkpoint-lock-ready'), 'synthetic protocol test')
         } else if (message.method === 'thread/tokenUsage/updated') {
-          assert.equal(readFileSync(path.join(root, 'base.txt'), 'utf8'), 'base\n')
+          assert.equal(readFileSync(path.join(root, resumed ? 'resumed.txt' : 'base.txt'), 'utf8'), resumed ? 'resumed\n' : 'base\n')
           usage.push(message.params.tokenUsage)
           if (interrupt && usage.length === 1) send({ id: 4, method: 'turn/interrupt', params: {} })
         } else if (message.method === 'turn/completed') {
@@ -86,6 +89,35 @@ test('UI budget-stream uses the real 500K preset with explicit synthetic counter
   assert.equal(observed.terminal, 'completed')
   assert.deepEqual(observed.usage.map(item => item.last.inputTokens), [300000, 300000])
   assert.equal(observed.usage.at(-1).total.totalTokens, 600000)
+})
+
+test('explicit recovery finish on a resumed thread does not replay original contract usage', async () => {
+  const observed = await observe('[budget-stream]\nRESUME INSTRUCTION:\n[budget-recovery-finish]', false, true)
+  assert.equal(observed.terminal, 'completed')
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [12])
+})
+
+test('recovery finish marker cannot suppress initial budget-stream usage', async () => {
+  const observed = await observe('[budget-stream] [budget-recovery-finish]')
+  assert.equal(observed.terminal, 'completed')
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [3000, 3000])
+})
+
+test('resumed budget-stream without explicit finish still exhausts the synthetic budget', async () => {
+  const observed = await observe('[budget-stream]', false, true)
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [3000, 3000])
+})
+
+test('missing-checkpoint fixture emits budget usage only after the QA lock handshake', async () => {
+  const observed = await observe('[budget-stream] [checkpoint-read-lock]', false, false, true)
+  assert.equal(observed.terminal, 'completed')
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [3000, 3000])
+})
+
+test('missing-checkpoint fixture still honors native interrupt after first usage', async () => {
+  const observed = await observe('[budget-stream] [checkpoint-read-lock]', true, false, true)
+  assert.equal(observed.terminal, 'interrupted')
+  assert.deepEqual(observed.usage.map(item => item.last.totalTokens), [3000])
 })
 
 test('native interrupt prevents later usage and completion in the UI fixture', async () => {
