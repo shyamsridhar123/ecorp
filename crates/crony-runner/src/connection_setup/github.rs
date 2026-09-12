@@ -148,7 +148,7 @@ fn repository_choice(value: &Value) -> Result<GitHubRepositoryChoice> {
     validate_ref(default_branch)?;
     Ok(GitHubRepositoryChoice {
         id: id.to_owned(),
-        repository: repository.to_owned(),
+        repository: repository.to_ascii_lowercase(),
         default_branch: default_branch.to_owned(),
         private: value["private"]
             .as_bool()
@@ -550,6 +550,23 @@ fn credential_storage(value: u8) -> CredentialStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_repository_choice_normalizes_case_without_changing_id_or_branch() {
+        let choice = repository_choice(&serde_json::json!({
+            "full_name": "OctoCat/Hello-World",
+            "node_id": "R_CaseSensitiveIdentity",
+            "default_branch": "Release/Main",
+            "private": true,
+            "permissions": { "push": true }
+        }))
+        .unwrap();
+        assert_eq!(choice.repository, "octocat/hello-world");
+        assert_eq!(choice.id, "R_CaseSensitiveIdentity");
+        assert_eq!(choice.default_branch, "Release/Main");
+        assert!(choice.private);
+        assert!(choice.can_push);
+    }
 
     #[test]
     fn repository_and_device_instruction_parsing_never_accept_shell_or_token_text() {
